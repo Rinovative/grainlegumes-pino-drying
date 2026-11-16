@@ -4,6 +4,7 @@ Responsibilities:
   - Bind spatial grid identity to coordinates, source indexes and field order
   - Reject direct comparisons with incompatible spatial representation
   - Produce deterministic endpoint-preserving display indexes and samples
+  - Give the physical extent of a coordinate grid, the one extent rule of its identity and of the maps drawn on it
 
 Design principles:
   - Presentation sampling never changes full-grid numerical reductions
@@ -90,6 +91,11 @@ def display_sample(values: np.ndarray, indices: tuple[np.ndarray, np.ndarray]) -
     return array[..., y_indices[:, None], x_indices]
 
 
+def physical_extent(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float, float]:
+    """Return the physical (x0, x1, y0, y1) extent the coordinate grids ``x`` and ``y`` span, the extent of every map drawn on them."""
+    return float(np.min(x)), float(np.max(x)), float(np.min(y)), float(np.max(y))
+
+
 def spatial_grid_identity(
     coordinates: np.ndarray,
     *,
@@ -138,7 +144,7 @@ def spatial_grid_identity(
         source_shape=source,
         axis_indices=indices,
         field_order=field_order,
-        physical_extent=(float(np.min(array[0])), float(np.max(array[0])), float(np.min(array[1])), float(np.max(array[1]))),
+        physical_extent=physical_extent(array[0], array[1]),
     )
 
 

@@ -261,11 +261,13 @@ def test_two_material_ood_datasets_keep_their_own_identity_membership_and_assign
     _publish(tmp_path, training_dataset_payload_factory("combined_train", material_role="id"))
     _publish(tmp_path, training_dataset_payload_factory("chickpea_ood", material_family="chickpea", material_role="ood"))
     _publish(tmp_path, training_dataset_payload_factory("family_ood", material_family="kidney_bean", material_role="ood"))
+    # Training never gets an OOD loader; the explicit held-out request of the data-pipeline acceptance builds them.
     _train_loader, loaders, _scaling, split_info, _artifact = _loaders(
         tmp_path,
         steady_task,
         "combined_train",
         ("chickpea_ood", "family_ood"),
+        held_out_loaders=True,
     )
 
     split = datasets.preprocessing.splits.admit_split(split_info)

@@ -23,9 +23,10 @@ permeability:
   - lower: 1.3e-07
     upper: 2.2e-07
   provenance:
-    evidence: project_baseline
+    evidence: engineering_estimate
     source_refs:
     - ba
+    method: No kidney-bean airflow measurement exists. The value is the thesis value corrected by K_A = 1.92 (uncorrected about 1.9e-08 m^2); faba bean by Kozeny-Carman gives 3-5e-08 m^2, so the value is plausible but not proven.
     applicability:
       packing: Only for packing bands in each complete density record; generated mean
         eps must pass the material band.
@@ -53,6 +54,7 @@ thermal_properties:
       evidence: literature_transfer
       source_refs:
       - matouk_thermal
+      method: Transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover; no kidney-bean data exist and the value is unchanged.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -75,6 +77,7 @@ thermal_properties:
       evidence: literature_transfer
       source_refs:
       - matouk_thermal
+      method: Transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover; no kidney-bean data exist and the value is unchanged.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -84,15 +87,15 @@ thermal_properties:
 # Initial moisture is dry basis (kg water/kg dry solids); amplitude controls field variation and field_support bounds generated values.
 initial_moisture:
   mean_db:
-    nominal: 0.28205128205128205
+    nominal: 0.21951219512195122
     support:
-      lower: 0.2195121951219512
-      upper: 0.38888888888888895
+      lower: 0.1904761904761905
+      upper: 0.28205128205128205
     transform: linear
     distribution: uniform
     ood_supports:
-    - lower: 0.44
-      upper: 0.55
+    - lower: 0.3
+      upper: 0.35
     provenance:
       evidence: engineering_estimate
       source_refs:
@@ -127,14 +130,14 @@ initial_moisture:
         gap and width policy.
       verification: mathematically_reproduced
   field_support:
-    lower: 0.2195121951219512
-    upper: 0.38888888888888895
+    lower: 0.17279069767441863
+    upper: 0.33205128205128204
     unit: kg/kg
     provenance:
       evidence: derived
       source_refs:
       - ba
-      method: X_db=X_wb/(1-X_wb)
+      method: X_db=X_wb/(1-X_wb); lower bound is the target 0.14/0.86 plus margin_above_target_db 0.01, upper bound is the upper mean_db 0.22/0.78 plus the upper amplitude_db 0.05.
       verification: mathematically_reproduced
   margin_above_target_db: 0.01
 # Dimensionless support for generated bed-mean porosity; density calibration stores a compatible paired reference state.
@@ -222,9 +225,9 @@ target_moisture:
   provenance:
     evidence: derived
     source_refs:
-    - manitoba_field_beans
-    method: Exact safe-storage reference 0.14315 wb, rounded to the nearest whole
-      wet-basis percentage point.
+    - swiss_crops
+    - saskpulse_storage
+    method: The Oswin fit of this material gives the equilibrium moisture 0.14315 wb at water activity 0.65 and 20 degC, the storage condition of swiss granum chapter 3. The target stays 0.14 wb, the SaskPulse long-term storage moisture of 14 % for beans.
     verification: mathematically_reproduced
     note: Single practical safe-storage drying target; market acceptance is not
       an operational target.
@@ -233,10 +236,10 @@ two_compartment_kinetics:
   record_id: kidney_bean_two_compartment_kinetics_v1
   components:
     r_surf_0:
-      nominal: 1.7e-05
+      nominal: 9.35e-05
       support:
-        lower: 8.0e-06
-        upper: 3.0e-05
+        lower: 4.4e-05
+        upper: 1.65e-04
       transform: log
     r_int_surf:
       nominal: 0.1
@@ -255,13 +258,12 @@ two_compartment_kinetics:
     evidence: calibration_prior
     source_refs:
     - kidney_drying
+    - lentil_drying_tahmasebi_2025
+    method: r_surf_0 and its support are the earlier design values multiplied by 5.5, the factor of lentil (Tahmasebi et al. 2025, calibrated at 35 degC and 20 % relative humidity), transferred because no comparable kidney-bean drying time exists (Doymaz 2016 starts at 53 % wb); r_int_surf and f_surf are unchanged.
     applicability:
       evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
         at known T, RH/omega, airflow and product state; T(t) if available
-      limitation: Kinetics were conservatively aligned using a limited numerical pilot
-        to reduce seven-day right-censoring and produce informative neural-operator
-        transients; they were not fitted to experiments or validated as real drying-time
-        predictions.
+      limitation: The rate prior is transferred from lentil, not fitted to experiments of this bed, and the drying times were not validated as real predictions.
   ood_provenance:
     evidence: synthetic_design
     source_refs: []

@@ -3,8 +3,9 @@ Budget-driven training, optimization, and persistence services.
 
 Provides:
 - adapter: task-owned training-step, evaluation-view and optimizer-work contracts
-- budget: stage budgets in units or optimisation seconds and their validation points
+- budget: stage budgets in units or supervised transitions and their validation points
 - checkpoint: atomic checkpoint and continuation-state persistence
+- history: durable completed-epoch training history of both tasks
 - loop: training and evaluation execution
 - optim: optimizer and learning-rate schedule construction
 """
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
     from . import learning_training_adapter as adapter
     from . import learning_training_budget as budget
     from . import learning_training_checkpoint as checkpoint
+    from . import learning_training_history as history
     from . import learning_training_loop as loop
     from . import learning_training_optim as optim
 
@@ -25,10 +27,11 @@ _MODULES = {
     "adapter": "learning_training_adapter",
     "budget": "learning_training_budget",
     "checkpoint": "learning_training_checkpoint",
+    "history": "learning_training_history",
     "loop": "learning_training_loop",
     "optim": "learning_training_optim",
 }
-__all__ = ["adapter", "budget", "checkpoint", "loop", "optim"]
+__all__ = ["adapter", "budget", "checkpoint", "history", "loop", "optim"]
 
 
 def __getattr__(name: str) -> object:

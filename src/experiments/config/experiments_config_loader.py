@@ -24,8 +24,8 @@ Notes:
   Stage budgets:
     - Steady and A0 state ``training.budget_epochs``, epochs of the full Train set that the run converts to seen units.
     - ``stage_a_only`` trains A0 alone; ``training.budget_epochs`` equals the schedule's ``budget_epochs``.
-    - ``matched_a1_b`` keeps A0's budget epochs with ``budget_unit: train_seconds``: B stops at its measured
-      seconds and A1 at B's receipt; neither has an epoch cap.
+    - ``matched_a1_b`` keeps A0's budget epochs K with ``budget_unit: supervised_transitions``: B stops after
+      K x N supervised transitions (N those of the full Train set) and A1 after B's receipt; neither has an epoch cap.
   Run layout:
     - Budget epochs, units per update and schedule name every run's seed group, so another value is another run.
 
@@ -949,11 +949,11 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
     if missing_training:
         msg = f"training must state {', '.join(f'training.{key}' for key in missing_training)}; the task's base config owns these values."
         raise ConfigError(msg)
-    # Steady and A0 state a budget in epochs of the full Train set; a matched B or A1 trains measured seconds and states none.
+    # Steady and A0 state a budget in epochs of the full Train set; a matched B or A1 trains supervised transitions and states none.
     continuation = config["task"] == "transient_drying" and training.get("comparison_arm") in {"b", "a1"}
     if continuation:
         if "budget_epochs" in training:
-            msg = "training.budget_epochs does not apply to a matched B or A1; it trains measured seconds."
+            msg = "training.budget_epochs does not apply to a matched B or A1; it trains supervised transitions."
             raise ConfigError(msg)
     else:
         duration = training.get("budget_epochs")
@@ -989,7 +989,7 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
 
 
 # One refusal for the matched-only training flags, whichever workflow or plan received them.
-MATCHED_TRAINING_FLAGS_MESSAGE = "--rollout-length, --train-seconds and --lr-scale require a transient matched_a1_b plan."
+MATCHED_TRAINING_FLAGS_MESSAGE = "--rollout-length and --lr-scale require a transient matched_a1_b plan."
 _EXACT_DATASET_DIGEST_TOKEN = re.compile(r"[0-9a-f]{16,64}\Z")
 
 
@@ -998,7 +998,7 @@ def layout_run_terms(config: Mapping[str, Any]) -> dict[str, Any]:
 
     The budget is the epochs of the full Train set of a steady run, an Optuna trial and
     A0; every stage of a transient seed group (A0, B and A1) carries A0's, because B and
-    A1 start from that A0 and name their own seconds budget in the pair key. The schedule
+    A1 start from that A0 and B's budget is K x N transitions with A0's K. The schedule
     is the scheduler kind, ``constant`` without one. A run never changes these terms, so
     another value is another run.
     """
@@ -1181,8 +1181,8 @@ def resolve_transient_stage_schedule(schedule: Mapping[str, Any]) -> dict[str, A
     raw = _as_mapping(schedule, path="training.stage_schedule")
     mode = raw.get("mode")
     if mode == "matched_a1_b":
-        if set(raw) != {"mode", "budget_unit", "a0_budget_epochs"} or raw.get("budget_unit") != "train_seconds":
-            _raise_config_error("matched_a1_b stage_schedule must be exactly {mode, budget_unit: train_seconds, a0_budget_epochs}.")
+        if set(raw) != {"mode", "budget_unit", "a0_budget_epochs"} or raw.get("budget_unit") != "supervised_transitions":
+            _raise_config_error("matched_a1_b stage_schedule must be exactly {mode, budget_unit: supervised_transitions, a0_budget_epochs}.")
         if type(raw["a0_budget_epochs"]) is not int or raw["a0_budget_epochs"] < 1:
             _raise_config_error("matched_a1_b a0_budget_epochs must be a positive integer.")
         return dict(raw)
@@ -1235,7 +1235,7 @@ def _resolve_curriculum(value: object, *, rollout_length: int) -> dict[str, Any]
     return resolved.as_dict()
 
 
-def _validate_transient_extensions(  # noqa: C901, PLR0912
+def _validate_transient_extensions(  # noqa: C901
     config: dict[str, Any], *, authored: Mapping[str, Any] | None = None
 ) -> None:
     """Resolve strict transient-only temporal, loader, and curriculum semantics."""
@@ -1263,7 +1263,7 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
     # Only Stage B draws rollout horizons, so only Stage B has a curriculum.
     if stage == "a" and "curriculum" in training:
         _raise_config_error("Stage A trains teacher-forced and draws no rollout horizon; only Stage B sets training.curriculum.")
-    # A0 trains for its budget in epochs of the full Train set; B and A1 for measured seconds without an epoch cap.
+    # A0 trains for its budget in epochs of the full Train set; B and A1 for supervised transitions without an epoch cap.
     required_training = {
         *(("budget_epochs",) if arm == "a0" else ()),
         "stage_schedule",
@@ -1308,14 +1308,11 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
         if (
             arm not in {"a0", "b", "a1"}
             or not isinstance(protocol, Mapping)
-            or set(protocol) != {"role", "train_seconds", "receipt_source_run_name", "initialization", "lr_scale"}
+            or set(protocol) != {"role", "receipt_source_run_name", "initialization", "lr_scale"}
         ):
             _raise_config_error("matched_a1_b requires its exact stage-owned protocol mapping.")
         if protocol["role"] != arm or protocol["initialization"] != "a0_best_full_common_fresh_controller":
             _raise_config_error("matched_a1_b role or branch initialization is invalid.")
-        seconds = protocol["train_seconds"]
-        if (arm == "b") != _is_positive_finite(seconds):
-            _raise_config_error("matched_a1_b B requires a positive train_seconds budget; A0/A1 derive no numeric target from YAML.")
         if (arm == "a1") != (isinstance(protocol["receipt_source_run_name"], str) and bool(protocol["receipt_source_run_name"])):
             _raise_config_error("matched_a1_b A1 must name its B receipt source, other stages must not.")
         if (arm != "a0") != _is_positive_finite(protocol["lr_scale"]):
@@ -1342,8 +1339,8 @@ def apply_epoch_budget(raw: Mapping[str, Any], epochs: int | None) -> dict[str, 
 
     Steady single-stage training uses ``training.budget_epochs``. A stage-A-only A0 run
     sets ``training.budget_epochs`` and its schedule's together. A matched plan sets
-    A0's ``training.a0.budget_epochs``; B stops at its measured seconds and A1 at B's
-    receipt. The budget names the run, so another budget is another run.
+    A0's ``training.a0.budget_epochs`` K, which also sets B's K x N supervised transitions;
+    A1 stops at B's receipt. The budget names the run, so another budget is another run.
     """
     requested = copy.deepcopy(dict(raw))
     if epochs is None:
@@ -1369,7 +1366,6 @@ def apply_training_overrides(
     *,
     epochs: int | None = None,
     train_dataset: str | None = None,
-    train_seconds: float | None = None,
     rollout_length: int | None = None,
     lr_scale: float | None = None,
     revision: str | None = None,
@@ -1377,9 +1373,9 @@ def apply_training_overrides(
 ) -> dict[str, Any]:
     """Copy and bind explicit Dataset, matched-protocol, revision, seed and epoch-budget overrides.
 
-    ``rollout_length``, ``train_seconds`` and ``lr_scale`` apply only to an authored
-    matched plan: the B window and its truncated curriculum, B's measured target,
-    and the continuation learning-rate factor shared by B and A1 for a paired sweep.
+    ``rollout_length`` and ``lr_scale`` apply only to an authored matched plan: the B
+    window and its truncated curriculum, and the continuation learning-rate factor
+    shared by B and A1 for a paired sweep.
     ``revision`` names a deliberately separate output location for otherwise identical
     science and is stored as ``run.revision``. ``seed`` replaces ``run.seed`` so a replicate
     needs no further config file; it derives the layout and every seed-plan entry.
@@ -1403,7 +1399,7 @@ def apply_training_overrides(
         and isinstance(requested.get("training"), Mapping)
         and (requested["training"].get("mode") == "matched_a1_b")
     )
-    if not matched and any(value is not None for value in (rollout_length, train_seconds, lr_scale)):
+    if not matched and any(value is not None for value in (rollout_length, lr_scale)):
         raise ConfigError(MATCHED_TRAINING_FLAGS_MESSAGE)
     if rollout_length is not None:
         if type(rollout_length) is not int or rollout_length not in {1, 2, 4, 8, 16, 32, 64}:
@@ -1419,9 +1415,7 @@ def apply_training_overrides(
         lengths = sorted({length for length in curriculum["lengths"] if length <= rollout_length} | {rollout_length})
         curriculum["lengths"] = lengths
         curriculum["milestone_fractions"] = [index / len(lengths) for index in range(len(lengths))]
-    # The matched plan resolver validates both values after binding; they are copied unchanged here.
-    if train_seconds is not None:
-        requested["training"]["b"]["train_seconds"] = train_seconds
+    # The matched plan resolver validates the value after binding; it is copied unchanged here.
     if lr_scale is not None:
         requested["training"]["b"]["lr_scale"] = lr_scale
         requested["training"]["a1"]["lr_scale"] = lr_scale
@@ -1782,9 +1776,12 @@ def create_dataloaders_from_config(
     seed_plan: Mapping[str, int],
     startup_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
     split_persist_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    held_out_loaders: bool = False,
 ) -> dict[str, Any]:
     """
     Create current dataloaders after validating the resolved task contract.
+
+    Training and tuning get the Train and validation loaders only; ID-test and OOD remain membership in the saved split.
 
     Parameters
     ----------
@@ -1801,16 +1798,22 @@ def create_dataloaders_from_config(
         Presentation-owned receiver for bounded semantic startup events.
     split_persist_callback : Callable or None, optional
         Persist resolved Experiment membership before fitting train-only scalers.
+    held_out_loaders : bool, optional
+        Also build the steady ``id_test``, ``material_ood`` and ``parameter_ood`` loaders; only the explicit
+        full-data acceptance asks for them, never a training run.
 
     Returns
     -------
     dict[str, Any]
-        Train/evaluation loaders, the admitted Train scaling, its artifact, and resolved split membership.
+        Train and validation (``eval``) loaders, the held-out loaders when requested, the admitted Train scaling,
+        its artifact, and resolved split membership.
 
     Raises
     ------
     ConfigError
         If the task contract or required data settings are invalid.
+    ValueError
+        If held-out loaders are requested for transient drying, whose acceptance does not use them.
 
     Notes
     -----
@@ -1827,6 +1830,9 @@ def create_dataloaders_from_config(
     num_workers = _effective_num_workers(data_cfg["num_workers"])
     model_sha256 = config[_PRODUCER_KEY]["model_sha256"]
     if task.id == "transient_drying":
+        if held_out_loaders:
+            msg = "Transient drying has no held-out loaders; its ID-test and OOD roles are evaluated only by the artifact step."
+            raise ValueError(msg)
         tensorizer = TransientTensorizerSpec.from_mapping(
             {"input_profile": config["input_profile"], "temporal_conditioning": config["temporal"]["temporal_conditioning"]}
         )
@@ -1858,9 +1864,6 @@ def create_dataloaders_from_config(
         return {
             "train": loaders.train,
             "eval": loaders.evaluation,
-            "material_ood": loaders.material_ood,
-            "parameter_ood": loaders.parameter_ood,
-            "id_test": loaders.id_test,
             "scaling": loaders.scaling,
             "scaling_artifact": loaders.scaling_artifact,
             "split_indices": loaders.split,
@@ -1887,13 +1890,11 @@ def create_dataloaders_from_config(
         scaling_artifact=scaling_artifact,
         split_persist_callback=split_persist_callback,
         startup_callback=startup_callback,
+        held_out_loaders=held_out_loaders,
     )
     return {
         "train": train_loader,
-        "eval": evaluation_loaders["eval"],
-        "id_test": evaluation_loaders["id_test"],
-        "material_ood": evaluation_loaders["material_ood"],
-        "parameter_ood": evaluation_loaders["parameter_ood"],
+        **evaluation_loaders,
         "scaling": train_scaling,
         "scaling_artifact": envelope,
         "split_indices": split_indices,

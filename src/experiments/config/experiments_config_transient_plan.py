@@ -5,7 +5,7 @@ Responsibilities:
   - Derive the A0, B and A1 child configurations through the normal loader
   - Derive A1's teacher-forced protocol from A0 so both arms share one sampling contract
   - Bind B and A1 teacher provenance, the shared branch identity and the pair key to the derived A0
-  - Project a plan's A0 with another budget into the stage-A-only experiment an Optuna study tunes, without B's budget
+  - Project a plan's A0 with another budget and A0's memory batch into the stage-A-only experiment an Optuna study tunes
 
 Design principles:
   - The existing resolved experiment schema remains the single runtime contract
@@ -26,7 +26,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from src import common, learning
 
@@ -38,12 +38,11 @@ if TYPE_CHECKING:
 
 MatchedStageName = Literal["a0", "b", "a1"]
 _TEMPORAL_KEYS = frozenset({"temporal_conditioning"})
-# Training keys a plan authors once for all three stages.
-SHARED_TRAINING_KEYS: Final = ("units_per_update", "memory_batch")
-_MATCHED_PLAN_KEYS = frozenset({"mode", *SHARED_TRAINING_KEYS, "a0", "b", "a1"})
-_MATCHED_A0_KEYS = frozenset({"budget_epochs", "sampling"})
-_MATCHED_B_KEYS = frozenset({"sampling", "curriculum", "train_seconds", "lr_scale"})
-_MATCHED_A1_KEYS = frozenset({"match_to", "lr_scale"})
+_MATCHED_PLAN_KEYS = frozenset({"mode", "units_per_update", "a0", "b", "a1"})
+# Every stage authors its own memory batch: an execution setting outside identity that changes only floating-point rounding.
+_MATCHED_A0_KEYS = frozenset({"budget_epochs", "sampling", "memory_batch"})
+_MATCHED_B_KEYS = frozenset({"sampling", "curriculum", "lr_scale", "memory_batch"})
+_MATCHED_A1_KEYS = frozenset({"lr_scale", "memory_batch"})
 _MATCHED_INITIALIZATION = "a0_best_full_common_fresh_controller"
 
 
@@ -109,7 +108,7 @@ def stage_a_only_experiment(raw: Mapping[str, Any], *, budget_epochs: int) -> di
     Returns
     -------
     dict[str, Any]
-        Independent experiment with the plan's shared sections, k, memory batch and A0
+        Independent experiment with the plan's shared sections, k, A0's memory batch and A0
         sampling, and a ``stage_a_only`` schedule over ``budget_epochs``; B and A1 are dropped.
 
     Raises
@@ -139,7 +138,8 @@ def stage_a_only_experiment(raw: Mapping[str, Any], *, budget_epochs: int) -> di
     authored["training"] = {
         "budget_epochs": budget_epochs,
         "stage_schedule": {"mode": "stage_a_only", "budget_unit": "units", "budget_epochs": budget_epochs},
-        **{key: training[key] for key in SHARED_TRAINING_KEYS},
+        "units_per_update": training["units_per_update"],
+        "memory_batch": a0["memory_batch"],
     }
     return authored
 
@@ -178,10 +178,11 @@ def resolve_matched_a1_b_plan(
     Notes
     -----
     A1 is A0's teacher-forced protocol continued from A0's selected checkpoint, so its
-    sampling is taken from ``a0``; ``units_per_update`` and ``memory_batch`` are authored
-    once and shared by all three stages; only its receipt binding and learning-rate scale
-    are authored. Only B has a curriculum: teacher forcing draws no rollout horizon. A0
-    trains for ``budget_epochs`` of the full Train set, B and A1 for measured seconds;
+    sampling is taken from ``a0``; ``units_per_update`` is authored once and shared by all
+    three stages, the memory batch once per stage; only A1's learning-rate scale and memory
+    batch are authored. Only B has a curriculum: teacher forcing draws no rollout horizon.
+    A0 trains for ``budget_epochs`` K of the full Train set, B for K x N supervised
+    transitions (N the full Train set's), A1 for B's committed transitions from its receipt;
     every stage validates at the same budget fractions and starts its own schedule.
 
     """
@@ -203,41 +204,31 @@ def resolve_matched_a1_b_plan(
     if type(a0["budget_epochs"]) is not int or a0["budget_epochs"] < 1:
         msg = "training.a0.budget_epochs must be a positive integer."
         raise loader.ConfigError(msg)
-    if a1_authored["match_to"] != "b.train_seconds":
-        msg = "A1 must explicitly match B's committed train_seconds receipt."
-        raise loader.ConfigError(msg)
-    seconds = b["train_seconds"]
-    if seconds is None:
-        msg = "training.b.train_seconds is required; set it in the experiment config or pass --train-seconds."
-        raise loader.ConfigError(msg)
-    if not _positive_finite(seconds):
-        msg = "B train_seconds must be positive and finite."
-        raise loader.ConfigError(msg)
     for name, stage in (("b", b), ("a1", a1_authored)):
         if not _positive_finite(stage["lr_scale"]):
             msg = f"training.{name}.lr_scale must be a positive finite continuation learning-rate factor."
             raise loader.ConfigError(msg)
-    stages = {"a0": dict(a0), "b": b, "a1": {"sampling": a0["sampling"]}}
+    stages = {"a0": dict(a0), "b": b, "a1": {"sampling": a0["sampling"], "memory_batch": a1_authored["memory_batch"]}}
     lr_scales = {"a0": None, "b": float(b["lr_scale"]), "a1": float(a1_authored["lr_scale"])}
-    schedule = {"mode": protocol_key, "budget_unit": "train_seconds", "a0_budget_epochs": a0["budget_epochs"]}
+    schedule = {"mode": protocol_key, "budget_unit": "supervised_transitions", "a0_budget_epochs": a0["budget_epochs"]}
 
     def derive(name: MatchedStageName, *, a0_name: str | None, b_name: str | None) -> dict[str, Any]:
         child = copy.deepcopy(authored)
         child["temporal"]["sampling"] = copy.deepcopy(stages[name]["sampling"])
         stage = stages[name]
         child["training"] = {
-            # Only A0 states epochs; B trains its measured seconds and A1 B's receipt.
+            # Only A0 states epochs; B trains K x N supervised transitions with A0's K and A1 B's receipt.
             **({"budget_epochs": stage["budget_epochs"]} if name == "a0" else {}),
             "stage_schedule": copy.deepcopy(schedule),
             "stage": "b" if name == "b" else "a",
             "comparison_arm": name,
-            # One k and one memory microbatch per run serve every stage; each stage counts them in its own unit.
-            **{key: training[key] for key in SHARED_TRAINING_KEYS},
+            # One k serves every stage, each counting it in its own unit; the memory batch is the stage's own.
+            "units_per_update": training["units_per_update"],
+            "memory_batch": stage["memory_batch"],
             **({"curriculum": copy.deepcopy(stage["curriculum"])} if name == "b" else {}),
             "teacher_handoff": None if name == "a0" else {"source_run_name": a0_name},
             protocol_key: {
                 "role": name,
-                "train_seconds": float(seconds) if name == "b" else None,
                 "receipt_source_run_name": b_name if name == "a1" else None,
                 "initialization": _MATCHED_INITIALIZATION,
                 "lr_scale": lr_scales[name],

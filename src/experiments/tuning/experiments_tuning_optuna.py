@@ -3,7 +3,13 @@
 Responsibilities:
   - Load strict study YAML with an inline experiment on the task base and a search space
   - Derive the trial budget as the study's fraction of the experiment's budget K; a transient study tunes its plan's A0 alone
-  - Bind reusable studies to scientific semantic signatures, trial budget included, before optimization
+  - Bind reusable studies to scientific semantic signatures, trial budget, effective sampler settings and Optuna version
+    included, before optimization, and refuse to reopen one on another numerical environment or device model
+  - Require a study that searches only physics values to equal its named supervised twin outside physics, k included
+  - Initialize a study in repeatable steps under one initialization record, its configured base enqueued as its first
+    trial, so a retry completes an interrupted creation; fail the trials an aborted invocation left RUNNING when the
+    study is next opened
+  - Admit one concrete device per invocation and refuse a trial that resolves another before its run exists
   - Run fresh numbered trials that report and prune at the eligible budget validation points, keyed by the point index
   - End a diverged trial pruned with a violated constraint TPE ranks last, and a trial without an eligible point pruned
   - Bind the same manifest identity and payload digests of either task, read by the one manifest reader, before the dry-run
@@ -11,14 +17,16 @@ Responsibilities:
   - Supply the trial status, reporting progress, failure context and best evidence of every terminal trial summary
   - Record the Slurm source binding of every invocation that creates or reopens a study, before its first trial
   - Classify non-finite, OOM, recoverable, interrupted, duplicate and unexpected outcomes explicitly
-  - Report the study: counts per trial status, the best value over completed trainings, the parameter importance over
-    trained trials, the work of every trial and the seconds of all invocations
+  - Report the study: its allocation's finished, pruned, failed and remaining trials, counts per trial status, the best
+    value over completed trainings, the parameter importance over trained trials, the work of every trial and the
+    seconds of all invocations
   - Declare the per-task HPO code projections: its own modules plus the training projection of the study's task
 
 Design principles:
-  - Reopening preserves history but each invocation allocates only additional fresh trials, with a sampler seed derived
-    from the study seed and the stored trial count, so a reopened study continues reproducibly instead of repeating;
-    every trial records that seed and every invocation the count
+  - ``study.n_trials`` is the study's total allocation: reopening preserves history and each invocation runs only the
+    fresh trials left, with a sampler seed derived from the study seed and the stored trial count, so a reopened study
+    continues reproducibly instead of repeating; every trial records that seed and every invocation the count
+  - Trials run one at a time, so TPE runs without ``constant_liar``; the code, not a config switch, fixes it
   - One invocation runs a study at a time, holding the study's lock from opening it until its summary is published
   - A repeated trial completes with its stored value but never counts as a training towards the pruner's startup or the
     parameter importance; its value, read from a completed training of the study, may be the study's best
@@ -49,6 +57,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass, field, replace
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -99,6 +108,18 @@ _STUDY_LOCK_FILENAME = "study.lock"
 _BEST_STATUSES = frozenset({"completed", "duplicate"})
 # Median-pruner settings the study policy fixes: pruning after 5 completed trials and only with 5 trials reported at the same point.
 _MEDIAN_PRUNER_DEFAULTS = {"n_startup_trials": 5, "n_min_trials": 5, "interval_steps": 1}
+# TPE settings the code fixes for every study: trials run one at a time, so no proposal steers away from a trial an aborted
+# invocation left running, and the random startup states the library default instead of following a later release.
+_TPE_FIXED_SETTINGS = {"constant_liar": False, "n_startup_trials": 10}
+# Study user attribute recording the study's initialization: ``started`` with its signature digest, then ``complete``.
+_INITIALIZATION_ATTR = "initialization"
+# Study user attribute prefix of the record of a trial an aborted invocation left RUNNING and a later one failed.
+_ABORTED_TRIAL_ATTR = "aborted_trial"
+# Study key naming, relative to the study file, the supervised experiment a physics-weight study is the twin of.
+_TWIN_KEY = "twin_of"
+# Marks a study without the twin key, so an explicit null still counts as naming a twin.
+_NO_TWIN = object()
+_PHYSICS_PATH_PREFIX = "loss.physics."
 # Trial user attribute naming the existing run a repeated trial answers from; a complete trial with it trained nothing.
 _DUPLICATE_ATTR = "duplicate_of"
 # The status a study report counts for a trial without a terminal status: running, or ended outside the trial driver.
@@ -121,7 +142,10 @@ HPO_PROJECTIONS = {
     "transient_drying": common.code_identity.CodeProjection(
         name="hpo_transient_drying",
         files=_HPO_FILES,
-        exemptions=_HPO_EXEMPTIONS,
+        exemptions={
+            **_HPO_EXEMPTIONS,
+            "domain/physics/domain_physics_brinkman.py": "steady mean-inlet-pressure reference of the shared scaling, only for steady encoding",
+        },
         includes=(learning.training.checkpoint.TRAINING_PROJECTIONS["transient_drying"],),
     ),
 }
@@ -394,6 +418,14 @@ def _normalise_sampler_config(value: Any) -> dict[str, Any]:
     return sampler
 
 
+def _effective_sampler_settings(value: Any) -> dict[str, Any]:
+    """Return every setting the sampler is built with: a TPE sampler states its multivariate flag and the fixed TPE settings."""
+    sampler = _normalise_sampler_config(value)
+    if sampler["kind"] != "tpe":
+        return sampler
+    return {"kind": "tpe", "multivariate": sampler.get("multivariate", False), **_TPE_FIXED_SETTINGS}
+
+
 def _normalise_pruner_config(value: Any) -> dict[str, Any]:
     """
     Validate and isolate one exact semantic pruner mapping.
@@ -595,6 +627,47 @@ def _validate_study_mode(base_config: Mapping[str, Any], *, mode: Any) -> None:
         raise ValueError(message)
 
 
+def _validate_physics_twin(
+    twin_of: Any,
+    base_config: Mapping[str, Any],
+    parameters: Sequence[search_space.SearchSpaceParameter],
+    *,
+    origin: Path,
+    budget_fraction: Any,
+    apply_overrides: Callable[[Mapping[str, Any]], dict[str, Any]],
+) -> None:
+    """
+    Require a study that searches only ``loss.physics`` values to equal its named supervised experiment outside physics.
+
+    Such a study tunes physics on a fixed model, so it is the twin of a supervised experiment (``study.twin_of``,
+    relative to the study file). That experiment, with the same overrides and trial budget, must be supervised and
+    equal the study's experiment in every scientific value outside ``loss.physics``, k included. Any other study
+    has no twin key, not even a null one (``twin_of`` is ``_NO_TWIN`` when the key is absent).
+    """
+    is_twin = all(parameter.path.startswith(_PHYSICS_PATH_PREFIX) for parameter in parameters)
+    if twin_of is _NO_TWIN or not is_twin:
+        if twin_of is not _NO_TWIN or is_twin:
+            message = (
+                "A study that searches only loss.physics values is a physics twin and must name its supervised experiment "
+                f"in study.{_TWIN_KEY}; no other study names one."
+            )
+            raise ValueError(message)
+        return
+    path = origin.parent / _require_nonempty_string(twin_of, label=f"study.{_TWIN_KEY}")
+    loader = experiments.config.loader
+    supervised, _ = _trial_experiment(apply_overrides(loader.apply_authored_base(loader.load_yaml(path), origin=path)), budget_fraction)
+    supervised = loader.resolve_config(supervised, source=config_naming.config_source_from_path(path))
+    if supervised["loss"]["physics"]["enabled"]:
+        message = f"study.{_TWIN_KEY} must name a supervised experiment, but {path} enables physics."
+        raise ValueError(message)
+    twin, reference = (learning.training.checkpoint.effective_config_identity_payload(config) for config in (base_config, supervised))
+    twin["loss"], reference["loss"] = ({key: value for key, value in payload["loss"].items() if key != "physics"} for payload in (twin, reference))
+    differing = sorted(key for key in twin.keys() | reference.keys() if twin.get(key) != reference.get(key))
+    if differing:
+        message = f"The physics twin differs from its supervised experiment {path} outside loss.physics in: {differing}."
+        raise ValueError(message)
+
+
 def load_optuna_study_config(
     path: Path | str,
     *,
@@ -671,17 +744,19 @@ def load_optuna_study_config(
         msg = "Optuna YAML must contain a search_space block"
         raise KeyError(msg)
 
-    authored_experiment = experiments.config.loader.apply_training_overrides(
-        experiments.config.loader.apply_authored_base(_as_mapping(raw_mapping["experiment"], label="experiment"), origin=source_path),
-        epochs=epochs,
-        train_dataset=train_dataset,
-        revision=revision,
+    # A physics twin's supervised experiment gets the same overrides, so both derive the same trial.
+    apply_overrides = functools.partial(
+        experiments.config.loader.apply_training_overrides, epochs=epochs, train_dataset=train_dataset, revision=revision
+    )
+    authored_experiment = apply_overrides(
+        experiments.config.loader.apply_authored_base(_as_mapping(raw_mapping["experiment"], label="experiment"), origin=source_path)
     )
     raw_run = _as_mapping(authored_experiment.get("run"), label="experiment.run")
     if "seed" not in raw_run:
         msg = "experiment.run.seed must be explicit for an Optuna study."
         raise ValueError(msg)
-    raw_study = _as_mapping(raw_mapping.get("study", {}), label="study")
+    raw_study = dict(_as_mapping(raw_mapping.get("study", {}), label="study"))
+    twin_of = raw_study.pop(_TWIN_KEY, _NO_TWIN)
     if "seed" not in raw_study:
         msg = "study.seed must be explicit for deterministic sampler reconstruction."
         raise ValueError(msg)
@@ -705,6 +780,14 @@ def load_optuna_study_config(
     _validate_search_space_choices(base_config, search_parameters)
     _validate_transient_study_policy(base_config, search_parameters)
     _validate_study_mode(base_config, mode=study["mode"])
+    _validate_physics_twin(
+        twin_of,
+        base_config,
+        search_parameters,
+        origin=source_path,
+        budget_fraction=study["budget_fraction"],
+        apply_overrides=apply_overrides,
+    )
     if not _task_base_path(base_config["task"]).is_file():
         msg = f"The task base {_task_base_path(base_config['task'])} that the best config is exported against is missing."
         raise ValueError(msg)
@@ -839,7 +922,6 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
 
     """
     validated, objective = _validate_study_contract(config)
-    sampler = _normalise_sampler_config(validated.study["sampler"])
     pruner = _normalise_pruner_config(validated.study["pruner"])
     sampler_seed = _sampler_seed(validated.study)
     if validated.dataset_identities is None:
@@ -866,7 +948,13 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
         },
         "objective": objective,
         "direction": objective["direction"],
-        "sampler": {**sampler, "seed": sampler_seed, "invocation_seed": "derived_from_seed_and_stored_trial_count"},
+        # The Optuna release defines what the sampler and pruner settings do, so another release is another study.
+        "sampler": {
+            **_effective_sampler_settings(validated.study["sampler"]),
+            "seed": sampler_seed,
+            "invocation_seed": "derived_from_seed_and_stored_trial_count",
+            "optuna_version": metadata.version("optuna"),
+        },
         "pruner": pruner,
         "reporting": {
             "metric_source": "held_out_evaluation",
@@ -882,7 +970,9 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
             "no_eligible_checkpoint": "pruned_without_value",
             "duplicate": "complete_with_stored_value_outside_pruner_startup",
             "resume_policy": "new_trials_only",
-            "trial_count_policy": "additional_fresh_trials_per_invocation",
+            "orphaned_running_trial": "failed_on_reopen",
+            "first_trial": "configured_base",
+            "trial_count_policy": "n_trials_is_total_allocation",
             "training_seed_policy": "fixed_configured_run_seed_across_trials",
             "trial_identity_policy": "native_zero_based_optuna_number",
         },
@@ -1068,16 +1158,13 @@ def _invocation_sampler_seed(study: Mapping[str, Any], stored_trials: int) -> in
 
 
 def _build_sampler(study: Mapping[str, Any], seed: int) -> Any:
-    """Build the Optuna sampler of one invocation with its derived seed; only TPE accepts the multivariate flag, and Optuna stays lazy."""
-    sampler_cfg = _normalise_sampler_config(study.get("sampler"))
-    sampler_type = sampler_cfg["kind"]
+    """Build the Optuna sampler of one invocation with its derived seed from the effective settings the signature binds; Optuna stays lazy."""
+    settings = _effective_sampler_settings(study.get("sampler"))
+    sampler_type = settings.pop("kind")
     optuna = _optuna_module()
 
     if sampler_type == "tpe":
-        return optuna.samplers.TPESampler(
-            seed=seed,
-            multivariate=sampler_cfg.get("multivariate", False),
-        )
+        return optuna.samplers.TPESampler(seed=seed, **settings)
     if sampler_type == "random":
         return optuna.samplers.RandomSampler(seed=seed)
     msg = f"Unsupported Optuna sampler: {sampler_type!r}"
@@ -1428,6 +1515,16 @@ def _trial_work(run_dir: Path, units_per_update: int) -> dict[str, Any]:
     }
 
 
+def _resolve_admitted_device(policy: Any, admitted_device: Mapping[str, str], *, trial_number: int) -> learning.device.DeviceResolution:
+    """Resolve a trial's device and refuse it before its run exists unless it is the device and model its invocation admitted."""
+    resolution = learning.device.resolve_device(policy, path="run.device")
+    resolved = _device_identity(resolution)
+    if resolved != dict(admitted_device):
+        message = f"Trial {trial_number} resolves {resolved}, not the device its invocation admitted {dict(admitted_device)}."
+        raise RuntimeError(message)
+    return resolution
+
+
 def _settle_close_failures(failures: Sequence[tuple[str, BaseException]], *, propagating: BaseException | None) -> None:
     """Note closing-step failures on the trial's propagating error, or raise the first one when the trial returned normally."""
     if not failures:
@@ -1448,6 +1545,7 @@ def run_trial(
     trial: TrialProtocol,
     *,
     sampler_seed: int,
+    admitted_device: Mapping[str, str],
 ) -> float:
     """
     Execute one trial of either task through the shared prepared-run lifecycle.
@@ -1460,6 +1558,9 @@ def run_trial(
         Optuna-compatible trial supplying suggestions, reports, pruning, and attrs.
     sampler_seed : int
         The seed the invocation derived for its sampler, which the trial records.
+    admitted_device : Mapping[str, str]
+        The concrete device and device model the invocation admitted; a trial that resolves another one is refused
+        before its run exists.
 
     Returns
     -------
@@ -1532,7 +1633,7 @@ def run_trial(
                 raise trial_pruned(message)
             status = "duplicate"
             return stored
-        device_resolution = learning.device.resolve_device(config["run"]["device"], path="run.device")
+        device_resolution = _resolve_admitted_device(config["run"]["device"], admitted_device, trial_number=trial.number)
         device = device_resolution.device
         experiments.run.validate_deterministic_model_device_policy(config, device_resolution)
         # Preparation and execution classify a failure of the trial's run like the trial itself.
@@ -1613,7 +1714,7 @@ def run_trial(
         _settle_close_failures(close_failures, propagating=None if returned else sys.exception())
 
 
-def create_objective(study_config: OptunaStudyConfig, *, sampler_seed: int) -> Callable[[TrialProtocol], float]:
+def create_objective(study_config: OptunaStudyConfig, *, sampler_seed: int, admitted_device: Mapping[str, str]) -> Callable[[TrialProtocol], float]:
     """
     Create an Optuna objective callable for a resolved study config.
 
@@ -1623,6 +1724,8 @@ def create_objective(study_config: OptunaStudyConfig, *, sampler_seed: int) -> C
         Resolved Optuna study configuration
     sampler_seed : int
         The invocation's derived sampler seed, recorded by every trial
+    admitted_device : Mapping[str, str]
+        The concrete device and device model the invocation admitted, which every trial must resolve
 
     Returns
     -------
@@ -1633,7 +1736,7 @@ def create_objective(study_config: OptunaStudyConfig, *, sampler_seed: int) -> C
 
     def objective(trial: TrialProtocol) -> float:
         """Run one trial for Optuna's optimize loop."""
-        return run_trial(study_config, trial, sampler_seed=sampler_seed)
+        return run_trial(study_config, trial, sampler_seed=sampler_seed, admitted_device=admitted_device)
 
     return objective
 
@@ -1718,14 +1821,12 @@ def _validate_existing_study(
     Missing signature fields, payload drift, or objective drift are rejected.
     Name and storage identity alone never authorize adding fresh trials.
     """
-    actual_direction = str(study.direction.name).lower()
-    if actual_direction != objective["direction"]:
-        msg = f"Existing Optuna study direction {actual_direction!r} does not match resolved objective direction {objective['direction']!r}."
-        raise ValueError(msg)
+    _require_direction(study, objective)
     environment = numerical_environment
     if environment is None:
         environment = learning.training.checkpoint.numerical_environment_identity()
     required = {
+        _INITIALIZATION_ATTR: {"state": "complete", "signature": signature["digest"]},
         _STUDY_SIGNATURE_ATTR: signature["digest"],
         _STUDY_SIGNATURE_PAYLOAD_ATTR: signature["payload"],
         _RESOLVED_OBJECTIVE_ATTR: dict(objective),
@@ -1775,8 +1876,9 @@ def _create_or_load_study(
             storage=storage,
             pruner=pruner,
         )
-        # The stored trials are known only once the study is loaded; the sampler continues after them.
-        stored_trials = len(study.get_trials(deepcopy=False))
+        # The stored trials are known only once the study is loaded; the sampler continues after them. A base an
+        # interrupted creation queued has not run, so the retry draws as the uninterrupted creation would have.
+        stored_trials = _allocated_trials(study.get_trials(deepcopy=False))
         study.sampler = sampler_for(stored_trials)
         return study, True, stored_trials
     return study, False, 0
@@ -1796,6 +1898,104 @@ def _fail_running_trials(study: Any, numbers: Sequence[int], error: BaseExceptio
                 study.tell(frozen.number, state=states.FAIL)
     except Exception as cleanup_error:  # noqa: BLE001 -- the error that ended the study stays the one the caller sees
         error.add_note(f"Unfinished Optuna trials could not be marked failed: {cleanup_error}")
+
+
+def _fail_orphaned_trials(study: Any, trial_root: Path) -> None:
+    """
+    Mark FAIL every trial an aborted invocation left RUNNING, recording why and what its run directories hold.
+
+    The caller holds the study's lock, so no invocation runs a trial of this study: a RUNNING trial was left by
+    one that ended without finalizing it (node loss, SIGKILL), and TPE must not keep it as pending. The study
+    attribute ``aborted_trial/<number>`` records the reason, the trial's directories and each run summary's status.
+    """
+    states = _optuna_module().trial.TrialState
+    for frozen in study.get_trials(deepcopy=False, states=(states.RUNNING,)):
+        directories = sorted(trial_root.glob(f"{frozen.number:04d}__*"))
+        summaries: dict[str, Any] = {}
+        for path in sorted(summary for directory in directories for summary in directory.rglob(common.paths.RUN_SUMMARY_FILENAME)):
+            run = path.parent.relative_to(trial_root).as_posix()
+            try:
+                summaries[run] = experiments.run.read_run_summary(path.parent).get("status")
+            except experiments.run.RunLifecycleError as error:
+                summaries[run] = f"unreadable: {error}"
+        record = {
+            "reason": "left RUNNING by an aborted invocation; failed when the study was next opened",
+            "trial_directories": [directory.name for directory in directories],
+            "run_summaries": summaries,
+        }
+        study.set_user_attr(f"{_ABORTED_TRIAL_ATTR}/{frozen.number}", record)
+        study.tell(frozen.number, state=states.FAIL)
+
+
+def _base_trial_parameters(config: OptunaStudyConfig) -> dict[str, Any]:
+    """Return the configured base value of every sampled parameter by its name: the study's first, counted trial."""
+    parameters: dict[str, Any] = {}
+    for parameter in config.search_space:
+        if parameter.kind != "fixed":
+            node: Any = config.base_config
+            for token in parameter.path.split("."):
+                node = node[int(token)] if isinstance(node, list) else node[token]
+            parameters[parameter.name] = copy.deepcopy(node)
+    return parameters
+
+
+def _allocated_trials(trials: Sequence[Any]) -> int:
+    """Return the trials that used the study's allocation: all but an enqueued trial no invocation started yet."""
+    return sum(_trial_state_name(trial) != "waiting" for trial in trials)
+
+
+def _device_identity(resolution: learning.device.DeviceResolution) -> dict[str, str]:
+    """Return a resolved device and its model: the CUDA device's name, else the device type."""
+    device = resolution.device
+    return {"device": str(device), "device_model": torch.cuda.get_device_name(device) if device.type == "cuda" else device.type}
+
+
+def _require_direction(study: Any, objective: Mapping[str, Any]) -> None:
+    """Refuse a stored study whose optimization direction is not the resolved objective's."""
+    actual_direction = str(study.direction.name).lower()
+    if actual_direction != objective["direction"]:
+        msg = f"Existing Optuna study direction {actual_direction!r} does not match resolved objective direction {objective['direction']!r}."
+        raise ValueError(msg)
+
+
+def _initialize_study(
+    study: Any,
+    config: OptunaStudyConfig,
+    *,
+    signature: Mapping[str, Any],
+    objective: Mapping[str, Any],
+    numerical_environment: Mapping[str, Any],
+) -> None:
+    """
+    Initialize a study under its lock, or complete an initialization an aborted invocation interrupted.
+
+    The record ``initialization`` is written first as ``started`` with the signature digest; then the configured base
+    is enqueued as the only trial, the semantic metadata is published and the record becomes ``complete``. Each step
+    repeats safely, so a retry completes whatever a crash left. A study without the record must be empty (the crash
+    fell between its creation and the record); one started for another signature, or holding anything but its
+    queued base, is refused.
+    """
+    _require_direction(study, objective)
+    started = {"state": "started", "signature": signature["digest"]}
+    record = study.user_attrs.get(_INITIALIZATION_ATTR)
+    trials = study.trials
+    if record is None and (study.user_attrs or trials):
+        msg = "Existing Optuna study has no initialization record but holds trials or attributes; it was not created by this driver."
+        raise ValueError(msg)
+    if record not in (None, started):
+        msg = f"Existing Optuna study is an interrupted initialization of another signature (record {record!r}); it is refused."
+        raise ValueError(msg)
+    base = _base_trial_parameters(config)
+    queued = [trial.system_attrs.get("fixed_params") if _trial_state_name(trial) == "waiting" else None for trial in trials]
+    if queued not in ([], [base]):
+        msg = "Existing Optuna study's interrupted initialization holds trials other than its queued configured base; it is refused."
+        raise ValueError(msg)
+    if record is None:
+        study.set_user_attr(_INITIALIZATION_ATTR, started)
+    if not trials:
+        study.enqueue_trial(base)
+    _publish_study_signature(study, signature, objective, numerical_environment=numerical_environment)
+    study.set_user_attr(_INITIALIZATION_ATTR, {"state": "complete", "signature": signature["digest"]})
 
 
 def _trial_status(trial: Any) -> str:
@@ -1831,6 +2031,15 @@ def _study_lifecycle_summary(
     ended invocation.
     """
     trials = sorted(study.trials, key=lambda item: int(item.number))
+    states = [_trial_state_name(trial) for trial in trials]
+    # The allocation counts trials by their Optuna state: a duplicate is finished, a diverged trial pruned, an aborted one failed.
+    allocation = {
+        "total": int(config.study["n_trials"]),
+        "finished": states.count("complete"),
+        "pruned": states.count("pruned"),
+        "failed": states.count("fail"),
+        "remaining": max(int(config.study["n_trials"]) - _allocated_trials(trials), 0),
+    }
     statuses = [_trial_status(trial) for trial in trials]
     counts = dict.fromkeys((*_TRIAL_OUTCOMES, *_OPTUNA_STATE_STATUSES.values()), 0)
     for trial_status in statuses:
@@ -1896,13 +2105,13 @@ def _study_lifecycle_summary(
         "task": config.base_config["task"],
         "model_kind": config.base_config["model"]["kind"],
         "objective": copy.deepcopy(dict(objective)),
-        "sampler": {**copy.deepcopy(config.study["sampler"]), "seed": _sampler_seed(config.study)},
+        "sampler": {**_effective_sampler_settings(config.study["sampler"]), "seed": _sampler_seed(config.study)},
         "pruner": copy.deepcopy(config.study["pruner"]),
         "training_seed": int(config.base_config["run"]["seed"]),
         "full_budget_epochs": config.study["full_budget_epochs"],
         "budget_fraction": config.study["budget_fraction"],
         "trial_budget_epochs": config.base_config["training"]["budget_epochs"],
-        "configured_trials": int(config.study["n_trials"]),
+        "allocation": allocation,
         "invocation_trials_requested": requested_trials,
         "continuation": "reopened" if reopened else "new",
         "attempted_trials": len(trials),
@@ -1973,7 +2182,7 @@ def _best_experiment_yaml(config: OptunaStudyConfig, summary: Mapping[str, Any],
     if config.study["mode"] == "stage_a_only":
         header = (
             f"{best}transfer these values into the matched experiment under configs/03_learning/{task}/experiments/architecture_comparison/, "
-            "which carries B's sampling and training.b.train_seconds (A0's measured time per architecture); the name is "
+            "which carries B's sampling and the B and A1 memory batches; the name is "
             f"{label}; B/A1 settings it sets appear in the pair folder (configs/README.md).\n"
         )
     else:
@@ -2017,10 +2226,18 @@ def _run_study_invocation(
     objective: Mapping[str, Any],
     signature: Mapping[str, Any],
     numerical_environment: Mapping[str, Any],
+    admitted_device: Mapping[str, str],
     study_paths: _OptunaStudyPaths,
-    trial_count: int,
+    trial_limit: int | None,
 ) -> Any:
-    """Open or create the study, run this invocation's trials and publish the summary; the caller holds the study's lock."""
+    """
+    Open or create the study, run this invocation's trials and publish the summary; the caller holds the study's lock.
+
+    A study without a complete initialization record is initialized, or its interrupted initialization completed
+    (:func:`_initialize_study`); an initialized one is admitted and fails the trials an aborted invocation left
+    RUNNING. The invocation then runs what is left of ``study.n_trials``, at most ``trial_limit``, each trial on
+    the admitted device.
+    """
     optuna = _optuna_module()
     pruner = _build_pruner(study_config.study)
     study_name = common.paths.validate_logical_name(study_config.study["name"], label="study.name")
@@ -2046,21 +2263,21 @@ def _run_study_invocation(
             experiments.source_binding.existing_study_run_dirs(study_config.base_config),
             study=study_paths.study_dir,
         )
+    record = study.user_attrs.get(_INITIALIZATION_ATTR)
+    if isinstance(record, Mapping) and record.get("state") == "complete":
         _validate_existing_study(
             study,
             signature=signature,
             objective=objective,
             numerical_environment=numerical_environment,
         )
+        _fail_orphaned_trials(study, study_paths.trial_root)
     else:
-        _publish_study_signature(
-            study,
-            signature,
-            objective,
-            numerical_environment=numerical_environment,
-        )
+        _initialize_study(study, study_config, signature=signature, objective=objective, numerical_environment=numerical_environment)
     # Recorded before any trial, so a study that never reached a trial session keeps its tree.
     experiments.source_binding.record_study_session(study_paths.study_dir)
+    remaining = max(int(study_config.study["n_trials"]) - _allocated_trials(study.trials), 0)
+    trial_count = remaining if trial_limit is None else min(trial_limit, remaining)
 
     storage_label = str(study_paths.local_storage_path)
     # One record per invocation: the stored trial count its sampler seed derives from, and its seconds once it ends.
@@ -2081,7 +2298,7 @@ def _run_study_invocation(
         full_budget_epochs=int(study_config.study["full_budget_epochs"]),
         continuation="reopened" if reopened else "new",
     )
-    run_objective = create_objective(study_config, sampler_seed=sampler_seed)
+    run_objective = create_objective(study_config, sampler_seed=sampler_seed, admitted_device=admitted_device)
     started_trials: list[int] = []
 
     def objective_of_invocation(trial: TrialProtocol) -> float:
@@ -2143,14 +2360,15 @@ def run_optuna_study(
     output_root: Path | str | None = None,
 ) -> Any:
     """
-    Run additional fresh trials in a new or semantically identical study.
+    Run the fresh trials left of the study's allocation in a new or semantically identical study.
 
     Parameters
     ----------
     config : OptunaStudyConfig | pathlib.Path | str
         Loaded study or YAML path.
     n_trials : int | None, optional
-        Positive number of additional trials for this invocation.
+        Positive limit on this invocation's trials; it runs at most the trials left of ``study.n_trials``, the
+        study's total allocation, and all of them when omitted.
     device : str | None, optional
         Runtime-only ``auto``, ``cpu``, or strict ``cuda`` override.
     output_root : pathlib.Path | str | None, optional
@@ -2164,15 +2382,17 @@ def run_optuna_study(
     Raises
     ------
     ValueError
-        If an existing study's direction, objective, or semantic signature differs.
+        If an existing study's direction, objective, semantic signature or numerical environment (device model
+        included) differs.
     TypeError
-        If the requested additional trial count is not an exact integer.
+        If the trial limit is not an exact integer.
     RuntimeError
         If another invocation runs the same study.
 
     Notes
     -----
     Reopening adds fresh trial numbers. It never resumes partial run directories.
+    A trial an aborted invocation left RUNNING is failed when the study is next opened.
     One invocation runs a study at a time: it holds the study's lock from opening
     the study and counting its trials until its summary is published, and a second
     invocation of the same study is refused before it opens the study.
@@ -2183,15 +2403,19 @@ def run_optuna_study(
     study_config, objective = _validate_study_contract(study_config)
     study_config = _bind_configured_dataset_identities(study_config)
     signature = build_study_signature(study_config)
-    numerical_environment = learning.training.checkpoint.numerical_environment_identity()
+    # The invocation admits one concrete device that every trial must resolve; its model is bound with the numerical
+    # environment, so a study runs on one GPU type.
+    admitted_device = _device_identity(learning.device.resolve_device(study_config.base_config["run"]["device"], path="run.device"))
+    numerical_environment = {
+        **learning.training.checkpoint.numerical_environment_identity(),
+        "device_model": admitted_device["device_model"],
+    }
 
-    raw_trial_count = n_trials if n_trials is not None else study_config.study["n_trials"]
-    if type(raw_trial_count) is not int:
-        msg = f"Optuna n_trials must be an integer, got: {raw_trial_count!r}"
+    if n_trials is not None and type(n_trials) is not int:
+        msg = f"Optuna n_trials must be an integer, got: {n_trials!r}"
         raise TypeError(msg)
-    trial_count = raw_trial_count
-    if trial_count <= 0:
-        msg = f"Optuna n_trials must be positive, got {trial_count}."
+    if n_trials is not None and n_trials <= 0:
+        msg = f"Optuna n_trials must be positive, got {n_trials}."
         raise ValueError(msg)
 
     study_paths = _resolve_study_paths(study_config)
@@ -2211,6 +2435,7 @@ def run_optuna_study(
             objective=objective,
             signature=signature,
             numerical_environment=numerical_environment,
+            admitted_device=admitted_device,
             study_paths=study_paths,
-            trial_count=trial_count,
+            trial_limit=n_trials,
         )

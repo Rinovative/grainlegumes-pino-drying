@@ -2,9 +2,10 @@
 
 Responsibilities:
   - Check CLI parsing, artifact delegation, dry-run isolation, result lines, failure status, redaction, and the Optuna logger level
+  - Check that training publishes no evaluation artifact and that a bounded artifact build needs an explicitly named role
 
 Design principles:
-  - Invalid requests fail before side effects; artifact failure preserves completed training
+  - Invalid requests fail before side effects; held-out roles are evaluated only by the explicit artifact command
 
 This module does NOT:
   - Perform production training or contact external tracking services
@@ -26,7 +27,6 @@ from src import analysis, common, experiments, learning
 from src.experiments.cli import cli_build_artifacts, cli_config_preflight, cli_optuna, cli_train
 
 _CLI_USAGE_ERROR = 2
-_NO_ARTIFACTS = SimpleNamespace(role_artifacts=dict)
 
 
 def test_public_cli_rejects_one_unknown_option() -> None:
@@ -84,51 +84,43 @@ def _cuda_zero_resolution() -> learning.device.DeviceResolution:
     )
 
 
-def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
+def test_training_publishes_no_held_out_artifacts_and_the_artifact_cli_is_their_explicit_call(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Forward the exact completed path and CUDA decision after releasing training."""
+    """Training ends without any evaluation artifact and says so; only the separate artifact command evaluates held-out roles."""
     run_dir = tmp_path / "renamed completed bundle"
-    resolution = _cuda_zero_resolution()
-    events: list[str] = []
     training_call: dict[str, object] = {}
-    post_training_call: dict[str, object] = {}
     artifact_cli_call: dict[str, object] = {}
 
     def capture_run(*_args: object, **kwargs: object) -> dict[str, object]:
-        events.append("training returned")
         training_call.update(kwargs)
         return {
             "run_dir": run_dir,
-            "result": {"status": "completed", "best_epoch": 1, "best_metric": 0.5},
-            "device_resolution": resolution,
+            "result": {
+                "status": "completed",
+                "best_epoch": 1,
+                "best_metric": 0.5,
+                "phase_seconds": {"startup": 5.0, "training": 70.0, "validation": 12.0},
+            },
+            "device_resolution": _cuda_zero_resolution(),
         }
 
-    def validate_completed(selected: object) -> dict[str, object]:
-        assert selected is run_dir
-        events.append("strict completion validated")
-        return {}
-
-    def cleanup(device: torch.device) -> None:
-        assert device is resolution.device
-        events.append("training resources cleaned")
-
-    def prepare(selected: object, **kwargs: object) -> SimpleNamespace:
-        assert selected is run_dir
-        post_training_call.update(kwargs)
-        events.append("artifacts prepared")
-        return SimpleNamespace(role_actions={"id": "reused", "material_ood": "generated"}, loaded_run=_NO_ARTIFACTS)
+    def reject_artifacts(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("training reached held-out artifact evaluation")
 
     def capture_build(**kwargs: object) -> dict[str, object]:
         artifact_cli_call.update(kwargs)
         return {}
 
     monkeypatch.setattr(experiments.run, "run_experiment", capture_run)
-    monkeypatch.setattr(experiments.run, "validate_completed_run", validate_completed)
-    monkeypatch.setattr(analysis.artifacts.service, "cleanup_runtime", cleanup)
-    monkeypatch.setattr(analysis.artifacts.service, "load_or_build_run_artifacts", prepare)
-    monkeypatch.setattr(analysis.artifacts.service, "build_artifacts", capture_build)
+    for name in ("cleanup_runtime", "load_prepared_run_artifacts", "build_artifacts"):
+        monkeypatch.setattr(analysis.artifacts.service, name, reject_artifacts)
+    with pytest.raises(SystemExit) as refused:
+        cli_train.main(["experiment.yaml", "--artifacts", "selected"])
+    assert refused.value.code == _CLI_USAGE_ERROR
+    capsys.readouterr()
 
     assert (
         cli_train.main(
@@ -142,8 +134,6 @@ def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
                 "synthetic_train",
                 "--seed",
                 "19",
-                "--train-seconds",
-                "25",
                 "--rollout-length",
                 "8",
                 "--lr-scale",
@@ -159,18 +149,15 @@ def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
     assert training_call["epochs"] == 1
     assert training_call["train_dataset"] == "synthetic_train"
     assert training_call["seed"] == 19
-    assert training_call["train_seconds"] == 25
     assert training_call["rollout_length"] == 8
     assert training_call["lr_scale"] == pytest.approx(0.5)
-    assert events == [
-        "training returned",
-        "strict completion validated",
-        "training resources cleaned",
-        "artifacts prepared",
-    ]
     assert training_call["device"] == "cpu"
-    assert post_training_call == {"rebuild_incompatible": True, "device_resolution": resolution}
+    final = capsys.readouterr().out.splitlines()[-1]
+    assert final.startswith("Post-training artifacts: none, ID-test and OOD are evaluated only by cli_build_artifacts | total ")
+    for part in ("startup 5 s", "training 1 min 10 s", "validation 12 s", "other "):
+        assert part in final
 
+    monkeypatch.setattr(analysis.artifacts.service, "build_artifacts", capture_build)
     assert (
         cli_build_artifacts.main(
             [
@@ -180,12 +167,16 @@ def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
                 str(tmp_path / "raw"),
                 "--device",
                 "cuda",
+                "--split",
+                "material_ood",
             ],
         )
         == 0
     )
     assert artifact_cli_call["device_policy"] == "cuda"
     assert artifact_cli_call["dataset_root"] == tmp_path / "raw"
+    # The canonical build releases exactly the named roles.
+    assert artifact_cli_call["roles"] == ("material_ood",)
 
 
 def test_artifact_cli_task_selects_only_its_own_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -194,7 +185,7 @@ def test_artifact_cli_task_selects_only_its_own_runs(tmp_path: Path, monkeypatch
     monkeypatch.setattr(common.paths, "get_experiments_root", lambda: tmp_path)
     monkeypatch.setattr(analysis.artifacts.service, "build_artifacts", lambda **kwargs: roots.append(kwargs["runs_root"]) or [])
 
-    assert cli_build_artifacts.main(["--task", "transient_drying", "--dataset-root", str(tmp_path / "datasets")]) == 0
+    assert cli_build_artifacts.main(["--task", "transient_drying", "--dataset-root", str(tmp_path / "datasets"), "--split", "id"]) == 0
     assert roots == [tmp_path / "transient_drying"]
 
 
@@ -257,31 +248,26 @@ def test_artifact_cli_delegates_bounded_transient_scope_to_noncanonical_output(
     }
 
 
-def test_direct_cli_opt_out_skips_only_post_training_artifacts(
+@pytest.mark.parametrize(
+    "scope",
+    [[], ["--one-case", "--output-root", "scoped"], ["--one-case", "--output-root", "scoped", "--split", "id", "--split", "material_ood"]],
+    ids=["canonical", "bounded", "bounded-two-roles"],
+)
+def test_artifact_cli_evaluates_no_held_out_role_unless_the_caller_names_it(
+    scope: list[str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep completed training unchanged when the trailing invocation flag opts out."""
-    resolution = _cuda_zero_resolution()
-    calls: list[str] = []
+    """No build has a default role: without ``--split`` (bounded: exactly one) it is refused before any evaluation."""
+    for name in ("build_artifacts", "build_scoped_transient_artifact"):
+        monkeypatch.setattr(analysis.artifacts.service, name, lambda **_kwargs: pytest.fail("an unnamed held-out role reached evaluation"))
 
-    def capture_run(*_args: object, **_kwargs: object) -> dict[str, object]:
-        calls.append("training")
-        return {
-            "run_dir": Path("run"),
-            "result": {"status": "completed", "best_epoch": 1, "best_metric": 0.5},
-            "device_resolution": resolution,
-        }
+    with pytest.raises(SystemExit) as refused:
+        cli_build_artifacts.main(["--run-dir", str(tmp_path / "run"), *scope])
 
-    def reject_post_training(*_args: object, **_kwargs: object) -> object:
-        pytest.fail("opt-out reached post-training artifact processing")
-
-    monkeypatch.setattr(experiments.run, "run_experiment", capture_run)
-    monkeypatch.setattr(experiments.run, "validate_completed_run", reject_post_training)
-    monkeypatch.setattr(analysis.artifacts.service, "cleanup_runtime", reject_post_training)
-    monkeypatch.setattr(analysis.artifacts.service, "load_or_build_run_artifacts", reject_post_training)
-
-    assert cli_train.main(["experiment.yaml", "--artifacts", "none"]) == 0
-    assert calls == ["training"]
+    assert refused.value.code == _CLI_USAGE_ERROR
+    assert "--split" in capsys.readouterr().err
 
 
 def test_matched_cli_forwards_its_plan_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -312,14 +298,10 @@ def test_matched_cli_forwards_its_plan_overrides(tmp_path: Path, monkeypatch: py
                 train_dataset,
                 "--epochs",
                 "8",
-                "--train-seconds",
-                "1",
                 "--rollout-length",
                 "4",
                 "--lr-scale",
                 "0.5",
-                "--artifacts",
-                "none",
             ]
         )
         == 0
@@ -327,7 +309,6 @@ def test_matched_cli_forwards_its_plan_overrides(tmp_path: Path, monkeypatch: py
 
     assert calls["train_dataset"] == train_dataset
     assert calls["epochs"] == 8
-    assert calls["train_seconds"] == 1
     assert calls["rollout_length"] == 4
     assert calls["lr_scale"] == pytest.approx(0.5)
 
@@ -375,85 +356,10 @@ def test_train_cli_rejects_an_invalid_lr_scale_before_any_run_is_allocated(
     """The public command surfaces the loader's rejection and leaves the output root untouched."""
     config_path = configs.write_config(tmp_path, configs.transient_matched_config(), canonical_root=tmp_path)
 
-    assert cli_train.main([str(config_path), "--lr-scale", lr_scale, "--artifacts", "none"]) == 1
+    assert cli_train.main([str(config_path), "--lr-scale", lr_scale]) == 1
 
     assert "lr_scale must be a positive finite" in capsys.readouterr().err
     assert not (tmp_path / "storage").exists()
-
-
-def test_artifact_failure_is_nonzero_without_relabeling_completed_training(
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Report recoverable post-processing failure without a lifecycle transition."""
-    resolution = _cuda_zero_resolution()
-
-    monkeypatch.setattr(
-        experiments.run,
-        "run_experiment",
-        lambda *_args, **_kwargs: {
-            "run_dir": Path("completed-run"),
-            "result": {"status": "completed", "best_epoch": 1, "best_metric": 0.5},
-            "device_resolution": resolution,
-        },
-    )
-    monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _path: {})
-    monkeypatch.setattr(analysis.artifacts.service, "cleanup_runtime", lambda _device: None)
-    monkeypatch.setattr(
-        analysis.artifacts.service,
-        "load_or_build_run_artifacts",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("artifact cache is incompatible")),
-    )
-    monkeypatch.setattr(
-        experiments.run,
-        "transition_run_status",
-        lambda *_args, **_kwargs: pytest.fail("artifact failure changed training lifecycle"),
-    )
-
-    assert cli_train.main(["experiment.yaml"]) == 1
-    captured = capsys.readouterr()
-    assert "Training status: completed" in captured.out
-    assert "Post-training artifacts: failed" in captured.err
-    assert "python -m src.experiments.cli.cli_build_artifacts --run-dir completed-run" in captured.err
-    assert "--rebuild" not in captured.err
-
-
-def _prepared_with_validity(valid: int, total: int) -> SimpleNamespace:
-    """Return prepared artifacts whose only role carries ``valid`` of ``total`` valid predictions."""
-    evidence = {"status_counts": {"VALID": valid}, "case_count": total}
-    artifact = SimpleNamespace(frame=SimpleNamespace(attrs={"artifact_provenance": {"evaluation": {"prediction_validity": evidence}}}))
-    return SimpleNamespace(role_actions={"id": "generated"}, loaded_run=SimpleNamespace(role_artifacts=lambda: {"id": artifact}))
-
-
-@pytest.mark.parametrize(("valid", "status"), [(0, "completed with invalid predictions (valid 0 of 2)"), (2, "generated")])
-def test_post_training_line_reports_invalid_predictions_and_the_duration_parts(
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-    valid: int,
-    status: str,
-) -> None:
-    """Never call artifacts complete while their predictions are invalid; the exit status stays 0 and the line shows the duration parts."""
-    outcome = {
-        "run_dir": Path("run"),
-        "result": {
-            "status": "completed",
-            "best_epoch": 1,
-            "best_metric": 0.5,
-            "phase_seconds": {"startup": 5.0, "training": 70.0, "validation": 12.0},
-        },
-        "device_resolution": _cuda_zero_resolution(),
-    }
-    monkeypatch.setattr(experiments.run, "run_experiment", lambda *_args, **_kwargs: outcome)
-    monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _path: {})
-    monkeypatch.setattr(analysis.artifacts.service, "cleanup_runtime", lambda _device: None)
-    monkeypatch.setattr(analysis.artifacts.service, "load_or_build_run_artifacts", lambda *_args, **_kwargs: _prepared_with_validity(valid, 2))
-
-    assert cli_train.main(["experiment.yaml"]) == 0
-
-    final = capsys.readouterr().out.splitlines()[-1]
-    assert final.startswith(f"Post-training artifacts: {status} (cuda:0) | total ")
-    for part in ("startup 5 s", "training 1 min 10 s", "validation 12 s", "artifacts 0 s", "other "):
-        assert part in final
 
 
 @pytest.mark.parametrize(
@@ -479,7 +385,7 @@ def test_the_status_line_names_the_end_status_of_the_run(
     outcome = {"run_dir": Path("run"), "result": result, "device_resolution": _cuda_zero_resolution()}
     monkeypatch.setattr(experiments.run, "run_experiment", lambda *_args, **_kwargs: outcome)
 
-    assert cli_train.main(["experiment.yaml", "--artifacts", "none"]) == exit_code
+    assert cli_train.main(["experiment.yaml"]) == exit_code
 
     assert line in capsys.readouterr().out
 
@@ -491,89 +397,6 @@ def test_run_admission_rejection_reports_the_saved_epochs(capsys: pytest.Capture
     error = capsys.readouterr().err
     assert "different settings" in error
     assert "saved 5 epochs" in error
-
-
-def _capture_post_training_rebuild_flags(monkeypatch: pytest.MonkeyPatch, outcome: dict[str, object]) -> dict[Path, object]:
-    """Run the train CLI on a fixed outcome and map each prepared run directory to its rebuild flag."""
-    flags: dict[Path, object] = {}
-
-    def prepare(selected: Path, **kwargs: object) -> SimpleNamespace:
-        flags[selected] = kwargs["rebuild_incompatible"]
-        # An authorized rebuild replaces the incompatible artifacts of an extended run, as the artifact service reports it.
-        return SimpleNamespace(role_actions={"id": "rebuilt" if kwargs["rebuild_incompatible"] else "reused"}, loaded_run=_NO_ARTIFACTS)
-
-    monkeypatch.setattr(experiments.run, "run_experiment", lambda *_args, **_kwargs: outcome)
-    monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _path: {})
-    monkeypatch.setattr(analysis.artifacts.service, "cleanup_runtime", lambda _device: None)
-    monkeypatch.setattr(analysis.artifacts.service, "load_or_build_run_artifacts", prepare)
-    assert cli_train.main(["experiment.yaml"]) == 0
-    return flags
-
-
-@pytest.mark.parametrize(("extra", "rebuild"), [({}, True), ({"already_complete": True}, False)])
-def test_single_run_rebuilds_incompatible_artifacts_only_when_trained_here(
-    monkeypatch: pytest.MonkeyPatch,
-    extra: dict[str, object],
-    rebuild: bool,
-) -> None:
-    """Authorize artifact replacement for a run trained now, never for a merely reused run."""
-    outcome = {
-        "run_dir": Path("run"),
-        "result": {"status": "completed", "best_epoch": 1, "best_metric": 0.5},
-        "device_resolution": _cuda_zero_resolution(),
-        **extra,
-    }
-
-    assert _capture_post_training_rebuild_flags(monkeypatch, outcome) == {Path("run"): rebuild}
-
-
-def test_matched_run_rebuilds_incompatible_artifacts_only_for_the_stage_trained_here(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Judge each matched stage by its own outcome so a reused stage is only validated."""
-    a0, b = tmp_path / "a0", tmp_path / "b"
-    completed = {"status": "completed", "best_epoch": 1, "best_metric": 0.5}
-    outcome = {
-        "run_dir": b,
-        "result": completed,
-        "stage_runs": {"a0": a0, "b": b},
-        "stage_outcomes": {
-            "a0": {"result": completed, "already_complete": True},
-            "b": {"result": completed},
-        },
-        "device_resolution": _cuda_zero_resolution(),
-    }
-
-    assert _capture_post_training_rebuild_flags(monkeypatch, outcome) == {a0: False, b: True}
-
-
-def test_incompatible_artifact_failure_recovery_command_requests_rebuild(
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Name --rebuild in the recovery command only for incompatible artifact targets."""
-    monkeypatch.setattr(
-        experiments.run,
-        "run_experiment",
-        lambda *_args, **_kwargs: {
-            "run_dir": Path("completed-run"),
-            "result": {"status": "completed", "best_epoch": 1, "best_metric": 0.5},
-            "device_resolution": _cuda_zero_resolution(),
-        },
-    )
-    monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _path: {})
-    monkeypatch.setattr(analysis.artifacts.service, "cleanup_runtime", lambda _device: None)
-    monkeypatch.setattr(
-        analysis.artifacts.service,
-        "load_or_build_run_artifacts",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(analysis.evaluation.artifact_loader.IncompatibleEvaluationArtifactsError("stale")),
-    )
-
-    assert cli_train.main(["experiment.yaml"]) == 1
-    recovery = [line for line in capsys.readouterr().err.splitlines() if line.startswith("Recovery:")]
-    assert len(recovery) == 1
-    assert recovery[0].endswith("--run-dir completed-run --rebuild")
 
 
 def test_optuna_dry_run_resolves_artificial_plan_without_side_effects(
@@ -666,7 +489,7 @@ def test_train_cli_prints_the_result_with_storage_relative_paths(
         },
     )
 
-    assert cli_train.main(["experiment.yaml", "--artifacts", "none"]) == 0
+    assert cli_train.main(["experiment.yaml"]) == 0
 
     output = capsys.readouterr().out
     for expected in ("Training status: completed", "best epoch 3", "1.235e-02", "03_experiments/run-a"):
@@ -735,7 +558,7 @@ def test_cli_failures_are_nonzero_and_redact_credentials(
     assert "api_key=<redacted>" in training_error
     assert "never-disclose" not in training_error
     assert cli_optuna.main(["unused.yaml", "--dry-run"]) == 1
-    assert cli_build_artifacts.main(["--runs-root", str(tmp_path)]) == 1
+    assert cli_build_artifacts.main(["--runs-root", str(tmp_path), "--split", "id"]) == 1
 
 
 def test_saved_effective_resume_cli_uses_run_config_without_repeating_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -753,7 +576,7 @@ def test_saved_effective_resume_cli_uses_run_config_without_repeating_overrides(
         }
 
     monkeypatch.setattr(experiments.run, "run_experiment", run)
-    assert cli_train.main(["--resume", str(run_dir), "--artifacts", "none"]) == 0
+    assert cli_train.main(["--resume", str(run_dir)]) == 0
     assert Path(str(calls["path"])) == run_dir / "config.yaml"
     assert calls["resume"] == str(run_dir)
-    assert all(calls[key] is None for key in ("epochs", "train_dataset", "train_seconds", "rollout_length", "lr_scale"))
+    assert all(calls[key] is None for key in ("epochs", "train_dataset", "rollout_length", "lr_scale"))

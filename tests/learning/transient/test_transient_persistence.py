@@ -1,20 +1,19 @@
-"""Protect transient completed-history admission and adapter rollback.
+"""Protect transient adapter checkpoint restore and handoff state.
 
 Responsibilities:
-  - Check completed history, ahead-of-checkpoint reconciliation, live non-finite metric classification, exact restore, and handoff state
+  - Check exact restore, late-failure rollback, and handoff state of common and adapter continuation state
 
 Design principles:
   - Late restore failures roll back common and adapter state transactionally
 
 This module does NOT:
-  - Allocate stage runs or discard incompatible history
+  - Allocate stage runs or test the epoch history, which the shared training-history tests cover
 """
 
 from __future__ import annotations
 
 import copy
 import hashlib
-import json
 import random
 from typing import Any
 
@@ -25,9 +24,8 @@ from torch import nn
 from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader, TensorDataset
 
-from src import common, learning
+from src import learning
 from src.datasets.runtime.dataset_runtime_units import UnitSampler
-from src.learning.transient import learning_transient_history as history
 
 _WORK = {"optimizer_steps": 1, "gradient_predictions": 2, "units": 2, "update_distinct_cases": 2}
 _UPDATE_WORK = [[2, 2, 2]]
@@ -90,102 +88,10 @@ def _identity(label: str = "transient-persistence") -> dict[str, Any]:
     }
 
 
-def _history_payload(identity: dict[str, Any], *, epochs: int, task: str = "transient_drying", run_name: str = "run") -> dict[str, Any]:
-    """Build one strict contiguous history payload."""
-    return {
-        "task": task,
-        "run_name": run_name,
-        "checkpoint_identity_digest": common.serialization.canonical_json_sha256(identity),
-        "epochs": [{"epoch": epoch, "loss": 1.0 / epoch} for epoch in range(1, epochs + 1)],
-    }
-
-
-def _write_history(tmp_path: Any, payload: dict[str, Any]) -> None:
-    """Write one deliberately test-owned history file."""
-    history.history_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
-
-
-@pytest.mark.parametrize(
-    ("payload", "completed_epoch", "error"),
-    [
-        (None, 1, FileNotFoundError),
-        ({"not": "history"}, 1, ValueError),
-        ("wrong_identity", 1, ValueError),
-        ("gapped", 2, ValueError),
-        ("ahead", 1, ValueError),
-    ],
-)
-def test_completed_history_admission_is_exact_and_read_only(
-    tmp_path: Any,
-    payload: dict[str, Any] | str | None,
-    completed_epoch: int,
-    error: type[Exception],
-) -> None:
-    """Reject absent, malformed, foreign, gapped, and ahead completed evidence without repair."""
-    identity = _identity()
-    if payload == "wrong_identity":
-        payload = _history_payload(_identity("other"), epochs=1)
-    elif payload == "gapped":
-        payload = _history_payload(identity, epochs=2)
-        payload["epochs"][1]["epoch"] = 3
-    elif payload == "ahead":
-        payload = _history_payload(identity, epochs=2)
-    if payload is not None:
-        assert isinstance(payload, dict)
-        _write_history(tmp_path, payload)
-    path = history.history_path(tmp_path)
-    before = path.read_bytes() if path.exists() else None
-
-    with pytest.raises(error):
-        history.validate_completed_history(
-            tmp_path,
-            task="transient_drying",
-            run_name="run",
-            checkpoint_identity=identity,
-            completed_epoch=completed_epoch,
-        )
-
-    assert (path.read_bytes() if path.exists() else None) == before
-
-
-def test_reconcile_history_truncates_records_ahead_of_the_checkpoint_only(tmp_path: Any) -> None:
-    """Retain exact history, truncate epochs trained after the restored last, and fail closed when history is behind."""
-    identity = _identity()
-    exact = _history_payload(identity, epochs=2)
-    _write_history(tmp_path, exact)
-    assert history.reconcile_history(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=identity, completed_epoch=2) == exact
-
-    _write_history(tmp_path, _history_payload(identity, epochs=4))
-    reconciled = history.reconcile_history(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=identity, completed_epoch=2)
-    assert reconciled == exact
-    assert json.loads(history.history_path(tmp_path).read_text(encoding="utf-8")) == exact
-
-    _write_history(tmp_path, _history_payload(identity, epochs=1))
-    with pytest.raises(ValueError, match="behind"):
-        history.reconcile_history(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=identity, completed_epoch=2)
-    _write_history(tmp_path, _history_payload(_identity("other"), epochs=2))
-    with pytest.raises(ValueError, match="identity"):
-        history.reconcile_history(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=identity, completed_epoch=2)
-
-
-@pytest.mark.parametrize("nonfinite", [float("inf"), float("nan")])
-def test_live_callback_classifies_nonfinite_metric_as_numerical_failure_without_persisting(tmp_path: Any, nonfinite: float) -> None:
-    """Raise FloatingPointError for a non-finite live metric while malformed values stay persistence errors."""
-    write_epoch = history.make_epoch_state_callback(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=_identity())
-    write_epoch(1, {"loss": 0.5, "id/physical/w_gr_rmse": 0.1})
-
-    with pytest.raises(FloatingPointError, match=r"id/physical/w_gr_rmse.*epoch 2"):
-        write_epoch(2, {"loss": 0.4, "id/physical/w_gr_rmse": nonfinite})
-    with pytest.raises(ValueError, match="finite numeric evidence"):
-        write_epoch(2, {"loss": 0.4, "id/physical/w_gr_rmse": "not-a-number"})  # type: ignore[dict-item]
-
-    assert len(json.loads(history.history_path(tmp_path).read_text(encoding="utf-8"))["epochs"]) == 1
-
-
 def _validated_budget(point: int) -> learning.training.budget.StageBudget:
     """Return a 20-unit budget validated at the given point, with deterministic clock seconds."""
     budget = learning.training.budget.StageBudget(unit="units", total=20)
-    budget.record_group(units=point, train_seconds=0.5 * point)
+    budget.record_group(units=point, supervised_transitions=3 * point, train_seconds=0.5 * point)
     budget.record_validation()
     return budget
 
@@ -286,7 +192,7 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
     failing = copy.deepcopy(payload)
     failing["adapter_state_dict"] = {"value": 7, "fail": True}
     # Move the live budget away from the saved state so a partial restore would show.
-    budget.record_group(units=3, train_seconds=1.0)
+    budget.record_group(units=3, supervised_transitions=9, train_seconds=1.0)
     before = {
         "model": copy.deepcopy(model.state_dict()),
         "optimizer": copy.deepcopy(optimizer.state_dict()),

@@ -31,7 +31,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("config_path")
     parser.add_argument("--epochs", type=int, help="Explicit single-stage, A0 or HPO epoch budget")
     parser.add_argument("--train-dataset")
-    parser.add_argument("--train-seconds", type=float)
     parser.add_argument("--rollout-length", type=int)
     parser.add_argument("--lr-scale", type=float)
     parser.add_argument("--revision", help="Label of a deliberately separate output location")
@@ -52,7 +51,6 @@ def main(argv: list[str] | None = None) -> int:
             requested_workflow=args.workflow,
             epochs=args.epochs,
             train_dataset=args.train_dataset,
-            train_seconds=args.train_seconds,
             rollout_length=args.rollout_length,
             lr_scale=args.lr_scale,
             revision=args.revision,

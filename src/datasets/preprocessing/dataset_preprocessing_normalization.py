@@ -5,6 +5,7 @@ Responsibilities:
   - Fit the steady scaling from Train cases, one case at a time
   - Hold, validate, serialize and digest the one persisted scaling state of both tasks
   - Encode and decode states, increments, static fields, scalars, boundary values and steady model inputs with the Train scale
+  - Nondimensionalize the steady representation by each case's mean prescribed inlet pressure P
   - State the preprocessing specification that the shared scaling identity binds, and admit a saved state under that identity
 
 Design principles:
@@ -12,6 +13,8 @@ Design principles:
   - The scale of a channel is max(sigma, 1e-7) of its population standard deviation sigma; the state persists sigma itself
   - A boundary value of a state uses that state's mean and scale: steady ``p_in_bc`` the scale of ``p``, the transient
     inlet and ambient temperatures the scale of ``T``
+  - The steady network sees p_in_bc/P and learns p/P, u/P, v/P; P is never a model input, every steady encode and decode
+    takes it explicitly, and the physical state statistics stay available for metrics and selection
   - Increments use the state scale without centering, so exact zeros stay zero
   - Persisted values are device-independent JSON-compatible lists, so digests do not depend on the runtime device
   - A state of another schema, such as a neuralop normalizer or an earlier transient scaling, is refused, never converted
@@ -22,8 +25,13 @@ This module does NOT:
   - Cache, envelope or persist scaling artifacts; the shared scaling service owns that
 
 Notes:
+  Steady representation, P the mean of p_in_bc over the domain's inlet mask (domain.physics.brinkman):
+    encoded input p_in_bc = (p_in_bc/P - mean_p)/scale_p, encoded state = (y/P - mean)/scale, decoding the exact inverse.
+    The Darcy-Brinkman equations are linear with homogeneous other boundary conditions and outlet gauge 0, so the
+    physical (p, u, v) scale exactly with the inlet pressure and the dimensionless fields do not depend on its level.
   Channel groups:
-    - steady_flow: ``state`` (the outputs p, u, v) and ``static`` (every input except ``p_in_bc``)
+    - steady_flow: ``state`` (the dimensionless outputs p/P, u/P, v/P that the encoding standardizes), ``static``
+      (every input except ``p_in_bc``) and ``physical_state`` (the physical outputs, for metrics and selection)
     - transient_drying: ``state``, ``static``, ``scalar``, ``omega_boundary`` (inlet humidity ratio) and
       ``grain_moisture`` (the derived w_gr, used only by diagnostics)
 
@@ -37,7 +45,7 @@ import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import torch
 
@@ -50,6 +58,8 @@ SCALE_FLOOR: Final = 1.0e-7
 STEADY_TASK: Final = "steady_flow"
 TRANSIENT_TASK: Final = "transient_drying"
 STEADY_BOUNDARY_STATES: Final = MappingProxyType({"p_in_bc": "p"})
+# The steady preprocessing names its per-case state reference, so a state of another representation is refused.
+STEADY_STATE_REFERENCE: Final = "mean_inlet_pressure"
 _STATE_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -80,7 +90,11 @@ def expected_groups(task: str) -> dict[str, tuple[str, ...]]:
     """Return the ordered channel names of every scaling group of one task."""
     if task == STEADY_TASK:
         spec = domain.tasks.registry.get_task(STEADY_TASK)
-        return {"state": spec.output_names, "static": tuple(name for name in spec.input_names if name not in STEADY_BOUNDARY_STATES)}
+        return {
+            "state": spec.output_names,
+            "static": tuple(name for name in spec.input_names if name not in STEADY_BOUNDARY_STATES),
+            "physical_state": spec.output_names,
+        }
     if task == TRANSIENT_TASK:
         contract = transient_contract.TRANSIENT_STEP_CONTRACT
         return {
@@ -152,6 +166,22 @@ def train_item_tensor(item: Mapping[str, Any], name: str) -> torch.Tensor:
         message = f"Train item {name} must contain only finite values."
         raise ValueError(message)
     return tensor
+
+
+def _mean_inlet_pressure(inputs: torch.Tensor, *, offset: int = 0) -> torch.Tensor:
+    """Return the detached steady reference P ``[B]`` of physical inputs ``[B, C, Y, X]``, refusing a non-positive one."""
+    names = domain.tasks.registry.get_task(STEADY_TASK).input_names
+    with torch.no_grad():
+        reference = domain.physics.brinkman.mean_inlet_pressure(inputs, input_fields=names)
+    invalid = ~(torch.isfinite(reference) & (reference > 0))
+    if bool(invalid.any().item()):
+        position = int(invalid.nonzero()[0, 0].item())
+        message = (
+            f"Steady case {offset + position} has mean prescribed inlet pressure {float(reference[position])}; "
+            "the steady representation divides by it, so it must be finite and positive."
+        )
+        raise ValueError(message)
+    return reference
 
 
 class CaseWeightedMoments:
@@ -334,6 +364,14 @@ class TrainScaling:
         if preprocessing.get("kind") != PREPROCESSING_KIND or not isinstance(preprocessing.get("spatial_view"), dict):
             message = f"Scaling preprocessing must be one {PREPROCESSING_KIND!r} specification with a spatial view."
             raise ValueError(message)
+        reference = STEADY_STATE_REFERENCE if self.task == STEADY_TASK else None
+        if preprocessing.get("state_reference") != reference:
+            message = (
+                f"Scaling preprocessing of {self.task} must name the state reference {reference!r}, got "
+                f"{preprocessing.get('state_reference')!r}; steady scalings saved before the nondimensionalization by the "
+                "mean inlet pressure are not read. Start a new run."
+            )
+            raise ValueError(message)
         object.__setattr__(self, "preprocessing", MappingProxyType(preprocessing))
         object.__setattr__(self, "dataset_identity", MappingProxyType(_canonical_mapping(self.dataset_identity, label="dataset_identity")))
         _require_sha256(self.train_membership_digest, label="train_membership_digest")
@@ -393,8 +431,13 @@ class TrainScaling:
 
     @property
     def state_scale(self) -> torch.Tensor:
-        """Return the state scale max(sigma, floor) that losses, checkpoint selection and back-transformation divide by."""
+        """Return the scale max(sigma, floor) of the encoded states (steady: dimensionless) that the data loss and decoding use."""
         return self.groups["state"].scale
+
+    @property
+    def physical_state(self) -> ChannelStatistics:
+        """Return the Train statistics of the physical states, whose scale metric normalization and checkpoint selection divide by."""
+        return self.groups["physical_state"] if self.task == STEADY_TASK else self.groups["state"]
 
     @property
     def regular_horizon(self) -> float:
@@ -518,19 +561,57 @@ class TrainScaling:
         """Admit one runtime tensor on this scaling's device and dtype."""
         return _runtime_value(value, label=label, device=self.device, dtype=self.dtype, require_finite=require_finite)
 
-    def encode_state(self, value: torch.Tensor) -> torch.Tensor:
-        """Standardize physical state channels of a BCHW or BLCHW tensor."""
+    def state_reference(self, inputs: torch.Tensor) -> torch.Tensor:
+        """
+        Return the per-case reference P ``[B]`` of physical steady model inputs ``[B, C, Y, X]``.
+
+        P is the mean prescribed inlet pressure; every steady encode and decode of the same cases takes it.
+
+        Raises
+        ------
+        ValueError
+            For the transient task, or if P of a case is not finite and positive (naming its batch position).
+
+        """
+        if self.task != STEADY_TASK:
+            message = f"Only the steady representation has a per-case state reference, not {self.task}."
+            raise ValueError(message)
+        return _mean_inlet_pressure(self._value(inputs, label="physical model inputs"))
+
+    def _per_case(self, reference: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor | None:
+        """Return the steady reference ``[B]`` as a broadcast view ``[B, 1, ...]``; the transient encoding takes none."""
+        if self.task != STEADY_TASK:
+            if reference is not None:
+                message = "The transient encoding takes no per-case reference; only the steady representation divides by one."
+                raise ValueError(message)
+            return None
+        if reference is None:
+            message = "The steady encoding requires the per-case reference P (state_reference of the physical inputs)."
+            raise ValueError(message)
+        tensor = self._value(reference, label="steady reference")
+        if tensor.ndim != 1 or tensor.shape[0] != value.shape[0] or not bool((tensor > 0).all().item()):
+            message = f"The steady reference must hold one positive value per case, shape ({value.shape[0]},), got {tuple(tensor.shape)}."
+            raise ValueError(message)
+        return tensor.view(-1, *([1] * (value.ndim - 1)))
+
+    def encode_state(self, value: torch.Tensor, *, reference: torch.Tensor | None = None) -> torch.Tensor:
+        """Standardize physical state channels of a BCHW or BLCHW tensor; steady states are divided by ``reference`` first."""
         tensor = self._value(value, label="state")
+        per_case = self._per_case(reference, tensor)
+        if per_case is not None:
+            tensor = tensor / per_case
         state = self.groups["state"]
         channels = len(state.names)
         return (tensor - _channel_view(state.mean, tensor, channels=channels)) / _channel_view(state.scale, tensor, channels=channels)
 
-    def decode_state(self, value: torch.Tensor) -> torch.Tensor:
-        """Return physical states from standardized ones; non-finite model outputs pass through for diagnostics."""
+    def decode_state(self, value: torch.Tensor, *, reference: torch.Tensor | None = None) -> torch.Tensor:
+        """Return physical states from standardized ones, steady ones times ``reference``; non-finite outputs pass through."""
         tensor = self._value(value, label="standardized state", require_finite=False)
+        per_case = self._per_case(reference, tensor)
         state = self.groups["state"]
         channels = len(state.names)
-        return tensor * _channel_view(state.scale, tensor, channels=channels) + _channel_view(state.mean, tensor, channels=channels)
+        decoded = tensor * _channel_view(state.scale, tensor, channels=channels) + _channel_view(state.mean, tensor, channels=channels)
+        return decoded if per_case is None else decoded * per_case
 
     def encode_delta(self, value: torch.Tensor) -> torch.Tensor:
         """Scale increments with the state scale without centering, so exact zeros stay zero."""
@@ -605,7 +686,7 @@ class TrainScaling:
         return encoded
 
     def input_affine(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the per-input mean and scale of the steady model inputs, boundary inputs taking their state's."""
+        """Return the per-input mean and scale of the steady model inputs, boundary inputs (divided by P) taking their state's."""
         if self.task != STEADY_TASK:
             message = "Model-input encoding applies to steady_flow; the transient tensorizer assembles its inputs."
             raise ValueError(message)
@@ -619,17 +700,26 @@ class TrainScaling:
             scales.append(source.scale[index])
         return torch.stack(means), torch.stack(scales)
 
-    def encode_inputs(self, value: torch.Tensor) -> torch.Tensor:
-        """Standardize steady model inputs ``[B, C, Y, X]``; ``p_in_bc`` uses the mean and scale of ``p``."""
+    def _input_divisor(self, reference: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
+        """Return the ``[B, C, 1, 1]`` divisor of steady model inputs: P for every boundary input, one for the others."""
+        per_case = cast("torch.Tensor", self._per_case(reference, value))
+        names = domain.tasks.registry.get_task(STEADY_TASK).input_names
+        boundary = torch.tensor([name in STEADY_BOUNDARY_STATES for name in names], device=self.device).view(1, -1, 1, 1)
+        return torch.where(boundary, per_case, torch.ones_like(per_case))
+
+    def encode_inputs(self, value: torch.Tensor, *, reference: torch.Tensor | None = None) -> torch.Tensor:
+        """Standardize steady model inputs ``[B, C, Y, X]``; ``p_in_bc/reference`` uses the mean and scale of ``p/P``."""
         tensor = self._value(value, label="model inputs")
         mean, scale = self.input_affine()
+        tensor = tensor / self._input_divisor(reference, tensor)
         return (tensor - _channel_view(mean, tensor, channels=mean.numel())) / _channel_view(scale, tensor, channels=scale.numel())
 
-    def decode_inputs(self, value: torch.Tensor) -> torch.Tensor:
-        """Return physical steady model inputs from standardized ones."""
+    def decode_inputs(self, value: torch.Tensor, *, reference: torch.Tensor | None = None) -> torch.Tensor:
+        """Return physical steady model inputs from standardized ones, the boundary inputs times ``reference``."""
         tensor = self._value(value, label="standardized model inputs")
         mean, scale = self.input_affine()
-        return tensor * _channel_view(scale, tensor, channels=scale.numel()) + _channel_view(mean, tensor, channels=mean.numel())
+        decoded = tensor * _channel_view(scale, tensor, channels=scale.numel()) + _channel_view(mean, tensor, channels=mean.numel())
+        return decoded * self._input_divisor(reference, tensor)
 
 
 def preprocessing_spec(task: str, *, spatial_view: Mapping[str, int], tensorizer: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -651,6 +741,8 @@ def preprocessing_spec(task: str, *, spatial_view: Mapping[str, int], tensorizer
         message = "A tensorizer identity belongs to the transient preprocessing specification only."
         raise ValueError(message)
     spec: dict[str, Any] = {"kind": PREPROCESSING_KIND, "spatial_view": dict(spatial_view)}
+    if task == STEADY_TASK:
+        spec["state_reference"] = STEADY_STATE_REFERENCE
     if tensorizer is not None:
         spec["tensorizer"] = dict(tensorizer)
     return spec
@@ -747,14 +839,16 @@ def fit_steady_scaling(
     Fit the steady scaling from Train items, each one complete case, without concatenating them.
 
     Every item holds inputs ``x`` ``[C_in, Y, X]`` and outputs ``y`` ``[C_out, Y, X]`` of one case, so
-    every case weighs one; ``p_in_bc`` is not fitted, it is encoded with the state scale of ``p``.
+    every case weighs one. The ``state`` moments are fitted on ``y/P`` with P the case's mean prescribed
+    inlet pressure, the ``physical_state`` moments on ``y``; ``p_in_bc`` is not fitted, ``p_in_bc/P`` is
+    encoded with the dimensionless state scale of ``p``.
     """
     task = domain.tasks.registry.get_task(STEADY_TASK)
     names = expected_groups(STEADY_TASK)
     static_indices = [task.input_names.index(name) for name in names["static"]]
     moments = {name: CaseWeightedMoments(len(channels)) for name, channels in names.items()}
     spatial_shape: tuple[int, int] | None = None
-    for item in items:
+    for position, item in enumerate(items):
         if not isinstance(item, Mapping):
             message = "Steady scaling items must be mappings."
             raise TypeError(message)
@@ -767,8 +861,10 @@ def fit_steady_scaling(
             message = "Steady scaling items must share one grid and carry the task's input and output channels."
             raise ValueError(message)
         spatial_shape = shape
+        reference = _mean_inlet_pressure(inputs[None], offset=position)[0]
         moments["static"].update(inputs[static_indices])
-        moments["state"].update(outputs)
+        moments["state"].update(outputs / reference)
+        moments["physical_state"].update(outputs)
         for moment in moments.values():
             moment.close_case()
     if spatial_shape is None:

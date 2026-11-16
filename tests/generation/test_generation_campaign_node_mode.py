@@ -6,8 +6,10 @@ Responsibilities:
   - Check dispatch capacity, ticket contents, dispatch order, recovery at each crash point, and draining
   - Check the run.json validators
   - Check the per-dispatch scheduler view, not-started persistence, worker binding, cancellation replay, licence retry, and node-job status
+  - Check that a cancel from another process waits for a running node-job submission and then records and cancels its job
   - Check that the rendered status of a live campaign shows its active resources, admission cap and admission count
   - Check that every validly published case gets exactly one success decision, from its worker or else from the feeder
+  - Check that the feeder's decision for a finished step is the step's bytes and that immutable evidence is never replaced
   - Check that the feeder's automatic failure decision skips every ineligible attempt, dispatch, and pending intent
 
 Design principles:
@@ -22,6 +24,8 @@ This module does NOT:
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -785,6 +789,53 @@ def test_cancel_marks_every_open_node_job_and_signals_only_the_scheduler_states_
         submit(campaign, world)
 
 
+def test_a_cancel_from_another_process_waits_for_a_node_job_submission_and_then_records_and_cancels_its_job(
+    generation_config_factory: Any, world: FakeSlurm, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The campaign lock serializes cancel against feed: a cancel started during sbatch waits, then records and cancels the new job."""
+    if "fork" not in mp.get_all_start_methods():
+        pytest.skip("POSIX fork context is required for a second process")
+    context = mp.get_context("fork")
+    campaign = make_campaign(generation_config_factory)
+    cluster_service = generation.campaign.cluster_service
+    real_sbatch = cluster_service.submit_node_job
+    started = context.Event()
+
+    def cancel_elsewhere() -> None:
+        started.set()
+        generation.campaign.cancel_campaign(run_id_of(campaign), storage_root=world.storage)
+
+    canceller = context.Process(target=cancel_elsewhere)
+
+    def sbatch_while_cancelled_elsewhere(*args: Any, **kwargs: Any) -> str:
+        job_id = real_sbatch(*args, **kwargs)
+        canceller.start()
+        assert started.wait(timeout=30)
+        canceller.join(timeout=1.0)
+        assert canceller.is_alive(), "the cancel waits for the feed's campaign lock"
+        assert load_manifest(campaign, world)["state"] == "submitting"
+        return job_id
+
+    monkeypatch.setattr(cluster_service, "submit_node_job", sbatch_while_cancelled_elsewhere)
+    try:
+        assert submit(campaign, world)["state"] == "active"
+    finally:
+        canceller.join(timeout=60)
+        if canceller.is_alive():
+            canceller.terminate()
+    assert canceller.exitcode == 0
+    persisted = load_manifest(campaign, world)
+    assert persisted["state"] == "cancel_requested"
+    assert persisted["slurm_job_ids"] == [row[0] for row in world.jobs()] == ["7001"], "no submitted job is unrecorded"
+    assert persisted["node_jobs"][0]["cancel_published"] is True
+    assert world.log("scancel.log") == ["7001"]
+    receipt_path = common.paths.resolve_generation_cancellations_path(
+        campaign_evidence.campaign_execution_directory(run_id_of(campaign), storage_root=world.storage)
+    )
+    (attempt,) = json.loads(receipt_path.read_text(encoding="utf-8"))["attempts"]
+    assert (attempt["pending_job_ids"], attempt["succeeded_job_ids"]) == (["7001"], ["7001"])
+
+
 def test_cancellation_is_a_desired_state_that_every_feed_replays_after_a_crash(
     generation_config_factory: Any, world: FakeSlurm, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1195,7 +1246,7 @@ def _spy_on_decisions(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 def test_cleanup_error_after_a_valid_publication_still_ends_in_the_success_decision(
     generation_config_factory: Any, world: FakeSlurm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A step that raises after its valid publication leaves no decision; the feeder records it once the step has ended."""
+    """A step that raises after its valid publication leaves no decision; the feeder records it, with the step's accounted id, once it ended."""
     campaign, manifest = _case_with_cleanup_error(generation_config_factory, world, tmp_path, monkeypatch)
 
     feed(campaign, world)
@@ -1210,7 +1261,7 @@ def test_cleanup_error_after_a_valid_publication_still_ends_in_the_success_decis
     assert decision["evidence"]["resources"] == {
         "dispatch_key": "7001-1",
         "slurm_job_id": "7001",
-        "slurm_step_id": None,
+        "slurm_step_id": "0",
         "submission_index": 1,
         "allocated_cores": 1,
     }
@@ -1236,6 +1287,166 @@ def test_success_decision_of_the_case_step_is_not_rewritten_by_the_feeder(
     assert feed(campaign, world)["state"] == "complete"
     assert writes == []
     assert decision_path.read_bytes() == decided
+
+
+@pytest.mark.parametrize("step_decides", [True, False])
+def test_the_feeders_decision_for_a_finished_step_is_the_steps_byte_for_byte_and_only_another_decision_conflicts(
+    generation_config_factory: Any, world: FakeSlurm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step_decides: bool
+) -> None:
+    """A step decides after the feed read its records: the feeder's write of the same decision is identical bytes; another one raises."""
+    campaign = make_campaign(generation_config_factory)
+    manifest = submit(campaign, world)
+    _publish_valid_case(monkeypatch, campaign, manifest, world.storage)
+    world.finish_dispatches(manifest)
+    world.set_state("7001", "COMPLETED")
+    path = common.paths.resolve_generation_case_decision_path(_only_candidate(campaign, world)["case_directory"])
+    real = generation.campaign._reconcile_success_decisions
+    writes = _spy_on_decisions(monkeypatch)
+    decided = b'{"outcome": "failed"}\n'
+
+    def decided_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        """Let the step (or another writer) decide after the feed read its records (the arguments hold the stale records), then reconcile."""
+        nonlocal decided
+        if step_decides:
+            _run_case_step(monkeypatch, manifest, world, tmp_path, lambda *_a, **_k: SimpleNamespace(status="completed"))
+            decided = path.read_bytes()
+        else:
+            path.write_bytes(decided)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(generation.campaign, "_reconcile_success_decisions", decided_meanwhile)
+    if step_decides:
+        assert feed(campaign, world)["state"] == "complete"
+        assert len(writes) == 2, "the step decided, then the feeder holding stale records wrote the identical decision"
+        assert json.loads(decided)["evidence"]["resources"]["slurm_step_id"] == "0"
+    else:
+        with pytest.raises(FileExistsError, match="conflicts"):
+            feed(campaign, world)
+    assert path.read_bytes() == decided
+    assert [item.name for item in path.parent.iterdir() if item.name.startswith(".")] == [], "no temporary sibling remains"
+
+
+def test_the_feeder_decides_only_after_the_steps_accounting_shows_its_end_and_never_with_other_resources(
+    generation_config_factory: Any, world: FakeSlurm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A synthetic accounting row (no end time) leaves the decision to the live step; strict byte identity still rejects other resources."""
+    campaign = make_campaign(generation_config_factory)
+    manifest = submit(campaign, world)
+    _publish_valid_case(monkeypatch, campaign, manifest, world.storage)
+    record = _only_candidate(campaign, world)
+    batch_name = campaign.batches[0].batch_name
+    view = {"batch_id": record["reservation"]["batch_id"], "batch_name": batch_name, "case_index": 1, "case_id": "case_0001"}
+    view |= {"state": "successful", "latest_job_id": "7001-1"}
+    monkeypatch.setattr(lifecycle, "execution_batch", lambda *_a: SimpleNamespace(batch_id=view["batch_id"]))
+    writes = _spy_on_decisions(monkeypatch)
+    synthetic = {"accounted": {"7001-1": ["7001-1", "NODE_FAIL", "", "t", "", "", "", "", "", ""]}}
+    assert generation.campaign._reconcile_success_decisions(
+        manifest, campaign, [view], (record,), synthetic, metadata_only=False, storage_root=world.storage
+    ) == (record,)
+    assert writes == []
+    _run_case_step(monkeypatch, manifest, world, tmp_path, lambda *_a, **_k: SimpleNamespace(status="completed"))
+    task = generation.campaign.cluster_service.require_campaign_task(campaign, batch_name=batch_name, case_index=1)
+    with pytest.raises(FileExistsError, match="conflicts"):
+        generation.campaign._record_success_decision(
+            campaign, task, resources={"slurm_job_id": "7001", "slurm_step_id": None}, storage_root=world.storage
+        )
+
+
+def _campaign_root(tmp_path: Path) -> Path:
+    """Return a canonical campaign directory below a test storage root, so its stage-level staging area resolves."""
+    return tmp_path / common.paths.GENERATION_AREA_NAME / "steady_flow" / "campaign"
+
+
+def test_immutable_evidence_never_replaces_a_record_that_this_node_does_not_see_yet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The file server decides that a name exists: a stale existence view still compares bytes, and no temporary sibling remains."""
+    root = _campaign_root(tmp_path)
+    path = root / "materials" / "lentil" / "case_0001" / "_record" / "decision.json"
+    lifecycle._write_new_json(root, path, {"outcome": "successful"})
+    published = path.read_bytes()
+    real_exists, real_is_file = Path.exists, Path.is_file
+    monkeypatch.setattr(Path, "exists", lambda self, **kwargs: self != path and real_exists(self, **kwargs))
+    monkeypatch.setattr(Path, "is_file", lambda self, **kwargs: self != path and real_is_file(self, **kwargs))
+    lifecycle._write_new_json(root, path, {"outcome": "successful"})
+    with pytest.raises(FileExistsError, match="conflicts"):
+        lifecycle._write_new_json(root, path, {"outcome": "failed"})
+    assert path.read_bytes() == published
+    assert [item.name for item in path.parent.iterdir()] == ["decision.json"]
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_a_publication_creates_no_entry_beside_its_record_but_its_final_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool) -> None:
+    """The record is staged in the stage's .state/, so a strict reader of its directory never sees anything but final names."""
+    root = _campaign_root(tmp_path)
+    directory = root / "_record" / "execution" / "epochs"
+    directory.mkdir(parents=True)
+    (directory / "epoch_0001.json").write_text("{}\n", encoding="utf-8")
+    if existing:
+        lifecycle._write_new_json(root, directory / "epoch_0002.json", {"epoch_index": 2})
+    before = sorted(item.name for item in directory.iterdir())
+    real_link = os.link
+    observed: list[list[str]] = []
+
+    def link(source: str, destination: str) -> None:
+        observed.append(sorted(item.name for item in directory.iterdir()))
+        real_link(source, destination)
+
+    monkeypatch.setattr(os, "link", link)
+    lifecycle._write_new_json(root, directory / "epoch_0002.json", {"epoch_index": 2})
+    assert observed == [before], "nothing was staged in the record's directory"
+    assert sorted(item.name for item in directory.iterdir()) == ["epoch_0001.json", "epoch_0002.json"]
+    assert [item.name for item in (root / "_record").iterdir()] == ["execution"], "the campaign folder keeps no staging"
+    assert common.paths.resolve_generation_record_staging_directory(root).is_relative_to(tmp_path / common.paths.GENERATION_AREA_NAME / ".state")
+
+
+def test_a_publication_fails_closed_when_its_staging_area_is_on_another_filesystem(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hard link cannot cross filesystems: a staging area on another device stops the publication before anything is written."""
+    root = _campaign_root(tmp_path)
+    path = root / "_record" / "campaign_plan.json"
+    staging = common.paths.resolve_generation_record_staging_directory(root)
+    real_stat = Path.stat
+
+    def stat(self: Path, **kwargs: Any) -> os.stat_result:
+        result = real_stat(self, **kwargs)
+        if self != staging:
+            return result
+        fields = list(result[:10])
+        fields[2] += 1  # st_dev
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    with pytest.raises(RuntimeError, match="different filesystems"):
+        lifecycle._write_new_json(root, path, {"plan": 1})
+    assert not path.exists()
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.parametrize("depth", [0, 3], ids=["staging", "state"])
+def test_a_publication_refuses_a_symlinked_staging_area(tmp_path: Path, depth: int) -> None:
+    """Staging that is or lies below a symlink into a strictly read records directory stops the publication before any write."""
+    root = _campaign_root(tmp_path)
+    epochs = root / "_record" / "execution" / "epochs"
+    epochs.mkdir(parents=True)
+    staging = common.paths.resolve_generation_record_staging_directory(root)
+    link = (staging, *staging.parents)[depth]
+    assert link.name == (".state" if depth else staging.name)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(epochs, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        lifecycle._write_new_json(root, epochs / "epoch_0001.json", {"epoch_index": 1})
+    assert list(epochs.iterdir()) == []
+
+
+def test_a_crashed_publication_leftover_never_breaks_the_strict_epoch_reader(generation_config_factory: Any, world: FakeSlurm) -> None:
+    """A temporary left by a writer that died stays in the stage's record staging area and is never read as an epoch."""
+    campaign = make_campaign(generation_config_factory)
+    manifest = submit(campaign, world)
+    epochs = lifecycle.execution_epochs(manifest)
+    root = common.paths.resolve_generation_campaign_directory(campaign.profile.id, campaign.source_name, storage_root=world.storage)
+    staging = common.paths.resolve_generation_record_staging_directory(root)
+    assert not staging.is_relative_to(root), "no campaign folder keeps staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "epoch_0002.json.a1b2c3.tmp").write_text('{"partial": ', encoding="utf-8")
+    assert lifecycle.execution_epochs(manifest) == epochs
 
 
 def test_metadata_only_feed_defers_the_success_decision_to_the_scheduled_feed(

@@ -1,19 +1,19 @@
 """Parse training CLI arguments and delegate to the reusable run service.
 
 Responsibilities:
-  - Parse config, resume, device, revision, seed, and artifact opt-out arguments
-  - Orchestrate completed-run artifact preparation after training ownership ends
-  - Return a non-zero process result for training or post-processing failures
+  - Parse config, resume, device, budget, dataset, seed, matched-plan, revision, and stage arguments
+  - Report the training result and that training publishes no evaluation artifacts
+  - Return a non-zero process result for training failures
 
 Design principles:
   - Parser and dispatch code stays thin and import-light
   - Runtime overrides are forwarded without semantic reinterpretation
-  - Training completion and artifact post-processing remain separate facts
+  - Training never evaluates a held-out role; ID test and OOD come only from the separate artifact command
   - Material lifecycle failures remain visible to shell and scheduler callers
 
 This module does NOT:
   - Allocate, seed, persist, resume, or train runs. ``experiments.run`` owns lifecycle
-  - Discover artifact roles or rebuild incompatible targets
+  - Build or validate artifacts. ``cli_build_artifacts`` is the explicit held-out evaluation
 """
 
 from __future__ import annotations
@@ -59,11 +59,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Replicate seed replacing run.seed; the run lands in its own seed-N leaf and derives its seed plan from N",
     )
     parser.add_argument(
-        "--train-seconds",
-        type=float,
-        help="Matched plan: measured B training-seconds target; A1 matches B's receipt",
-    )
-    parser.add_argument(
         "--rollout-length",
         type=int,
         help="Matched plan: Stage-B rollout window length and stride",
@@ -78,25 +73,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Label of a deliberately separate output location for otherwise identical science (stored as run.revision)",
     )
     parser.add_argument("--train-stages", help="Matched mode only: all or a comma-separated subset of a0,b,a1")
-    parser.add_argument(
-        "--artifacts",
-        default="selected",
-        help="Post-training artifacts: selected (default) or none; matched plans also accept all or comma-separated a0,b,a1",
-    )
     return parser
 
 
-def _parse_stage_selection(value: str | None, *, option: str, allow_policies: bool) -> tuple[str, ...] | str | None:
-    """Reject duplicates and return canonical stage order independent of text order."""
-    if value is None:
+def _parse_stage_selection(value: str | None) -> tuple[str, ...] | None:
+    """Reject duplicates and return canonical stage order independent of text order; ``all`` and no value select every stage."""
+    if value is None or value == "all":
         return None
-    if value == "all":
-        return None if option == "--train-stages" else "all"
-    if allow_policies and value in {"selected", "none"}:
-        return value
     tokens = value.split(",")
     if not tokens or any(token not in {"a0", "b", "a1"} for token in tokens) or len(tokens) != len(set(tokens)):
-        msg = f"{option} requires distinct a0,b,a1 tokens in a comma-separated list."
+        msg = "--train-stages requires distinct a0,b,a1 tokens in a comma-separated list."
         raise ValueError(msg)
     return tuple(name for name in ("a0", "b", "a1") if name in tokens)
 
@@ -128,7 +114,6 @@ def _append_cli_overrides(command: list[str], args: argparse.Namespace) -> None:
         ("--epochs", args.epochs),
         ("--train-dataset", args.train_dataset),
         ("--seed", args.seed),
-        ("--train-seconds", args.train_seconds),
         ("--rollout-length", args.rollout_length),
         ("--lr-scale", args.lr_scale),
         ("--revision", args.revision),
@@ -152,7 +137,6 @@ def _print_matched_stage_failure(error: object, args: argparse.Namespace) -> Non
         "--train-stages",
         error.stage,
     ]
-    command.extend(("--artifacts", "none"))
     _append_cli_overrides(command, args)
     if error.resumable:
         print(f"Saved checkpoint can continue: {error.recovery_reason}", file=sys.stderr)
@@ -167,23 +151,6 @@ def _print_matched_stage_failure(error: object, args: argparse.Namespace) -> Non
             "or choose a scientifically distinct configuration before retrying this stage.",
             file=sys.stderr,
         )
-
-
-def _artifact_action_label(role_actions: dict[str, str]) -> str:
-    """Summarize ID and OOD artifact actions without role-level verbosity."""
-    actions = set(role_actions.values())
-    automatic = {"generated", "reused", "rebuilt"}
-    if len(actions) == 1 and actions <= automatic:
-        return next(iter(actions))
-    if actions and actions <= automatic:
-        return "mixed"
-    msg = f"Unexpected automatic artifact actions: {sorted(actions)}."
-    raise RuntimeError(msg)
-
-
-def _validity_label(label: str, note: str | None) -> str:
-    """Replace an artifact status by the invalid-predictions status when the artifacts hold invalid predictions."""
-    return label if note is None else f"completed with invalid predictions ({note})"
 
 
 def _end_status(result: dict[str, Any]) -> str:
@@ -205,7 +172,7 @@ def _phase_seconds(outcome: dict[str, Any]) -> dict[str, float]:
     return totals
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
+def main(argv: list[str] | None = None) -> int:
     """
     Start a run, or continue an interrupted one, and return its process result.
 
@@ -217,14 +184,16 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
     Returns
     -------
     int
-        ``0`` after completed training and requested post-processing, ``1``
-        for a caught training or artifact failure, and ``130`` when interrupted.
+        ``0`` after completed training, ``2`` without a result or with an unrun
+        selected stage, ``1`` for a caught training failure, and ``130`` when interrupted.
 
     Notes
     -----
     The reusable run service owns allocation, persistence, device resolution,
-    training, and resume. The artifact service owns role discovery, validation,
-    generation, and reuse. Parser usage errors raise ``SystemExit`` directly.
+    training, and resume. Training publishes no evaluation artifact: ID test and
+    OOD are evaluated only by the separate ``cli_build_artifacts`` call once
+    configurations and analysis rules are frozen. Parser usage errors raise
+    ``SystemExit`` directly.
 
     """
     started = time.monotonic()
@@ -237,25 +206,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
         args.config_path = str(Path(args.resume).expanduser() / "config.yaml")
     try:
         from src.experiments import experiments_run  # noqa: PLC0415
-        from src.experiments.config import experiments_config_loader, experiments_config_transient_plan  # noqa: PLC0415
 
-        train_stages = _parse_stage_selection(args.train_stages, option="--train-stages", allow_policies=False)
-        artifact_stages = _parse_stage_selection(args.artifacts, option="--artifacts", allow_policies=True)
-        if args.artifacts not in {"selected", "none"}:
-            invocation_config = experiments_config_loader.load_authored_config(args.config_path)
-            is_saved_resume = (
-                args.resume is not None
-                and Path(args.config_path).expanduser().resolve() == (Path(args.resume).expanduser() / "config.yaml").resolve()
-            )
-            is_matched = experiments_config_transient_plan.is_matched_a1_b_config(invocation_config) or (
-                is_saved_resume and invocation_config.get("training", {}).get("comparison_arm") is not None
-            )
-            if not is_matched:
-                msg = "--artifacts all or a stage list applies only to matched_a1_b plans."
-                raise ValueError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
-        if isinstance(train_stages, str):
-            msg = "Training stage parser returned an artifact policy."
-            raise TypeError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
+        train_stages = _parse_stage_selection(args.train_stages)
         if args.epochs is not None and args.epochs < 1:
             msg = "--epochs must be positive."
             raise ValueError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
@@ -274,7 +226,6 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
             epochs=args.epochs,
             train_dataset=args.train_dataset,
             seed=args.seed,
-            train_seconds=args.train_seconds,
             rollout_length=args.rollout_length,
             lr_scale=args.lr_scale,
             revision=args.revision,
@@ -311,7 +262,6 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
 
     result = outcome["result"]
     run_dir = outcome["run_dir"]
-    device_resolution = outcome["device_resolution"]
     outcome_record = result.get("training_outcome") or {}
     # The terminal stage decides the exit code, matched or not: 2 without a result (no eligible checkpoint),
     # and 2 when a matched plan stopped before a selected stage (an A0 without an eligible checkpoint).
@@ -331,112 +281,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
             # The status line names only the last stage; each trained stage names its own end, so a diverged A0 stays visible.
             end = f" | {_end_status(stage_outcomes[name]['result'])}" if name in stage_outcomes else ""
             print(f"Stage {display_name} run directory: {console.display_path(stage_dir)}{end}")
-    if result.get("best_epoch") is None and "stage_outcomes" not in outcome:
-        print("Post-training artifacts: none, the run has no eligible checkpoint")
-        return exit_code
-    if artifact_stages == "none":
-        print(
-            f"Post-training artifacts: skipped by --artifacts none | {console.duration_summary(time.monotonic() - started, _phase_seconds(outcome))}"
-        )
-        return exit_code
-    active_artifact_stage: str | None = None
-    active_artifact_dir = run_dir
-    artifacts_started = time.monotonic()
-    try:
-        from src import analysis  # noqa: PLC0415
-
-        stage_outcomes = outcome.get("stage_outcomes")
-        if isinstance(stage_outcomes, dict):
-            if not isinstance(stage_runs, dict):
-                msg = "Matched outcome lacks stage run directories."
-                raise TypeError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
-            if artifact_stages == "selected":
-                requested = tuple(
-                    name
-                    for name, stage_outcome in stage_outcomes.items()
-                    if stage_outcome["result"]["status"] in {"completed", "diverged"} and stage_outcome["result"].get("best_epoch") is not None
-                )
-            elif artifact_stages == "all":
-                requested = tuple(stage_runs)
-            elif isinstance(artifact_stages, tuple):
-                requested = artifact_stages
-            else:
-                msg = "Matched artifact selection is invalid."
-                raise TypeError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
-            available = []
-            unavailable = []
-            prepared_runs = []
-            for name in requested:
-                active_artifact_stage = name
-                active_artifact_dir = stage_runs[name]
-                try:
-                    experiments_run.validate_completed_run(active_artifact_dir)
-                except (FileNotFoundError, experiments_run.RunLifecycleError):
-                    stage_status = experiments_run.read_run_summary(active_artifact_dir).get("status") if active_artifact_dir.exists() else None
-                    # A stage without an eligible checkpoint, or one a stopped plan never started, has no artifacts; every other must.
-                    if stage_status != "unsuccessful" and name not in outcome.get("unrun_stages", ()):
-                        raise
-                    unavailable.append(name)
-                else:
-                    available.append(name)
-            for name in available:
-                active_artifact_stage = name
-                active_artifact_dir = stage_runs[name]
-                analysis.artifacts.service.cleanup_runtime(device_resolution.device)
-                stage_outcome = stage_outcomes.get(name)
-                # Only a stage trained here may have artifacts built for an older best checkpoint; a reused stage is validated as is.
-                trained_here = stage_outcome is not None and not stage_outcome.get("already_complete", False)
-                prepared = analysis.artifacts.service.load_or_build_run_artifacts(
-                    stage_runs[name],
-                    rebuild_incompatible=trained_here,
-                    device_resolution=device_resolution,
-                )
-                prepared_runs.append(prepared)
-                label = _artifact_action_label(prepared.role_actions)
-                print(f"Stage {name} artifacts: {_validity_label(label, analysis.artifacts.service.invalid_prediction_note(prepared))}")
-            for name in unavailable:
-                reason = "was not trained" if name in outcome.get("unrun_stages", ()) else "has no eligible checkpoint"
-                print(f"Stage {name} artifacts: unavailable, the stage {reason} ({stage_runs[name]})")
-            artifact_status = (
-                "partial"
-                if unavailable
-                else _validity_label("completed" if requested else "skipped", analysis.artifacts.service.invalid_prediction_note(*prepared_runs))
-            )
-        else:
-            active_artifact_dir = run_dir
-            experiments_run.validate_completed_run(run_dir)
-            analysis.artifacts.service.cleanup_runtime(device_resolution.device)
-            prepared = analysis.artifacts.service.load_or_build_run_artifacts(
-                run_dir,
-                rebuild_incompatible=not outcome.get("already_complete", False),
-                device_resolution=device_resolution,
-            )
-            artifact_status = _validity_label(
-                _artifact_action_label(prepared.role_actions), analysis.artifacts.service.invalid_prediction_note(prepared)
-            )
-    except KeyboardInterrupt:
-        print("Post-training artifacts: failed", file=sys.stderr)
-        if active_artifact_stage is not None:
-            print(f"Failed artifact stage: {active_artifact_stage}", file=sys.stderr)
-        print(f"Failed artifact run directory: {console.display_path(active_artifact_dir)}", file=sys.stderr)
-        print(f"Recovery: python -m src.experiments.cli.cli_build_artifacts --run-dir {shlex.quote(str(active_artifact_dir))}", file=sys.stderr)
-        return 130
-    except Exception as error:  # noqa: BLE001
-        from src import analysis  # noqa: PLC0415
-
-        print("Post-training artifacts: failed", file=sys.stderr)
-        if active_artifact_stage is not None:
-            print(f"Failed artifact stage: {active_artifact_stage}", file=sys.stderr)
-        print(f"Artifact error: {type(error).__name__}: {console.sanitized_exception_message(error)}", file=sys.stderr)
-        print(f"Failed artifact run directory: {console.display_path(active_artifact_dir)}", file=sys.stderr)
-        recovery = f"python -m src.experiments.cli.cli_build_artifacts --run-dir {shlex.quote(str(active_artifact_dir))}"
-        if isinstance(error, analysis.evaluation.artifact_loader.IncompatibleEvaluationArtifactsError):
-            recovery += " --rebuild"
-        print(f"Recovery: {recovery}", file=sys.stderr)
-        return 1
-
-    durations = console.duration_summary(time.monotonic() - started, {**_phase_seconds(outcome), "artifacts": time.monotonic() - artifacts_started})
-    print(f"Post-training artifacts: {artifact_status} ({device_resolution.device}) | {durations}")
+    # Training never evaluates a held-out role; the stage-6 release of ID test and OOD is the explicit artifact command.
+    durations = console.duration_summary(time.monotonic() - started, _phase_seconds(outcome))
+    print(f"Post-training artifacts: none, ID-test and OOD are evaluated only by cli_build_artifacts | {durations}")
     return exit_code
 
 

@@ -133,6 +133,7 @@ GENERATION_INPUT_REFERENCE_FILENAME = "input_reference.json"
 GENERATION_INPUT_STORE_FILENAME = "inputs.h5"
 GENERATION_RESULT_HDF5_FILENAME = "case.h5"
 GENERATION_RESERVATION_STAGING_DIRNAME = "reservation-staging"
+GENERATION_RECORD_STAGING_DIRNAME = "record-staging"
 GENERATION_INPUT_TRANSACTIONS_DIRNAME = "input-transactions"
 _GENERATION_STATE_NAME_SEPARATOR = "~"
 _CAMPAIGN_BATCH_PART_COUNT = 5
@@ -844,6 +845,12 @@ def resolve_generation_reservation_staging_directory(campaign_directory: Path | 
         / validate_logical_name(material, label="material")
         / GENERATION_RESERVATION_STAGING_DIRNAME
     )
+
+
+def resolve_generation_record_staging_directory(campaign_directory: Path | str) -> Path:
+    """Return the private area where an immutable campaign record is written before it is linked to its name."""
+    state_root, task, campaign_name = _campaign_state_location(campaign_directory)
+    return _generation_staging_directory(state_root, task, campaign_name) / GENERATION_RECORD_STAGING_DIRNAME
 
 
 @dataclass(frozen=True, slots=True)

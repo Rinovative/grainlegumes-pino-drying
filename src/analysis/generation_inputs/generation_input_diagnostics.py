@@ -887,7 +887,9 @@ def display_unit(name: str, unit: str, *, control: bool = False) -> str:
     percent = _percent_quantity(name)
     if percent is not None:
         return field_labels.display_unit(unit, field=percent[0], quantity_kind=percent[1], control=control)
-    return "°C" if name in _ABSOLUTE_TEMPERATURE_DISPLAY_NAMES and unit == "K" else unit
+    if unit == "K":  # only an absolute temperature reads in °C; an amplitude or difference stays in K
+        return "°C" if name in _ABSOLUTE_TEMPERATURE_DISPLAY_NAMES else unit
+    return field_labels.display_unit(unit)  # the notation of the axes and colour bars: m^2 as m², 1 as -
 
 
 def display_value(name: str, value: Any, unit: str) -> Any:

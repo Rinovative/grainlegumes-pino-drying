@@ -51,6 +51,7 @@ GENERATION_INPUT_PROJECTION = common.code_identity.CodeProjection(
         "common/common_serialization.py",
         "domain/domain_moisture.py",
         "domain/domain_permeability.py",
+        "domain/physics/domain_physics_contracts.py",
         "generation/cases/generation_cases_case.py",
         "generation/cases/generation_cases_config.py",
         "generation/cases/generation_cases_fields.py",

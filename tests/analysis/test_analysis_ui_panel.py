@@ -29,6 +29,7 @@ import pandas as pd
 import pytest
 
 from src.analysis import presentation
+from src.analysis.evaluation import evaluation_datasets as dataset_cuts
 from src.analysis.ui import analysis_ui_controls as controls
 from src.analysis.ui import analysis_ui_navigation as navigation
 from src.analysis.ui import analysis_ui_notebook as notebook_ui
@@ -38,7 +39,7 @@ from src.analysis.ui import analysis_ui_style as style
 from src.analysis.ui import analysis_ui_viewers as viewers
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable, Sequence
+    from collections.abc import Hashable, Mapping, Sequence
 
 
 @pytest.fixture
@@ -95,26 +96,53 @@ def test_first_labels_align_and_every_element_sits_on_the_grid() -> None:
 
 def test_panel_reserves_its_rows_and_hidden_rows_keep_their_space() -> None:
     view, _runs, _other = _three_row_panel()
-    block = view.widget.children[0]
+    block = view.content.children[0]
     assert block.layout.height == f"{3 * style.ROW_PITCH_PX}px"
     controls.set_visible(cast("widgets.DOMWidget", view.rows[2]), False)
     assert block.layout.height == f"{3 * style.ROW_PITCH_PX}px"
     assert view.slot is not None
-    assert view.widget.children[1] is view.status.widget
-    assert view.widget.children[3] is view.slot.widget
+    assert view.content.children[1] is view.status.widget
+    assert view.content.children[3] is view.slot.widget
 
 
-def test_popover_body_is_a_panel_child_below_its_own_row() -> None:
+def test_popover_body_overlays_the_content_in_one_grid_cell_below_its_own_row() -> None:
     view, runs, other = _three_row_panel()
-    assert runs.body in view.widget.children
+    assert isinstance(view.widget, widgets.GridBox)
+    assert view.widget.children == (view.content, runs.body, other.body)
     assert all(runs.body not in _children(row) for row in view.rows)
-    assert runs.body.layout.left == "0px"
-    assert runs.body.layout.top == f"{2 * style.ROW_PITCH_PX}px"
+    assert {child.layout.grid_area for child in view.widget.children} == {"1 / 1"}
+    assert runs.body.layout.margin == f"{2 * style.ROW_PITCH_PX}px 0 0 0"
     assert "glp-popover" in runs.body._dom_classes
+    assert view.content.children[0].layout.height == f"{3 * style.ROW_PITCH_PX}px"  # the rows, so the plot below never moves
     runs.header.value = True
     other.header.value = True
     assert runs.header.value is False
     assert runs.body.layout.display == "none"
+
+
+def test_panel_without_popovers_is_not_wrapped() -> None:
+    plain = panel.ViewPanel([panel.row(controls.toggle("x"))])
+    assert plain.widget is plain.content
+    assert style.ROOT_CLASS in plain.widget._dom_classes
+    view, _runs, _other = _three_row_panel()
+    assert view.widget is not view.content
+    assert {"glp-panel", style.ROOT_CLASS} <= set(view.widget._dom_classes)
+
+
+def test_popover_overlay_validates_before_changing_anything() -> None:
+    first_header, first_body = panel.disclosure("a", widgets.VBox())
+    bad_header, bad_body = panel.disclosure("b", widgets.VBox())
+    rows = [panel.row(first_header)]
+    notifiers = len(first_header._trait_notifiers.get("value", {}).get("change", []))
+    with pytest.raises(ValueError, match="rows"):
+        panel.popover_overlay(widgets.VBox(), rows, [(first_header, first_body), (bad_header, bad_body)])
+    assert first_body.layout.grid_area is None
+    assert len(first_header._trait_notifiers.get("value", {}).get("change", [])) == notifiers
+    second_header, second_body = panel.disclosure("c", widgets.VBox(), opened=True)
+    first_header.value = True
+    with pytest.raises(ValueError, match="At most one"):
+        panel.popover_overlay(widgets.VBox(), [panel.row(first_header, second_header)], [(first_header, first_body), (second_header, second_body)])
+    assert first_body.layout.grid_area is None
 
 
 def test_popover_header_must_stand_in_a_row() -> None:
@@ -459,6 +487,52 @@ def test_view_section_stacks_a_list_result_and_exports_its_figures(shown: list[A
     assert not plt.fignum_exists(figure.number)
 
 
+@pytest.mark.parametrize("container", [list, tuple])
+@pytest.mark.parametrize("path", ["render_view", "show_result", "view_section"])
+def test_a_list_and_a_tuple_result_show_and_export_the_same_items_on_every_path(container: type, path: str, shown: list[Any]) -> None:
+    first, second = plt.figure(), plt.figure()
+    result = container([widgets.HTML("a"), None, first, second])
+    state: dict[str, Any] = {}
+    if path == "view_section":
+        section = notebook_ui.view_section([("S", lambda: result, "s")], export_state=state)
+        section.activate()
+    else:
+        view = panel.ViewPanel([], slot=panel.PlotSlot())
+        export = {"export_state": state, "export_plot_name": "s", "export_title": "S"}
+        if path == "render_view":
+            assert viewers.render_view(view, lambda: result, **export)
+        else:
+            assert viewers.show_result(view, result, **export)
+    assert len(shown) == 3
+    assert shown[1:] == [first, second]
+    assert state["fig"] is first
+    assert state["figures"] == (first, second)
+    assert not plt.fignum_exists(first.number)
+    assert not plt.fignum_exists(second.number)
+
+
+def test_a_single_result_and_none_are_one_item_and_nothing(shown: list[Any]) -> None:
+    view = panel.ViewPanel([], slot=panel.PlotSlot())
+    state: dict[str, Any] = {}
+    viewers.show_result(view, "text", export_state=state)
+    assert shown == ["text"]
+    assert state["figures"] == ()
+    viewers.show_result(view, None, export_state=state)
+    assert shown == ["text"]
+    viewers.show_result(view, ["a", "b"])
+    assert shown == ["text", "a", "b"]
+
+
+def test_show_result_on_a_hidden_view_publishes_nothing_and_closes_the_figure(shown: list[Any]) -> None:
+    # show_result supersedes and publishes in one synchronous call, so a hidden view is the only way it stops being current.
+    view = panel.ViewPanel([], slot=panel.PlotSlot())
+    view.deactivate()
+    figure = plt.figure()
+    assert not viewers.show_result(view, figure)
+    assert shown == []
+    assert not plt.fignum_exists(figure.number)
+
+
 def test_lazy_panel_keeps_control_rows_and_exports_to_the_view_status(monkeypatch: pytest.MonkeyPatch) -> None:
     state: dict[str, Any] = {}
     block = selectors.ChoiceBlock("Datensätze", [("ID", [("lentil, ID", "l")])], multiple=True, selected=["l"])
@@ -470,9 +544,11 @@ def test_lazy_panel_keeps_control_rows_and_exports_to_the_view_status(monkeypatc
     assert lazy.widget.children[0].children[1] is lazy.open_button
     lazy.open_button.click()
     assert lazy.expanded
-    content = lazy.widget.children[0].children[1]
+    overlay = lazy.widget.children[0].children[1]
+    content = overlay.children[0]
+    assert overlay.children[1] is block.body
     assert content.children[-1] is lazy.tabs
-    assert block.body.layout.top == f"{2 * style.ROW_PITCH_PX}px"
+    assert block.body.layout.margin == f"{2 * style.ROW_PITCH_PX}px 0 0 0"
     exported: list[Any] = []
     monkeypatch.setattr(notebook_ui, "write_export", lambda status, **_kwargs: exported.append(status))
     lazy.export_button.click()
@@ -510,6 +586,29 @@ def test_export_reports_on_a_status_line(tmp_path: Any, monkeypatch: pytest.Monk
 def _inventory() -> presentation.dataset_selection.DatasetInventory:
     items = [presentation.dataset_selection.DatasetItem(key, key, "id", f"{key}, ID") for key in ("lentil", "chickpea")]
     return presentation.dataset_selection.DatasetInventory(items, group_order=("id",), group_labels={"id": "ID"}, poolable=True)
+
+
+@pytest.mark.usefixtures("shown")
+def test_case_count_view_hands_labelled_frames_to_the_plot_unchanged() -> None:
+    frames = {"A · lentil, ID": pd.DataFrame({"x": range(3)})}
+    labelled = dataset_cuts.DisplayFrames(frames, {"A · lentil, ID": ("lentil, ID", "A")})
+    calls: list[dict[str, Any]] = []
+
+    viewers.case_count_view(
+        lambda **kwargs: calls.append(kwargs), datasets=cast("Mapping[Hashable, pd.DataFrame]", labelled), start_cases=5, step_size=1
+    )
+
+    assert isinstance(calls[-1]["datasets"], dataset_cuts.DisplayFrames)
+    assert calls[-1]["datasets"].labels == labelled.labels
+    selector = selectors.DatasetSelector(_inventory(), multiple=True, selected=["lentil"], pool_reason="not here")
+    with pytest.raises(TypeError, match="display labels"):
+        viewers.case_count_view(
+            lambda **_kwargs: None,
+            datasets=cast("Mapping[Hashable, pd.DataFrame]", labelled),
+            start_cases=1,
+            step_size=1,
+            selector=selector,
+        )
 
 
 @pytest.mark.usefixtures("shown")

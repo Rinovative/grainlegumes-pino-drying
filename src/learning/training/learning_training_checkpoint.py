@@ -83,6 +83,8 @@ _TRAINING_IDENTITY_CONTRACT: Final = {
     "optimization": "resolved_optimizer_scheduler_and_training_including_budget",
     "preprocessing": "fitted_normalizer_artifact_sha256",
     "selection": "resolved_evaluation_objective_and_ordered_split",
+    # The evaluation gate: runs of the earlier protocol, whose training also evaluated OOD, carry another digest.
+    "held_out_evaluation": "never_in_training_or_tuning; id_test_and_ood_only_through_the_explicit_artifacts_call",
 }
 TRAINING_IDENTITY_CONTRACT_DIGEST: Final = common.serialization.canonical_json_sha256(_TRAINING_IDENTITY_CONTRACT)
 _CONFIG_SEMANTIC_ROOT_KEYS: Final = frozenset(
@@ -133,11 +135,20 @@ _MODEL_EXEMPTIONS: Final = {
     "learning/learning_device.py": "device choice; the numerical environment is bound separately",
     "learning/learning_device_policy.py": "device choice; the numerical environment is bound separately",
 }
+_STEADY_REFERENCE_EXEMPTION: Final = "steady mean-inlet-pressure reference of the shared scaling, reached only by steady encoding"
 MODEL_PROJECTIONS: Final[dict[str, common.code_identity.CodeProjection]] = {
     "steady_flow": common.code_identity.CodeProjection(
         name="model_steady_flow",
         directories=_MODEL_DIRECTORIES,
-        files=(*_MODEL_FILES, "domain/physics/domain_physics_contracts.py", "domain/tasks/domain_task_steady_flow.py"),
+        files=(
+            *_MODEL_FILES,
+            # The steady scaling divides by the mean inlet pressure that the Brinkman module defines.
+            "domain/physics/domain_physics_boundary.py",
+            "domain/physics/domain_physics_brinkman.py",
+            "domain/physics/domain_physics_contracts.py",
+            "domain/physics/domain_physics_derivatives.py",
+            "domain/tasks/domain_task_steady_flow.py",
+        ),
         excluded_markers=("transient",),
         exemptions={
             **_MODEL_EXEMPTIONS,
@@ -161,7 +172,7 @@ MODEL_PROJECTIONS: Final[dict[str, common.code_identity.CodeProjection]] = {
             "learning/transient/learning_transient_tensorizer.py",
         ),
         excluded_markers=("steady", "_pino"),
-        exemptions=_MODEL_EXEMPTIONS,
+        exemptions={**_MODEL_EXEMPTIONS, "domain/physics/domain_physics_brinkman.py": _STEADY_REFERENCE_EXEMPTION},
     ),
 }
 _TRAINING_DIRECTORIES: Final = ("learning/losses", "learning/metrics", "learning/models", "learning/training")
@@ -203,6 +214,7 @@ TRAINING_PROJECTIONS: Final[dict[str, common.code_identity.CodeProjection]] = {
         exemptions={
             **_TRAINING_EXEMPTIONS,
             "domain/physics/domain_physics_derivatives.py": "steady PINO derivative operators, reached through the loss factory dispatch",
+            "domain/physics/domain_physics_brinkman.py": _STEADY_REFERENCE_EXEMPTION,
         },
         includes=(MODEL_PROJECTIONS["transient_drying"],),
     ),

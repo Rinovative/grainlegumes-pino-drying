@@ -7,18 +7,33 @@ Responsibilities:
     for the cells beyond (on the state bars fixed over the scaled times), error scales (signed by default) fixed over the
     scaled times, tick decimals fixed per colour bar over the scaled times, one scale note under the title and a mean |e|
     line above each error map
-  - Plot physical state trajectories and exact grain-moisture derivations
-  - Plot central rollout error across time, horizons, and reduction scopes
+  - Draw exact-time aggregate error maps on the same geometry: a row per field, a column per context, the signed mean by
+    default (or the absolute or train-sigma-normalized one), one round scale per row locked over the contexts, a unit on every bar
+  - Plot physical state trajectories and exact grain-moisture derivations, and the error over physical time, in time
+    windows (the first 24 h, the middle in days, the last 24 h): a prediction-minus-reference row under each state mean,
+    one labelled line per distinct target moisture on the grain moisture, a case-count row, one legend outside at the top right;
+    the error over time alternatively over the normalized time τ = t / t_stop in equal τ bins
+  - Plot rollout error across horizons and reduction scopes
   - Plot per-field relative norms over physical time with their supported case counts
-  - Present target, matched-compute, pipeline-degradation, and timing evidence
+  - Present target, matched-compute, pipeline-degradation, and timing evidence; duration ratios as the median of the paired
+    per-case ratios with their 10th to 90th percentile as error bar
 
 Design principles:
+  - Styles are resolved once per comparison from all its loaded runs (``series.comparison_styles``) and passed to every view, which
+    looks each series up by its entities (model kind, Dataset role, material, selected checkpoint, read alike from record
+    identity and session provenance) and never resolves its own rows: a run (model kind and checkpoint) keeps one colour in every
+    view, also where a view holds evidence for only some runs; a figure of run colours says «colour = run» in its context line;
+    legends follow ``figure_layout.add_legend``
   - Dynamic states follow the shared EDA labels, units, and display conversions in the active label style: phi in
     percent with errors in pp, and the water densities w_surf, w_int and w_gr as surface, internal and grain moisture in
     percent of wet basis with errors in pp, converted per case with its dry bulk density; cells with negative or
     non-finite water are masked
   - Normalized errors stay on the stored states and saved train scales
   - Physical times are selected exactly and never nearest-neighbour substituted
+  - Cases of different duration share the last window as hours before their own end; the windows only select stored times
+  - In τ, every case starts at t = 0 and keeps its own stored times: a bin averages each case's values inside it before the
+    cases are reduced; a case of the error over time without a time after its origin is refused, never dropped
+  - A duration ratio is drawn on its log scale only when its median and percentiles are positive and finite
   - Endpoint and cumulative reductions remain visually and semantically distinct
 
 This module does NOT:
@@ -32,7 +47,7 @@ import math
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Real
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -41,12 +56,15 @@ import torch
 from matplotlib import colormaps
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import BoundaryNorm, Normalize
+from matplotlib.patches import Patch
+from matplotlib.ticker import MaxNLocator
 
 from src import datasets, domain, learning
 from src.analysis.evaluation import evaluation_transient_artifact as artifact
 from src.analysis.evaluation import evaluation_transient_comparison as comparison
 from src.analysis.evaluation import evaluation_transient_timing as timing
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as plot_layout
+from src.analysis.evaluation.evaluation_plot import evaluation_plot_series as series
 from src.analysis.presentation import analysis_compute as compute
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_display_labels as display_labels
@@ -55,10 +73,14 @@ from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
 from src.analysis.presentation import analysis_moisture_display as moisture_display
 from src.analysis.presentation import analysis_visual_semantics as visual_semantics
+from src.analysis.ui import analysis_ui_figure_layout as figure_layout
 from src.analysis.ui import analysis_ui_plot_layout as layout
-from src.analysis.ui import analysis_ui_time as time_axis
+from src.analysis.ui import analysis_ui_time as time_ui
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from matplotlib.axes import Axes
     from matplotlib.colors import Colormap
     from matplotlib.figure import Figure
 
@@ -80,6 +102,23 @@ _GRAIN_MOISTURE_FIELD = "w_gr"
 _MAX_ERROR_BATCH_INPUT_BYTES = 64 * 1024 * 1024
 _ERROR_PAIR_MASK_BYTES = 17
 _MIN_BAND_CASES = 2
+_WINDOW_PANEL_WIDTH_IN = 4.4  # one time window's column; the legend grows the figure by its own width
+_WINDOW_ROW_HEIGHT_IN = 2.6
+_HALF_ROW = 0.5  # a difference or case-count row against a full row of 1
+_SAME_END_HOURS = 1.0e-6  # cases ending within this of each other share the clock in the last window
+_TAU_TOLERANCE = 1.0e-9  # in bin widths: a τ on a bin edge belongs to the bin below, whatever the rounding
+_REFERENCE_LINE: Final = {"linewidth": 3.2, "alpha": 0.35}  # the reference is wide and pale beside the prediction in its series style
+_PREDICTION_WIDTH = 1.6
+_SCOPE_MARKERS: Final = {"cumulative": "o", "endpoint": "s"}  # A4: colour and line style belong to entity and role
+_CONDITION_MARKERS: Final = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "p", "h", "*")  # mode and horizon of one material
+_STAGE_COLOURS: Final = {"B/A": "#1B9E77", "C/A": "#D95F02", "C/B": "#7570B3"}  # airflow-substitution stages, no entity colours
+_NEUTRAL_COLOUR = "0.55"
+_GROUPED_PANEL_IN = (8.0, 4.2)  # one channel comparison of bars or boxes per frame and material
+_TARGET_COLOUR = "0.35"
+_TARGET_LABEL_GAP_PT = 11.0  # target values closer than this are pushed apart
+_TARGET_LABEL_OFFSET_PT = 4.0  # frame to the target value
+_UNAVAILABLE_LABEL = "non-finite, unavailable"  # the legend shows the x marker beside it
+_UNAVAILABLE_HEIGHT = 0.06  # of the row, above its x axis
 
 
 def _value(record: Any, name: str) -> Any:
@@ -128,6 +167,46 @@ def _material_role_label(
         else material
     )
     return f"{label} · {frame_name}" if include_frame else label
+
+
+def _record_entity(record: Any) -> tuple[Any, ...]:
+    """Return one record's entity facts from its identity, ordered as ``series.ENTITY_COLUMNS``; the checkpoint is the selected one."""
+    material = _record_material(record)  # also admits the identity as a mapping
+    identity = _value(record, "identity")
+    checkpoint = identity.get("checkpoint_identity")
+    selected = checkpoint.get("best_checkpoint_sha256") if isinstance(checkpoint, Mapping) else None
+    return identity.get("model_kind"), identity.get("dataset_role"), material, selected
+
+
+def _record_styles(groups: Mapping[str, Sequence[Any]], styles: series.SeriesStyles) -> series.SeriesStyles:
+    """Return the comparison style of every labelled record series by its records' identity."""
+    return series.select_styles({label: [_record_entity(record) for record in records] for label, records in groups.items()}, styles)
+
+
+def _frame_styles(groups: Mapping[str, pd.DataFrame], styles: series.SeriesStyles) -> series.SeriesStyles:
+    """Return the comparison style of every labelled series of session summary rows by their provenance columns ``series.ENTITY_COLUMNS``."""
+    columns = list(series.ENTITY_COLUMNS)
+    for label, rows in groups.items():
+        if missing := [column for column in columns if column not in rows]:
+            msg = f"Summary rows of series {label!r} lack the session provenance columns {missing}."
+            raise ValueError(msg)
+    return series.select_styles({label: list(rows[columns].itertuples(index=False, name=None)) for label, rows in groups.items()}, styles)
+
+
+def _summary_series(rows: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Group summary rows into one series per frame and material, labelled by material and role, plus the frame where roles do not separate them."""
+    include_frame = rows["frame"].nunique() > rows["dataset_role"].nunique()
+    return {
+        _material_role_label(frame, material, group["dataset_role"].iloc[0], include_frame=include_frame): group
+        for (frame, material), group in rows.groupby(["frame", "material_family"], sort=False)
+    }
+
+
+def _legend(figure: Figure, axes: np.ndarray, *, outside: bool = False) -> None:
+    """Write one legend of every labelled artist of ``axes`` by ``figure_layout.add_legend`` (L1); a figure without one draws none."""
+    handles, labels = figure_layout.legend_entries(axes.flat)
+    if labels:
+        figure_layout.add_legend(figure, axes, handles, labels, outside=outside)
 
 
 def _selected_fields(fields: Sequence[str] | None) -> tuple[str, ...]:
@@ -315,7 +394,7 @@ def _error_definition(field: str, error_mode: str, finite_errors: np.ndarray) ->
     """Build one field's error colour scale from its finite displayed errors; errors beyond it set the bar's arrows."""
     signed = error_mode == error_diagnostics.SIGNED_ERROR
     normalized = error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
-    boundaries = plot_layout.error_boundaries(finite_errors, signed=signed)
+    boundaries = field_maps.error_boundaries(finite_errors, signed=signed)
     return field_maps.build_field_map(
         # The scale's own ends keep a uniform error (all zero included) from being a constant field, whose map refuses locked boundaries.
         np.append(finite_errors, boundaries[[0, -1]]),
@@ -338,7 +417,7 @@ class StateMapNorm:
     """
 
     error: field_maps.FieldMapDefinition | None
-    state_format: plot_layout.TickFormat
+    state_format: layout.TickFormat
     arrows: tuple[field_maps.FieldMapExtend, field_maps.FieldMapExtend]
     fixed: tuple[Normalize | None, Normalize | None] | None = None
 
@@ -388,10 +467,12 @@ def state_map_norms(
     Return per-field error colour scales and state tick decimals from all given time indices.
 
     The state colour scales are not fixed here unless the field is in ``fixed_time_fields``: ``plot_state_maps`` derives
-    them from each drawn time. Their tick decimals are the most any time's ticks need, at most three and never a power of
-    ten (``plot_layout.state_format``); a near-uniform time does not set them but is widened (``lock_scale`` as in
-    ``plot_state_maps``). A fixed field's state scale is the one of the 5th to 95th percentile of the displayed values
-    pooled over all given times (the prediction's own without ``lock_scale``), and its decimals come from that scale.
+    them from each drawn time. Their tick decimals are the most any time's ticks need, at most three (``layout.state_format``);
+    a near-uniform time does not set them but is widened (``lock_scale`` as in ``plot_state_maps``). A state bar takes its
+    power of ten from the size of its values (``field_maps.state_exponent``); the transient states lie where that is 0, and
+    the transient bars carry none, so a field whose state bands would need one raises ``ValueError`` naming it. A fixed
+    field's state scale is the one of the 5th to 95th percentile of the displayed values pooled over all given times (the
+    prediction's own without ``lock_scale``), and its decimals come from that scale.
     A name in ``fixed_time_fields`` that is not a drawn field raises ``ValueError``, a bare string ``TypeError``.
     """
     fields = _selected_fields(state_fields)
@@ -431,14 +512,14 @@ def state_map_norms(
             if state_range is None:  # a constant frame keeps one tick and never sets the format
                 continue
             # A near-uniform frame records the finer step it needs: it never sets the format, but keeps three decimals if no frame fits.
-            bands = layout.rounded_boundaries(*state_range, max_decimals=plot_layout.MAX_TICK_DECIMALS)
-            bands = layout.rounded_boundaries(*state_range) if bands is None else bands
+            bands = field_maps.rounded_boundaries(*state_range, max_decimals=field_maps.MAX_TICK_DECIMALS)
+            bands = field_maps.rounded_boundaries(*state_range) if bands is None else bands
             if bands is not None:
                 steps.append(float(bands[1] - bands[0]))
-        state_format = plot_layout.state_format(steps)
-        fixed = _state_norms(shown_reference[0], shown_prediction[0], shared=lock_scale, decimals=state_format.decimals) if pooled else None
+        state_format = layout.state_format(steps)
+        fixed = _state_norms(field, shown_reference[0], shown_prediction[0], shared=lock_scale, decimals=state_format.decimals) if pooled else None
         frame_norms = [
-            fixed or _state_norms(shown, other, shared=lock_scale, decimals=state_format.decimals)
+            fixed or _state_norms(field, shown, other, shared=lock_scale, decimals=state_format.decimals)
             for shown, other in zip(frames_reference, frames_prediction, strict=True)
         ]
         norms[field] = StateMapNorm(
@@ -472,26 +553,34 @@ def _frame_range(values: np.ndarray) -> tuple[float, float] | None:
     return None if _is_constant(full) else (float(np.asarray(full.vmin)), float(np.asarray(full.vmax)))
 
 
-def _state_norm(values: np.ndarray, decimals: int) -> Normalize | None:
+def _state_norm(field: str, values: np.ndarray, decimals: int) -> Normalize | None:
     """
-    Return the discrete scale over the 5th to the 95th percentile of the finite ``values`` (``None`` without any).
+    Return the discrete scale of ``field`` over the 5th to the 95th percentile of the finite ``values`` (``None`` without any).
 
-    The bands are the round ones of ``plot_layout.state_boundaries``, with a ``BoundaryNorm`` of one colour per band.
+    The bands are the round ones of ``field_maps.state_boundaries``, with a ``BoundaryNorm`` of one colour per band.
     A degenerate percentile range falls back to the values' own full finite range, and a constant field to a padded
     continuous scale of one tick. A near-uniform scale whose step is finer than the bar's ``decimals`` is widened to
-    11 steps of 10**-``decimals``.
+    11 steps of 10**-``decimals``. The bar is written without a power of ten, so a field whose state bands (a constant:
+    its value) or whose widened bands have a nonzero ``field_maps.state_exponent`` (largest magnitude outside 10^-3 to
+    10^4) raises ``ValueError``.
     """
+    finite = values[np.isfinite(values)]
+    if not finite.size:
+        return None
     scale = _frame_range(values)
-    if scale is None:
-        finite = values[np.isfinite(values)]
-        return layout.linear_norm(finite) if finite.size else None
-    boundaries = plot_layout.state_boundaries(*scale)
-    if plot_layout.is_finer_than_decimals(float(boundaries[1] - boundaries[0]), decimals):
-        boundaries = np.linspace(*plot_layout.widened_range(*scale, decimals), field_maps.N_COLOR_BINS + 1)
-    return BoundaryNorm(boundaries, boundaries.size - 1)
+    banded = np.array([finite.min(), finite.max()]) if scale is None else field_maps.state_boundaries(*scale)
+    boundaries = banded
+    if scale is not None and layout.is_finer_than_decimals(float(banded[1] - banded[0]), decimals):
+        boundaries = np.linspace(*field_maps.widened_range(*scale, decimals), field_maps.N_COLOR_BINS + 1)
+    if any(field_maps.state_exponent(float(drawn[0]), float(drawn[-1])) for drawn in (banded, boundaries)):
+        msg = f"The transient state {field!r} spans {boundaries[0]!r} to {boundaries[-1]!r}: its bar would need a power of ten it never carries."
+        raise ValueError(msg)
+    return layout.linear_norm(finite) if scale is None else BoundaryNorm(boundaries, boundaries.size - 1)
 
 
-def _state_norms(reference: np.ndarray, prediction: np.ndarray, *, shared: bool, decimals: int) -> tuple[Normalize | None, Normalize | None]:
+def _state_norms(
+    field: str, reference: np.ndarray, prediction: np.ndarray, *, shared: bool, decimals: int
+) -> tuple[Normalize | None, Normalize | None]:
     """
     Return one time's reference and prediction colour scales (``None`` for a panel without finite values).
 
@@ -499,9 +588,9 @@ def _state_norms(reference: np.ndarray, prediction: np.ndarray, *, shared: bool,
     widens it; a reference without finite values leaves each panel its own scale. Otherwise each panel scales to its own
     5th to 95th percentile.
     """
-    if shared and (together := _state_norm(reference, decimals)) is not None:
+    if shared and (together := _state_norm(field, reference, decimals)) is not None:
         return together, together
-    return _state_norm(reference, decimals), _state_norm(prediction, decimals)
+    return _state_norm(field, reference, decimals), _state_norm(field, prediction, decimals)
 
 
 def _static_conditioning(record: Any) -> np.ndarray:
@@ -622,12 +711,12 @@ def plot_state_maps(
             _absolute_display(record, field, raw_prediction),
             _error_display(field, error_mode, error_result),
         )
-        exponent = plot_layout.error_format(None if norm.error is None else norm.error.boundaries, signed=signed_error).exponent
+        exponent = layout.error_format(None if norm.error is None else norm.error.boundaries, signed=signed_error).exponent
         error_unit = None if normalized_error else _display_unit(field, difference=True)
         error_texts.append(plot_layout.mean_error_text(values[2], unit=error_unit, exponent=exponent))
         masked_note = "Negative or non-finite water masked" if moisture_display.is_moisture_field(field) else "Non-finite cells masked"
         reference_norm, prediction_norm = (
-            _state_norms(values[0], values[1], shared=lock_scale, decimals=norm.state_format.decimals) if norm.fixed is None else norm.fixed
+            _state_norms(field, values[0], values[1], shared=lock_scale, decimals=norm.state_format.decimals) if norm.fixed is None else norm.fixed
         )
         for column, value in enumerate(values):
             axis = axes[row, column]
@@ -669,9 +758,7 @@ def plot_state_maps(
             if error_scale is None:
                 extend: field_maps.FieldMapExtend = "neither" if normalizer is None else norm.arrows[column]
                 ticks = np.empty(0) if normalizer is None else _state_ticks(normalizer)
-                plot_layout.set_fixed_decimal_ticks(
-                    layout.add_slot_colorbar(figure, image, slot, label=unit, extend=extend), ticks, norm.state_format
-                )
+                layout.set_fixed_decimal_ticks(layout.add_slot_colorbar(figure, image, slot, label=unit, extend=extend), ticks, norm.state_format)
                 continue
             colorbar = layout.add_slot_colorbar(
                 figure,
@@ -680,10 +767,10 @@ def plot_state_maps(
                 label=f"{error_diagnostics.NORMALIZED_ERROR_SYMBOL} [{field_labels.display_unit('1')}]" if normalized_error else unit,
                 extend=error_scale.extend,
             )
-            plot_layout.set_fixed_decimal_ticks(colorbar, plot_layout.error_ticks(error_scale.boundaries, signed=signed_error))
+            layout.set_fixed_decimal_ticks(colorbar, layout.error_ticks(error_scale.boundaries, signed=signed_error))
     plot_layout.set_error_headers(axes, ("Reference", "Prediction", _ERROR_HEADERS[error_mode]), error_texts)
     layout.set_row_labels(axes, [_display_symbol(field) for field in fields])
-    layout.set_figure_title(
+    layout.set_map_title(
         figure,
         f"Transient state comparison at t={selected_time:g} h"
         if title_context is None
@@ -723,24 +810,24 @@ def _trajectory_values(
     return times, reference_values, prediction_values
 
 
-def _union_record_times(records: Sequence[Any], *, exclude_origin: bool) -> np.ndarray:
-    """Return every exact supported physical time, without filling short tails."""
+def _record_end_hours(records: Sequence[Any], *, exclude_origin: bool) -> np.ndarray:
+    """
+    Return the end of every record: its last stored time, at most one interval before its exact stop.
+
+    The last stored time, not the exact stop, keeps the offsets before the end on the shared time grid, so cases still aggregate. The
+    stored times are validated by the shared time owner; with ``exclude_origin`` every record must hold a time after its origin, so
+    none silently leaves the cohort.
+    """
     admitted = tuple(records)
     if not admitted:
         msg = "Transient trajectory summaries require at least one record."
         raise ValueError(msg)
-    support: set[float] = set()
-    for record in admitted:
-        values = np.asarray(_value(record, "physical_times"), dtype=np.float64)
-        if values.ndim != 1 or not np.isfinite(values).all() or not np.all(np.diff(values) > 0.0):
-            msg = "Transient physical times must be finite and strictly increasing."
-            raise ValueError(msg)
-        support.update(float(value) for value in values[1 if exclude_origin else 0 :])
-    times = np.asarray(sorted(support), dtype=np.float64)
-    if not times.size:
-        msg = "Transient trajectory records contain no required exact physical times."
+    grids = [time_ui.validated_times(_value(record, "physical_times")) for record in admitted]
+    short = [str(_value(record, "case_id")) for record, grid in zip(admitted, grids, strict=True) if len(grid) < _MINIMUM_TRAJECTORY_TIMES]
+    if exclude_origin and short:
+        msg = f"Transient records of cases {short} hold no stored time after its origin; a case is refused, not dropped from the cohort."
         raise ValueError(msg)
-    return times
+    return np.asarray([grid[-1] for grid in grids], dtype=np.float64)
 
 
 @dataclass(frozen=True, slots=True)
@@ -809,74 +896,265 @@ def _aggregate_exact_time_errors(rows: Sequence[tuple[np.ndarray, np.ndarray]], 
     return _ExactTimeSummary(times, central, lower, upper, count, invalid)
 
 
+def _shared_windows(
+    admitted: Mapping[str, tuple[Any, ...]], *, exclude_origin: bool, normalized: bool = False
+) -> tuple[tuple[time_ui.TimeWindow, ...], dict[str, np.ndarray]]:
+    """
+    Return the time windows of all contexts and the final hour of every record (its t_stop), per context.
+
+    ``normalized`` gives the one τ window; otherwise cases of one duration share the clock, and the last window counts hours
+    before each case's own end.
+    """
+    ends = {label: _record_end_hours(records, exclude_origin=exclude_origin) for label, records in admitted.items()}
+    if normalized:
+        return (time_ui.TAU_WINDOW,), ends
+    longest = max(float(values.max()) for values in ends.values())
+    shortest = min(float(values.min()) for values in ends.values())
+    return time_ui.drying_windows(longest, before_end=longest - shortest > _SAME_END_HOURS), ends
+
+
+def _window_rows(window: time_ui.TimeWindow, rows: Sequence[tuple[np.ndarray, np.ndarray]], ends: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return every row's exact points inside the window on its coordinate; a row keeps its place when none of its points lies inside."""
+    shown = []
+    for (times, values), end in zip(rows, ends, strict=True):
+        inside = window.select(times, end_hours=float(end))
+        shown.append((window.hours(times[inside], end_hours=float(end)), values[inside]))
+    return shown
+
+
+def _tau_bin_count(records: Iterable[Any]) -> int:
+    """
+    Return the number of equal τ bins, each at least as wide as the widest stored step of any case divided by its end.
+
+    Every case must start at t = 0 and hold a time after it: its steps in τ are then no wider than a bin, so it has a stored
+    time in every bin, and τ = t / t_stop is the fraction of its run. A case starting later is refused, since it would miss the
+    early bins and shrink their cohort unseen.
+    """
+    widest = 0.0
+    for record in records:
+        grid = np.asarray(_value(record, "physical_times"), dtype=np.float64)
+        if grid[0] != 0.0:
+            msg = f"τ = t / t_stop requires every case to start at t = 0; case {_value(record, 'case_id')!r} starts at {grid[0]:g} h."
+            raise ValueError(msg)
+        widest = max(widest, float(np.max(np.diff(grid)) / grid[-1]))
+    return max(1, math.floor(1.0 / widest + _TAU_TOLERANCE))
+
+
+def _tau_binned(rows: Sequence[tuple[np.ndarray, np.ndarray]], bin_count: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Average each row's values over the τ bins ((k - 1) / ``bin_count``, k / ``bin_count``], each drawn at its upper edge.
+
+    A row keeps its own stored times: its bin value is the mean over its stored τ inside, non-finite when one of them is.
+    """
+    binned = []
+    for tau, values in rows:
+        index = np.clip(np.ceil(tau * bin_count - _TAU_TOLERANCE).astype(np.int64) - 1, 0, bin_count - 1)
+        present = np.unique(index)
+        binned.append(((present + 1) / bin_count, np.asarray([np.mean(values[index == bin_index]) for bin_index in present], dtype=np.float64)))
+    return binned
+
+
+def _window_figure(windows: Sequence[time_ui.TimeWindow], heights: Sequence[float]) -> tuple[Figure, np.ndarray]:
+    """
+    Return a figure on the shared panel engine and its axes ``[row, window]``, a row ``heights`` of a full row high.
+
+    The axes take the shared text sizes; the legend grows the figure later. The engine's gaps are paddings in inches only (no
+    figure fraction), so a figure grown for its legend keeps every panel's size.
+    """
+    figure = plt.figure(figsize=(_WINDOW_PANEL_WIDTH_IN * len(windows), sum(heights) * _WINDOW_ROW_HEIGHT_IN), layout=figure_layout.panel_engine())
+    axes = layout.window_axes(figure, figure.add_gridspec(1, 1)[0, 0], windows, heights)
+    figure_layout.apply_text_sizes(axes.flat)
+    return figure, axes
+
+
+def _count_symbol(windows: Sequence[time_ui.TimeWindow]) -> str:
+    """Return the symbol of the case count over the windows' time: n(τ) over normalized time, else n(t)."""
+    return "n(τ)" if windows[0].unit == "1" else "n(t)"
+
+
+def _draw_case_count(axis: Axes, time: np.ndarray, count: np.ndarray, *, style: visual_semantics.SeriesStyle, label: str) -> None:
+    """Draw the cases that have a stored time at each exact time (or τ bin); every field has the same count."""
+    axis.step(time, count, where="mid", color=style.color, linestyle=style.linestyle, alpha=0.55, label=label)
+
+
+def _mark_unavailable(axis: Axes, time: np.ndarray, unavailable: np.ndarray, *, color: Any) -> None:
+    """Mark on a field's own row the exact times at which a non-finite value voids its score."""
+    if unavailable.any():
+        axis.plot(
+            time[unavailable],
+            np.full(int(unavailable.sum()), _UNAVAILABLE_HEIGHT),
+            transform=axis.get_xaxis_transform(),
+            linestyle="none",
+            marker="x",
+            markersize=5,
+            color=color,
+            clip_on=False,
+            label=_UNAVAILABLE_LABEL,
+        )
+
+
+def _draw_target_lines(axes: Sequence[Axes], records: Sequence[Any]) -> list[float]:
+    """
+    Draw one horizontal line per distinct wet-basis target moisture of the shown cases, in the plot's percent, and return the levels.
+
+    The target is a property of the case: records of one case that carry different targets are refused.
+    """
+    by_case: dict[str, set[float]] = {}
+    for record in records:
+        by_case.setdefault(str(_value(record, "case_id")), set()).add(float(_value(_value(record, "target"), "target_moisture_wb")))
+    for case_id, case_targets in by_case.items():
+        if len(case_targets) > 1:
+            msg = f"Transient plot records of case {case_id!r} carry different target_moisture_wb values: {sorted(case_targets)}."
+            raise ValueError(msg)
+    targets = sorted({target for case_targets in by_case.values() for target in case_targets})
+    levels = [float(level) for level in field_labels.display_values(targets, "1", field="target_moisture_wb")]
+    for index, level in enumerate(levels):
+        for column, axis in enumerate(axes):
+            legend = f"Target {_display_symbol(_GRAIN_MOISTURE_FIELD)}" if index == column == 0 else "_nolegend_"
+            axis.axhline(level, color=_TARGET_COLOUR, linestyle=":", linewidth=1.2, label=legend)
+    return levels
+
+
+def _label_target_lines(figure: Figure, axis: Axes, levels: Sequence[float]) -> None:
+    """
+    Write each target's value inside ``axis`` at the left end of its line; values closer than one text line are pushed apart and joined to their line.
+
+    The left end is the start of the run, where the grain moisture stands well above every target, so the values cover no curve.
+    """
+    engine = figure.get_layout_engine()
+    if engine is not None:
+        engine.execute(figure)  # the final size and y scale of the row
+    lines = [float(axis.transData.transform((0.0, level))[1]) for level in levels]
+    placed = list(lines)
+    gap = _TARGET_LABEL_GAP_PT * figure.dpi / 72.0
+    for index in range(1, len(placed)):
+        placed[index] = max(placed[index], placed[index - 1] + gap)
+    centring = (sum(lines) - sum(placed)) / len(placed)
+    unit = _display_unit(_GRAIN_MOISTURE_FIELD, difference=False)
+    for level, line, pixel in zip(levels, lines, placed, strict=True):
+        text = axis.annotate(
+            f"{level:g} {unit}",
+            xy=(0.0, level),
+            xycoords=axis.get_yaxis_transform(),
+            xytext=(_TARGET_LABEL_OFFSET_PT, (pixel + centring - line) * 72.0 / figure.dpi),
+            textcoords="offset points",
+            ha="left",
+            va="center",
+            fontsize="small",
+            color=_TARGET_COLOUR,
+            bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.5},
+            annotation_clip=False,
+            arrowprops={"arrowstyle": "-", "color": _TARGET_COLOUR, "linewidth": 0.6, "relpos": (0.0, 0.5), "shrinkA": 0, "shrinkB": 0},
+        )
+        text.set_in_layout(False)  # inside the panel: the windows keep their widths
+
+
+def _finish_window_figure(
+    figure: Figure,
+    axes: np.ndarray,
+    windows: Sequence[time_ui.TimeWindow],
+    title: str,
+    *,
+    note: str | None,
+    target_axis: Axes | None = None,
+    target_levels: Sequence[float] = (),
+) -> Figure:
+    """
+    Title the windows and the figure, style every time axis and write the one legend outside right, top aligned with the top frame.
+
+    Tick numbers and the time label stay under the bottom row; the case-count row (last) gets its own label and integer ticks.
+    The legend (``figure_layout.add_legend``) collects the entries of every axis once by label and grows the figure, never a row.
+    """
+    last_row = axes.shape[0] - 1
+    for column, window in enumerate(windows):
+        figure_layout.set_panel_title(axes[0, column], window.title)
+        for row in range(axes.shape[0]):
+            time_ui.style_window_axis(axes[row, column], window, bottom=row == last_row)
+            axes[row, column].grid(axis="y", alpha=0.25)
+    axes[last_row, 0].set_ylabel(_count_symbol(windows))
+    axes[last_row, 0].set_ylim(bottom=0)
+    axes[last_row, 0].yaxis.set_major_locator(MaxNLocator(integer=True))
+    figure_layout.set_figure_title(figure, axes, title, note=note)
+    _legend(figure, axes)
+    if target_axis is not None:
+        _label_target_lines(figure, target_axis, target_levels)  # after the legend, on the final y scale of the row
+    return figure
+
+
 def plot_state_trajectory_summary(
     series: Mapping[str, Sequence[Any]],
     *,
     state_fields: Sequence[str],
+    styles: series.SeriesStyles,
 ) -> Figure:
-    """Plot material-aware aggregate or single-case trajectories on exact times."""
+    """
+    Plot material-aware aggregate or single-case trajectories on exact times, in time windows.
+
+    Each state has a row of reference and prediction means with a half-height row of prediction minus reference below it,
+    where a non-finite value that voids a score is marked; the grain moisture also carries one line per distinct wet-basis
+    target moisture of the shown cases. A last row counts the cases with a stored time at each exact time, the same for every state.
+    A series takes its style from the comparison's ``styles`` (``series.comparison_styles``) by its records' identity; its reference is
+    drawn wide and pale under its prediction.
+    """
     fields = _selected_fields(state_fields)
     admitted = {label: tuple(records) for label, records in series.items()}
     if not admitted or any(not label or not records for label, records in admitted.items()):
         msg = "Trajectory summaries require labelled non-empty record groups."
         raise ValueError(msg)
-    all_times = np.concatenate([_union_record_times(records, exclude_origin=False) for records in admitted.values()])
-    display_time = time_axis.physical_time_display(all_times, preferred_unit="auto")
-    figure, axes = plt.subplots(
-        len(fields),
-        1,
-        figsize=(9.2, max(4.8, 3.8 * len(fields))),
-        layout="constrained",
-        squeeze=False,
-    )
-    colors = plt.colormaps["tab10"]
-    for row, field in enumerate(fields):
-        axis = axes[row, 0]
-        support_axis = axis.twinx() if row == 0 else None
-        for series_index, (label, records) in enumerate(admitted.items()):
-            reference_rows: list[tuple[np.ndarray, np.ndarray]] = []
-            prediction_rows: list[tuple[np.ndarray, np.ndarray]] = []
-            for record in records:
-                record_times, reference, prediction = _trajectory_values(record, field)
-                reference_means, prediction_means = _spatial_means(record, field, reference, prediction)
-                reference_rows.append((record_times, reference_means))
-                prediction_rows.append((record_times, prediction_means))
-            reference_summary = _aggregate_exact_time_values(reference_rows)
-            prediction_summary = _aggregate_exact_time_values(prediction_rows)
-            plotted_time = display_time.values(reference_summary.times)
-            color = colors(series_index % colors.N)
-            axis.plot(
-                plotted_time,
-                reference_summary.mean,
-                color=color,
-                linewidth=2.0,
-                label=f"{label} · Reference",
-            )
-            axis.plot(
-                plotted_time,
-                prediction_summary.mean,
-                color=color,
-                linewidth=2.0,
-                linestyle="--",
-                label=f"{label} · Prediction",
-            )
-            axis.fill_between(plotted_time, reference_summary.lower, reference_summary.upper, color=color, alpha=0.08)
-            axis.fill_between(plotted_time, prediction_summary.lower, prediction_summary.upper, color=color, alpha=0.08)
-            if support_axis is not None:
-                support_axis.step(plotted_time, reference_summary.count, where="mid", color=color, alpha=0.55, label=f"{label} n(t)")
-                unavailable = (reference_summary.invalid_count + prediction_summary.invalid_count) > 0
-                if unavailable.any():
-                    support_axis.scatter(plotted_time[unavailable], reference_summary.count[unavailable], color=color, marker="x", s=28)
-        display_time.configure(axis)
-        axis.set_ylabel(_display_label(field))
-        axis.grid(alpha=0.25)
-        axis.legend(frameon=False, fontsize="small")
-        if support_axis is not None:
-            support_axis.set_ylabel("Exact cases n(t); x marker = non-finite unavailable")
-            support_axis.set_ylim(bottom=0)
-            support_axis.legend(loc="lower right", frameon=False, fontsize="small")
-    figure.suptitle("Reference vs prediction trajectories — exact-time spatial means; bands require n(t) ≥ 2")
-    return figure
+    styles = _record_styles(admitted, styles)
+    windows, ends = _shared_windows(admitted, exclude_origin=False)
+    figure, axes = _window_figure(windows, [height for _field in fields for height in (1.0, _HALF_ROW)] + [_HALF_ROW])
+    try:
+        target_axis, target_levels = None, []
+        for row, field in enumerate(fields):
+            quantity_axes, difference_axes = axes[2 * row], axes[2 * row + 1]
+            for label, records in admitted.items():
+                reference_rows: list[tuple[np.ndarray, np.ndarray]] = []
+                prediction_rows: list[tuple[np.ndarray, np.ndarray]] = []
+                for record in records:
+                    record_times, reference, prediction = _trajectory_values(record, field)
+                    reference_means, prediction_means = _spatial_means(record, field, reference, prediction)
+                    reference_rows.append((record_times, reference_means))
+                    prediction_rows.append((record_times, prediction_means))
+                style = styles[label]
+                line = {"color": style.color, "linestyle": style.linestyle}
+                for column, window in enumerate(windows):
+                    shown_reference = _window_rows(window, reference_rows, ends[label])
+                    if not any(times.size for times, _values in shown_reference):
+                        continue
+                    reference_summary = _aggregate_exact_time_values(shown_reference)
+                    prediction_summary = _aggregate_exact_time_values(_window_rows(window, prediction_rows, ends[label]))
+                    time = reference_summary.times
+                    axis = quantity_axes[column]
+                    axis.plot(time, reference_summary.mean, **line, **_REFERENCE_LINE, label=f"{label} · Reference")
+                    axis.plot(time, prediction_summary.mean, **line, linewidth=_PREDICTION_WIDTH, label=f"{label} · Prediction")
+                    axis.fill_between(time, reference_summary.lower, reference_summary.upper, color=style.color, alpha=0.08)
+                    axis.fill_between(time, prediction_summary.lower, prediction_summary.upper, color=style.color, alpha=0.08)
+                    difference_axes[column].plot(time, prediction_summary.mean - reference_summary.mean, **line, linewidth=1.3)
+                    _mark_unavailable(
+                        difference_axes[column], time, (reference_summary.invalid_count + prediction_summary.invalid_count) > 0, color=style.color
+                    )
+                    if row == 0:
+                        _draw_case_count(axes[-1, column], time, reference_summary.count, style=style, label=f"{label} n(t)")
+            if field == _GRAIN_MOISTURE_FIELD:
+                target_axis = quantity_axes[0]
+                target_levels = _draw_target_lines(quantity_axes, [record for records in admitted.values() for record in records])
+            quantity_axes[0].set_ylabel(_display_label(field))
+            difference_axes[0].set_ylabel(f"pred \N{MINUS SIGN} ref [{_display_unit(field, difference=True)}]")
+            for axis in difference_axes:
+                axis.axhline(0.0, color="0.6", linewidth=0.8)
+        return _finish_window_figure(
+            figure,
+            axes,
+            windows,
+            "Reference vs prediction trajectories",
+            note=plot_layout.series_note(styles, "exact-time spatial means; bands require n(t) ≥ 2"),
+            target_axis=target_axis,
+            target_levels=target_levels,
+        )
+    except Exception:
+        plt.close(figure)
+        raise
 
 
 def _normalized_squared_error_trajectory(
@@ -909,146 +1187,104 @@ def plot_error_over_physical_time(
     *,
     scaling_states: Mapping[str, Mapping[str, Any]],
     state_fields: Sequence[str],
+    styles: series.SeriesStyles,
+    time_axis: Literal["hours", "tau"] = "hours",
 ) -> Figure:
     """
-    Plot saved-scale channel errors over exact physical time by context.
+    Plot saved-scale channel errors over exact physical time, or over the normalized time τ, by context, in the comparison's ``styles``.
 
-    The line is the normalized RMSE of the cases present at each time, reduced like every
-    reported field RMSE (root after the material-case mean of the per-case mean squared
-    error); the band spans the 10th to 90th quantile of the per-case RMSEs.
+    In hours the line is the normalized RMSE of the cases present at each exact time, reduced like every reported field RMSE
+    (root after the material-case mean of the per-case mean squared error); the band spans the 10th to 90th quantile of the
+    per-case RMSEs. With ``time_axis="tau"`` each case's times become τ = t / t_stop, t_stop its last stored time, so every case
+    ends at τ = 1; τ is cut into equal bins no narrower than any case's widest stored step (``_tau_bin_count``), a case's value
+    in a bin is the mean of its per-time mean squared errors there, and the cases are reduced per bin as per exact time above.
+    A record without a time after its origin, and in τ a case that does not start at t = 0, raise ``ValueError``.
     """
+    if time_axis not in {"hours", "tau"}:
+        msg = f"time_axis must be 'hours' or 'tau', not {time_axis!r}."
+        raise ValueError(msg)
     fields = tuple(field for field in _selected_fields(state_fields) if field in artifact.STATE_ORDER)
     admitted = {label: tuple(records) for label, records in series.items()}
     if not fields or not admitted or set(admitted) != set(scaling_states):
         msg = "Error-over-time series require stored fields and matching scaling contexts."
         raise ValueError(msg)
-    all_times = np.concatenate([_union_record_times(records, exclude_origin=True) for records in admitted.values()])
-    display_time = time_axis.physical_time_display(all_times, preferred_unit="auto")
-    figure, axes = plt.subplots(
-        len(fields),
-        1,
-        figsize=(9.2, max(4.8, 3.5 * len(fields))),
-        layout="constrained",
-        squeeze=False,
-    )
-    colors = plt.colormaps["tab10"]
-    for row, field in enumerate(fields):
-        axis = axes[row, 0]
-        support_axis = axis.twinx() if row == 0 else None
-        for series_index, (label, records) in enumerate(admitted.items()):
-            rows: list[tuple[np.ndarray, np.ndarray]] = []
-            materials: list[str] = []
-            for record in records:
-                record_times, values = _normalized_squared_error_trajectory(
-                    record,
-                    scaling_state=scaling_states[label],
-                    fields=fields,
-                )
-                rows.append((record_times, values[field]))
-                materials.append(_record_material(record))
-            summary = _aggregate_exact_time_errors(rows, materials=materials)
-            plotted_time = display_time.values(summary.times)
-            color = colors(series_index % colors.N)
-            axis.plot(plotted_time, summary.mean, color=color, linewidth=2.0, label=f"{label} · material-case RMSE")
-            axis.fill_between(plotted_time, summary.lower, summary.upper, color=color, alpha=0.1, label=f"{label} · per-case RMSE 10th-90th")
-            if support_axis is not None:
-                support_axis.step(plotted_time, summary.count, where="mid", color=color, alpha=0.55, label=f"{label} n(t)")
-                unavailable = summary.invalid_count > 0
-                if unavailable.any():
-                    support_axis.scatter(plotted_time[unavailable], summary.count[unavailable], color=color, marker="x", s=28)
-        display_time.configure(axis)
-        axis.set_ylabel(f"{field_labels.metric_label('nRMSE', field, mathtext=True)} [{field_labels.display_unit('1')}]")
-        axis.grid(alpha=0.25)
-        axis.legend(frameon=False, fontsize="small")
-        if support_axis is not None:
-            support_axis.set_ylabel("Exact cases n(t); x marker = non-finite unavailable")
-            support_axis.set_ylim(bottom=0)
-            support_axis.legend(loc="lower right", frameon=False, fontsize="small")
-    figure.suptitle(
-        "Error over physical time — root of the material-case mean squared error at each exact time; per-case RMSE 10th-90th bands require n(t) ≥ 2"
-    )
-    return figure
+    styles = _record_styles(admitted, styles)
+    normalized = time_axis == "tau"
+    windows, ends = _shared_windows(admitted, exclude_origin=True, normalized=normalized)
+    bin_count = _tau_bin_count(record for records in admitted.values() for record in records) if normalized else 0
+    count_symbol = _count_symbol(windows)
+    figure, axes = _window_figure(windows, [*([1.0] * len(fields)), _HALF_ROW])
+    try:
+        for label, records in admitted.items():
+            trajectories = [_normalized_squared_error_trajectory(record, scaling_state=scaling_states[label], fields=fields) for record in records]
+            materials = [_record_material(record) for record in records]
+            style = styles[label]
+            for row, field in enumerate(fields):
+                rows = [(record_times, values[field]) for record_times, values in trajectories]
+                for column, window in enumerate(windows):
+                    shown = _window_rows(window, rows, ends[label])
+                    if not any(times.size for times, _values in shown):
+                        continue
+                    summary = _aggregate_exact_time_errors(_tau_binned(shown, bin_count) if normalized else shown, materials=materials)
+                    axis = axes[row, column]
+                    line = {"color": style.color, "linestyle": style.linestyle, "linewidth": 2.0}
+                    axis.plot(summary.times, summary.mean, **line, label=f"{label} · material-case RMSE")
+                    axis.fill_between(
+                        summary.times, summary.lower, summary.upper, color=style.color, alpha=0.1, label=f"{label} · per-case RMSE 10th-90th"
+                    )
+                    _mark_unavailable(axis, summary.times, summary.invalid_count > 0, color=style.color)
+                    if row == 0:
+                        _draw_case_count(axes[-1, column], summary.times, summary.count, style=style, label=f"{label} {count_symbol}")
+        for row, field in enumerate(fields):
+            axes[row, 0].set_ylabel(f"{field_labels.metric_label('nRMSE', field, mathtext=True)} [{field_labels.display_unit('1')}]")
+        where = f"in each of {bin_count} equal τ bins, each case first averaged over its stored times there" if normalized else "at each exact time"
+        note = f"root of the material-case mean squared error {where}; per-case RMSE 10th-90th bands require {count_symbol} ≥ 2"
+        title = "Error over normalized time" if normalized else "Error over physical time"
+        return _finish_window_figure(figure, axes, windows, title, note=plot_layout.series_note(styles, note))
+    except Exception:
+        plt.close(figure)
+        raise
 
 
-def plot_central_error_vs_time(
-    record: Any,
-    *,
-    scaling_state: Mapping[str, Any],
-) -> Figure:
-    """Plot central and per-channel normalized errors against physical time."""
-    scaling = datasets.preprocessing.normalization.TrainScaling.from_state_dict(scaling_state)
-    reference = torch.as_tensor(
-        np.asarray(_value(record, "reference_states"), dtype=np.float32),
-        dtype=torch.float32,
-    )
-    prediction = torch.as_tensor(
-        np.asarray(_value(record, "predicted_states"), dtype=np.float32),
-        dtype=torch.float32,
-    )
-    if reference.shape != prediction.shape or reference.ndim != _STATE_ARRAY_RANK:
-        msg = "Transient error curves require aligned state arrays."
-        raise ValueError(msg)
-    normalized_error = (scaling.encode_state(prediction) - scaling.encode_state(reference)).detach().cpu().numpy()
-    channel_rmse = np.sqrt(np.mean(np.square(normalized_error[1:], dtype=np.float64), axis=(2, 3)))
-    weights = np.asarray((1.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0))
-    central = channel_rmse @ weights
-    times = np.asarray(_value(record, "physical_times"), dtype=np.float64)[1:]
-    display_time = time_axis.physical_time_display(times, preferred_unit="auto")
-    plotted_time = display_time.values(times)
-    figure, axis = plt.subplots(figsize=(9.5, 5.5), layout="constrained")
-    axis.plot(
-        plotted_time,
-        central,
-        marker="o",
-        linewidth=2.2,
-        label="Central Drying metric",
-    )
-    for channel, field in enumerate(artifact.STATE_ORDER):
-        axis.plot(
-            plotted_time,
-            channel_rmse[:, channel],
-            alpha=0.75,
-            label=field_labels.field_label(field, mathtext=True),
-        )
-    display_time.configure(axis)
-    axis.set_ylabel("Normalized RMSE [-]")
-    figure.legend(loc="outside right upper", frameon=False)
-    axis.grid(axis="y", alpha=0.25)
-    return figure
-
-
-def plot_relative_norms_over_time(curves: Mapping[str, pd.DataFrame]) -> Figure:
+def plot_relative_norms_over_time(curves: Mapping[str, pd.DataFrame], *, styles: series.SeriesStyles) -> Figure:
     """
     Plot the per-field relative L2 and H1 of complete rollouts over physical time with their supported case counts.
 
-    ``curves`` maps a label to :meth:`TransientEvaluationSession.relative_norm_curve`. A gap is
-    a time without a supported case in some material; the step line counts the supported cases.
+    ``curves`` maps a session frame name to :meth:`TransientEvaluationSession.relative_norm_curve`. A gap is
+    a time without a supported case in some material; the step line counts the supported cases. A curve takes its frame's style
+    of the comparison's ``styles`` (:meth:`TransientEvaluationSession.series_styles`); a name the comparison lacks raises
+    ``ValueError``. One legend stands outside right.
     """
     if not curves or any(frame.empty for frame in curves.values()):
         msg = "Relative-norm curves require at least one labelled non-empty curve."
         raise ValueError(msg)
+    if missing := [label for label in curves if label not in styles]:
+        msg = f"Relative-norm curves {missing} are no frames of the comparison's styles."
+        raise ValueError(msg)
     all_times = np.concatenate([frame["physical_time"].to_numpy(dtype=np.float64) for frame in curves.values()])
-    display_time = time_axis.physical_time_display(all_times, preferred_unit="auto")
+    display_time = time_ui.physical_time_display(all_times, preferred_unit="auto")
     figure, axes = plt.subplots(2, len(artifact.STATE_ORDER), figsize=(5.0 * len(artifact.STATE_ORDER), 7.6), layout="constrained", squeeze=False)
-    colors = plt.colormaps["tab10"]
     for row, norm in enumerate(("l2", "h1")):
         for column, field in enumerate(artifact.STATE_ORDER):
             axis = axes[row, column]
             support_axis = axis.twinx()
-            for index, (label, frame) in enumerate(curves.items()):
+            for label, frame in curves.items():
                 selected = frame.loc[frame["metric_id"] == f"physical_relative_{norm}_{field}"].sort_values("physical_time")
                 plotted_time = display_time.values(selected["physical_time"].to_numpy(dtype=np.float64))
-                axis.plot(plotted_time, selected["value"].to_numpy(dtype=np.float64), color=colors(index % colors.N), linewidth=2.0, label=label)
-                support_axis.step(plotted_time, selected["supported_cases"], where="mid", color=colors(index % colors.N), alpha=0.4)
+                style = styles[label]
+                line = {"color": style.color, "linestyle": style.linestyle}
+                axis.plot(plotted_time, selected["value"].to_numpy(dtype=np.float64), **line, linewidth=2.0, label=label)
+                support_axis.step(plotted_time, selected["supported_cases"], where="mid", **line, alpha=0.4)
             display_time.configure(axis)
-            axis.set_title(field_labels.metric_label(f"rel. {norm.upper()}", field, mathtext=True))
+            figure_layout.set_panel_title(axis, field_labels.metric_label(f"rel. {norm.upper()}", field, mathtext=True))
             axis.grid(alpha=0.25)
             support_axis.set_ylim(bottom=0)
             if column == len(artifact.STATE_ORDER) - 1:
                 support_axis.set_ylabel("Supported cases n(t)")
         axes[row, 0].set_ylabel(f"Relative {norm.upper()} [-]")
-    axes[0, 0].legend(frameon=False, fontsize="small")
-    figure.suptitle("Relative norms over physical time: per-case ratios, equal over cases and materials; gaps are unavailable")
+    note = plot_layout.series_note(styles, "per-case ratios, equal over cases and materials; gaps are unavailable")
+    figure_layout.set_figure_title(figure, axes, "Relative norms over physical time", note=note)
+    _legend(figure, axes)
     return figure
 
 
@@ -1059,12 +1295,13 @@ def _aggregate_snapshot_evidence(  # noqa: PLR0915 -- one bounded physical snaps
     physical_time: float,
     compute_device: str = "cpu",
     device_evidence: dict[str, str] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Pool exact-time case evidence without stacking complete trajectories.
 
-    Returns the grid coordinates, the pooled mean absolute and signed-error standard deviation maps in displayed
-    difference units, and the displayed case spatial means (see ``_spatial_means``) of reference and prediction.
+    Returns the grid coordinates, the pooled mean absolute, mean signed (``error_sum`` over the count) and signed-error standard
+    deviation maps in displayed difference units, and the displayed case spatial means (see ``_spatial_means``) of reference and
+    prediction. A cell any case left non-finite is NaN in all three maps.
     """
     if state_field not in {*artifact.STATE_ORDER, _GRAIN_MOISTURE_FIELD}:
         msg = f"Aggregate transient snapshot field is unsupported: {state_field!r}."
@@ -1202,11 +1439,13 @@ def _aggregate_snapshot_evidence(  # noqa: PLR0915 -- one bounded physical snaps
     np.divide(error_square_sum, counts, out=mean_square_error, where=counts > 0)
     error_variance = np.maximum(mean_square_error - np.square(mean_error), 0.0)
     mean_absolute_error[divergent] = np.nan
+    mean_error[divergent] = np.nan
     error_variance[divergent] = np.nan
     return (
         x_values,
         y_values,
         mean_absolute_error,
+        mean_error,
         np.sqrt(error_variance),
         np.asarray(reference_means, dtype=np.float64),
         np.asarray(prediction_means, dtype=np.float64),
@@ -1242,6 +1481,32 @@ def _labelled_record_series(
     return series
 
 
+def _aggregate_divisors(
+    series: Mapping[str, Sequence[Any]],
+    fields: Sequence[str],
+    reference_scales: Mapping[str, Mapping[str, error_diagnostics.ReferenceScale | str]] | None,
+) -> dict[str, float]:
+    """Return each field's train sigma in displayed difference units, the one every shown context shares, else raise ``ValueError``."""
+    divisors: dict[str, float] = {}
+    for field in fields:
+        if moisture_display.is_moisture_field(field):
+            msg = f"Normalized aggregate errors are defined on the stored states, but {field!r} is shown in wet-basis percentage points."
+            raise ValueError(msg)
+        scales: list[error_diagnostics.ReferenceScale] = []
+        for context in (name for name, current_records in series.items() if current_records):
+            scale = (reference_scales or {}).get(context, {}).get(field)
+            if scale is None or isinstance(scale, str):  # a missing scale or its unavailability reason, "" included
+                msg = scale or f"No valid train reference scale was given for {field!r} in context {context!r}."
+                raise ValueError(msg)
+            if scale.field != field or scale.unit != _state_unit(field):
+                msg = f"The reference scale of {field!r} in context {context!r} belongs to a different physical field or unit."
+                raise ValueError(msg)
+            scales.append(scale)
+        common = error_diagnostics.require_common_reference_scale(scales)
+        divisors[field] = float(_difference_display(field, np.asarray(common.value)))
+    return divisors
+
+
 def plot_aggregate_error_maps(
     records: Sequence[Any] | Mapping[str, Sequence[Any]],
     *,
@@ -1249,79 +1514,88 @@ def plot_aggregate_error_maps(
     physical_time: float,
     statistic: str,
     compute_device: str = "cpu",
+    error_mode: str = error_diagnostics.DEFAULT_ERROR_MODE,
+    reference_scales: Mapping[str, Mapping[str, error_diagnostics.ReferenceScale | str]] | None = None,
 ) -> Figure:
-    """Plot exact-time mean or standard-deviation error maps by context."""
+    """
+    Plot exact-time mean or standard-deviation error maps on the fixed map-grid geometry: a row per field, a column per context.
+
+    The mean map follows ``error_mode``: the signed mean of prediction minus reference (default, blue-white-red), the mean absolute
+    error, or the mean absolute error over the train sigma, which needs ``reference_scales`` (context, then field) and is refused
+    unless every shown context has the same one, and for water, which is shown in wet-basis percentage points. The standard
+    deviation map is that of the signed error whatever the mode. Each row has one round scale locked over its contexts, and every bar
+    carries its unit; an arrow stands only where that map has values beyond.
+    """
     fields = _selected_fields(state_fields)
     if statistic not in {"mean", "std"}:
         msg = "Aggregate error-map statistic must be 'mean' or 'std'."
         raise ValueError(msg)
+    if error_mode not in error_diagnostics.TRANSIENT_ERROR_MODES:
+        msg = f"Aggregate error mode must be one of {error_diagnostics.TRANSIENT_ERROR_MODES}, not {error_mode!r}."
+        raise ValueError(msg)
     series = _labelled_record_series(records, allow_empty_contexts=True)
-    figure, axes = layout.map_subplots(
-        rows=len(fields),
-        columns=len(series),
-    )
-    total_cases = 0
+    signed = statistic == "mean" and error_mode == error_diagnostics.SIGNED_ERROR
+    normalized = statistic == "mean" and error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
+    divisors = _aggregate_divisors(series, fields, reference_scales) if normalized else {}
+    cells: dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     routes: set[str] = set()
-    for column, (context, current_records) in enumerate(series.items()):
-        total_cases += len(current_records)
+    for column, current_records in enumerate(series.values()):
         for row, field in enumerate(fields):
-            if not current_records:
-                axis = axes[row, column]
-                axis.text(0.5, 0.5, "No case at this exact time", ha="center", va="center", transform=axis.transAxes)
-                if row == 0 and context:
-                    axis.set_title(context)
+            if current_records:
+                device_evidence: dict[str, str] = {}
+                x_values, y_values, absolute, signed_mean, std_error, *_ = _aggregate_snapshot_evidence(
+                    current_records,
+                    state_field=field,
+                    physical_time=physical_time,
+                    compute_device=compute_device,
+                    device_evidence=device_evidence,
+                )
+                routes.update(device_evidence.values())
+                displayed = std_error if statistic == "std" else signed_mean if signed else absolute / divisors.get(field, 1.0)
+                cells[row, column] = (x_values, y_values, displayed)
+    extents = {(float(x.min()), float(x.max()), float(y.min()), float(y.max())) for x, y, _ in cells.values()}
+    if len(extents) != 1:
+        msg = "The maps of one figure share one physical extent, but the shown contexts have different grids."
+        raise ValueError(msg)
+    extent = next(iter(extents))
+    geometry = layout.plan_geometry(len(fields), len(series), (extent[1] - extent[0], extent[3] - extent[2]), width_cap=None)
+    figure, axes, slots = layout.map_grid(geometry, extent=extent)
+    top_notes: list[str] = []
+    for row, field in enumerate(fields):
+        row_values = [values[np.isfinite(values)] for (cell_row, _), (_, _, values) in cells.items() if cell_row == row]
+        available = np.concatenate(row_values)
+        unit = "1" if normalized else _display_unit(field, difference=True)
+        definition = _error_definition(field, error_mode if statistic == "mean" else "Absolute error", available) if available.size else None
+        bar_label = f"{error_diagnostics.NORMALIZED_ERROR_SYMBOL} [{field_labels.display_unit('1')}]" if normalized else f"[{unit}]"
+        exponent = 0 if definition is None else layout.error_format(definition.boundaries, signed=signed).exponent
+        for column in range(len(series)):
+            cell = cells.get((row, column))
+            # R16: one small mean line above each mean map, "n/a" without one; the std maps have none.
+            shown = None if cell is None else cell[2]
+            note = "" if statistic == "std" else plot_layout.mean_error_text(shown, unit=None if normalized else unit, exponent=exponent)
+            if row == 0:
+                top_notes.append(note)
+            elif note:
+                layout.add_map_note(axes[row, column], note)
+            if cell is None:
+                layout.empty_cell(axes[row, column], "No case at this exact time")
                 continue
-            device_evidence: dict[str, str] = {}
-            (
-                x_values,
-                y_values,
-                mean_error,
-                std_error,
-                _reference_means,
-                _prediction_means,
-            ) = _aggregate_snapshot_evidence(
-                current_records,
-                state_field=field,
-                physical_time=physical_time,
-                compute_device=compute_device,
-                device_evidence=device_evidence,
-            )
-            routes.update(device_evidence.values())
-            displayed = mean_error if statistic == "mean" else std_error
-            axis = axes[row, column]
-            if not np.isfinite(displayed).any():
-                axis.text(0.5, 0.5, "Prediction non-finite in every cell", ha="center", va="center", transform=axis.transAxes)
-                if row == 0 and context:
-                    axis.set_title(context)
+            values = cell[2]
+            finite = np.isfinite(values)
+            if definition is None or not finite.any():
+                layout.empty_cell(axes[row, column], "Prediction non-finite in every cell")
                 continue
-            image = axis.pcolormesh(
-                x_values,
-                y_values,
-                displayed,
-                shading="auto",
-                cmap=visual_semantics.field_visual_semantics(
-                    field,
-                    role="absolute_error",
-                ).colormap,
-                norm=layout.linear_norm(displayed[np.isfinite(displayed)]),
-            )
-            axis.set_aspect("equal")
-            if row == 0 and context:
-                axis.set_title(context)
-            layout.add_map_colorbar(figure, image, axis, label=_display_unit(field, difference=True))
-            if column == 0:
-                layout.add_channel_row_label(axis, _display_label(field))
-    layout.apply_map_grid_axis_labels(
-        axes,
-        x_label="x [m]",
-        y_label="y [m]",
-    )
-    statistic_label = "Mean absolute" if statistic == "mean" else "Standard deviation of signed"
-    layout.set_suptitle_over_axes(
-        figure,
-        (f"{statistic_label} error at t={physical_time:g} h — {total_cases} case-context observations\n" + "; ".join(sorted(routes))),
-        axes.flat,
-    )
+            image = axes[row, column].pcolormesh(cell[0], cell[1], np.ma.masked_invalid(values), shading="auto", **definition.pcolormesh_kwargs())
+            extend = field_maps.locked_extend(values[finite], definition.boundaries)
+            layout.add_field_map_colorbar(figure, image, slots[row, column], definition, label=bar_label, extend=extend)
+    layout.set_column_headers(axes, list(series), top_notes)
+    layout.set_row_labels(axes, [_display_symbol(field) for field in fields])
+    statistic_label = f"Mean {_ERROR_HEADERS[error_mode].lower()}" if statistic == "mean" else "Standard deviation of signed error"
+    total_cases = sum(len(current_records) for current_records in series.values())
+    layout.set_map_title(figure, f"{statistic_label} at t={physical_time:g} h — {total_cases} case-context observations")
+    plot_layout.add_scale_note(figure, shared=False)
+    if routes:
+        figure.text(0.5, 0.01, "; ".join(sorted(routes)), ha="center", va="bottom", fontsize=8, color="0.3")
     return figure
 
 
@@ -1330,33 +1604,36 @@ def plot_predicted_vs_reference_channels(
     *,
     state_fields: Sequence[str],
     physical_time: float,
+    styles: series.SeriesStyles,
 ) -> Figure:
-    """Plot exact-time case spatial means by channel and material context."""
+    """Plot exact-time case spatial means by channel (rows, the water states side by side) and context (columns), each in its comparison style."""
     fields = _selected_fields(state_fields)
-    series = _labelled_record_series(records, allow_empty_contexts=True)
+    contexts = _labelled_record_series(records, allow_empty_contexts=True)
+    styles = _record_styles(contexts, styles)
     figure, raw_axes = plt.subplots(
         len(fields),
-        len(series),
+        len(contexts),
         figsize=(
-            max(7.2, 5.8 * len(series)),
+            max(7.2, 5.8 * len(contexts)),
             max(5.2, 4.6 * len(fields)),
         ),
         layout="constrained",
         squeeze=False,
     )
     total_cases = 0
-    for column, (context, current_records) in enumerate(series.items()):
+    for column, (context, current_records) in enumerate(contexts.items()):
         total_cases += len(current_records)
         for row, field in enumerate(fields):
             if not current_records:
                 axis = raw_axes[row, column]
                 axis.text(0.5, 0.5, "No case at this exact time", ha="center", va="center", transform=axis.transAxes)
                 if row == 0 and context:
-                    axis.set_title(context)
+                    figure_layout.set_panel_title(axis, context)
                 continue
             (
                 _x,
                 _y,
+                _mean_absolute_error,
                 _mean_error,
                 _std_error,
                 reference_display,
@@ -1376,11 +1653,15 @@ def plot_predicted_vs_reference_channels(
                 lower -= padding
                 upper += padding
             axis = raw_axes[row, column]
+            style = styles[context]
             axis.scatter(
                 reference_display,
                 prediction_display,
                 s=55,
                 alpha=0.8,
+                color=style.color,
+                marker=style.marker or "o",
+                label=context or "_nolegend_",
             )
             axis.plot(
                 (lower, upper),
@@ -1397,39 +1678,49 @@ def plot_predicted_vs_reference_channels(
             axis.set_xlabel(f"Reference case spatial mean — {label}")
             axis.set_ylabel(f"Predicted case spatial mean — {label}")
             if row == 0 and context:
-                axis.set_title(context)
+                figure_layout.set_panel_title(axis, context)
             axis.grid(alpha=0.25)
-    figure.suptitle(f"Prediction versus reference at t={physical_time:g} h — {total_cases} case-context observations")
+    note = plot_layout.series_note(styles, f"{total_cases} case-context observations")
+    figure_layout.set_figure_title(figure, raw_axes, f"Prediction versus reference at t={physical_time:g} h", note=note)
+    _legend(figure, raw_axes)
     return figure
 
 
 def plot_error_distributions(
     case_frame: pd.DataFrame,
     *,
+    styles: series.SeriesStyles,
     state_fields: Sequence[str] = artifact.STATE_ORDER,
 ) -> Figure:
-    """Show complete-rollout case-error distributions by stored channel."""
+    """Show complete-rollout case-error distributions by stored channel, one box per frame and material in its comparison colour and role hatch."""
     selected = _full_autonomous_cumulative(case_frame)
     fields = tuple(field for field in _selected_fields(state_fields) if field in artifact.STATE_ORDER)
     if not fields:
         msg = "Transient error distributions require at least one stored channel metric."
         raise ValueError(msg)
-    values = []
-    for field in fields:
-        column = f"normalized_rmse_{field}"
-        if column not in selected:
-            msg = f"Transient error distributions lack {column!r}."
-            raise ValueError(msg)
-        current = selected[column].to_numpy(dtype=np.float64)
-        if not np.isfinite(current).all():
-            msg = "Transient case errors must be finite."
-            raise ValueError(msg)
-        values.append(current)
-    figure, axis = plt.subplots(figsize=(9.0, 5.2), layout="constrained")
-    axis.boxplot(values, tick_labels=tuple(field_labels.field_label(field, mathtext=True) for field in fields), showfliers=True)
-    axis.set_ylabel("Normalized RMSE [-]")
-    axis.set_title("Full-rollout case error distributions")
+    columns = [f"normalized_rmse_{field}" for field in fields]
+    if missing := [column for column in columns if column not in selected]:
+        msg = f"Transient error distributions lack {missing}."
+        raise ValueError(msg)
+    if not np.isfinite(selected[columns].to_numpy(dtype=np.float64)).all():
+        msg = "Transient case errors must be finite."
+        raise ValueError(msg)
+    groups = _summary_series(selected)
+    styles = _frame_styles(groups, styles)
+    figure, axes = figure_layout.panel_figure(1, 1, panel_in=_GROUPED_PANEL_IN)
+    axis, width = axes[0, 0], 0.8 / len(groups)
+    for offset, (label, rows) in enumerate(groups.items()):
+        style = styles[label]
+        positions = np.arange(len(fields)) - 0.4 + width * (offset + 0.5)
+        values = [rows[column].to_numpy(dtype=np.float64) for column in columns]
+        boxes = axis.boxplot(values, positions=positions, widths=0.9 * width, patch_artist=True)
+        for box in boxes["boxes"]:
+            box.set(facecolor=style.color, hatch=style.hatch, alpha=0.75)
+    axis.set_xticks(np.arange(len(fields)), [field_labels.field_label(field, mathtext=True) for field in fields])
+    axis.set_ylabel(f"Normalized RMSE [{field_labels.display_unit('1')}]")
     axis.grid(axis="y", alpha=0.25)
+    figure_layout.set_figure_title(figure, axes, "Full-rollout case error distributions", note=plot_layout.series_note(styles))
+    figure_layout.add_legend(figure, axes, [Patch(facecolor=styles[label].color, hatch=styles[label].hatch) for label in groups], list(groups))
     return figure
 
 
@@ -1489,40 +1780,33 @@ def plot_error_vs_target_magnitude(
     series: Mapping[str, Sequence[Any]],
     *,
     state_fields: Sequence[str],
+    styles: series.SeriesStyles,
 ) -> Figure:
-    """Plot bounded trajectory-element error trends against target magnitude."""
+    """Plot bounded trajectory-element error trends against target magnitude, one panel per field, each series in its comparison style."""
     fields = _selected_fields(state_fields)
     admitted = {label: tuple(records) for label, records in series.items()}
     if not admitted or any(not records for records in admitted.values()):
         msg = "Target-magnitude error trends require labelled non-empty record groups."
         raise ValueError(msg)
-    figure, axes = plt.subplots(
-        len(fields),
-        1,
-        figsize=(8.8, max(4.8, 3.6 * len(fields))),
-        layout="constrained",
-        squeeze=False,
-    )
-    colors = plt.colormaps["tab10"]
+    styles = _record_styles(admitted, styles)
+    figure, axes = figure_layout.panel_figure(len(fields), 1, panel_in=(7.0, 3.6))
     for row, field in enumerate(fields):
-        axis = axes[row, 0]
-        for series_index, (label, records) in enumerate(admitted.items()):
+        axis, notes = axes[row, 0], []
+        for label, records in admitted.items():
             centers, medians, diverging, total = _finite_error_trend(records, field)
-            # The medians describe finite errors; the exact count of diverging values is named, never hidden.
-            shown = f"{label} · {diverging} of {total} values non-finite, excluded" if diverging else label
-            axis.plot(
-                centers,
-                medians,
-                marker="o",
-                linewidth=2.0,
-                color=colors(series_index % colors.N),
-                label=shown,
-            )
+            style = styles[label]
+            axis.plot(centers, medians, color=style.color, linestyle=style.linestyle, marker=style.marker or "o", linewidth=2.0, label=label)
+            if diverging:  # the medians describe finite errors; the exact count of diverging values is named, never hidden
+                notes.append(f"{label} · {diverging} of {total} values non-finite, excluded")
+        if notes:
+            axis.text(0.02, 0.98, "\n".join(notes), va="top", fontsize="small", transform=axis.transAxes)
         axis.set_xlabel(f"|{_display_symbol(field)}| [{_display_unit(field, difference=False)}]")
         axis.set_ylabel(f"Median absolute error [{_display_unit(field, difference=True)}]")
         axis.grid(alpha=0.25)
-        axis.legend(frameon=False, fontsize="small")
-    figure.suptitle("Error vs |GT| magnitude — all stored post-origin times; deterministic bounded bins")
+    figure_layout.set_figure_title(
+        figure, axes, "Error vs reference magnitude", note=plot_layout.series_note(styles, "all stored post-origin times; deterministic bounded bins")
+    )
+    _legend(figure, axes)
     return figure
 
 
@@ -1565,6 +1849,7 @@ def _full_autonomous_cumulative(frame: pd.DataFrame) -> pd.DataFrame:
     required = {
         "frame",
         "material_family",
+        "dataset_role",
         "mode",
         "requested_horizon",
         "scope",
@@ -1583,50 +1868,50 @@ def _full_autonomous_cumulative(frame: pd.DataFrame) -> pd.DataFrame:
 def plot_channel_error(
     summary_frame: pd.DataFrame,
     *,
+    styles: series.SeriesStyles,
     state_fields: Sequence[str] = artifact.STATE_ORDER,
 ) -> Figure:
-    """Compare complete-rollout normalized RMSE for selected stored states."""
+    """Compare complete-rollout normalized RMSE for selected stored states, one bar per frame and material in its comparison colour and role hatch."""
     selected = _full_autonomous_cumulative(summary_frame)
     fields = tuple(field for field in _selected_fields(state_fields) if field in artifact.STATE_ORDER)
     if not fields:
         msg = "Transient channel-error plots require at least one stored state."
         raise ValueError(msg)
-    columns = tuple(f"normalized_rmse_{field}" for field in fields)
+    columns = [f"normalized_rmse_{field}" for field in fields]
     if any(column not in selected for column in columns):
         msg = "Transient channel-error plot lacks per-state normalized RMSE."
         raise ValueError(msg)
-    labels = tuple(field_labels.field_label(field, mathtext=True) for field in fields)
+    groups = _summary_series(selected)
+    styles = _frame_styles(groups, styles)
     positions = np.arange(len(columns), dtype=np.float64)
-    width = 0.8 / len(selected)
-    figure, axis = plt.subplots(figsize=(9.0, 5.2), layout="constrained")
-    role_count = selected["dataset_role"].nunique() if "dataset_role" in selected else 0
-    include_frame = selected["frame"].nunique() > role_count
-    for offset, (_, row) in enumerate(selected.iterrows()):
-        values = row.loc[list(columns)].to_numpy(dtype=np.float64)
-        axis.bar(
-            positions - 0.4 + width / 2.0 + offset * width,
-            values,
-            width=width,
-            label=_material_role_label(
-                row["frame"],
-                row["material_family"],
-                row.get("dataset_role"),
-                include_frame=include_frame,
-            ),
-        )
-    axis.set_xticks(positions, labels)
-    axis.set_ylabel("Normalized RMSE [-]")
-    axis.set_title("Full-rollout per-state error")
+    width = 0.8 / len(groups)
+    figure, axes = figure_layout.panel_figure(1, 1, panel_in=_GROUPED_PANEL_IN)
+    axis = axes[0, 0]
+    for offset, (label, rows) in enumerate(groups.items()):
+        if len(rows) != 1:
+            msg = f"Transient channel-error plot requires one summary row per frame and material; {label!r} has {len(rows)}."
+            raise ValueError(msg)
+        style = styles[label]
+        values = rows[columns].to_numpy(dtype=np.float64)[0]
+        axis.bar(positions - 0.4 + width * (offset + 0.5), values, width=width, color=style.color, hatch=style.hatch, edgecolor="0.2", label=label)
+    axis.set_xticks(positions, [field_labels.field_label(field, mathtext=True) for field in fields])
+    axis.set_ylabel(f"Normalized RMSE [{field_labels.display_unit('1')}]")
     axis.grid(axis="y", alpha=0.25)
-    axis.legend(frameon=False)
+    figure_layout.set_figure_title(figure, axes, "Full-rollout per-state error", note=plot_layout.series_note(styles))
+    _legend(figure, axes)
     return figure
 
 
-def plot_horizon_error(summary_frame: pd.DataFrame) -> Figure:
-    """Plot rollout-index and physical-time views without conflating axes."""
+def plot_horizon_error(summary_frame: pd.DataFrame, *, styles: series.SeriesStyles) -> Figure:
+    """
+    Plot rollout-index and physical-time views without conflating axes.
+
+    A frame and material keeps its comparison colour and role line style; the reduction scope is the marker (cumulative, endpoint).
+    """
     required = {
         "frame",
         "material_family",
+        "dataset_role",
         "mode",
         "requested_horizon",
         "scope",
@@ -1650,43 +1935,21 @@ def plot_horizon_error(summary_frame: pd.DataFrame) -> Figure:
     )
     horizon_positions = {value: position for position, value in enumerate(horizons)}
     physical_times = selected["elapsed_physical_time_median"].to_numpy(dtype=np.float64)
-    display_time = time_axis.physical_time_display(
+    display_time = time_ui.physical_time_display(
         physical_times,
         preferred_unit="auto",
     )
-    figure, axes_grid, legend_axis = layout.subplots_with_legend_column(
-        rows=1,
-        columns=2,
-        column_width=5.2,
-        row_height=5.0,
-        legend_width=3.0,
-    )
-    axes = axes_grid[0]
-    handles = []
-    role_count = selected["dataset_role"].nunique() if "dataset_role" in selected else 0
-    include_frame = selected["frame"].nunique() > role_count
-    role_by_context = (
-        selected.groupby(["frame", "material_family"], sort=False)["dataset_role"].first().to_dict() if "dataset_role" in selected else {}
-    )
-    for (frame, material, scope), group in selected.groupby(
-        ["frame", "material_family", "scope"],
-        sort=False,
-    ):
-        ordered = group.assign(_position=group["requested_horizon"].map(horizon_positions)).sort_values("_position")
-        label = f"{_material_role_label(frame, material, role_by_context.get((frame, material)), include_frame=include_frame)} — {scope}"
-        (handle,) = axes[0].plot(
-            ordered["_position"],
-            ordered["normalized_drying_group_macro_rmse"],
-            marker="o",
-            label=label,
-        )
-        handles.append(handle)
-        axes[1].plot(
-            display_time.values(ordered["elapsed_physical_time_median"]),
-            ordered["normalized_drying_group_macro_rmse"],
-            marker="o",
-            color=handle.get_color(),
-        )
+    figure, grid = figure_layout.panel_figure(1, 2, panel_in=(5.2, 4.2))
+    axes = grid[0]
+    groups = _summary_series(selected)
+    styles = _frame_styles(groups, styles)
+    for series_label, rows in groups.items():
+        style = styles[series_label]
+        for scope, group in rows.groupby("scope", sort=False):
+            ordered = group.assign(_position=group["requested_horizon"].map(horizon_positions)).sort_values("_position")
+            line = {"color": style.color, "linestyle": style.linestyle, "marker": _SCOPE_MARKERS.get(str(scope), "o")}
+            axes[0].plot(ordered["_position"], ordered["normalized_drying_group_macro_rmse"], **line, label=f"{series_label} — {scope}")
+            axes[1].plot(display_time.values(ordered["elapsed_physical_time_median"]), ordered["normalized_drying_group_macro_rmse"], **line)
     axes[0].set_xticks(
         np.arange(len(horizons)),
         [str(value) for value in horizons],
@@ -1694,18 +1957,20 @@ def plot_horizon_error(summary_frame: pd.DataFrame) -> Figure:
     axes[0].set_xlabel("Requested horizon [transitions]")
     display_time.configure(axes[1])
     axes[1].set_xlabel(f"Median elapsed physical time [{display_time.unit}]")
+    figure_layout.label_rows_once(grid, f"Normalized Drying group macro RMSE [{field_labels.display_unit('1')}]")
     for axis in axes:
-        axis.set_ylabel("Normalized Drying group macro RMSE [-]")
         axis.grid(axis="y", alpha=0.25)
-    legend_axis.legend(handles=handles, loc="upper left", frameon=False)
+    figure_layout.set_figure_title(figure, grid, "Error vs rollout horizon", note=plot_layout.series_note(styles))
+    _legend(figure, grid)
     return figure
 
 
-def plot_endpoint_vs_cumulative(summary_frame: pd.DataFrame) -> Figure:
-    """Compare endpoint and cumulative central error without conflating scopes."""
+def plot_endpoint_vs_cumulative(summary_frame: pd.DataFrame, *, styles: series.SeriesStyles) -> Figure:
+    """Compare endpoint and cumulative central error without conflating scopes: a point per mode and horizon of a frame and material, in its style."""
     required = {
         "frame",
         "material_family",
+        "dataset_role",
         "mode",
         "requested_horizon",
         "scope",
@@ -1714,30 +1979,36 @@ def plot_endpoint_vs_cumulative(summary_frame: pd.DataFrame) -> Figure:
     if not isinstance(summary_frame, pd.DataFrame) or not required.issubset(summary_frame):
         msg = "Endpoint comparison requires transient summary columns."
         raise ValueError(msg)
-    pivot = summary_frame.pivot_table(
-        index=["frame", "material_family", "mode", "requested_horizon"],
-        columns="scope",
-        values="normalized_drying_group_macro_rmse",
-        aggfunc="first",
-    ).dropna(subset=["cumulative", "endpoint"])
-    if pivot.empty:
+    groups = _summary_series(summary_frame)
+    pairs = {
+        label: rows.pivot_table(index=["mode", "requested_horizon"], columns="scope", values="normalized_drying_group_macro_rmse", aggfunc="first")
+        for label, rows in groups.items()
+    }
+    pairs = {label: pivot.dropna(subset=["cumulative", "endpoint"]) for label, pivot in pairs.items() if {"cumulative", "endpoint"} <= set(pivot)}
+    pairs = {label: pivot for label, pivot in pairs.items() if not pivot.empty}
+    if not pairs:
         msg = "Endpoint comparison requires paired cumulative and endpoint evidence."
         raise ValueError(msg)
-    figure, axis = plt.subplots(figsize=(6.5, 6.0), layout="constrained")
-    for frame_name, group in pivot.groupby(level="frame", sort=False):
-        axis.scatter(group["cumulative"], group["endpoint"], label=str(frame_name))
-    axis.legend()
-    maximum = float(np.max(pivot[["cumulative", "endpoint"]].to_numpy()))
+    styles = _frame_styles({label: groups[label] for label in pairs}, styles)
+    figure, axes = figure_layout.panel_figure(1, 1, panel_in=(5.5, 5.0))
+    axis = axes[0, 0]
+    for label, pivot in pairs.items():
+        style = styles[label]
+        axis.scatter(pivot["cumulative"], pivot["endpoint"], color=style.color, marker=style.marker or "o", label=label)
+    maximum = max(float(np.max(pivot[["cumulative", "endpoint"]].to_numpy())) for pivot in pairs.values())
     axis.plot((0.0, maximum), (0.0, maximum), linestyle="--", color="black")
-    axis.set_xlabel("Cumulative central error [-]")
-    axis.set_ylabel("Endpoint central error [-]")
+    axis.set_xlabel(f"Cumulative central error [{field_labels.display_unit('1')}]")
+    axis.set_ylabel(f"Endpoint central error [{field_labels.display_unit('1')}]")
     axis.grid(alpha=0.25)
+    figure_layout.set_figure_title(figure, axes, "Endpoint vs cumulative error", note=plot_layout.series_note(styles))
+    _legend(figure, axes)
     return figure
 
 
-def plot_target_time(records: Sequence[Any] | Mapping[str, Sequence[Any]]) -> Figure:
-    """Plot reached target pairs by saved model and retain censored/unavailable counts."""
-    groups = records if isinstance(records, Mapping) else {"Selected model": records}
+def plot_target_time(records: Sequence[Any] | Mapping[str, Sequence[Any]], *, styles: series.SeriesStyles) -> Figure:
+    """Plot reached target pairs by saved model, each in its comparison style by its records' identity, and retain censored/unavailable counts."""
+    groups = {str(label): tuple(selected) for label, selected in (records if isinstance(records, Mapping) else {"Selected model": records}).items()}
+    styles = _record_styles(groups, styles)
     pairs: dict[str, tuple[list[float], list[float]]] = {}
     notices = []
     all_times: list[float] = []
@@ -1760,24 +2031,26 @@ def plot_target_time(records: Sequence[Any] | Mapping[str, Sequence[Any]]) -> Fi
                 prediction.append(float(pred_time))
             else:
                 censored += 1
-        pairs[str(label)] = (reference, prediction)
+        pairs[label] = (reference, prediction)
         all_times.extend((*reference, *prediction))
         notices.append(f"{label}: paired reached {len(reference)}, censored {censored}, unavailable {unavailable}")
-    figure, axis = plt.subplots(figsize=(8.5, 6.0), layout="constrained")
-    display_time = time_axis.physical_time_display(tuple(all_times) if all_times else (0.0,), preferred_unit="auto")
+    figure, axes = figure_layout.panel_figure(1, 1, panel_in=(6.5, 6.0))
+    axis = axes[0, 0]
+    display_time = time_ui.physical_time_display(tuple(all_times) if all_times else (0.0,), preferred_unit="auto")
     for label, (reference, prediction) in pairs.items():
         if reference:
-            axis.scatter(display_time.values(reference), display_time.values(prediction), label=label)
+            style = styles[label]
+            axis.scatter(display_time.values(reference), display_time.values(prediction), color=style.color, marker=style.marker or "o", label=label)
     if all_times:
         lower, upper = display_time.values((min(all_times), max(all_times)))
         axis.plot((lower, upper), (lower, upper), linestyle="--", color="black")
-        axis.legend()
     display_time.configure(axis)
     display_time.configure(axis, dimension="y")
     axis.set_xlabel(f"Reference time to target [{display_time.unit}]")
     axis.set_ylabel(f"Predicted time to target [{display_time.unit}]")
-    axis.set_title("\n".join(notices), fontsize="small")
     axis.grid(alpha=0.25)
+    figure_layout.set_figure_title(figure, axes, "Time to target", note=plot_layout.series_note(styles, "\n".join(notices)))
+    _legend(figure, axes)
     return figure
 
 
@@ -1786,7 +2059,9 @@ def plot_training_performance_vs_compute(performance: pd.DataFrame, *, lineage: 
     Plot the admitted A0/B/A1 arms with a result in their actual clock, and every arm without one as a status line.
 
     A B or A1 without an eligible checkpoint has no rows; the admitted comparison names its
-    status, budget progress and eligible points in the title, so A0 alone still plots.
+    status, budget progress and eligible points in the panel title, so A0 alone still plots. The arms are one lineage evaluated on
+    its ID artifacts, so a line takes its material's fixed colour and the ID line style; its mode and horizon are the marker. The
+    panel is 12 x 7 in with its legend outside right at the top frame.
     """
     unavailable = [arm for arm in (lineage.b, lineage.a1) if not isinstance(arm, comparison.TrainingArmEvidence)]
     required = {
@@ -1808,27 +2083,35 @@ def plot_training_performance_vs_compute(performance: pd.DataFrame, *, lineage: 
         raise ValueError(msg)
     matched_rows = performance["comparison_arm"].isin(("A1", "B"))
     clocks = set(performance.loc[matched_rows, "compute_clock"]) if "compute_clock" in performance else set()
-    if matched_rows.any() and clocks != {"train_seconds"}:
-        msg = "Matched A1/B plot requires persisted committed train_seconds for every arm with a result."
+    if matched_rows.any() and clocks != {"supervised_transitions"}:
+        msg = "Matched A1/B plot requires persisted committed supervised transitions for every arm with a result."
         raise ValueError(msg)
     selected = performance.loc[performance["scope"] == "cumulative"].copy()
     if selected.empty:
         msg = "Matched-compute plot requires cumulative Evaluation evidence."
         raise ValueError(msg)
-    figure, axis = plt.subplots(figsize=(10.0, 6.0), layout="constrained")
-    for (material, mode, horizon), group in selected.groupby(
-        ["material_family", "mode", "requested_horizon"],
-        sort=False,
-    ):
+    lines = dict(tuple(selected.groupby(["material_family", "mode", "requested_horizon"], sort=False)))
+    conditions = list(dict.fromkeys((mode, horizon) for _material, mode, horizon in lines))
+    if len(conditions) > len(_CONDITION_MARKERS):
+        msg = f"Matched-compute plots tell at most {len(_CONDITION_MARKERS)} modes and horizons apart, not {len(conditions)}."
+        raise ValueError(msg)
+    labels = {key: f"{_material_label(key[0])} · {key[1]} / {key[2]}" for key in lines}
+    styles = series.resolve_styles([series.SeriesEntity(labels[key], "", False, "id", (str(key[0]),), "lineage") for key in lines])
+    figure, axes = figure_layout.panel_figure(1, 1, panel_in=(12.0, 7.0))
+    axis = axes[0, 0]
+    for (material, mode, horizon), group in lines.items():
         if group["comparison_arm"].duplicated().any():
             msg = "Matched-compute series requires at most one value per arm, material, mode, and horizon."
             raise ValueError(msg)
         ordered = group.assign(_arm_order=group["comparison_arm"].map({"A0": 0, "A1": 1, "B": 2})).sort_values("_arm_order")
+        style = styles[labels[material, mode, horizon]]
         axis.plot(
             ordered["training_compute"] if "training_compute" in ordered else ordered["optimizer_device_compute"],
             ordered["normalized_drying_group_macro_rmse"],
-            marker="o",
-            label=f"{_material_label(material)} · {mode} / {horizon}",
+            color=style.color,
+            linestyle=style.linestyle,
+            marker=_CONDITION_MARKERS[conditions.index((mode, horizon))],
+            label=labels[material, mode, horizon],
         )
         for row in ordered.itertuples(index=False):
             axis.annotate(
@@ -1838,44 +2121,39 @@ def plot_training_performance_vs_compute(performance: pd.DataFrame, *, lineage: 
                 textcoords="offset points",
                 fontsize="small",
             )
-    axis.set_xlabel("Committed training time [s]")
-    axis.set_ylabel("Cumulative normalized Drying group macro RMSE [-]")
-    if unavailable:
-        axis.set_title(
+    axis.set_xlabel(f"Committed post-handoff supervised transitions [{field_labels.display_unit('1')}]")
+    axis.set_ylabel(f"Cumulative normalized Drying group macro RMSE [{field_labels.display_unit('1')}]")
+    if unavailable:  # the panel's own status: its title, at the shared panel-title size
+        figure_layout.set_panel_title(
+            axis,
             "\n".join(
                 f"{arm.arm}: {arm.training_status} at {100.0 * arm.budget_progress:.0f} % of its budget, "
                 f"{arm.eligible_points} eligible points, no result"
                 for arm in unavailable
             ),
-            fontsize="small",
         )
-    axis.legend()
     axis.grid(alpha=0.25)
+    _legend(figure, axes, outside=True)  # S:33 names this plot: legend outside right at the top frame, unlike other single panels
     return figure
 
 
 def plot_pipeline_degradation(
     evidence: Sequence[comparison.AirflowDegradationMetrics],
 ) -> Figure:
-    """Plot B/A, C/A, and C/B errors while retaining unavailable C evidence."""
+    """Plot B/A, C/A, and C/B errors in their fixed stage colours, named in the first panel's legend (L10), while retaining unavailable C evidence."""
     values = tuple(evidence)
     if not values:
         msg = "Pipeline degradation plot requires metric evidence."
         raise ValueError(msg)
-    figure, axes = plt.subplots(
-        len(values),
-        1,
-        figsize=(8.5, 3.8 * len(values)),
-        squeeze=False,
-        layout="constrained",
-    )
+    figure, axes = figure_layout.panel_figure(len(values), 1, panel_in=(6.0, 3.6))
     for axis, item in zip(axes[:, 0], values, strict=True):
-        heights = [
-            item.drying_surrogate_error,
-            np.nan if item.complete_pipeline_error is None else item.complete_pipeline_error,
-            np.nan if item.airflow_substitution_discrepancy is None else item.airflow_substitution_discrepancy,
-        ]
-        axis.bar(("B/A", "C/A", "C/B"), heights)
+        heights = {
+            "B/A": item.drying_surrogate_error,
+            "C/A": np.nan if item.complete_pipeline_error is None else item.complete_pipeline_error,
+            "C/B": np.nan if item.airflow_substitution_discrepancy is None else item.airflow_substitution_discrepancy,
+        }
+        for stage, height in heights.items():
+            axis.bar(stage, height, color=_STAGE_COLOURS[stage], label=stage)
         axis.set_ylabel(item.metric_id)
         if not item.c_available:
             axis.text(
@@ -1886,83 +2164,51 @@ def plot_pipeline_degradation(
                 ha="right",
                 va="top",
             )
+    _legend(figure, axes[:1, :1])  # every panel holds the same stages: one legend inside the first, also of several panels
     return figure
 
 
 def plot_timing_speedups(report: timing.TransientTimingReport) -> Figure:
-    """Plot paired per-case values for every component-composed speedup."""
+    """
+    Plot every component-composed duration ratio as one neutral bar on a log scale, a formula without paired cases as a note.
+
+    The bar is the median of the paired per-case ratios and its error bar spans their 10th to 90th percentile, both the timing
+    report's own statistics (NumPy's linear quantile); the label names the paired count and the ratio of the summed durations.
+    A ratio whose median or percentiles are not all positive and finite has no place on the log scale and is a note as well;
+    without any drawn ratio the scale stays linear.
+    """
     if not isinstance(report, timing.TransientTimingReport):
         msg = "Timing plot requires one validated TransientTimingReport."
         raise TypeError(msg)
-    names = tuple(report.speedups)
-    figure, axes = plt.subplots(
-        len(names),
-        1,
-        figsize=(10.0, 3.6 * len(names)),
-        squeeze=False,
-        layout="constrained",
-    )
-    for axis, name in zip(axes[:, 0], names, strict=True):
-        summary = report.speedups[name]
-        available = [(case.case_id, case.speedup) for case in summary.cases if case.speedup is not None]
-        axis.bar(
-            [case_id for case_id, _speedup in available],
-            [speedup for _case_id, speedup in available],
-        )
-        axis.set_ylabel("Duration ratio [-]")
-        axis.set_title(
-            f"{summary.reference_boundary} /\n{summary.surrogate_boundary}\n"
-            f"{summary.available_count}/{summary.total_count} paired; ratio of sums={summary.ratio_of_sums}",
-            fontsize="small",
-        )
-        axis.tick_params(axis="x", rotation=45)
-    return figure
-
-
-def plot_timing_distributions(report: timing.TransientTimingReport) -> Figure:
-    """Plot paired reference and surrogate runtime distributions per formula."""
-    if not isinstance(report, timing.TransientTimingReport):
-        msg = "Timing distribution plot requires one validated TransientTimingReport."
-        raise TypeError(msg)
-    names = tuple(report.speedups)
-    figure, axes = plt.subplots(
-        len(names),
-        1,
-        figsize=(10.0, 3.8 * len(names)),
-        squeeze=False,
-        layout="constrained",
-    )
-    for axis, name in zip(axes[:, 0], names, strict=True):
-        summary = report.speedups[name]
-        pairs = [
-            (case.reference_seconds, case.surrogate_seconds)
-            for case in summary.cases
-            if case.reference_seconds is not None and case.surrogate_seconds is not None
-        ]
-        if pairs:
-            reference = [pair[0] for pair in pairs]
-            surrogate = [pair[1] for pair in pairs]
-            axis.boxplot((reference, surrogate), positions=(0, 1), widths=0.5)
-            for reference_seconds, surrogate_seconds in pairs:
-                axis.plot(
-                    (0, 1),
-                    (reference_seconds, surrogate_seconds),
-                    marker="o",
-                    alpha=0.45,
-                )
+    summaries = [report.speedups[name] for name in report.speedups]
+    figure, axes = figure_layout.panel_figure(1, 1, panel_in=(7.0, 0.9 * len(summaries) + 1.0))
+    axis = axes[0, 0]
+    drawn = False
+    for position, summary in enumerate(summaries):
+        lower, median, upper = summary.q10, summary.median, summary.q90
+        if lower is None or median is None or upper is None:
+            note = "no paired case"
+        elif not all(math.isfinite(value) and value > 0.0 for value in (lower, median, upper)):
+            note = "no positive finite ratio"
         else:
-            axis.text(
-                0.5,
-                0.5,
-                "No paired runtime evidence available",
-                transform=axis.transAxes,
-                ha="center",
-                va="center",
-            )
-        axis.set_xticks((0, 1), (summary.reference_boundary, summary.surrogate_boundary))
-        axis.set_ylabel("Recorded duration [s]")
-        axis.set_title(f"{summary.comparison_scope} — {summary.available_count}/{summary.total_count} paired cases", fontsize="small")
-        axis.grid(axis="y", alpha=0.25)
+            axis.barh(position, median, xerr=[[median - lower], [upper - median]], color=_NEUTRAL_COLOUR, capsize=4.0, error_kw={"elinewidth": 1.0})
+            drawn = True
+            continue
+        axis.text(0.02, position, note, transform=axis.get_yaxis_transform(), va="center", fontsize="small")
+    axis.set_yticks(
+        range(len(summaries)),
+        [
+            f"{summary.reference_boundary} /\n{summary.surrogate_boundary}\n{summary.available_count}/{summary.total_count} paired"
+            + ("" if summary.ratio_of_sums is None else f"; ratio of sums {summary.ratio_of_sums:.3g}")
+            for summary in summaries
+        ],
+        fontsize="small",
+    )
+    axis.invert_yaxis()
+    if drawn:  # every drawn median and percentile is positive and finite
+        figure_layout.set_log_scale(axis, "x")
+    axis.set_xlabel(f"Duration ratio, median and 10th-90th percentile of the paired cases [{field_labels.display_unit('1')}]")
+    axis.grid(axis="x", which="both", alpha=0.25)
     return figure
 
 
@@ -1996,9 +2242,10 @@ def plot_accuracy_runtime_comparison(
     accuracy: pd.DataFrame,
     reports: Mapping[str, timing.TransientTimingReport],
     *,
+    styles: series.SeriesStyles,
     measure: str = "prepared_wall",
 ) -> Figure:
-    """Compare saved models using exact paired case accuracy and a named measured clock."""
+    """Compare saved models using exact paired case accuracy and a named measured clock, each model frame in its comparison style."""
     labels = {
         "prepared_wall": "Prepared rollout request wall, warmed median [s]",
         "model": "Rollout model calls only, warmed median [s]",
@@ -2007,11 +2254,13 @@ def plot_accuracy_runtime_comparison(
     if measure not in labels or "frame" not in accuracy:
         msg = "Accuracy/runtime comparison requires a named clock and frame identity."
         raise ValueError(msg)
-    figure, axis = plt.subplots(figsize=(10.0, 6.5), layout="constrained")
+    frames = {frame_name: accuracy.loc[accuracy["frame"] == frame_name] for frame_name in reports}
+    styles = _frame_styles(frames, styles)
+    figure, axes = figure_layout.panel_figure(1, 1, panel_in=(8.0, 5.5))
+    axis = axes[0, 0]
     notices = []
-    for index, (frame_name, report) in enumerate(reports.items()):
-        selected = accuracy.loc[accuracy["frame"] == frame_name]
-        values = _case_accuracy_values(selected, label=f"Accuracy/runtime comparison {frame_name}")
+    for frame_name, report in reports.items():
+        values = _case_accuracy_values(frames[frame_name], label=f"Accuracy/runtime comparison {frame_name}")
         durations: Mapping[str, float]
         if measure == "ratio":
             durations = {case.case_id: case.speedup for case in report.speedups["drying_only_solver_speedup"].cases if case.speedup is not None}
@@ -2020,19 +2269,20 @@ def plot_accuracy_runtime_comparison(
             durations = timing.component_case_medians(report, component)
         paired = [(durations[case_id], value) for case_id, value in values.items() if case_id in durations]
         if paired:
+            style = styles[frame_name]
             axis.scatter(
                 [point[0] for point in paired],
                 [point[1] for point in paired],
-                color=plt.colormaps["tab10"](index % 10),
+                color=style.color,
+                marker=style.marker or "o",
                 label=f"{frame_name} ({len(paired)} cases)",
             )
         notices.append(f"{frame_name}: {len(paired)}/{len(values)} paired")
     axis.set_xlabel(labels[measure])
-    axis.set_ylabel("Cumulative full-rollout normalized Drying group macro RMSE [-]")
-    axis.set_title("\n".join(notices), fontsize="small")
-    if axis.collections:
-        axis.legend()
-    else:
+    axis.set_ylabel(f"Cumulative full-rollout normalized Drying group macro RMSE [{field_labels.display_unit('1')}]")
+    if not axis.collections:
         axis.text(0.5, 0.5, "No paired saved accuracy/runtime evidence", transform=axis.transAxes, ha="center")
     axis.grid(alpha=0.25)
+    figure_layout.set_figure_title(figure, axes, "Accuracy vs measured runtime", note=plot_layout.series_note(styles, "\n".join(notices)))
+    _legend(figure, axes)
     return figure

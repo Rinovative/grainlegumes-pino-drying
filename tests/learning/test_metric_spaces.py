@@ -3,6 +3,7 @@
 Responsibilities:
   - Check named channels, physical inverse transforms, units, and mixed-unit rejection
   - Check that a prediction that overflows on decoding counts as a non-finite validation case
+  - Check that the physical evaluation view decodes with each case's inlet-pressure reference
 
 Design principles:
   - Metric-space routing transforms physical tensors exactly once
@@ -18,7 +19,7 @@ import copy
 import pytest
 import torch
 from support import configs
-from support.scaling import steady_scaling
+from support.scaling import steady_inputs, steady_scaling
 
 from src import domain, experiments, learning
 
@@ -66,7 +67,7 @@ def test_normalized_and_physical_rmse_are_space_correct_once() -> None:
     )
     scaling = steady_scaling((3, 4), state_mean=10.0, state_std=2.0)
     raw_batch = {
-        "x": torch.zeros((2, _TASK.in_channels, 3, 4)),
+        "x": steady_inputs(2, (3, 4)),
         "y": torch.full((2, _TASK.out_channels, 3, 4), 10.0),
         "meta": {"simulation_case_id": ["case-a", "case-b"], "material_family": ["lentil", "pea"]},
     }
@@ -84,6 +85,39 @@ def test_normalized_and_physical_rmse_are_space_correct_once() -> None:
         assert {metric_id: values[metric_id] for metric_id in ids} == pytest.approx(dict.fromkeys(ids, expected))
 
 
+class _FixedOutputModel(torch.nn.Module):
+    """Return one fixed normalized output whatever the inputs."""
+
+    def __init__(self, output: torch.Tensor) -> None:
+        super().__init__()
+        self.output = output
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Return the fixed output."""
+        del inputs
+        return self.output
+
+
+def test_physical_views_equal_the_physical_targets_through_the_inlet_pressure_reference() -> None:
+    """A model that returns the encoded targets of cases with P = 3 and P = 0.5 has zero physical error in Pa and m/s."""
+    metrics = _metrics(*(metric.id for metric in _PHYSICAL_FIELD_METRICS))
+    scaling = steady_scaling((3, 4), state_mean=10.0, state_std=2.0)
+    inputs = torch.cat([steady_inputs(1, (3, 4), inlet_pressure=3.0), steady_inputs(1, (3, 4), inlet_pressure=0.5)])
+    targets = torch.linspace(1.0, 50.0, 2 * _TASK.out_channels * 12).reshape(2, _TASK.out_channels, 3, 4)
+    encoded = scaling.encode_state(targets, reference=scaling.state_reference(inputs))
+    raw_batch = {"x": inputs, "y": targets, "meta": {"simulation_case_id": ["case-a", "case-b"], "material_family": ["lentil", "pea"]}}
+    values = learning.training.loop.eval_one_epoch(
+        _FixedOutputModel(encoded),
+        [raw_batch],  # type: ignore[arg-type]
+        metrics,
+        torch.device("cpu"),
+        scaling,
+    )
+
+    for definition in _PHYSICAL_FIELD_METRICS:
+        assert values[definition.id] == pytest.approx(0.0, abs=1e-4)
+
+
 def test_validation_produces_the_curated_relative_l2_above_the_reference_floors() -> None:
     """
     The curated ``physical_relative_l2`` has a producer: references of 10 and physical errors of 2 give 0.2.
@@ -93,7 +127,7 @@ def test_validation_produces_the_curated_relative_l2_above_the_reference_floors(
     """
     metrics = _metrics("physical_relative_l2")
     raw_batch = {
-        "x": torch.zeros((2, _TASK.in_channels, 3, 4)),
+        "x": steady_inputs(2, (3, 4)),
         "y": torch.full((2, _TASK.out_channels, 3, 4), 10.0),
         "meta": {"simulation_case_id": ["case-a", "case-b"], "material_family": ["lentil", "pea"]},
     }
@@ -121,7 +155,7 @@ class _OverflowingCaseModel(torch.nn.Module):
 def test_a_finite_normalized_prediction_that_overflows_on_decoding_is_a_non_finite_case() -> None:
     """A state scale of 1e10 decodes the finite 1e30 to inf: validation counts the case and reports no value instead of raising."""
     raw_batch = {
-        "x": torch.zeros((2, _TASK.in_channels, 3, 4)),
+        "x": steady_inputs(2, (3, 4)),
         "y": torch.full((2, _TASK.out_channels, 3, 4), 10.0),
         "meta": {"simulation_case_id": ["case-a", "case-b"], "material_family": ["lentil", "pea"]},
     }

@@ -613,19 +613,20 @@ def output_scales(
     output_fields: Iterable[str],
 ) -> dict[str, float]:
     """
-    Return the operational Train state scale of every output field.
+    Return the operational physical Train state scale of every output field.
 
     Parameters
     ----------
     scaling : TrainScaling
-        The run's common Train-fitted scaling.
+        The run's common Train-fitted scaling; its physical state statistics are read, never the dimensionless
+        steady encoding.
     output_fields : Iterable[str]
         Ordered unique TaskSpec output names; they must equal the scaling's state channels.
 
     Returns
     -------
     dict[str, float]
-        Output field to ``max(sigma, floor)``, the scale of the loss, the selection and this objective.
+        Output field to ``max(sigma, floor)`` of the physical state, the scale of the selection and this objective.
 
     Raises
     ------
@@ -634,7 +635,7 @@ def output_scales(
 
     """
     fields = tuple(output_fields)
-    state = scaling.group("state")
+    state = scaling.physical_state
     if state.names != fields:
         msg = f"Saved scaling state channels {list(state.names)} do not equal the output fields {list(fields)}."
         raise ValueError(msg)
@@ -835,7 +836,7 @@ def steady_physics_provenance(task: TaskSpec) -> dict[str, Any]:
         "continuity_kind": task.physics.continuity,
         "boundary_condition_kind": task.physics.boundary,
         "constants": {
-            "dynamic_viscosity_pa_s": brinkman.AIR_DYNAMIC_VISCOSITY,
+            "dynamic_viscosity_pa_s": domain.physics.contracts.AIR_DYNAMIC_VISCOSITY,
             "porosity_floor": brinkman.POROSITY_FLOOR,
             "permeability_scale_floor_m2": brinkman.PERMEABILITY_SCALE_FLOOR,
             "permeability_determinant_floor": brinkman.PERMEABILITY_DETERMINANT_FLOOR,

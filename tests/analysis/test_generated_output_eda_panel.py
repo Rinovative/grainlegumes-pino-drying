@@ -17,7 +17,8 @@ from __future__ import annotations
 
 from inspect import Parameter, signature
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 import ipywidgets as widgets
 import pandas as pd
@@ -28,6 +29,7 @@ from src.analysis.eda import eda_selection as selection
 from src.analysis.eda import eda_sources as sources
 from src.analysis.eda import eda_viewers as viewers
 from src.analysis.presentation import analysis_presentation_registry as presentation
+from src.analysis.ui import analysis_ui_controls as ui_controls
 from src.analysis.ui import analysis_ui_panel as ui_panel
 from src.analysis.ui import analysis_ui_viewers as ui_viewers
 
@@ -37,8 +39,11 @@ if TYPE_CHECKING:
     import pytest
 
 
-def _catalog(unreadable: str | None = None) -> selection.GeneratedOutputEDACatalog:
-    """Return one steady and one transient profile-native view in one catalog; the ``unreadable`` task fails to load."""
+_DEFAULT_VIEWS = (("steady_flow", "Airflow · Reference range"), ("transient_drying", "Drying · Lentil · Parameter extension"))
+
+
+def _catalog(unreadable: str | None = None, specs: tuple[tuple[str, str], ...] = _DEFAULT_VIEWS) -> selection.GeneratedOutputEDACatalog:
+    """Return one profile-native view per ``(task, label)`` spec, by default one steady and one transient; the ``unreadable`` task fails to load."""
 
     def loader(frame: pd.DataFrame, task_id: str) -> Callable[[], pd.DataFrame]:
         def load() -> pd.DataFrame:
@@ -51,13 +56,7 @@ def _catalog(unreadable: str | None = None) -> selection.GeneratedOutputEDACatal
 
     views = []
     batches = []
-    for task_id, label in (
-        ("steady_flow", "Airflow · Reference range"),
-        (
-            "transient_drying",
-            "Drying · Lentil · Parameter extension",
-        ),
-    ):
+    for task_id, label in specs:
         frame = pd.DataFrame(
             {"value": [1.0]},
             index=pd.Index(["case_0001"], name="sample_id"),
@@ -80,7 +79,7 @@ def _catalog(unreadable: str | None = None) -> selection.GeneratedOutputEDACatal
         case = sources.GeneratedOutputEDACase(case_id="case_0001", case_index=1, row=row)
         batch = sources.GeneratedOutputEDABatch(
             generation_root=Path(),
-            batch_id=f"{task_id}-batch",
+            batch_id=f"{label}-batch",
             campaign_name=f"{task_id}-campaign",
             source_name=row["source_name"],
             campaign_digest="a" * 64,
@@ -119,10 +118,10 @@ def _empty_view() -> ui_panel.ViewPanel:
 
 
 def _case_count_viewer(
-    *, datasets: dict[str, pd.DataFrame], plot: Callable[..., Figure] | None = None, start_cases: int = 100, **options: Any
+    *, datasets: dict[str, pd.DataFrame], styles: object = None, plot: Callable[..., Figure] | None = None, start_cases: int = 100, **options: Any
 ) -> ui_panel.ViewPanel:
     """Return a real nested case-count viewer over datasets of 5 and 100 cases of its own, as the statistics plot functions return one."""
-    del datasets
+    del datasets, styles
     frames: dict[Hashable, pd.DataFrame] = {"short": pd.DataFrame({"value": range(5)}), "long": pd.DataFrame({"value": range(100)})}
     return ui_viewers.case_count_view(plot or (lambda **_kwargs: Figure()), datasets=frames, start_cases=start_cases, step_size=1, **options)
 
@@ -293,6 +292,18 @@ def test_published_tensor_view_shows_load_failure_and_clears_export() -> None:
     assert (export_state["plot_name"], export_state["title"]) == ("tensor", "Tensor")
 
 
+def test_channels_check_only_their_default_at_the_first_offer_then_keep_the_retained_choice() -> None:
+    """The first offer checks the default channels that exist; once a choice is retained, a rebind keeps it and checks new channels."""
+    state = selection.GeneratedOutputSelectionState(_catalog())
+    channels = viewers._Channels("Fields", state, "transient_snapshot_fields", ui_controls.StatusLine(), default=("T", "phi", "w_gr"))
+    channels.rebind(("T", "phi", "w_surf", "w_gr", "rho"), {})
+    assert channels.selected == ("T", "phi", "w_gr")
+    channels.observe(lambda: None)
+    channels.checks.boxes["phi"].value = False
+    channels.rebind(("T", "phi", "w_gr", "p"), {})
+    assert channels.selected == ("T", "w_gr", "p")
+
+
 def test_deactivated_view_ignores_shared_selection_until_reactivated() -> None:
     """A hidden view neither loads nor renders on shared changes and renders once on reactivation."""
     catalog = _catalog()
@@ -431,6 +442,60 @@ def test_deactivation_supersedes_a_render_in_flight(monkeypatch: pytest.MonkeyPa
 
     assert calls == 2
     assert export_state["fig"] is first
+
+
+def test_a_dataset_keeps_its_line_style_and_hatch_when_another_is_deselected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The viewer resolves styles over the whole catalog: with A deselected, batch B of the same material stays dashed and hatched."""
+    catalog = _catalog(specs=(("transient_drying", "A"), ("transient_drying", "B")))
+    state = selection.GeneratedOutputSelectionState(catalog)
+    drawn: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def plot(*, datasets: dict[str, pd.DataFrame], styles: dict[str, Any]) -> Figure:
+        drawn.append((tuple(datasets), styles))
+        return Figure()
+
+    monkeypatch.setattr(viewers.plots.transient, "plot_completion_target_analysis", plot)
+    export_state: dict[str, Any] = {"fig": None, "figures": (), "plot_name": "completion", "title": "Completion"}
+    viewers.make_completion_target_view(
+        catalog=catalog, selection_state=state, export_state=export_state, export_plot_name="completion", export_title="Completion"
+    )
+    state.select_datasets((catalog.views[1].key,))
+
+    assert [names for names, _styles in drawn] == [("A", "B"), ("B",)]
+    both, alone = drawn[0][1]["B"], drawn[1][1]["B"]
+    assert alone == both
+    assert alone.linestyle != "-"
+    assert alone.hatch
+
+
+def test_a_published_package_of_one_material_takes_that_materials_color_without_loading() -> None:
+    """The material comes from the manifest: one material colors the package like a generated batch of it; several do not."""
+
+    def package(name: str, materials: list[str]) -> selection.PublishedDatasetEDAView:
+        manifest = {
+            "dataset_id": name,
+            "dataset_name": name,
+            "dataset_view": "transient_drying",
+            "materials": materials,
+            "source_case_identities": [{"source": {"simulation_case_id": "1" * 64}}],
+        }
+        return selection.PublishedDatasetEDAView(manifest=manifest, case_limit=None, loader=pd.DataFrame)
+
+    views = (package("single", ["lentil"]), package("mixed", ["lentil", "chickpea"]))
+    styles = viewers._dataset_styles(cast("Any", SimpleNamespace(views=views)))
+    assert styles[views[0].label].color == viewers.plots.transient.visual_semantics.material_color("lentil")
+    assert styles[views[1].label].color != styles[views[0].label].color
+    assert not views[0].is_loaded
+
+
+def test_a_published_package_label_shows_its_identity_once_when_the_name_equals_it() -> None:
+    def label(name: str) -> str:
+        identities = [{"package_case_id": "c1", "source": {"simulation_case_id": "s1"}}]
+        manifest = {"dataset_id": "pkg", "dataset_name": name, "dataset_view": "steady_flow", "source_case_identities": identities}
+        return selection.PublishedDatasetEDAView(manifest=manifest, case_limit=None, loader=pd.DataFrame).label
+
+    assert label("pkg") == "pkg"
+    assert label("Package") == "Package [pkg]"
 
 
 def test_statistics_view_keeps_its_case_count_across_activations() -> None:

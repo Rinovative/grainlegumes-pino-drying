@@ -52,11 +52,11 @@ def test_plan_derives_ordered_children_with_teacher_and_receipt_binding() -> Non
     assert plan.a0["training"]["teacher_handoff"] is None
     assert plan.b["training"]["teacher_handoff"] == plan.a1["training"]["teacher_handoff"] == {"source_run_name": plan.a0["run"]["name"]}
     assert plan.a1["training"]["matched_a1_b"]["receipt_source_run_name"] == plan.b["run"]["name"]
-    assert plan.b["training"]["matched_a1_b"]["train_seconds"] == pytest.approx(0.25)
-    assert plan.a0["training"]["matched_a1_b"]["train_seconds"] is plan.a1["training"]["matched_a1_b"]["train_seconds"] is None
-    # A0 states its budget in epochs of the full Train set; B and A1 run until B's train seconds, without an epoch cap.
+    # A0 states its budget K in epochs of the full Train set; B trains K x N supervised transitions and A1 B's receipt, without an epoch cap.
     assert "budget_epochs" in plan.a0["training"]
     assert all("budget_epochs" not in config["training"] for config in (plan.b, plan.a1))
+    assert {config["training"]["stage_schedule"]["budget_unit"] for config in plan.stages} == {"supervised_transitions"}
+    assert {config["training"]["stage_schedule"]["a0_budget_epochs"] for config in plan.stages} == {plan.a0["training"]["budget_epochs"]}
     for name, config in zip(("a0", "b", "a1"), plan.stages, strict=True):
         assert plan.stage(name) is config
         assert loader.validate_resolved_config(config)["run"]["name"] == config["run"]["name"]
@@ -66,17 +66,19 @@ def test_plan_derives_ordered_children_with_teacher_and_receipt_binding() -> Non
 
 @pytest.mark.parametrize("model_kind", ["fno", "rno"])
 def test_a1_inherits_the_teacher_forced_protocol_of_a0(model_kind: str) -> None:
-    """A1 continues A0 teacher-forced: only its learning-rate scale is its own; every stage shares k and the memory batch."""
+    """A1 continues A0 teacher-forced: only its learning-rate scale and memory batch are its own; every stage shares k."""
     raw = configs.transient_matched_config(model_kind=model_kind)
-    raw["training"].update({"units_per_update": 3, "memory_batch": 1})
+    raw["training"]["units_per_update"] = 3
+    for stage, memory_batch in (("a0", 3), ("b", 1), ("a1", 2)):
+        raw["training"][stage]["memory_batch"] = memory_batch
     plan = _resolve(raw)
 
     assert plan.a1["temporal"]["sampling"] == plan.a0["temporal"]["sampling"] == raw["training"]["a0"]["sampling"]
     # Teacher forcing draws no rollout horizon: A0 and A1 have no curriculum, and only B has one.
     assert "curriculum" not in plan.a0["training"]
     assert "curriculum" not in plan.a1["training"]
-    for field in ("units_per_update", "memory_batch"):
-        assert [config["training"][field] for config in plan.stages] == [raw["training"][field]] * 3
+    assert [config["training"]["units_per_update"] for config in plan.stages] == [3] * 3
+    assert [config["training"]["memory_batch"] for config in plan.stages] == [3, 1, 2]
     assert plan.a0["training"]["budget_epochs"] == raw["training"]["a0"]["budget_epochs"]
     assert plan.b["temporal"]["sampling"] == raw["training"]["b"]["sampling"]
     assert plan.b["training"]["curriculum"] == raw["training"]["b"]["curriculum"]
@@ -92,24 +94,29 @@ def test_a1_inherits_the_teacher_forced_protocol_of_a0(model_kind: str) -> None:
         (lambda raw: raw["training"]["b"].update(teacher_handoff=None), r"training\.b"),
         (lambda raw: raw["training"]["a1"].update(sampling={"mode": "one_step_transition"}), r"training\.a1"),
         (lambda raw: raw["temporal"].update(sampling={"mode": "one_step_transition"}), "temporal"),
+        (lambda raw: raw["training"]["b"].update(train_seconds=60.0), r"training\.b"),
+        (lambda raw: raw["training"]["b"].pop("memory_batch"), r"training\.b"),
+        (lambda raw: raw["training"].update(memory_batch=2), "training"),
     ],
-    ids=["missing-b", "extra-training-key", "a0-extra-key", "a0-curriculum", "b-extra-key", "a1-extra-key", "temporal-extra-key"],
+    ids=[
+        "missing-b",
+        "extra-training-key",
+        "a0-extra-key",
+        "a0-curriculum",
+        "b-extra-key",
+        "a1-extra-key",
+        "temporal-extra-key",
+        "b-seconds-budget",
+        "b-without-memory-batch",
+        "shared-memory-batch",
+    ],
 )
 def test_authored_plan_schema_is_exact(mutate: Callable[[dict[str, Any]], object], path: str) -> None:
-    """Fail closed when an authored node omits or adds keys; A1 cannot author its own sampling."""
+    """Fail closed when an authored node omits or adds keys; A1 cannot author its own sampling, and no stage a seconds budget."""
     raw = configs.transient_matched_config()
     mutate(raw)
 
     with pytest.raises(loader.ConfigError, match=rf"{path} keys must be exactly"):
-        _resolve(raw)
-
-
-def test_b_budget_must_be_authored_or_passed() -> None:
-    """A null B target is an incomplete plan, not an implicit default."""
-    raw = configs.transient_matched_config()
-    raw["training"]["b"]["train_seconds"] = None
-
-    with pytest.raises(loader.ConfigError, match=r"training\.b\.train_seconds is required"):
         _resolve(raw)
 
 
@@ -127,14 +134,13 @@ def test_continuation_lr_scale_must_be_positive_finite(stage: str, value: object
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
-        (lambda raw: raw["training"]["b"].update(train_seconds=0.0), "B train_seconds must be positive"),
-        (lambda raw: raw["training"]["a1"].update(match_to="b.best_epoch_seconds"), "B's committed train_seconds"),
         (lambda raw: raw["training"]["a0"].update(budget_epochs=0), r"training\.a0\.budget_epochs must be a positive integer"),
         (lambda raw: raw["training"].update(units_per_update=0), r"training\.units_per_update must be a positive"),
+        (lambda raw: raw["training"]["a1"].update(memory_batch=0), r"training\.memory_batch must be a positive"),
         (lambda raw: raw["data"].update(persistent_workers=True), "persistent_workers"),
         (lambda raw: raw.update(task="steady_flow"), "only for transient_drying"),
     ],
-    ids=["zero-seconds", "unmatched-receipt", "zero-a0-budget", "zero-units", "persistent-workers", "other-task"],
+    ids=["zero-a0-budget", "zero-units", "zero-a1-memory-batch", "persistent-workers", "other-task"],
 )
 def test_matched_plan_rejects_unsupported_budgets_workers_and_tasks(mutate: Callable[[dict[str, Any]], object], match: str) -> None:
     """Keep the stage budgets, the update size and the loader settings explicit and fail-closed."""
@@ -252,14 +258,14 @@ def test_removed_keys_are_rejected(mutate: Callable[[dict[str, Any]], object]) -
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda raw: raw["training"]["b"].update(train_seconds=2.0),
+        lambda raw: raw["training"]["b"]["sampling"].update(rollout_length=8, window_stride=8),
         lambda raw: raw["training"]["b"].update(lr_scale=0.5),
         lambda raw: raw["training"]["a1"].update(lr_scale=0.5),
     ],
-    ids=["train-seconds", "b-lr-scale", "a1-lr-scale"],
+    ids=["b-rollout", "b-lr-scale", "a1-lr-scale"],
 )
 def test_branch_settings_change_the_branch_but_never_the_shared_a0(mutate: Callable[[dict[str, Any]], object]) -> None:
-    """B/A1 budget and continuation scale select a new branch of the same A0 checkpoint."""
+    """B's rollout window and the continuation scales select a new branch of the same A0 checkpoint."""
     raw = configs.transient_matched_config()
     reference = _resolve(raw)
     mutate(raw)
@@ -270,6 +276,21 @@ def test_branch_settings_change_the_branch_but_never_the_shared_a0(mutate: Calla
     assert changed.b["run"]["layout"]["a0_id"] == reference.b["run"]["layout"]["a0_id"]
     assert changed.b["run"]["layout"]["branch_id"] != reference.b["run"]["layout"]["branch_id"]
     assert changed.b["run"]["layout"]["branch_id"] == changed.a1["run"]["layout"]["branch_id"]
+
+
+def test_stage_memory_batches_stay_outside_every_identity_and_name() -> None:
+    """The three memory batches change only rounding: A0, branch, pair and run names and digests stay; the children carry their own."""
+    raw = configs.transient_matched_config()
+    reference = _resolve(raw)
+    for stage in ("a0", "b", "a1"):
+        raw["training"][stage]["memory_batch"] = 1
+    changed = _resolve(raw)
+
+    for before, after in zip(reference.stages, changed.stages, strict=True):
+        assert after["run"]["name"] == before["run"]["name"]
+        assert after["run"]["layout"] == before["run"]["layout"]
+        assert learning.training.checkpoint.config_digest(after) == learning.training.checkpoint.config_digest(before)
+        assert after["training"]["memory_batch"] == 1
 
 
 def test_seed_remains_part_of_the_shared_a0_identity() -> None:

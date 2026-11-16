@@ -21,7 +21,7 @@ import pytest
 
 from src import common
 
-_PAIR = "b-a1__budget-600s__rollout-8__lr-1"
+_PAIR = "b-a1__rollout-8__lr-1"
 _BUDGET = 40
 _SEED_GROUP = f"seed-9__ep-{_BUDGET}__k-16__sch-cosine"
 
@@ -202,7 +202,7 @@ def test_run_layout_shares_a0_group_and_separates_pairs(tmp_path: Path) -> None:
     output_root = tmp_path / "03_experiments"
     branch = "b" * 16
     group = output_root / f"transient_drying/lentil-train1/architecture_comparison/fno_m12x12_h8_l2/{_SEED_GROUP}"
-    other_pair = "b-a1__budget-300s__rollout-8__lr-1"
+    other_pair = "b-a1__rollout-8__lr-0p5"
 
     def run_dir(stage: str, pair: str | None = None) -> Path:
         return common.paths.resolve_config_run_dir(_config(output_root, stage=stage, pair=pair, branch_id=None if pair is None else branch))

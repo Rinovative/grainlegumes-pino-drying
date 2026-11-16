@@ -228,14 +228,15 @@ def test_transient_plan_name_shows_shared_and_a0_leaves_but_leaves_b_and_a1_to_t
     # Only B has a curriculum; it names the pair folder like B's other leaves.
     curriculum = {"lengths": [2, 4, 8, 16, 32], "milestone_fractions": [0.0, 0.2, 0.4, 0.6, 0.8]}
     b_a1 = {
-        "b": {"sampling": {"mode": "rollout_window", "window_stride": 16}, "curriculum": curriculum, "train_seconds": 600.0, "lr_scale": 0.5},
-        "a1": {"match_to": "b.train_seconds", "lr_scale": 0.5},
+        "b": {"sampling": {"mode": "rollout_window", "window_stride": 16}, "curriculum": curriculum, "lr_scale": 0.5, "memory_batch": 1},
+        "a1": {"lr_scale": 0.5, "memory_batch": 16},
     }
+    a0 = {"budget_epochs": 100, "memory_batch": 16, "sampling": {"mode": "trajectory", "rollout_length": 32}}
     authored = {
         "loss": {"data": {"kind": "h1"}},
         "data": {"spatial_stride": 2},
         "optimizer": {"lr": 0.001},
-        "training": {"mode": "matched_a1_b", "a0": {"budget_epochs": 100, "sampling": {"mode": "trajectory", "rollout_length": 32}}, **b_a1},
+        "training": {"mode": "matched_a1_b", "a0": a0, **b_a1},
     }
     expected = "fno_m4x5_h8_l2_p0p1__loss-h1__stride-2__lr-0p001__a0smp-trajectory__a0rl-32"
 
@@ -344,11 +345,11 @@ def test_worst_case_names_stay_within_one_path_component() -> None:
     plan["model"] = uno["model"]
     transient = _name(plan, {"optimizer": {"lr": 0.000532}, "training": {"a0": {"sampling": {"mode": "one_step_transition"}}}})
     assert transient.endswith("__lr-0p000532__a0smp-one-step-transition")
-    b, a1 = _plan_children(b_scale=0.5, a1_scale=0.25, seconds=3600.0)
+    b, a1 = _plan_children(b_scale=0.5, a1_scale=0.25)
     b_sampling = {"mode": "rollout_window", "window_stride": 32, "window_offset": 0}
     authored = {"training": {"b": {"sampling": b_sampling}}}
     pair = naming.pair_key(b, a1, authored)
-    assert pair.startswith("b-a1__budget-3600s__rollout-4__lr-b-0p5__lr-a1-0p25__bsmp-rollout-window__bws-32__bwo-0")
+    assert pair.startswith("b-a1__rollout-4__lr-b-0p5__lr-a1-0p25__bsmp-rollout-window__bws-32__bwo-0")
 
     seed_group = "__seed-29__ep-1000__k-32__sch-reduce-on-plateau"
     steady_suffix = f"{seed_group}__rev-wave-2026-11-09"
@@ -375,40 +376,40 @@ def test_a_name_beyond_the_component_limit_is_a_resolve_time_error_with_its_byte
 def test_a_final_b_run_name_beyond_the_component_limit_is_refused_with_its_byte_count() -> None:
     """The pair key and stage join B's name after its first resolution: a name that outgrows the component there stays a config error."""
     raw = configs.transient_matched_config()
-    fits = loader.apply_training_overrides(raw, revision="r" * 145)
+    fits = loader.apply_training_overrides(raw, revision="r" * 155)
     assert max(len(stage["run"]["name"]) for stage in configs.resolve_plan(fits).stages) <= 255  # the component limit
-    longer = loader.apply_training_overrides(raw, revision="r" * 155)  # A0 still fits; B and A1 outgrow the limit with pair key and stage
+    longer = loader.apply_training_overrides(raw, revision="r" * 170)  # A0 still fits; B and A1 outgrow the limit with pair key and stage
 
     with pytest.raises(loader.ConfigError, match=r"run\.name must not exceed 255 UTF-8 bytes.*got \d+ bytes"):
         configs.resolve_plan(longer)
 
 
-def _plan_children(*, b_scale: float = 1.0, a1_scale: float = 1.0, seconds: float = 0.25) -> tuple[dict[str, Any], dict[str, Any]]:
+def _plan_children(*, b_scale: float = 1.0, a1_scale: float = 1.0) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return the resolved B and A1 children of a matched plan with explicit pair settings."""
     raw = configs.transient_matched_config()
-    raw["training"]["b"].update({"lr_scale": b_scale, "train_seconds": seconds})
+    raw["training"]["b"]["lr_scale"] = b_scale
     raw["training"]["a1"]["lr_scale"] = a1_scale
     plan = configs.resolve_plan(raw)
     return dict(plan.b), dict(plan.a1)
 
 
-def test_pair_key_names_budget_rollout_and_one_shared_learning_rate_scale() -> None:
-    """Equal B and A1 scales share one lr token; the rollout is B's window length."""
-    b, a1 = _plan_children(b_scale=0.5, a1_scale=0.5, seconds=600.0)
+def test_pair_key_names_rollout_and_one_shared_learning_rate_scale() -> None:
+    """Equal B and A1 scales share one lr token; the rollout is B's window length; no budget, which A0's K in the seed group sets."""
+    b, a1 = _plan_children(b_scale=0.5, a1_scale=0.5)
 
-    assert naming.pair_key(b, a1, None) == "b-a1__budget-600s__rollout-4__lr-0p5"
+    assert naming.pair_key(b, a1, None) == "b-a1__rollout-4__lr-0p5"
     assert b["run"]["layout"]["pair"] == a1["run"]["layout"]["pair"] == naming.pair_key(b, a1, None)
 
 
 def test_pair_key_separates_unequal_learning_rate_scales() -> None:
-    """Different B and A1 scales are named separately; a fractional budget keeps its decimal."""
-    b, a1 = _plan_children(b_scale=1.0, a1_scale=0.25, seconds=0.25)
+    """Different B and A1 scales are named separately."""
+    b, a1 = _plan_children(b_scale=1.0, a1_scale=0.25)
 
-    assert naming.pair_key(b, a1, None) == "b-a1__budget-0p25s__rollout-4__lr-b-1__lr-a1-0p25"
+    assert naming.pair_key(b, a1, None) == "b-a1__rollout-4__lr-b-1__lr-a1-0p25"
 
 
 def test_pair_key_requires_the_b_child_first() -> None:
-    """The key reads B's budget and window, so swapped children are refused."""
+    """The key reads B's window, so swapped children are refused."""
     b, a1 = _plan_children()
 
     with pytest.raises(ValueError, match="B child first"):
@@ -416,22 +417,22 @@ def test_pair_key_requires_the_b_child_first() -> None:
 
 
 def test_pair_key_adds_one_token_per_authored_b_a1_leaf_the_fixed_part_does_not_show() -> None:
-    """The fixed part shows budget, B's rollout and both scales; every other authored B/A1 leaf follows in table order, a partial one is refused."""
-    b, a1 = _plan_children(b_scale=0.5, a1_scale=0.5, seconds=600.0)
+    """The fixed part shows B's rollout and both scales; other authored B/A1 leaves but memory batches follow in table order; a partial one fails."""
+    b, a1 = _plan_children(b_scale=0.5, a1_scale=0.5)
     authored = {
         "optimizer": {"lr": 0.001},
         "training": {
             "b": {
                 "sampling": {"mode": "rollout_window", "rollout_length": 4, "window_stride": 16},
                 "curriculum": {"lengths": [3, 6], "milestone_fractions": [0.0, 0.25]},
-                "train_seconds": 600.0,
                 "lr_scale": 0.5,
+                "memory_batch": 1,
             },
-            "a1": {"match_to": "b.train_seconds", "lr_scale": 0.5},
+            "a1": {"lr_scale": 0.5, "memory_batch": 16},
         },
     }
 
-    assert naming.pair_key(b, a1, authored) == ("b-a1__budget-600s__rollout-4__lr-0p5__bcur-3-6-at-0-0p25__bsmp-rollout-window__bws-16")
+    assert naming.pair_key(b, a1, authored) == ("b-a1__rollout-4__lr-0p5__bcur-3-6-at-0-0p25__bsmp-rollout-window__bws-16")
     with pytest.raises(loader.ConfigError, match=r"part of name token 'bcur' but not 'training\.b\.curriculum\.milestone_fractions'"):
         naming.pair_key(b, a1, {"training": {"b": {"curriculum": {"lengths": [3, 6]}}}})
 
@@ -450,13 +451,13 @@ def test_editing_a_b_leaf_of_a_plan_file_keeps_the_config_name_and_the_a0_folder
         configs.write_yaml(path, {**authored, "training": {"b": b_leaves}})
         return plan_service.resolve_matched_a1_b_plan(loader.load_authored_config(path), source=naming.config_source_from_path(path))
 
-    first = resolve({"train_seconds": 0.25})
-    second = resolve({"train_seconds": 0.5, "lr_scale": 0.5})
+    first = resolve({"memory_batch": 1})
+    second = resolve({"memory_batch": 1, "lr_scale": 0.5})
 
     assert first.a0["run"]["layout"]["config_name"] == second.a0["run"]["layout"]["config_name"] == name
     assert common.paths.resolve_config_run_dir(first.a0) == common.paths.resolve_config_run_dir(second.a0)
-    assert first.b["run"]["layout"]["pair"] == "b-a1__budget-0p25s__rollout-4__lr-1"
-    assert second.b["run"]["layout"]["pair"] == "b-a1__budget-0p5s__rollout-4__lr-b-0p5__lr-a1-1"
+    assert first.b["run"]["layout"]["pair"] == "b-a1__rollout-4__lr-1"
+    assert second.b["run"]["layout"]["pair"] == "b-a1__rollout-4__lr-b-0p5__lr-a1-1"
 
 
 def test_trial_leaf_formats_number_label_and_sorted_values() -> None:
@@ -491,7 +492,7 @@ _LAYOUT = {
 def test_run_name_follows_steady_stage_pair_revision_and_trial() -> None:
     """Every run names budget, k and schedule; staged runs append pair and stage; a revision stays last; trials use study and number."""
     group = "seed-9__ep-40__k-16__sch-cosine"
-    pair = "b-a1__budget-600s__rollout-4__lr-1"
+    pair = "b-a1__rollout-4__lr-1"
     study = {**_LAYOUT, "family": "optuna", "config_name": "fno_search", "trial": "0003__fno_m4x5_h8_l2"}
 
     assert naming.run_name(_LAYOUT) == f"fno_m4x5_h8_l2__{group}"

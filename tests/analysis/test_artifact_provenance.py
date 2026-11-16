@@ -16,6 +16,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -316,7 +317,9 @@ def test_steady_artifact_relative_h1_is_the_shared_case_metric_in_metres(tmp_pat
     frame, _root, _provenance = _steady_artifact(tmp_path, model, target=target)
 
     inputs = {"x": x_grid[None, None], "y": y_grid[None, None]}
-    prediction = model(torch.cat([inputs[name] if name in inputs else torch.zeros_like(x_grid)[None, None] for name in task.input_names], dim=1))
+    # The identity scaling leaves the model's dimensionless output to be multiplied by the case's inlet pressure P.
+    encoded = torch.cat([inputs[name] if name in inputs else torch.zeros_like(x_grid)[None, None] for name in task.input_names], dim=1)
+    prediction = _STEADY_INLET_PRESSURE * model(encoded)
     metrics = learning.metrics.metrics
     sums = metrics.field_statistics(prediction.double(), target.double(), grid_spacing=(0.125, 0.2))[0]
     per_field = {
@@ -724,11 +727,42 @@ def test_artifact_batch_preserves_distinct_grouped_runs_with_equal_leaf_names(
     monkeypatch.setattr(service, "cleanup_runtime", lambda _device: None)
     owners_file = tmp_path / "owners"
     monkeypatch.setenv("JOB_LOG_OWNERS_FILE", str(owners_file))
-    outputs = service.build_artifacts(runs_root=root, dataset_root=tmp_path / "datasets", device_policy="cpu")
+    outputs = service.build_artifacts(runs_root=root, dataset_root=tmp_path / "datasets", device_policy="cpu", roles=("id",))
     assert set(outputs) == {str(run.resolve()) for run in runs}
     for run in runs:
         assert outputs[str(run.resolve())]["eval"]["run"].tolist() == [str(run)]
     assert owners_file.read_text(encoding="utf-8").splitlines() == [str(run.resolve()) for run in runs]
+
+
+def test_a_canonical_build_evaluates_only_the_held_out_roles_its_caller_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No role is released by default: an empty request or a role the run lacks is refused before any build; a named role builds alone."""
+    service = analysis.artifacts.service
+    run = tmp_path / "run"
+    run.mkdir()
+    material = replace(_role_plan(("ood-case",)), split="material_ood", dataset_role="material_ood", dataset_name="ood")
+    monkeypatch.setattr(service, "iter_run_dirs", lambda root, **_kwargs: iter((root,)))
+    monkeypatch.setattr(
+        service,
+        "load_run_artifact_plan",
+        lambda path: analysis.artifacts.plan.ArtifactPlan(
+            run_dir=path, run_name="run", task="steady_flow", id_role=_role_plan(("case",)), ood_roles={"material_ood": material}
+        ),
+    )
+    built: list[str] = []
+    monkeypatch.setattr(service, "run_or_load_artifacts", lambda **kwargs: built.append(kwargs["split"]) or pd.DataFrame())
+    monkeypatch.setattr(service, "cleanup_runtime", lambda _device: None)
+    monkeypatch.setenv("JOB_LOG_OWNERS_FILE", str(tmp_path / "owners"))
+
+    with pytest.raises(ValueError, match="names no held-out role"):
+        service.build_artifacts(runs_root=run, dataset_root=tmp_path, device_policy="cpu", roles=())
+    with pytest.raises(FileNotFoundError, match="no saved parameter_ood artifact role"):
+        service.build_artifacts(runs_root=run, dataset_root=tmp_path, device_policy="cpu", roles=("parameter_ood",))
+    assert built == []
+
+    outputs = service.build_artifacts(runs_root=run, dataset_root=tmp_path, device_policy="cpu", roles=("material_ood",))
+
+    assert built == ["material_ood"]
+    assert set(outputs[str(run.resolve())]) == {"material_ood"}
 
 
 @pytest.mark.parametrize("task", ["steady_flow", "transient_drying"])

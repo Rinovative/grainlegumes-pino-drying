@@ -342,6 +342,12 @@ def build_transient_inference_context(
     if spec.as_dict() != scaling.preprocessing.get("tensorizer"):
         msg = "Completed transient config tensorizer disagrees with admitted scaling artifact."
         raise RuntimeError(msg)
+    run = config.get("run")
+    if not isinstance(run, Mapping):
+        msg = "Completed transient config must provide its run section."
+        raise TypeError(msg)
+    # The run's numerics hold for its predictions too; artifact generation can start in a fresh process.
+    experiments.run.configure_numerics(bool(run["deterministic"]))
     model = model_factory.build_model(dict(config), device=resolved_device)
     best_checkpoint = completed.get("best_checkpoint")
     if not isinstance(best_checkpoint, Mapping) or not isinstance(best_checkpoint.get("model_state_dict"), Mapping):

@@ -134,13 +134,13 @@ srun --partition standard --cpus-per-task 2 --mem 8G --time 01:00:00 \
   configs/02_datasets/transient_drying/lentil_chickpea__ood_kidney_bean.yaml
 ```
 
-3. Train one architecture on the published Dataset (matched A0, B and A1; `--train-seconds` is B's measured target, see [Training](docs/05_training.md#matched-comparison-a0--b-a1)):
+3. Train one architecture on the published Dataset (matched A0, B and A1: A0 trains K passes, B K × N supervised transitions and A1 exactly B's, with K from `training.a0.budget_epochs` or `--epochs`, see [Training](docs/05_training.md#matched-comparison-a0--b-a1)):
 
 ```bash
 ./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 \
   --mem 32G --time 04:00:00 --gres gpu:rtx6000ada:1 train \
   configs/03_learning/transient_drying/experiments/architecture_comparison/fno_m64x80_h64_l3_p0p1__lr-0p000388__a0smp-one-step-transition.yaml \
-  --train-dataset DATASET_ID --train-seconds 600
+  --train-dataset DATASET_ID
 ```
 
 `DATASET_ID` is the computed Dataset name printed by the preview (the directory below `storage/02_datasets/<task>/`). The resource options above are optional and show the GPU defaults; every default of `slurm_ml.sh` is in [ML jobs](docs/01_setup_and_execution.md#ml-jobs), and `--dry-run` of the Dataset command is off by default ([run options](docs/04_datasets.md#small-runs-and-run-options)).

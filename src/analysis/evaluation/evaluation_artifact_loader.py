@@ -7,7 +7,8 @@ Responsibilities:
   - Read artifact roots only inside the admitting path, since DataFrame provenance does not prove run, timing, or role
   - Serve as the one role validator for private stages, cache hits, and reads of both tasks
   - Return comparison-ready DataFrames with the same role attrs and stable canonical identity digests
-  - Report actionable host commands for missing or incompatible artifacts
+  - Report actionable host commands for missing or incompatible artifacts, each naming exactly the held-out roles it builds
+  - Refuse a run whose canonical roles, read together, record different analysis producers
 
 Design principles:
   - Scientific run and saved-split evidence remain the source of artifact identity
@@ -34,7 +35,7 @@ from __future__ import annotations
 
 import json
 import shlex
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from numbers import Integral
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
 
 ArtifactRole = artifact_plan.ArtifactSplit
 ArtifactSelectionRole = artifact_plan.ArtifactDatasetRole
+_COMPARED_ROLES = 2  # one run's producer agreement needs at least two roles read together
 
 __all__ = [
     "ArtifactRole",
@@ -315,13 +317,17 @@ def _nonempty_string(value: Any, *, label: str) -> str:
     return value
 
 
-def _artifact_command(*, run_dir: Path, rebuild: bool) -> str:
-    """Return the host wrapper command for one exact current run directory."""
+def artifact_command(*, run_dir: Path, roles: Sequence[artifact_plan.ArtifactDatasetRole], rebuild: bool = False) -> str:
+    """Return the host wrapper command that builds exactly ``roles`` of one current run; every held-out role is released by name."""
+    if not roles:
+        msg = "An artifact command must name at least one held-out role."
+        raise ValueError(msg)
+    selection = "".join(f" --split {role}" for role in roles)
     suffix = " --rebuild" if rebuild else ""
     return (
         "./scripts/slurm_ml.sh --mode cpu --partition standard --cpus-per-task 4 "
         "--mem 16G --time 02:00:00 artifacts --run-dir "
-        f"{shlex.quote(str(run_dir))}{suffix}"
+        f"{shlex.quote(str(run_dir))}{selection}{suffix}"
     )
 
 
@@ -346,7 +352,7 @@ def _missing(*, task: str, run_name: str, run_dir: Path, role: ArtifactRole, roo
         Failure carrying the generic host-side build command.
 
     """
-    command = _artifact_command(run_dir=run_dir, rebuild=False)
+    command = artifact_command(run_dir=run_dir, roles=(artifact_plan.dataset_role_of(role),))
     return MissingEvaluationArtifactsError(
         f"Evaluation artifacts are missing for run {task}/{run_name} ({role} expected at {root}).\nBuild them locally:\n  {command}",
         role=role,
@@ -385,7 +391,7 @@ def _incompatible(
         Failure carrying the generic host-side rebuild command.
 
     """
-    command = _artifact_command(run_dir=run_dir, rebuild=True)
+    command = artifact_command(run_dir=run_dir, roles=(artifact_plan.dataset_role_of(role),), rebuild=True)
     return IncompatibleEvaluationArtifactsError(
         f"Evaluation artifacts are incompatible with run {task}/{run_name} "
         f"({role} at {root}): {reason}\n"
@@ -1161,6 +1167,26 @@ def _require_role_selection(artifact_roles: tuple[ArtifactSelectionRole, ...]) -
         raise ValueError(msg)
 
 
+def _require_one_producer(run_dir: Path, loaded: Mapping[ArtifactSelectionRole, LoadedEvaluationArtifact]) -> None:
+    """
+    Refuse a run whose canonical roles, read together, record different analysis producers.
+
+    Roles of other analysis code are read as evidence, but one run must not mix producers: a crash between the renames
+    of a rebuild, or a read that straddles a publication, would otherwise pair roles of two codes. Roles of one producer
+    from two builds are equivalent evidence, because each role is bound to the run's checkpoint, configuration,
+    normalizer and Dataset before this check. The reader may retry; a persistent mix is repaired by rebuilding every role read.
+    """
+    if len(loaded) < _COMPARED_ROLES:
+        return
+    try:
+        contracts.require_common_analysis_producer({role: artifact.frame.attrs.get("artifact_provenance") for role, artifact in loaded.items()})
+    except ValueError as error:
+        roles: tuple[ArtifactSelectionRole, ...] = tuple(role for role in artifact_plan.ARTIFACT_DATASET_ROLES if role in loaded)
+        command = artifact_command(run_dir=run_dir, roles=roles, rebuild=True)
+        msg = f"The artifacts of {run_dir.name} carry two analysis producers: {error}\nRebuild every role together:\n  {command}"
+        raise IncompatibleEvaluationArtifactsError(msg, run_dir=run_dir) from error
+
+
 def _load_admitted_transient_run_artifacts(
     run_dir: Path,
     admitted: Mapping[str, Any],
@@ -1175,7 +1201,7 @@ def _load_admitted_transient_run_artifacts(
     if set(overrides).difference(artifact_roles):
         msg = "Artifact root overrides must belong to selected transient roles."
         raise ValueError(msg)
-    loaded = {
+    loaded: dict[ArtifactSelectionRole, LoadedEvaluationArtifact] = {
         selection_role: _transient_role_artifact(
             run_dir,
             admitted,
@@ -1187,6 +1213,9 @@ def _load_admitted_transient_run_artifacts(
         for selection_role in artifact_plan.ARTIFACT_DATASET_ROLES
         if selection_role in artifact_roles
     }
+    # A scoped debug root is not canonical and cannot be rebuilt by the run, so only canonical roles must agree.
+    canonical: dict[ArtifactSelectionRole, LoadedEvaluationArtifact] = {role: artifact for role, artifact in loaded.items() if role not in overrides}
+    _require_one_producer(run_dir, canonical)
     summary = _mapping(admitted.get("summary"), label="completed transient summary")
     return LoadedRunArtifacts(
         task="transient_drying",
@@ -1236,7 +1265,8 @@ def _load_admitted_run_artifacts(
     if unplanned:
         msg = f"Evaluable run has no saved {unplanned[0]} role."
         raise ValueError(msg)
-    loaded = {role: _load_role(role=saved_roles[role], **context) for role in artifact_roles}
+    loaded: dict[ArtifactSelectionRole, LoadedEvaluationArtifact] = {role: _load_role(role=saved_roles[role], **context) for role in artifact_roles}
+    _require_one_producer(run_dir, loaded)
     evaluation = context["evaluation"]
     return LoadedRunArtifacts(
         task=task_spec.id,

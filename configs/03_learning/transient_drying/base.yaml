@@ -2,22 +2,20 @@
 # The code holds no default for what this file states; configs/README.md lists every key a config chain must state. The Optuna A0 studies under optuna/ inherit it too and tune its A0 alone.
 
 training:
-  mode: matched_a1_b  # A0 -> {B, A1}: B self-feeds rollouts, A1 stays teacher-forced; both start from A0's selected checkpoint. Every stage validates at each 1/20 of its budget.
+  mode: matched_a1_b  # A0 -> {B, A1}: B self-feeds rollouts, A1 stays teacher-forced; both start from A0's selected checkpoint. Every stage validates at each 1/20 of its budget; ID test and OOD are never evaluated in training, only by the separate artifact step.
   units_per_update: 16  # k, units per optimizer update in every stage: FNO and UNO one transition in A0 and A1 and one rollout window in B; the RNO one whole trajectory (its configs set 4). Every Train case counts equally per epoch.
-  memory_batch: 2  # Units computed at once; gradients accumulate up to k, so it changes only floating-point rounding, never the science.
+  # Each experiment states training.a0/b/a1.memory_batch, the units computed at once per stage (no default here).
   a0:
-    budget_epochs: 100  # A0 budget K in passes over the full Train set, counted in seen units; the best validation checkpoint is handed to B and A1, and an A0 study trains a fraction of it. --epochs overrides it and names another run (seed-N__ep-E__k-K__sch-S).
+    budget_epochs: 100  # K, one value for every architecture: A0 trains K passes over the full Train set in seen units, B K x N supervised transitions (N the full Train set's transitions); the best validation checkpoint is handed to B and A1, and an A0 study trains a fraction of it. --epochs overrides it and names another run (seed-N__ep-E__k-K__sch-S).
   b:
-    train_seconds: null  # B budget in optimisation-clock seconds, set per experiment or via --train-seconds: A0's measured optimisation clock (terminal_budget.train_seconds) on the same GPU type. B stops after the group that crosses it; there is no epoch cap.
-    lr_scale: 1.0  # B restarts its own schedule at lr_scale times A0's start rate and keeps only A0's Adam moments and step counters.
+    lr_scale: 1.0  # B restarts its own schedule at lr_scale times A0's start rate and keeps only A0's Adam moments and step counters. B stops after the group that crosses K x N supervised transitions; there is no epoch cap.
     sampling:
       rollout_length: 32  # Number of consecutive transitions in each sampled rollout window; a shorter case forms one window over its whole trajectory.
     curriculum:
       lengths: [2, 4, 8, 16, 32]  # Self-fed rollout lengths of this stage's curriculum, drawn per window and capped at a shorter window; they must fit the sampling rollout length.
       milestone_fractions: [0.0, 0.2, 0.4, 0.6, 0.8]  # Fractions of the stage budget at which curriculum lengths advance.
-  a1:  # Teacher-forced continuation with A0's sampling.
+  a1:  # Teacher-forced continuation with A0's sampling, from the same A0 checkpoint for exactly B's committed supervised transitions (B's receipt), on B's GPU type.
     lr_scale: 1.0  # A1 restarts its own schedule at lr_scale times A0's start rate; keep equal to B's unless a sweep selected otherwise.
-    match_to: b.train_seconds  # A1 trains for B's measured seconds from the same A0 checkpoint.
 
 data:
   train_dataset: null  # Exact built Dataset ID; null needs --train-dataset.

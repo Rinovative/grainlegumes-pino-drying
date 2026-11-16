@@ -11,10 +11,12 @@ Design principles:
   - Checkpoints are only ever replaced by rename, so a later best checkpoint of the source never changes the linked snapshot bytes
   - Existing snapshots are accepted only when byte-identical and valid
   - Compatibility separates scientific state from comparison execution policy
+  - The source A0's device is recorded, never required of B or A1: budgets count supervised transitions, not seconds
 
 This module does NOT:
   - Construct models, fit scalers, or restore checkpoint state
   - Choose source runs or infer target budgets
+  - Bind a B/A1 pair to one GPU model; the B receipt and run admission do
 
 Notes:
   Snapshot layout:
@@ -50,8 +52,8 @@ def _canonical_digest(value: Mapping[str, Any]) -> str:
     return common.serialization.canonical_json_sha256(dict(value))
 
 
-def _device_evidence(device: Mapping[str, Any]) -> dict[str, str | None]:
-    """Admit exact device type and CUDA GPU model evidence."""
+def device_evidence(device: Mapping[str, Any]) -> dict[str, str | None]:
+    """Return the exact device type and CUDA GPU model of a device record (a resolution, a runtime session or a manifest)."""
     device_type = device.get("device_type")
     gpu_model = device.get("cuda_device_name")
     if (
@@ -59,7 +61,7 @@ def _device_evidence(device: Mapping[str, Any]) -> dict[str, str | None]:
         or (device_type == "cuda" and (not isinstance(gpu_model, str) or not gpu_model))
         or (device_type == "cpu" and gpu_model is not None)
     ):
-        msg = "Teacher handoff device evidence must be CPU or CUDA with an exact GPU model."
+        msg = "Device evidence must be CPU or CUDA with an exact GPU model."
         raise ValueError(msg)
     return {"device_type": device_type, "cuda_device_name": gpu_model}
 
@@ -138,14 +140,14 @@ def publish_stage_a_handoff(
         "checkpoint_identity": copy.deepcopy(dict(checkpoint_identity)),
         "best_epoch": best_epoch,
         "global_step": global_step,
-        "device": _device_evidence(device),
+        "device": device_evidence(device),
         "compatibility": compatibility,
         "compatibility_digest": _canonical_digest(compatibility),
         "target_reset_policy": {"adapter": "fresh", "selection": "fresh", "global_step": "fresh", "history": "fresh"},
     }
     destination = source / HANDOFF_DIRECTORY
     if destination.exists():
-        existing = validate_stage_a_handoff(destination, target_config=config, device=device, expected_source_run_name=source_run_name)
+        existing = validate_stage_a_handoff(destination, target_config=config, expected_source_run_name=source_run_name)
         if existing["files"]["checkpoint"]["sha256"] != common.serialization.file_sha256(checkpoint) or existing["files"]["scaling"][
             "sha256"
         ] != common.serialization.file_sha256(scaling):
@@ -162,7 +164,7 @@ def publish_stage_a_handoff(
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return validate_stage_a_handoff(destination, target_config=config, device=device, expected_source_run_name=source_run_name)
+    return validate_stage_a_handoff(destination, target_config=config, expected_source_run_name=source_run_name)
 
 
 def validate_local_teacher_handoff(
@@ -170,7 +172,6 @@ def validate_local_teacher_handoff(
     *,
     local_normalizer_path: Path | str,
     target_config: Mapping[str, Any],
-    device: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Validate a target-local teacher identity without reopening its source run."""
     path = Path(manifest_path)
@@ -226,9 +227,7 @@ def validate_local_teacher_handoff(
     if dict(compatibility) != compatibility_payload(target_config):
         msg = "Local teacher handoff is scientifically incompatible with the target configuration."
         raise ValueError(msg)
-    if _device_evidence(manifest["device"]) != _device_evidence(device):
-        msg = "Local teacher handoff device type or CUDA GPU model does not match the target runtime."
-        raise ValueError(msg)
+    device_evidence(manifest["device"])
     return copy.deepcopy(dict(manifest))
 
 
@@ -236,10 +235,9 @@ def validate_stage_a_handoff(
     handoff_dir: Path | str,
     *,
     target_config: Mapping[str, Any],
-    device: Mapping[str, Any],
     expected_source_run_name: str | None = None,
 ) -> dict[str, Any]:
-    """Validate immutable snapshot bytes, device, and scientific compatibility."""
+    """Validate immutable snapshot bytes, the recorded source device, and scientific compatibility."""
     path = Path(handoff_dir)
     manifest_path = path / _MANIFEST_FILENAME
     try:
@@ -290,7 +288,5 @@ def validate_stage_a_handoff(
     if dict(compatibility) != compatibility_payload(target_config):
         msg = "Transient handoff is scientifically incompatible with the target configuration."
         raise ValueError(msg)
-    if _device_evidence(manifest["device"]) != _device_evidence(device):
-        msg = "Transient handoff device type or CUDA GPU model does not match the target runtime."
-        raise ValueError(msg)
+    device_evidence(manifest["device"])
     return copy.deepcopy(dict(manifest))

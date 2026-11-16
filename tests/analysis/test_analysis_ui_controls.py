@@ -131,6 +131,17 @@ def test_channel_checks_rebind_keeps_valid_choices_and_names_removed_ones() -> N
         checks.rebind(("T", "T"))
 
 
+def test_channel_checks_rebind_can_name_the_checked_channels_and_int_field_stays_on_the_grid() -> None:
+    checks = controls.ChannelChecks(("T", "phi", "w_gr", "w_int"))
+    assert checks.rebind(("T", "phi", "w_gr", "p"), checked=("w_gr",)) == ("w_int",)
+    assert checks.selected == ("w_gr",)
+    with pytest.raises(ValueError, match="subset"):
+        checks.rebind(("T",), checked=("phi",))
+    field = controls.int_field("fps", value=4, minimum=1, maximum=10)
+    assert (field.value, field.min, field.max) == (4, 1, 10)
+    assert controls.element_width(field) == style.GRID.snap(controls.element_width(field))
+
+
 def test_channel_checks_rebind_detaches_the_removed_checkboxes() -> None:
     checks = controls.ChannelChecks(("T", "phi"))
     calls: list[tuple[str, ...]] = []
@@ -218,8 +229,12 @@ def test_stylesheet_carries_the_decided_layout_rules() -> None:
     assert "white-space: normal" in sheet
     assert "-webkit-appearance: none" in sheet
     assert "text-align: left; }" in sheet
-    assert "position: absolute; left: 0; z-index: 20" in sheet
-    assert f"max-height: {style.POPOVER_MAX_PX}px" in sheet
+    popover_rule = sheet.split(".glp-popover {", 1)[1].split("}", 1)[0]
+    assert "position: relative; z-index: 20; align-self: start; justify-self: start" in popover_rule
+    assert "max-height" not in popover_rule
+    assert "overflow-x: auto; overflow-y: hidden;" in popover_rule
+    choice_rule = sheet.split(".glp-ui .glp-popover .widget-toggle-button", 1)[1].split("}", 1)[0]
+    assert "justify-content: flex-start; text-align: left;" in choice_rule
     assert ".glp-ui.glp-tabw-36 .lm-TabBar-tab" in sheet
     assert "glp-guide" not in sheet
     assert "@" not in sheet

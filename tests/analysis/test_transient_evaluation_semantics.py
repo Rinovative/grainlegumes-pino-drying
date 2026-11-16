@@ -336,20 +336,20 @@ def _arm(
 
 
 def test_matched_a1_b_lineage_uses_common_origin_and_receipt_backed_time() -> None:
-    """Admit committed B/A1 seconds while retaining a distinct A1 identity."""
+    """Admit committed B/A1 supervised transitions while retaining a distinct A1 identity."""
     shared = {"parent_experiment_sha256": "p" * 64}
     a0 = _arm("A0", "stage_a")
     b = replace(
-        _arm("B", "rollout", actual=12.5, planned=10.0),
+        _arm("B", "rollout", actual=21, planned=20),
         **shared,
-        clock_kind="train_seconds",
+        clock_kind="supervised_transitions",
         receipt_sha256="r" * 64,
         a0_handoff_sha256="h" * 64,
     )
     a1 = replace(
-        _arm("A1", "teacher_forced_matched_train_seconds", actual=13.0, planned=12.5),
+        _arm("A1", "teacher_forced_matched_supervised_transitions", actual=22, planned=21),
         **shared,
-        clock_kind="train_seconds",
+        clock_kind="supervised_transitions",
         receipt_sha256="r" * 64,
         a0_handoff_sha256="h" * 64,
     )
@@ -361,38 +361,38 @@ def test_matched_a1_b_lineage_uses_common_origin_and_receipt_backed_time() -> No
     with pytest.raises(ValueError, match="immutable B receipt"):
         comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=b, a1=replace(a1, receipt_sha256="x" * 64))
     with pytest.raises(ValueError, match="receipt-backed committed"):
-        comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=b, a1=replace(a1, planned_post_handoff_compute=12.0, safe_boundary_overrun=1.0))
+        comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=b, a1=replace(a1, planned_post_handoff_compute=20, safe_boundary_overrun=2))
     with pytest.raises(ValueError, match="immutable lineage"):
         comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=b, a1=replace(a1, parent_id="other"))
     with pytest.raises(ValueError, match="completed or diverged"):
         comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=replace(b, budget_complete=False), a1=a1)
 
 
-def _matched_pair(*, b_actual: float, b_planned: float, a1_actual: float) -> tuple[comparison.TrainingArmEvidence, ...]:
-    """Return A0 and the B and A1 arms of one receipt, B with its own measured seconds and A1 planned at them."""
-    shared = {"parent_experiment_sha256": "p" * 64, "clock_kind": "train_seconds", "receipt_sha256": "r" * 64, "a0_handoff_sha256": "h" * 64}
+def _matched_pair(*, b_actual: int, b_planned: int, a1_actual: int) -> tuple[comparison.TrainingArmEvidence, ...]:
+    """Return A0 and the B and A1 arms of one receipt, B with its own committed transitions and A1 planned at them."""
+    shared = {"parent_experiment_sha256": "p" * 64, "clock_kind": "supervised_transitions", "receipt_sha256": "r" * 64, "a0_handoff_sha256": "h" * 64}
     b = replace(_arm("B", "rollout", actual=b_actual, planned=b_planned), **shared)
-    a1 = replace(_arm("A1", "teacher_forced_matched_train_seconds", actual=a1_actual, planned=b_actual), **shared)
+    a1 = replace(_arm("A1", "teacher_forced_matched_supervised_transitions", actual=a1_actual, planned=b_actual), **shared)
     return _arm("A0", "stage_a"), b, a1
 
 
 def test_a_diverged_b_is_admitted_with_its_signed_shortfall_and_reported_by_its_status() -> None:
-    """B diverged at 30 % of 10 s: actual - planned is -7 s, admitted only for a divergence."""
-    a0, b, a1 = _matched_pair(b_actual=3.0, b_planned=10.0, a1_actual=3.1)
+    """B diverged at 30 % of 20 transitions: actual - planned is -14, admitted only for a divergence."""
+    a0, b, a1 = _matched_pair(b_actual=6, b_planned=20, a1_actual=7)
     diverged = replace(b, budget_complete=False, training_status="diverged", budget_progress=0.3)
 
     admitted = comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=diverged, a1=a1)
 
     assert isinstance(admitted.b, comparison.TrainingArmEvidence)
     assert admitted.b.training_status == "diverged"
-    assert admitted.b.safe_boundary_overrun == pytest.approx(-7.0)
+    assert admitted.b.safe_boundary_overrun == -14
     with pytest.raises(ValueError, match="completed or diverged"):
         comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=replace(diverged, training_status="completed"), a1=a1)
 
 
 def test_a_diverged_a0_is_the_common_handoff_and_reported_by_its_status() -> None:
     """A0 diverged at 40 % of its budget with its best eligible checkpoint: it keeps zero post-handoff compute and its handoff."""
-    a0, b, a1 = _matched_pair(b_actual=10.2, b_planned=10.0, a1_actual=10.3)
+    a0, b, a1 = _matched_pair(b_actual=21, b_planned=20, a1_actual=22)
     diverged = replace(a0, budget_complete=False, training_status="diverged", budget_progress=0.4)
 
     admitted = comparison.validate_matched_a1_b_lineage_comparison(a0=diverged, b=b, a1=a1)
@@ -404,7 +404,7 @@ def test_a_diverged_a0_is_the_common_handoff_and_reported_by_its_status() -> Non
 
 def test_an_arm_without_an_eligible_checkpoint_enters_the_comparison_with_its_status_and_no_result() -> None:
     """A B without an eligible checkpoint enters from the shared receipt; its result is unavailable, never a refusal."""
-    a0, _b, a1 = _matched_pair(b_actual=10.2, b_planned=10.0, a1_actual=10.3)
+    a0, _b, a1 = _matched_pair(b_actual=21, b_planned=20, a1_actual=22)
     b = comparison.UnavailableArm(
         arm="B", training_status="no_eligible_checkpoint", budget_progress=1.0, eligible_points=0, receipt_sha256="r" * 64, a0_handoff_sha256="h" * 64
     )
@@ -420,7 +420,7 @@ def test_an_arm_without_an_eligible_checkpoint_enters_the_comparison_with_its_st
 
 
 def test_b_diverging_in_its_first_group_reports_both_statuses_without_results() -> None:
-    """B's receipt holds 0 s; A1 trained none of them and ended without an eligible checkpoint."""
+    """B's receipt holds 0 transitions; A1 trained none and ended without an eligible checkpoint."""
     a0 = _arm("A0", "stage_a")
     shared = {"receipt_sha256": "r" * 64, "a0_handoff_sha256": "h" * 64}
     b = comparison.UnavailableArm(arm="B", training_status="diverged", budget_progress=0.0, eligible_points=0, **shared)

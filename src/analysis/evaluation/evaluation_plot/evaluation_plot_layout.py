@@ -1,214 +1,73 @@
-"""Define shared current-native layout contracts for evaluation field maps.
+"""Define the title, case-count and text helpers shared by evaluation figures.
 
 Responsibilities:
-  - Keep equivalent evaluation maps at one readable notebook-native scale
-  - Keep map colorbars proportionate and consistently padded
-  - Keep comparable map axes equal-sized with row/column-aware axis labels
-  - Size composite line-and-map figures without plot-local magic numbers
-  - Center figure titles over data axes when a right-side column is present
+  - Draw the step ECDF that every distribution figure shares and give every display channel its fixed palette colour
+  - Title figures with exact aggregate case counts or visible case numbers, also per dataset panel
+  - Name the models and the roles of dataset-panel figures in one legend, in their fixed styles
   - Mark panels whose bounded prefix has no finite case as unavailable
-  - Choose the round error bands over a percentile reach, label colour-bar ticks at fixed decimals (a finer
-    step as a multiple of a power of ten in the unit) and write the one colour-scale note and the mean-error line
-    above each error map of a fixed-inch map grid
+  - Write the one colour-scale note under the title and the mean-error line above each error map of a fixed-inch
+    map grid, the mean in the power of ten of its bar
 
 Design principles:
   - Layout is presentation-only and never changes scientific values
-  - Physical aspect ratios remain owned by the plotting axes
-  - One immutable contract serves predictive, physics, sample, and outlier maps
+  - The title, case-count and unavailable-panel helpers serve every evaluation figure, not only field maps
+  - Map geometry, headers and colour bars belong to the shared fixed-inch map grid; this module only adds text to it
 
 This module does NOT:
   - Load artifacts, select cases, calculate statistics, or clip scientific data
-  - Choose colormaps, labels, coordinates, or plot-specific panel composition
+  - Choose map colormaps, labels, coordinates, or plot-specific panel composition
+  - Plan map grids, choose colour-scale bands (``analysis_field_maps``) or label colour bars (``analysis_ui_plot_layout``)
   - Own notebook controls, display calls, exports, or lazy rendering
 """
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
 from numbers import Integral
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.ticker import FuncFormatter
+from matplotlib import colormaps
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
+from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
-from src.analysis.presentation import analysis_field_maps as field_maps
+from src.analysis.ui import analysis_ui_figure_layout as figure_layout
 from src.analysis.ui import analysis_ui_plot_layout as shared_layout
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence, Sized
 
+    import pandas as pd
+    from matplotlib.artist import Artist
     from matplotlib.axes import Axes
-    from matplotlib.cm import ScalarMappable
-    from matplotlib.colorbar import Colorbar
     from matplotlib.figure import Figure
-    from matplotlib.text import Text
+
+    from src.analysis.evaluation import evaluation_presentation as presentation
+    from src.analysis.evaluation.evaluation_plot import evaluation_plot_series as series
+    from src.analysis.presentation import analysis_visual_semantics as visual_semantics
 
 
-@dataclass(frozen=True, slots=True)
-class MapLayoutContract:
-    """Define one consistent notebook-scale physical-map layout."""
-
-    column_width: float = shared_layout.MAP_LAYOUT.column_width
-    row_height: float = shared_layout.MAP_LAYOUT.row_height
-    maximum_width: float = shared_layout.MAP_LAYOUT.maximum_width
-    map_column_spacing: float = 0.18
-    map_row_spacing: float = 0.10
-    colorbar_fraction: float = 0.046
-    colorbar_pad: float = 0.025
-    composite_line_height: float = 3.25
-    composite_vertical_gap: float = 0.25
-    composite_height_ratios: tuple[float, float] = (1.0, 1.35)
-    composite_hspace: float = 0.30
-    composite_group_spacing: float = 0.28
-
-    def figure_size(self, *, rows: int, columns: int) -> tuple[float, float]:
-        """Return a readable size for an all-map grid."""
-        if rows <= 0 or columns <= 0:
-            msg = "Map grids require positive row and column counts."
-            raise ValueError(msg)
-        return min(self.column_width * columns, self.maximum_width), self.row_height * rows
-
-    def composite_size(self, *, map_columns: int) -> tuple[float, float]:
-        """Return size for one line region above one row of maps."""
-        if map_columns <= 0:
-            msg = "Composite figures require at least one map column."
-            raise ValueError(msg)
-        return min(self.column_width * map_columns, self.maximum_width), self.composite_line_height + self.composite_vertical_gap + self.row_height
-
-
-MAP_LAYOUT = MapLayoutContract()
 _NOTE_FROM_TOP_IN = 0.36  # the scale note's top below the figure top: under the 12 pt title of a fixed-inch map grid
 _NOTE_SIZE_PT = 9.0
 _NOTE_COLOUR = "0.20"
-_MINIMUM_TICKS = 2
-MAX_TICK_DECIMALS = 3  # an error bar's finer step moves its power of ten into the unit; a state bar never does (owner 14.11.)
+_EMPTY_PREFIX_GID = "empty-prefix"
+MARK_EVERY = 0.1  # a marker every tenth of the axes diagonal, so dense lines stay readable
+PERCENTILE_SCALE = "5th\N{EN DASH}95th percentile"  # the ends of a state or error scale over its robust range (field_maps.percentile_scale)
 
 
-def error_boundaries(values: np.ndarray, *, signed: bool) -> np.ndarray:
+def add_scale_note(figure: Figure, *, shared: bool = True, scale: str = PERCENTILE_SCALE) -> None:
     """
-    Return the round error bands of the finite error ``values``: from 0 to the round top over their reach, or symmetric about 0 if signed.
+    Write the one colour-scale note under the title of a fixed-inch map grid: what sets the bars' ends and that arrows mark values beyond.
 
-    The reach is the 95th percentile (signed: the larger absolute one of the 5th and 95th). The bands are
-    the round bands of ``shared_layout.rounded_boundaries`` (9 to 13 of m times a power of ten, m in 1, 2, 2.5, 5); a signed
-    scale has an odd count with the neutral band centred on 0 (``shared_layout.symmetric_boundaries``).
-    A map without any error (reach 0) gets the scale of reach 1, so it never degenerates to one colour.
+    ``scale`` names the rule of the ends, the robust percentile range by default; ``shared`` adds that the prediction uses the reference
+    scale. Every map figure whose bars can show an arrow writes it here.
     """
-    scale = field_maps.percentile_scale(values, "signed" if signed else "magnitude")
-    if scale is None:
-        msg = "No round error bands exist for values without a finite error."
-        raise ValueError(msg)
-    reach = scale[1] if scale[1] > 0.0 else 1.0
-    boundaries = shared_layout.symmetric_boundaries(reach) if signed else shared_layout.rounded_boundaries(0.0, reach)
-    if boundaries is None:
-        msg = f"No round error bands exist for a reach of {reach!r}."
-        raise ValueError(msg)
-    # BoundaryNorm sends a value equal to its last boundary to the over colour; an error exactly at the round top belongs to the scale.
-    boundaries[-1] = np.nextafter(boundaries[-1], np.inf)
-    return boundaries
-
-
-def state_boundaries(lower: float, upper: float) -> np.ndarray:
-    """
-    Return the round state boundaries (9 to 13 bands) from ``lower`` that reach ``upper``, never cut short.
-
-    A constant value spans its magnitude (at least 1) upward, so it fills the lowest band of a readable bar. A near-uniform
-    range whose round step is finer than the three decimals a state bar may show is widened to 11 bands of 0.001 about its centre.
-    """
-    top = upper if upper > lower else lower + max(abs(lower), 1.0)
-    boundaries = shared_layout.rounded_boundaries(lower, top, max_decimals=MAX_TICK_DECIMALS)
-    if boundaries is None:
-        return np.linspace(*widened_range(lower, top, MAX_TICK_DECIMALS), field_maps.N_COLOR_BINS + 1)
-    return boundaries
-
-
-def error_ticks(boundaries: np.ndarray, *, signed: bool) -> np.ndarray:
-    """Return the labelled ticks of an error bar: the band boundaries, or for a signed scale the band centres 0, ±w, ±2w ... (w the band width)."""
-    return (boundaries[:-1] + boundaries[1:]) / 2.0 if signed else boundaries
-
-
-@dataclass(frozen=True, slots=True)
-class TickFormat:
-    """The labels of a colour bar: ``decimals`` after the point, the ticks written divided by 10**``exponent`` (the factor stands in the unit)."""
-
-    decimals: int = 1
-    exponent: int = 0
-
-
-def tick_step(ticks: np.ndarray) -> float | None:
-    """Return the smallest step between the ticks (``None`` for fewer than two or equal ones)."""
-    step = float(np.min(np.diff(ticks))) if ticks.size >= _MINIMUM_TICKS else 0.0
-    return step if step > 0.0 else None
-
-
-def tick_format(step: float | None) -> TickFormat:
-    """
-    Return the labels of an error bar whose smallest round tick step is ``step``: exactly the decimals the step needs.
-
-    A step that would need more than three decimals is written as a multiple of its power of ten instead, which the unit
-    names. The error bars are centred on 0; a state bar uses ``state_format`` and never gets a factor.
-    """
-    if step is None:
-        return TickFormat()
-    decimals = shared_layout.step_decimals(step)
-    if decimals <= MAX_TICK_DECIMALS:
-        return TickFormat(decimals)
-    exponent = math.floor(math.log10(step) + 1e-9)
-    return TickFormat(shared_layout.step_decimals(step / 10.0**exponent), exponent)
-
-
-def state_format(steps: Iterable[float | None]) -> TickFormat:
-    """
-    Return the labels of a state bar, which never carries a power of ten: the decimals its frames' round tick steps need, at most three.
-
-    A frame whose step would need more decimals is near-uniform and does not set them (``widened_range`` serves it);
-    ``None`` steps (constant frames) are ignored. Without any frame that fits, the bar gets the three decimals.
-    """
-    needed = [shared_layout.step_decimals(step) for step in steps if step is not None]
-    fitting = [decimals for decimals in needed if decimals <= MAX_TICK_DECIMALS]
-    return TickFormat(max(fitting) if fitting else MAX_TICK_DECIMALS if needed else 1)
-
-
-def is_finer_than_decimals(step: float | None, decimals: int) -> bool:
-    """Return whether a round tick ``step`` is below the unit of the last decimal ``decimals``."""
-    return step is not None and step < 10.0**-decimals * (1.0 - 1e-9)
-
-
-def widened_range(lower: float, upper: float, decimals: int) -> tuple[float, float]:
-    """Return a range widened symmetrically about its centre to 11 steps of 10**-``decimals``, starting on a whole step."""
-    unit = 10.0**-decimals
-    start = round(((lower + upper) / 2.0 - 5.5 * unit) / unit) * unit
-    return start, start + 11.0 * unit
-
-
-def set_fixed_decimal_ticks(colorbar: Colorbar, ticks: np.ndarray, fixed: TickFormat | None = None) -> None:
-    """
-    Label ``colorbar`` at ``ticks`` in the format ``fixed`` (default: the one its own ticks need), with the true minus sign and no "-0".
-
-    A power of ten is written into the unit bracket of the bar's label. A caller that draws several frames passes the format
-    that fits all of them, so the labels and the unit never change between frames.
-    """
-    shown = tick_format(tick_step(ticks)) if fixed is None else fixed
-    colorbar.set_ticks(ticks.tolist())
-    if shown.exponent:
-        colorbar.set_label(shared_layout.label_with_exponent(colorbar.ax.get_ylabel(), shown.exponent))
-    # Rounding first turns a small negative value into +0.0, so no label reads "-0.0".
-    colorbar.ax.yaxis.set_major_formatter(
-        FuncFormatter(
-            lambda value, _position: f"{round(value / 10.0**shown.exponent, shown.decimals) + 0.0:.{shown.decimals}f}".replace("-", "\N{MINUS SIGN}")
-        )
-    )
-
-
-def add_scale_note(figure: Figure, *, shared: bool = True) -> None:
-    """Write the one colour-scale note under the title of a fixed-inch map grid (``shared``: reference scale)."""
     reference = "prediction uses the reference scale; " if shared else ""
     figure.text(
         0.5,
         1.0 - _NOTE_FROM_TOP_IN / figure.get_figheight(),
-        f"Colour scales: 5th\N{EN DASH}95th percentile; {reference}arrows mark values outside",
+        f"Colour scales: {scale}; {reference}arrows mark values outside",
         ha="center",
         va="top",
         fontsize=_NOTE_SIZE_PT,
@@ -216,17 +75,12 @@ def add_scale_note(figure: Figure, *, shared: bool = True) -> None:
     )
 
 
-def error_format(boundaries: np.ndarray | None, *, signed: bool) -> TickFormat:
-    """Return the label format of an error bar over ``boundaries``, the one ``set_fixed_decimal_ticks`` derives from its ticks."""
-    return TickFormat() if boundaries is None else tick_format(tick_step(error_ticks(boundaries, signed=signed)))
-
-
 def mean_error_text(values: np.ndarray | None, *, unit: str | None, exponent: int = 0) -> str:
     """
     Return the mean-error line of one error map: mean |e| of its finite ``values`` in ``unit`` (``None``: normalized), else "n/a".
 
     The mean runs over every finite cell of the field, independent of the display sampling. A bar that writes its labels as
-    multiples of a power of ten (``exponent``, from ``error_format``) gets the mean as a multiple of that same power. The
+    multiples of a power of ten (``exponent``, from ``shared_layout.error_format``) gets the mean as a multiple of that same power. The
     mean keeps three significant digits and is always written positionally, never in e-notation.
     """
     finite = None if values is None else np.asarray(values, dtype=np.float64)[np.isfinite(values)]
@@ -296,143 +150,123 @@ def empty_prefix_text(case_count: int) -> str:
     return f"unavailable (0 finite of {case_count} prefix cases)"
 
 
-def mark_empty_prefix(*axes: Axes, case_count: int) -> None:
-    """Show on every given panel that its bounded prefix has no finite case, instead of drawing or failing."""
+def mark_empty_prefix(*axes: Axes, case_count: int, model: str | None = None) -> None:
+    """
+    Show on every given panel that its bounded prefix has no finite case, instead of drawing or failing.
+
+    With ``model`` the line starts with the model's name; several models of one panel stack their lines.
+    """
+    text = empty_prefix_text(case_count) if model is None else f"{model}: {empty_prefix_text(case_count)}"
     for axis in axes:
-        axis.text(0.5, 0.5, empty_prefix_text(case_count), ha="center", va="center", transform=axis.transAxes)
+        earlier = sum(item.get_gid() == _EMPTY_PREFIX_GID for item in axis.texts)
+        axis.text(0.5, 0.5 - 0.08 * earlier, text, ha="center", va="center", transform=axis.transAxes, gid=_EMPTY_PREFIX_GID)
 
 
-def map_subplots(*, rows: int, columns: int, **kwargs: Any) -> tuple[Figure, Any]:
-    """Create one equal-column map grid under the shared layout contract."""
-    if "figsize" in kwargs or "squeeze" in kwargs or "layout" in kwargs or "gridspec_kw" in kwargs:
-        msg = "Shared map grids own figsize, squeeze, layout, and GridSpec spacing."
-        raise ValueError(msg)
-    return plt.subplots(
-        rows,
-        columns,
-        figsize=MAP_LAYOUT.figure_size(rows=rows, columns=columns),
-        squeeze=False,
-        layout="compressed",
-        gridspec_kw={"wspace": MAP_LAYOUT.map_column_spacing, "hspace": MAP_LAYOUT.map_row_spacing},
-        **kwargs,
+def plot_ecdf(
+    axis: Axes,
+    values: np.ndarray,
+    *,
+    color: object,
+    linestyle: str = "-",
+    marker: str | None = None,
+    label: str | None = None,
+    positive_only: bool = False,
+) -> None:
+    """
+    Draw the empirical CDF i/n of ``values`` (finite, non-empty) as a step line, without smoothing.
+
+    ``positive_only`` leaves the exact zeros off, which a log axis cannot place; they keep their share of the CDF, and at
+    least one value must be positive. The line
+    starts with the rise at the smallest drawn value from the CDF level below it, so a single value is a visible step.
+    """
+    ordered = np.sort(np.asarray(values, dtype=float))
+    step = 1.0 / ordered.size
+    cumulative = np.arange(1, ordered.size + 1, dtype=float) * step
+    if positive_only:
+        ordered, cumulative = ordered[ordered > 0.0], cumulative[ordered > 0.0]
+    start = cumulative[0] - step  # 0, or the share of the exact zeros left off
+    axis.step(
+        np.r_[ordered[0], ordered],
+        np.r_[start, cumulative],
+        where="post",
+        color=color,
+        linestyle=linestyle,
+        linewidth=2.0,
+        marker=marker,
+        markevery=MARK_EVERY,
+        label=label,
     )
 
 
-def add_map_colorbar(
+def channel_colors(fields: Iterable[presentation.DisplayField]) -> dict[str, tuple[float, float, float, float]]:
+    """Return the fixed colour of every display channel by field key, in display order: a channel keeps it whichever channels are drawn."""
+    palette = colormaps["tab10"]
+    return {field.key: palette(index % palette.N) for index, field in enumerate(fields)}
+
+
+def dataset_title_context(title: str, groups: Mapping[str, Mapping[str, str]], counts: Mapping[str, int]) -> tuple[str, dict[str, str]]:
+    """
+    Return ``aggregate_title_context`` for the dataset panels of ``groups`` (``series.panel_groups``).
+
+    ``counts`` is by frame key; a dataset panel counts the cases of its first model's frame, as the models of one dataset are case-matched.
+    """
+    return aggregate_title_context(title, {dataset: counts[next(iter(models.values()))] for dataset, models in groups.items()})
+
+
+def series_note(styles: series.SeriesStyles, *notes: str | None) -> str | None:
+    """Join the given figure notes, adding «colour = run» when the figure's styles colour by run, not by architecture; ``None`` without any."""
+    lines = [note for note in notes if note]
+    if styles.run_colours:
+        lines.append("colour = run")
+    return "\n".join(lines) or None
+
+
+def add_series_legend(
     figure: Figure,
-    image: ScalarMappable,
-    axis: Axes,
+    axes: np.ndarray,
+    frames: Mapping[str, pd.DataFrame],
+    groups: Mapping[str, Mapping[str, str]],
+    styles: Mapping[str, visual_semantics.SeriesStyle],
     *,
-    label: str | None = None,
-    colorbar_axis: Axes | None = None,
-) -> Colorbar:
-    """Attach one proportionate colorbar under the shared sizing contract."""
-    if colorbar_axis is None:
-        colorbar = figure.colorbar(image, ax=axis, fraction=MAP_LAYOUT.colorbar_fraction, pad=MAP_LAYOUT.colorbar_pad)
-    else:
-        colorbar = figure.colorbar(image, cax=colorbar_axis)
-    if label is not None:
-        colorbar.set_label(label)
-    return colorbar
-
-
-def _map_axis_grid(axes: Iterable[Iterable[Axes]]) -> tuple[tuple[Axes, ...], ...]:
-    """Normalize and validate one rectangular map-axis grid."""
-    rows = tuple(tuple(row) for row in axes)
-    if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
-        msg = "Map-axis grids must be non-empty and rectangular."
-        raise ValueError(msg)
-    return rows
-
-
-def apply_map_grid_axis_labels(
-    axes: Iterable[Iterable[Axes]],
-    *,
-    x_label: str,
-    y_label: str,
+    bars: bool = False,
+    extra: Mapping[str, Mapping[str, Artist]] | None = None,
+    name_models: bool = True,
+    name_roles: bool = True,
 ) -> None:
     """
-    Apply coordinate and tick labels only at visible map-grid edges.
+    Write the legend of ``axes`` naming the models and, where panels differ in role, the roles; ``extra`` adds titled entry groups first.
 
-    Parameters
-    ----------
-    axes : Iterable[Iterable[Axes]]
-        Rectangular rows of map axes. Invisible or disabled axes are ignored.
-    x_label : str
-        Label applied to active maps in the global bottom row.
-    y_label : str
-        Label applied to active maps in the global leftmost column.
-
-    Raises
-    ------
-    ValueError
-        If the map grid is empty or not rectangular.
-
-    Notes
-    -----
-    Tick positions are preserved. Repeated tick-label artists are hidden without
-    changing map extents, and a standalone active map keeps complete axes.
-
+    A model gets one entry in the colour of its run, a solid line or a patch for ``bars``, only when several models are drawn (one
+    model is told by the panel titles) and ``name_models`` holds; a figure that colours something else drops it.
+    Roles get a second group with one grey entry per role, in its line style or hatch, only when the panels differ in role, so no
+    panel's role stands for the others; ``name_roles`` is off for scatter figures, whose points show no line style or hatch.
+    Without any entry (a single model of a single role) no legend is
+    written. A single titled group keeps its title also inside a single panel.
     """
-    rows = _map_axis_grid(axes)
-    active = tuple(tuple(axis.get_visible() and axis.axison for axis in row) for row in rows)
-    bottom_row = len(rows) - 1
-    for row, axis_row in enumerate(rows):
-        for column, axis in enumerate(axis_row):
-            if not active[row][column]:
-                continue
-            is_bottom = row == bottom_row
-            is_left = column == 0
-            axis.set_xlabel(x_label if is_bottom else "")
-            axis.set_ylabel(y_label if is_left else "")
-            axis.tick_params(axis="x", labelbottom=is_bottom)
-            axis.tick_params(axis="y", labelleft=is_left)
+    first: dict[str, str] = {}
+    roles: dict[str, visual_semantics.SeriesStyle] = {}
+    for by_model in groups.values():
+        for model, key in by_model.items():
+            first.setdefault(model, key)
+            roles.setdefault(dataframe.dataset_role(frames[key]), styles[key])
+    entries: dict[str, Artist] = {}
+    named: dict[str, list[str]] = {}
+    for title, group in (extra or {}).items():
+        entries |= group
+        named[title] = list(group)
 
+    def artist(color: str, linestyle: visual_semantics.LineStyle, hatch: str, *, role: bool) -> Artist:
+        if bars:
+            return Patch(facecolor="white" if role else color, edgecolor="0.35" if role else "white", hatch=hatch)
+        return Line2D([0], [0], color=color, linestyle=linestyle, linewidth=2.0)
 
-def _center_text_artist(figure: Figure, artist: Text, plot_axes: tuple[Axes, ...]) -> None:
-    """Keep one text artist centered over its visible plotting axes."""
-
-    def center_artist(_event: object = None) -> None:
-        """Follow final Matplotlib positions without forcing an eager draw."""
-        positions = [axis.get_position() for axis in plot_axes if axis.get_visible()]
-        if positions:
-            left = min(position.x0 for position in positions)
-            right = max(position.x1 for position in positions)
-            artist.set_x((left + right) / 2.0)
-
-    center_artist()
-    figure.canvas.mpl_connect("draw_event", center_artist)
-
-
-def title_over_axes(
-    figure: Figure,
-    title: str,
-    axes: Iterable[Axes],
-    **kwargs: Any,
-) -> Text:
-    """Keep one figure title centered over its data axes after layout."""
-    plot_axes = tuple(axes)
-    if not plot_axes:
-        msg = "Title centering requires at least one plotting axis."
-        raise ValueError(msg)
-    title_artist = figure.suptitle(title, **kwargs)
-    _center_text_artist(figure, title_artist, plot_axes)
-    return title_artist
-
-
-def text_over_axes(
-    figure: Figure,
-    text: str,
-    axes: Iterable[Axes],
-    *,
-    y: float,
-    **kwargs: Any,
-) -> Text:
-    """Place figure-level explanatory text above and centered on data axes."""
-    plot_axes = tuple(axes)
-    if not plot_axes:
-        msg = "Explanatory-text centering requires at least one plotting axis."
-        raise ValueError(msg)
-    text_artist = figure.text(0.5, y, text, **kwargs)
-    _center_text_artist(figure, text_artist, plot_axes)
-    return text_artist
+    if name_models and len(first) > 1:
+        entries |= {model: artist(styles[key].color, "-", "", role=False) for model, key in first.items()}
+        named["Model"] = list(first)
+    if name_roles and len(roles) > 1:
+        entries |= {role: artist("0.35", style.linestyle, style.hatch, role=True) for role, style in roles.items()}
+        named["Role"] = list(roles)
+    if entries:
+        figure_layout.add_legend(
+            figure, axes, list(entries.values()), list(entries), title=next(iter(named)) if len(named) == 1 else None, groups=named
+        )

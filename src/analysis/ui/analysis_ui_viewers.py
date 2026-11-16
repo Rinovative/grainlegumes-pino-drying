@@ -79,8 +79,8 @@ def _require_slot(view: panel.ViewPanel) -> panel.PlotSlot:
 
 
 def _items(result: Any) -> list[Any]:
-    """Return the items of a plot result: the non-``None`` items of a tuple in their order, else the result itself."""
-    return [item for item in (result if isinstance(result, tuple) else (result,)) if item is not None]
+    """Return the items of a plot result: the non-``None`` items of a list or tuple in order, else the result itself unless ``None``."""
+    return [item for item in (result if isinstance(result, (list, tuple)) else (result,)) if item is not None]
 
 
 def _close_figures(outcome: _Outcome) -> None:
@@ -99,12 +99,13 @@ def _show_failure(view: panel.ViewPanel, error: BaseException, export: _Export) 
 
 
 def _show_items(view: panel.ViewPanel, items: list[Any], export: _Export) -> None:
-    """Export the first figure of ``items``, show every item in order in the plot slot, then clear a shown failure."""
-    figure = next((item for item in items if isinstance(item, Figure)), None)
+    """Export the first figure as ``fig`` and every figure as ``figures``, show every item in order in the plot slot, then clear a shown failure."""
+    figures = tuple(item for item in items if isinstance(item, Figure))
+    figure = figures[0] if figures else None
     if export.state is not None:
         if export.state.get("fig") is not figure:
             ui_controls.release_export(export.state)
-        export.state.update(fig=figure, figures=() if figure is None else (figure,), plot_name=export.plot_name, title=export.title)
+        export.state.update(fig=figure, figures=figures, plot_name=export.plot_name, title=export.title)
     try:
         _require_slot(view).show(items)
     finally:
@@ -147,10 +148,10 @@ def render_view(
     """
     Invoke ``plot_func`` and show its result in the plot slot of ``view``; only the newest request publishes (rule 3).
 
-    The result is one displayable item (a Matplotlib figure, a widget, a table, a string) or a tuple of items, shown in
-    their order without the ``None`` entries. The first figure becomes the export target; every figure is closed after
-    display. A failure of ``plot_func`` or of the publication replaces the plot with the failure display and releases
-    the export target; a later successful render gives the plot its place back.
+    The result is one displayable item (a Matplotlib figure, a widget, a table, a string) or a list or tuple of items,
+    shown in their order without the ``None`` entries. The first figure becomes the export target and all figures the
+    export bundle; every figure is closed after display. A failure of ``plot_func`` or of the publication replaces the
+    plot with the failure display and releases the export target; a later successful render gives the plot its place back.
 
     The request supersedes every earlier one before ``plot_func`` runs, so a request made while it runs wins. Returns
     whether the result was published: False when a newer request, hiding the view, or the end of its host's render
@@ -165,6 +166,19 @@ def render_view(
     except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
         outcome = _Failure(error)
     return _publish(view, generation, outcome, export)
+
+
+def show_result(
+    view: panel.ViewPanel,
+    result: Any,
+    *,
+    export_state: dict[str, Any] | None = None,
+    export_plot_name: str | None = None,
+    export_title: str | None = None,
+) -> bool:
+    """Supersede pending renders and show an already computed ``result`` in the plot slot of ``view`` like ``render_view``."""
+    _require_slot(view)
+    return _publish(view, view.supersede(), _items(result), _Export(export_state, export_plot_name, export_title))
 
 
 def clear_view(
@@ -213,9 +227,9 @@ def _observe_control(control: ViewControl, callback: Callable[[], None]) -> None
         raise TypeError(message)
 
 
-def _labelled_frames(datasets: Mapping[Hashable, pd.DataFrame], *, kind: str) -> dict[Hashable, pd.DataFrame]:
-    """Return the datasets as a dict and refuse an empty mapping or an empty frame."""
-    frames = dict(datasets)
+def _labelled_frames(datasets: Mapping[Hashable, pd.DataFrame], *, kind: str) -> Mapping[Hashable, pd.DataFrame]:
+    """Return the datasets, a plain dict copied and any other mapping (an immutable one carrying labels) kept, refusing empty input."""
+    frames = dict(datasets) if isinstance(datasets, dict) else datasets
     if not frames or any(frame.empty for frame in frames.values()):
         message = f"{kind} views require non-empty labelled datasets."
         raise ValueError(message)
@@ -229,16 +243,19 @@ def _require_separate_selector(selector: DatasetSelector | None, frames: Mapping
     if selector.pool_enabled:
         message = "Case viewers draw separate datasets; build their DatasetSelector with a pool_reason."
         raise ValueError(message)
+    if not isinstance(frames, dict):
+        message = "A dataset selector re-keys the frames by dataset label and would drop their display labels; pass a plain dict."
+        raise TypeError(message)
     missing = [item.key for item in selector.inventory.items if item.key not in frames]
     if missing:
         message = f"The dataset selector offers keys without a frame: {missing!r}."
         raise ValueError(message)
 
 
-def _selected_frames(frames: Mapping[Hashable, pd.DataFrame], selector: DatasetSelector | None) -> dict[Hashable, pd.DataFrame]:
-    """Return every frame, or the selected ones keyed by their dataset label."""
+def _selected_frames(frames: Mapping[Hashable, pd.DataFrame], selector: DatasetSelector | None) -> Mapping[Hashable, pd.DataFrame]:
+    """Return every frame as given (a plain dict copied), or the selected ones keyed by their dataset label (a plain dict)."""
     if selector is None:
-        return dict(frames)
+        return dict(frames) if isinstance(frames, dict) else frames
     return {choice.label: frames[choice.items[0].key] for choice in selector.choices() if choice.available}
 
 

@@ -83,7 +83,8 @@ def _install_stage_fakes(monkeypatch: pytest.MonkeyPatch, *, fail_arm: str | Non
     monkeypatch.setattr(run_service, "_run_resolved_experiment", fake_execute)
     monkeypatch.setattr(run_service, "validate_completed_run", fake_validate_completed)
     monkeypatch.setattr(run_service, "_validate_reusable_stage_a", fake_handoff_check)
-    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: {"test": "receipt"})
+    # A1's device check reads the receipt's device: the synthetic plans run on the CPU.
+    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: {"test": "receipt", "device": {"device_type": "cpu", "cuda_device_name": None}})
     monkeypatch.setattr(budget, "publish_b_receipt", lambda *_args: None)
     monkeypatch.setattr(budget, "load_b_receipt", lambda *_args, **_kwargs: {"test": "receipt"})
     return executions, handoff_checks

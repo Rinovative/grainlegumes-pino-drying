@@ -86,7 +86,7 @@ def _uniform_darcy_flow() -> tuple[torch.Tensor, torch.Tensor, tuple[str, ...], 
     y_grid = inputs[:, input_fields.index("y")]
     gradient = _INLET_PRESSURE / 1.0
     outputs[:, output_fields.index("p")] = _INLET_PRESSURE * (1.0 - y_grid)
-    outputs[:, output_fields.index("v")] = _PERMEABILITY * gradient / domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY
+    outputs[:, output_fields.index("v")] = _PERMEABILITY * gradient / domain.physics.contracts.AIR_DYNAMIC_VISCOSITY
     return inputs, outputs, input_fields, output_fields
 
 
@@ -100,7 +100,7 @@ def test_uniform_darcy_flow_satisfies_every_term_exactly() -> None:
     """
     inputs, outputs, input_fields, output_fields = _uniform_darcy_flow()
     diagnostics = _evaluate(inputs, outputs, input_fields, output_fields)
-    velocity_scale = _PERMEABILITY * _INLET_PRESSURE / domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY
+    velocity_scale = _PERMEABILITY * _INLET_PRESSURE / domain.physics.contracts.AIR_DYNAMIC_VISCOSITY
 
     assert diagnostics.momentum.x.shape == outputs[:, 0].shape
     assert diagnostics.flux_balance.shape == outputs[:, 0, :, 0].shape
@@ -153,7 +153,7 @@ def test_scales_use_each_samples_geometric_permeability_pressure_and_extents() -
 
     scales = _evaluate(inputs, outputs, task.input_names, task.output_names).scales
 
-    viscosity = domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY
+    viscosity = domain.physics.contracts.AIR_DYNAMIC_VISCOSITY
     expected_pressure, expected_gradient, expected_velocity, expected_flux = [], [], [], []
     for sample in range(2):
         pressure = inlet_pressure[sample, 0].mean().item()
@@ -211,7 +211,7 @@ def test_linear_state_matches_analytic_brinkman_residuals() -> None:
     outputs[:, output_fields.index("u")] = velocity_scale * x_grid
     outputs[:, output_fields.index("v")] = -velocity_scale * y_grid
     diagnostics = _evaluate(inputs, outputs, input_fields, output_fields)
-    viscosity = domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY
+    viscosity = domain.physics.contracts.AIR_DYNAMIC_VISCOSITY
     expected_x = -torch.ones_like(x_grid) - viscosity * velocity_scale * x_grid
     expected_y = -2.0 * torch.ones_like(y_grid) + viscosity * velocity_scale * y_grid
     rows = y_grid[:, :, 0]
@@ -254,7 +254,7 @@ def test_anisotropic_permeability_drag_matches_the_inverse_tensor() -> None:
         [[permeability_xx, cross_permeability], [cross_permeability, permeability_yy]],
         dtype=torch.float64,
     )
-    expected = -pressure_gradient - domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY * torch.linalg.inv(tensor) @ velocity
+    expected = -pressure_gradient - domain.physics.contracts.AIR_DYNAMIC_VISCOSITY * torch.linalg.inv(tensor) @ velocity
 
     assert torch.allclose(diagnostics.momentum.x, torch.full_like(x_grid, expected[0].item()), rtol=1e-9, atol=1e-9)
     assert torch.allclose(diagnostics.momentum.y, torch.full_like(y_grid, expected[1].item()), rtol=1e-9, atol=1e-9)
@@ -301,7 +301,7 @@ def test_viscous_stress_matches_the_comsol_brinkman_stress() -> None:
         0.2,
         0.125,
     )
-    viscosity = domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY
+    viscosity = domain.physics.contracts.AIR_DYNAMIC_VISCOSITY
     expected_x = viscosity * (0.5 * (4.0 * y_grid - 2.0 * x_grid) / 3.0 + inverse_porosity / 3.0 - velocity)
     expected_y = viscosity * (0.5 * (x_grid + y_grid) + inverse_porosity / 3.0 - velocity)
     # One-sided edge stencils are inexact for quadratics; two cells inward only central ones remain.
@@ -320,7 +320,7 @@ def test_viscosity_matches_comsol_air_at_flow_reference_temperature() -> None:
     coefficients = (-8.38278e-7, 8.35717342e-8, -7.69429583e-11, 4.6437266e-14, -1.06585607e-17)
     comsol_viscosity = sum(coefficient * temperature**power for power, coefficient in enumerate(coefficients))
 
-    assert pytest.approx(comsol_viscosity, rel=1e-5) == domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY
+    assert pytest.approx(comsol_viscosity, rel=1e-5) == domain.physics.contracts.AIR_DYNAMIC_VISCOSITY
 
 
 def test_scales_reject_a_missing_inlet_pressure() -> None:

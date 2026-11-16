@@ -22,6 +22,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 import numpy as np
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
     from src.analysis.presentation import analysis_display_grid as display_grid
+    from src.analysis.presentation.analysis_visual_semantics import SeriesStyle
 
     type Action = Callable[[], None]
 
@@ -58,6 +60,15 @@ _CASE_COUNT_STEP: Final = 50
 def _export(export_state: dict[str, Any] | None, export_plot_name: str | None, export_title: str | None) -> dict[str, Any]:
     """Return the export identity arguments of the render helpers."""
     return {"export_state": export_state, "export_plot_name": export_plot_name, "export_title": export_title}
+
+
+def _dataset_styles(catalog: selection.GeneratedOutputEDACatalog) -> dict[str, SeriesStyle]:
+    """Resolve line color, style and hatch of every dataset of the catalog, so a dataset keeps its style whatever the selection."""
+    materials = {
+        view.label: view.batch.material_family if isinstance(view, selection.GeneratedOutputEDAView) else view.material_family
+        for view in catalog.views
+    }
+    return plots.transient.batch_styles(materials)
 
 
 def _surface(
@@ -93,8 +104,11 @@ class _Channels:
         selection_state: selection.GeneratedOutputSelectionState,
         capability: str,
         status: ui.controls.StatusLine,
+        *,
+        default: Sequence[str] = (),
     ) -> None:
-        """Create the hidden row."""
+        """Create the hidden row; ``default`` names the channels checked at the first offer, when none was chosen yet."""
+        self._default = tuple(default)
         self._state = selection_state
         self._capability = capability
         self._status = status
@@ -113,7 +127,8 @@ class _Channels:
     def rebind(self, options: Sequence[str], labels: Mapping[str, str]) -> None:
         """Offer ``options``, keep the still valid retained choice, and name removed channels on the status line."""
         retained = self._state.channel_selection(self._capability)
-        removed = self.checks.rebind(options, labels=labels, retained=retained or ())
+        first = [name for name in self._default if name in options] if retained is None else []
+        removed = self.checks.rebind(options, labels=labels, retained=retained or (), checked=first or None)
         self._state.select_channels(self._capability, self.checks.selected)
         ui.controls.set_visible(self.checks.widget, True)
         if removed:
@@ -287,6 +302,7 @@ def make_statistics_view(
     )
     export = _export(export_state, export_plot_name, export_title)
     view, guarded = _surface(local, (), export)
+    styles = _dataset_styles(catalog)
     nested: ui.panel.ViewPanel | None = None
 
     @guarded
@@ -303,7 +319,7 @@ def make_statistics_view(
         def build() -> widgets.Widget:
             # The viewer publishes its own figures to the export state while the render of this view that built it is
             # current, so hiding or rebuilding this view supersedes its renders, those of its own construction included.
-            built.append(plot_function(datasets=frames, host=view, **carried, **export))
+            built.append(plot_function(datasets=frames, styles=styles, host=view, **carried, **export))
             return built[0].widget
 
         if ui.viewers.render_view(view, build) and built:  # a failed build published its failure and left nothing to keep
@@ -337,6 +353,7 @@ def make_spectral_view(
     count = _CaseCount(local.selected_views()) if aggregate_plot_function is not None else None
     scope = _scope_group(selection_state, "spectral") if count is not None else None
     semantic = dict(semantic_controls or {})
+    styles = _dataset_styles(catalog)
     channels = _Channels("Spectral channels", selection_state, "spectral", local.status)
     selection_row = [case.widget] if count is None or scope is None else [scope, count.control.widget, case.widget]
     rows = [ui.panel.row(*selection_row), ui.panel.row(channels.checks.widget)]
@@ -371,6 +388,8 @@ def make_spectral_view(
                 return
             plot_function = single_plot_function
             plot_kwargs = {"datasets": frames, "case_number": case_number, "channels": selected_channels, **semantic_values}
+        if "styles" in inspect.signature(plot_function).parameters:  # the evolution maps are color-mapped and draw no dataset lines
+            plot_kwargs["styles"] = styles
         ui.viewers.render_view(view, plot_function, kwargs=plot_kwargs, **export)
 
     def update_scope_row() -> None:
@@ -546,8 +565,9 @@ def _make_transient_snapshot_view(
     )
     export = _export(export_state, export_plot_name, export_title)
     scale_lock = _scale_lock(selection_state, preference_key="transient_snapshot_maps")
+    styles = _dataset_styles(catalog)
     time_axis = _TimeAxis(selection_state, "transient_snapshot", local.status)
-    channels = _Channels("State and conditioning fields", selection_state, "transient_snapshot_fields", local.status)
+    channels = _Channels("State and conditioning fields", selection_state, "transient_snapshot_fields", local.status, default=("T", "phi", "w_gr"))
     rows = [
         ui.panel.row(local.case.widget),
         ui.panel.row(channels.checks.widget),
@@ -585,6 +605,7 @@ def _make_transient_snapshot_view(
                 "case_ids": case_ids,
                 "physical_time_hours": time_axis.physical_time,
                 "channels": selected_channels,
+                "styles": styles,
                 "lock_scale": bool(scale_lock.value),
             },
             **export,
@@ -645,6 +666,7 @@ def _make_transient_trajectory_view(
     export = _export(export_state, export_plot_name, export_title)
     count = _CaseCount(local.selected_views())
     scope = _scope_group(selection_state, "transient_trajectories")
+    styles = _dataset_styles(catalog)
     channels = _Channels("Transient state channels", selection_state, "transient_trajectory_fields", local.status)
     rows = [ui.panel.row(scope, count.control.widget, local.case.widget), ui.panel.row(channels.checks.widget)]
     view, guarded = _surface(local, rows, export)
@@ -665,14 +687,14 @@ def _make_transient_trajectory_view(
         plot_function: Callable[..., Figure]
         if scope.value == "aggregate":
             plot_function = plots.transient.plot_state_trajectory_summary
-            kwargs: dict[str, Any] = {"datasets": frames, "max_cases": count.value, "channels": selected_channels}
+            kwargs: dict[str, Any] = {"datasets": frames, "max_cases": count.value, "channels": selected_channels, "styles": styles}
         else:
             case_ids = local.selected_case_ids()
             if not case_ids:
                 ui.viewers.clear_view(view, "Selected transient datasets have no shared case number.", **export)
                 return
             plot_function = plots.transient.plot_state_trajectory_comparison
-            kwargs = {"datasets": frames, "case_ids": case_ids, "channels": selected_channels}
+            kwargs = {"datasets": frames, "case_ids": case_ids, "channels": selected_channels, "styles": styles}
         ui.viewers.render_view(view, plot_function, kwargs=kwargs, **export)
 
     def update_scope_row() -> None:
@@ -757,6 +779,7 @@ def make_completion_target_view(
     )
     export = _export(export_state, export_plot_name, export_title)
     view, guarded = _surface(local, (), export)
+    styles = _dataset_styles(catalog)
 
     @guarded
     def render() -> None:
@@ -765,7 +788,7 @@ def make_completion_target_view(
         if not frames:
             ui.viewers.clear_view(view, "Select at least one compatible transient dataset.", **export)
             return
-        ui.viewers.render_view(view, plots.transient.plot_completion_target_analysis, kwargs={"datasets": frames}, **export)
+        ui.viewers.render_view(view, plots.transient.plot_completion_target_analysis, kwargs={"datasets": frames, "styles": styles}, **export)
 
     local.set_callback(render)
     local.activate()

@@ -32,24 +32,23 @@ if TYPE_CHECKING:
     from typing import Any
 
 
-def _blue_numeric_styles(table: pd.DataFrame, *, shade_constant: bool) -> pd.DataFrame:
-    """Return quantile-bounded blue fills for finite numeric cells, column-local."""
+def _blue_numeric_styles(table: pd.DataFrame, *, shade_constant: bool, columns: Sequence[str] | None = None) -> pd.DataFrame:
+    """Return quantile-bounded blue fills for the finite numeric cells of ``columns`` (default: all), column-local."""
     styles = pd.DataFrame("", index=table.index, columns=table.columns)
     colormap = plt.get_cmap("Blues")
-    for column in table.columns:
+    for column in table.columns if columns is None else columns:
         numeric = np.asarray(pd.to_numeric(table[column], errors="coerce"), dtype=float)
         finite = numeric[np.isfinite(numeric)]
         if finite.size == 0:
             continue
         lower, upper = np.quantile(finite, (0.05, 0.95))
-        if np.isclose(lower, upper) and not shade_constant:
+        constant = bool(np.isclose(lower, upper, atol=0.0))  # relative only: a column of tiny values still varies
+        if constant and not shade_constant:
             continue
         for row, value in enumerate(numeric):
             if not np.isfinite(value):
                 continue
-            if np.isclose(lower, upper):
-                continue
-            fraction = float(np.clip((value - lower) / (upper - lower), 0.0, 1.0))
+            fraction = 0.0 if constant else float(np.clip((value - lower) / (upper - lower), 0.0, 1.0))
             red, green, blue, _alpha = colormap(0.05 + 0.90 * fraction)
             column_index = cast("int", styles.columns.get_loc(column))
             styles.iloc[row, column_index] = f"background-color: rgba({int(red * 255)}, {int(green * 255)}, {int(blue * 255)}, 0.55)"
@@ -170,6 +169,7 @@ def styled_dataframe(
     shade_constant: bool = True,
     row_local: bool = False,
     heading_level: int = 2,
+    shade_columns: Sequence[str] | None = None,
 ) -> widgets.VBox:
     """
     Render one analysis table using the maintained blue numeric style.
@@ -190,6 +190,9 @@ def styled_dataframe(
         coloring.
     heading_level : int, optional
         HTML heading level, from 2 through 4, used for the table title.
+    shade_columns : Sequence[str], optional
+        Fill only these columns, each against its own values; the default fills every numeric column. Not combined with
+        ``row_local``.
 
     Returns
     -------
@@ -206,6 +209,9 @@ def styled_dataframe(
     if heading_level not in {2, 3, 4}:
         message = "Styled analysis table headings must use HTML level 2, 3, or 4."
         raise ValueError(message)
+    if shade_columns is not None and row_local:
+        message = "shade_columns applies to column-local fills and cannot be combined with row_local."
+        raise ValueError(message)
     display_table = table.copy(deep=True)
     styles = (
         row_local_style_matrix(
@@ -216,6 +222,7 @@ def styled_dataframe(
         else _blue_numeric_styles(
             display_table,
             shade_constant=shade_constant,
+            columns=shade_columns,
         )
     )
 
@@ -246,6 +253,7 @@ def grouped_styled_dataframes(
     format_spec: str = "{:.4g}",
     shade_constant: bool = True,
     row_local: bool = False,
+    shade_columns: Sequence[str] | None = None,
 ) -> widgets.VBox:
     """
     Render category-grouped tables in compact responsive rows.
@@ -258,7 +266,7 @@ def grouped_styled_dataframes(
         Shared heading rendered once above all groups.
     columns : int, optional
         Maximum number of tables placed beside one another.
-    format_spec, shade_constant, row_local
+    format_spec, shade_constant, row_local, shade_columns
         Styling options forwarded unchanged to each grouped table.
 
     Returns
@@ -282,6 +290,7 @@ def grouped_styled_dataframes(
             shade_constant=shade_constant,
             row_local=row_local,
             heading_level=3,
+            shade_columns=shade_columns,
         )
         for group_title, table in selected
     )

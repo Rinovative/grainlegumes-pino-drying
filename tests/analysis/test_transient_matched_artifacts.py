@@ -1,4 +1,4 @@
-"""Bind matched transient artifacts to the real A0 parent and B time receipt.
+"""Bind matched transient artifacts to the real A0 parent and B supervised-transition receipt.
 
 Responsibilities:
   - Check semantic parent digests, distinct A1 lineage, and live budget-receipt admission
@@ -36,14 +36,22 @@ if TYPE_CHECKING:
     )
 
 
-def _seconds_budget(total: float, spent: float) -> dict[str, Any]:
-    """Return one completed B or A1 budget on the optimisation clock."""
-    return {"unit": "train_seconds", "total": total, "units": 6, "train_seconds": spent, "validated_point": 20, "skipped_points": []}
+def _transition_budget(total: int, spent: int) -> dict[str, Any]:
+    """Return one completed B or A1 budget in supervised transitions."""
+    return {
+        "unit": "supervised_transitions",
+        "total": total,
+        "units": 6,
+        "supervised_transitions": spent,
+        "train_seconds": 2.5,
+        "validated_point": 20,
+        "skipped_points": [],
+    }
 
 
 def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     output_root = tmp_path / "outputs"
-    pair = "b-a1__budget-12p5s__rollout-1__lr-1"
+    pair = "b-a1__rollout-1__lr-1"
     group = output_root / "transient_drying" / "dataset" / "matched" / "fno_m2x2_h4_l1" / "seed-9__ep-3__k-2__sch-cosine"
     branch = group / pair
     runs = {"a0": group / "a0", "b": branch / "b", "a1": branch / "a1"}
@@ -86,7 +94,7 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
                 "material_ood_datasets": [],
             },
             "input_profile": "profile",
-            "temporal": {"temporal_conditioning": "time"},
+            "temporal": {"temporal_conditioning": {"kind": "normalized_current_time"}},
             "model": {"kind": "fno", "params": {"n_modes": [2, 2], "hidden_channels": 4, "n_layers": 1}},
             "evaluation": {"objective": {"id": "objective"}},
             "training": {
@@ -132,9 +140,10 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
     manifest.write_text(json.dumps({"source_run_name": "a0", "files": {"checkpoint": {"sha256": "a" * 64}}}), encoding="utf-8")
     b_summary = {
         "status": "completed",
+        "runtime_sessions": [{"device_type": "cuda", "cuda_device_name": "NVIDIA RTX 6000 Ada Generation"}],
         "terminal_controller": {"post_handoff_optimizer_steps": 4},
         "training_outcome": {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None},
-        "terminal_budget": _seconds_budget(10.0, 12.5),
+        "terminal_budget": _transition_budget(10, 12),
         "terminal_epoch": 2,
         "best_epoch": 2,
         "best_checkpoint_sha256": "b" * 64,
@@ -151,7 +160,7 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
     parent = {"source_run_name": "a0", "source_checkpoint_sha256": "a" * 64}
     completed: dict[str, dict[str, Any]] = {}
     for arm in ("b", "a1"):
-        planned, actual = (10.0, 12.5) if arm == "b" else (12.5, 13.0)
+        planned, actual = (10, 12) if arm == "b" else (12, 13)
         controller = {
             "arm": arm.upper(),
             "stage": "stage_b_self_fed" if arm == "b" else "stage_a_teacher_forcing",
@@ -170,7 +179,7 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
                 **({"terminal_curriculum": {"stage": 1}} if arm == "b" else {}),
                 "training_outcome": {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None},
             },
-            "last_checkpoint": {"adapter_state_dict": {"controller": controller}, "budget_state_dict": _seconds_budget(planned, actual)},
+            "last_checkpoint": {"adapter_state_dict": {"controller": controller}, "budget_state_dict": _transition_budget(planned, actual)},
             "selected_checkpoint_sha256": "b" * 64 if arm == "b" else "d" * 64,
             "selected_checkpoint_epoch": 2,
             "normalizer_sha256": "e" * 64,
@@ -215,7 +224,7 @@ def test_a1_lineage_preserves_distinct_arm_and_actual_b_receipt(tmp_path: Path, 
     assert (b["curriculum_identity"], a1["curriculum_identity"]) == ({"stage": 1}, None)
     assert b["matched_compute_manifest"]["b_train_budget_receipt"] == receipt
     assert a1["matched_compute_manifest"]["b_train_budget_receipt"] == receipt
-    assert a1["training_strategy"] == "teacher_forced_matched_train_seconds"
+    assert a1["training_strategy"] == "teacher_forced_matched_supervised_transitions"
     assert b["parent_checkpoint"] == a1["parent_checkpoint"]
 
     changed = deepcopy(completed["a1"])
@@ -271,7 +280,7 @@ def test_cached_a1_lineage_rechecks_live_immutable_receipt(tmp_path: Path, monke
             completed=a1,
             role=role,
         )
-    loaded.provenance["lineage"]["matched_compute_manifest"]["b_train_budget_receipt"]["train_seconds"] = 99.0
+    loaded.provenance["lineage"]["matched_compute_manifest"]["b_train_budget_receipt"]["supervised_transitions"] = 99
     with pytest.raises(ValueError, match="lineage is stale"):
         artifact._validate_transient_role_evidence(
             cast("LoadedTransientSequenceArtifact | TransientSequenceArtifactIndex", loaded),

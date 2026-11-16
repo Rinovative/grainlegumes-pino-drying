@@ -97,7 +97,7 @@ def test_steady_history_follows_the_design_sections() -> None:
 
     assert sections == {
         "Overview": _OVERVIEW,
-        "Training": [*_BUDGET, "learning_rate", "optimizer_steps", *(f"weight-{term}" for term in _TERMS)],
+        "Training": [*_BUDGET, "learning_rate", "optimisation_seconds", "optimizer_steps", *(f"weight-{term}" for term in _TERMS)],
         "Loss": ["data-p", "data-total", "data-u", "data-v", "data-velocity", *(f"physics-{term}" for term in _TERMS)],
         "Residuals": [f"val-{term}" for term in _TERMS],
         "Fields": _pages(("p", "u", "v", "velocity")),
@@ -119,6 +119,7 @@ def test_transient_history_follows_the_design_sections() -> None:
             "curriculum-progress",
             "forward_transitions",
             "learning_rate",
+            "optimisation_seconds",
             "optimizer_steps",
             "transitions",
         ],
@@ -158,11 +159,11 @@ def test_series_without_a_producer_are_not_listed() -> None:
 
     assert set(steady) == {"Overview", "Training", "Loss", "Fields", "Physical", "Norms", "Performance"}
     assert steady["Overview"] == ["objective-id_validation", "train-loss_total"]
-    assert steady["Training"] == [*_BUDGET, "learning_rate", "optimizer_steps"]
+    assert steady["Training"] == [*_BUDGET, "learning_rate", "optimisation_seconds", "optimizer_steps"]
     # The data loss is produced by every run, so both projects show it under the same name.
     assert steady["Loss"] == ["data-p", "data-total", "data-u", "data-v", "data-velocity"]
     assert "data-total" in transient["Loss"]
-    assert teacher_forced["Training"] == [*_BUDGET, "forward_transitions", "learning_rate", "optimizer_steps", "transitions"]
+    assert teacher_forced["Training"] == [*_BUDGET, "forward_transitions", "learning_rate", "optimisation_seconds", "optimizer_steps", "transitions"]
     assert transient["Loss"] == ["data-phi", "data-temperature", "data-total", "data-w_int", "data-w_surf"]
     assert transient["OneStep"] == [f"id_validation-{kind}-{name}" for kind in ("one_step", "rollout") for name in _FIELDS]
     assert "Residuals" not in transient

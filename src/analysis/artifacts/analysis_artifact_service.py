@@ -7,7 +7,9 @@ Responsibilities:
   - Stamp steady artifacts with the running analysis producer and refuse a complete target or stage of other analysis code
   - Reject partial or semantically mismatched caches without substitution
   - Rebuild only explicit exact targets and propagate every material failure
-  - Load valid artifacts or generate only missing roles through one build flow shared by both tasks
+  - Build exactly the held-out roles the explicit artifact call names, through one build flow shared by both tasks
+  - Load valid artifacts read-only for notebook preparation, which never builds
+  - Rebuild the named roles of one run all or nothing, and refuse a build beside the backup of an interrupted publication
 
 Design principles:
   - Saved split membership is always required
@@ -29,8 +31,8 @@ import gc
 import json
 import os
 import shutil
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
@@ -969,46 +971,73 @@ def _clear_artifact_stage(stage: Path) -> None:
         shutil.rmtree(stage)
 
 
-def _publish_staged_artifact(*, run_dir: Path, save_root: Path, staging_root: Path) -> None:
-    """
-    Publish one validated sibling stage at an exact run-owned target.
+def _restore_published_targets(moved: Sequence[tuple[Path, Path, Path | None]]) -> list[tuple[Path, str]]:
+    """Try to restore every target a failed publication touched, newest first; return each target left unrestored with its reason."""
+    unrestored: list[tuple[Path, str]] = []
+    for target, stage, backup in reversed(moved):
+        try:
+            if target.exists() and not stage.exists() and (backup is None or backup.exists()):
+                target.replace(stage)  # the new role goes back to its stage
+            if backup is not None and backup.exists() and not target.exists():
+                backup.replace(target)
+        except OSError as error:
+            unrestored.append((target, f"{type(error).__name__}: {error}"))
+    return unrestored
 
-    The stage must carry its provenance completion marker. A new target appears
-    in one atomic rename. An existing target is first renamed to a unique backup,
-    so it is briefly absent but never mixed. If publication fails, that backup is
-    moved back before the exception escapes. A successful replacement removes the
-    backup on a best-effort basis.
+
+def _publish_staged_artifacts(*, run_dir: Path, stages: Sequence[tuple[Path, Path]]) -> None:
+    """
+    Publish validated sibling stages of one run at their exact run-owned targets, all or none.
+
+    Every ``(save_root, staging_root)`` pair is checked before the first rename: the stage must be the deterministic
+    sibling of its target and carry its provenance completion marker. A new target appears in one atomic rename. An
+    existing target is first renamed to a unique backup, so it is briefly absent but never mixed. If any rename fails,
+    every target this call already published is moved back to its stage and every backup back to its target before the
+    exception escapes, so a run never holds some new roles beside the stale ones they were to replace. The rollback
+    attempts every target even when one restore fails. A successful publication removes the backups on a best-effort
+    basis. A hard crash between renames can still leave a published role or a backup; the reader refuses mixed
+    producers and the next build refuses a backup.
 
     Raises
     ------
     ValueError
-        If the stage is not the deterministic stage sibling of the target.
+        If a stage is not the deterministic stage sibling of its target.
     ArtifactCacheError
-        If the stage lacks its completion marker.
+        If a stage lacks its completion marker, or if the rollback left a target unrestored (naming each).
 
     """
-    _analysis_root, target = _validated_artifact_target(run_dir=run_dir, save_root=save_root)
-    stage = _normalise_path(staging_root)
-    if stage != contracts.artifact_stage_path(target):
-        msg = f"Artifact staging root is not the expected sibling of the exact target: {stage}"
-        raise ValueError(msg)
-    if not contracts.artifact_provenance_path(stage).is_file():
-        msg = f"Refusing to publish an artifact stage without its completion marker: {stage}"
-        raise ArtifactCacheError(msg)
+    checked: list[tuple[Path, Path]] = []
+    for save_root, staging_root in stages:
+        _analysis_root, target = _validated_artifact_target(run_dir=run_dir, save_root=save_root)
+        stage = _normalise_path(staging_root)
+        if stage != contracts.artifact_stage_path(target):
+            msg = f"Artifact staging root is not the expected sibling of the exact target: {stage}"
+            raise ValueError(msg)
+        if not contracts.artifact_provenance_path(stage).is_file():
+            msg = f"Refusing to publish an artifact stage without its completion marker: {stage}"
+            raise ArtifactCacheError(msg)
+        checked.append((target, stage))
 
-    backup = target.with_name(f".{target.name}.backup.{uuid4().hex}")
-    moved_previous = False
+    moved: list[tuple[Path, Path, Path | None]] = []
     try:
-        if target.exists():
-            target.replace(backup)
-            moved_previous = True
-        stage.replace(target)
-    except BaseException:
-        if moved_previous and backup.exists() and not target.exists():
-            backup.replace(target)
+        for target, stage in checked:
+            backup = target.with_name(f".{target.name}.backup.{uuid4().hex}") if target.exists() else None
+            if backup is not None:
+                target.replace(backup)
+            moved.append((target, stage, backup))
+            stage.replace(target)
+    except BaseException as error:
+        unrestored = _restore_published_targets(moved)
+        if unrestored:
+            msg = (
+                "Artifact publication failed and its rollback left unrestored: "
+                + "; ".join(f"{target} ({reason})" for target, reason in unrestored)
+                + ". Restore each from its backup or stage before any further build of this run."
+            )
+            raise ArtifactCacheError(msg) from error
         raise
-    else:
-        if moved_previous:
+    for _target, _stage, backup in moved:
+        if backup is not None:
             with suppress(OSError):
                 shutil.rmtree(backup)
 
@@ -1143,6 +1172,36 @@ def _steady_target_build(
     )
 
 
+@dataclass(frozen=True)
+class _StagedTarget:
+    """One validated, still unpublished stage, with the admission and progress report its publication completes."""
+
+    save_root: Path
+    stage: Path
+    admit: Callable[[Path], pd.DataFrame]
+    reporter: artifact_performance.ArtifactProgressReporter
+
+
+def _publish_and_admit(run_dir: Path, staged: Sequence[_StagedTarget]) -> list[pd.DataFrame]:
+    """Publish the validated stages of one run together, then admit and report every published target in order."""
+    finished = 0
+    try:
+        _publish_staged_artifacts(run_dir=run_dir, stages=[(target.save_root, target.stage) for target in staged])
+        frames: list[pd.DataFrame] = []
+        for target in staged:
+            with target.reporter.phase("publication"):
+                frame = target.admit(target.save_root)
+            target.reporter.done()
+            finished += 1
+            _report_admitted_target(frame)
+            frames.append(frame)
+    except BaseException:
+        for target in staged[finished:]:
+            target.reporter.failure()
+        raise
+    return frames
+
+
 def _run_or_load_artifacts_locked(
     *,
     run_dir: Path,
@@ -1150,15 +1209,35 @@ def _run_or_load_artifacts_locked(
     split: ArtifactSplit,
     device_resolution: DeviceResolution,
     dataset_root: Path,
-    rebuild: bool = False,
 ) -> pd.DataFrame:
+    """Load or generate and publish one target of one run; the caller holds the run-wide and target locks."""
+    outcome = _load_or_stage_locked(
+        run_dir=run_dir,
+        dataset_name=dataset_name,
+        split=split,
+        device_resolution=device_resolution,
+        dataset_root=dataset_root,
+        rebuild=False,
+    )
+    return outcome if isinstance(outcome, pd.DataFrame) else _publish_and_admit(run_dir, (outcome,))[0]
+
+
+def _load_or_stage_locked(
+    *,
+    run_dir: Path,
+    dataset_name: str,
+    split: ArtifactSplit,
+    device_resolution: DeviceResolution,
+    dataset_root: Path,
+    rebuild: bool,
+) -> pd.DataFrame | _StagedTarget:
     """
-    Load or generate artifacts for one run and saved split.
+    Load one valid target of a run and saved split, or generate and validate its stage without publishing it.
 
     Reuses existing Parquet+NPZ artifacts only after exact provenance and
     payload validation. If artifacts do not exist, runs split-aware inference via
     learning.inference.context.load_inference_context() and generates
-    Parquet+NPZ artifacts via generation.generate_artifacts().
+    Parquet+NPZ artifacts via generation.generate_artifacts() into the stage.
 
     Parameters
     ----------
@@ -1173,13 +1252,14 @@ def _run_or_load_artifacts_locked(
         Immutable device decision resolved once at the artifact boundary.
     dataset_root : Path
         Current final-dataset root.
-    rebuild : bool, optional
-        Force staged regeneration and atomically replace only this target.
+    rebuild : bool
+        Force staged regeneration of this target. Only the run-level rebuild passes it, after it checked that the
+        rebuild names every role of other analysis code, so the sibling check is skipped here.
 
     Returns
     -------
-    pandas.DataFrame
-        Validated non-empty artifact summary DataFrame.
+    pandas.DataFrame or _StagedTarget
+        The validated frame of a valid existing target, or the validated stage the caller publishes.
 
     Notes
     -----
@@ -1243,7 +1323,7 @@ def _run_or_load_artifacts_locked(
     if not rebuild and (sibling := _sibling_from_other_analysis(run_dir=run_dir, plan=plan, task_id=task.id, split=split)):
         msg = (
             f"Artifact {unit} would leave {run_dir.name} with two analysis producers: its published {sibling} artifact "
-            "comes from other analysis code; rebuild the run's artifacts with --rebuild."
+            f"comes from other analysis code; rebuild it with --split {artifact_plan.dataset_role_of(sibling)} --rebuild."
         )
         raise ArtifactCacheError(msg)
     stage_marker = contracts.artifact_provenance_path(contracts.artifact_stage_path(save_root))
@@ -1291,17 +1371,12 @@ def _run_or_load_artifacts_locked(
         with reporter.phase("validation"):
             build.finish_stage(stage)
             admit(stage)
-        with reporter.phase("publication"):
-            _publish_staged_artifact(run_dir=run_dir, save_root=save_root, staging_root=stage)
-            frame = admit(save_root)
-        reporter.done()
     except BaseException:
         reporter.failure()
         raise
     finally:
         cleanup_runtime(device_resolution.device)
-    _report_admitted_target(frame)
-    return frame
+    return _StagedTarget(save_root=save_root, stage=stage, admit=admit, reporter=reporter)
 
 
 def run_or_load_artifacts(
@@ -1311,10 +1386,9 @@ def run_or_load_artifacts(
     split: ArtifactSplit,
     device_resolution: DeviceResolution,
     dataset_root: Path,
-    rebuild: bool = False,
 ) -> pd.DataFrame:
     """
-    Validate, reuse, or atomically generate one split-qualified artifact cache.
+    Validate, reuse, or atomically generate one split-qualified artifact cache; replacing one is a run-level rebuild.
 
     Parameters
     ----------
@@ -1328,9 +1402,6 @@ def run_or_load_artifacts(
         Device decision resolved once before any inference allocation.
     dataset_root : pathlib.Path
         Final training-dataset root.
-    rebuild : bool, optional
-        Replace only the observed target. A concurrent newer publication wins and
-        is validated instead of being deleted.
 
     Returns
     -------
@@ -1352,33 +1423,104 @@ def run_or_load_artifacts(
     -----
     The shared run reader lease excludes lifecycle writers; one run-wide artifact
     lock serializes the builds of one run, and the target-specific lock marks the
-    target's active writer for run inspection. Rebuilds generate and validate a sibling stage before replacing the target.
-    Provenance remains the final completion marker. Without ``rebuild``, a target
-    is not generated beside the run's other published role when that role
-    records other analysis code, so one run never gains a second producer.
+    target's active writer for run inspection. A target is generated and validated in its sibling stage before it is
+    published. Provenance remains the final completion marker. A target is not generated beside the run's other
+    published role when that role records other analysis code, so one run never gains a second producer.
 
     """
     logical_dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
     save_root = _artifact_save_root(run_dir=run_dir, dataset_name=logical_dataset_name, split=split)
-    completion_path = contracts.artifact_provenance_path(save_root)
-    observed_completion = _completion_marker_identity(completion_path) if rebuild else None
-    lock_path = _artifact_lock_path(run_dir=run_dir, save_root=save_root)
-    with (
-        experiments.run.run_reader_lease(run_dir),
-        # Builds of one run are serialized, so the sibling producer check still holds when this target is published.
-        common.locking.exclusive_file_lock(common.paths.resolve_artifact_lock_path(common.paths.resolve_analysis_root(run_dir)), blocking=True),
-        common.locking.exclusive_file_lock(lock_path, blocking=True),
-    ):
-        current_completion = _completion_marker_identity(completion_path)
-        effective_rebuild = rebuild and (current_completion is None or current_completion == observed_completion)
+    with _run_artifact_locks(run_dir, (save_root,)):
         return _run_or_load_artifacts_locked(
             run_dir=run_dir,
             dataset_name=logical_dataset_name,
             split=split,
             device_resolution=device_resolution,
             dataset_root=dataset_root,
-            rebuild=effective_rebuild,
         )
+
+
+def _refuse_interrupted_publication(run_dir: Path) -> None:
+    """Refuse a build of a run whose analysis tree still holds the backup of an interrupted publication."""
+    analysis_root = common.paths.resolve_analysis_root(run_dir)
+    parents = (analysis_root, *(analysis_root / split for split in artifact_plan.ARTIFACT_SPLITS if split != "eval"))
+    leftovers = sorted(path for parent in parents if parent.is_dir() for path in parent.glob(".*.backup.*"))
+    if leftovers:
+        # A backup can hold the only copy of the replaced target, so it is never deleted or restored automatically.
+        msg = (
+            f"An interrupted publication left backups in {run_dir.name}: {', '.join(str(path) for path in leftovers)}. "
+            "Each holds the role its build replaced: move it back if its target is missing; otherwise the target holds the newer role "
+            "and the backup may be deleted, after which a read names any roles left to rebuild together. Then rerun the build."
+        )
+        raise ArtifactCacheError(msg)
+
+
+@contextmanager
+def _run_artifact_locks(run_dir: Path, save_roots: Sequence[Path]) -> Iterator[None]:
+    """Hold the run reader lease, the run-wide artifact lock and the lock of every target, then refuse an interrupted publication."""
+    with ExitStack() as locks:
+        locks.enter_context(experiments.run.run_reader_lease(run_dir))
+        # Builds of one run are serialized, so the sibling producer check still holds when a target is published.
+        run_lock = common.paths.resolve_artifact_lock_path(common.paths.resolve_analysis_root(run_dir))
+        locks.enter_context(common.locking.exclusive_file_lock(run_lock, blocking=True))
+        for save_root in save_roots:
+            locks.enter_context(common.locking.exclusive_file_lock(_artifact_lock_path(run_dir=run_dir, save_root=save_root), blocking=True))
+        _refuse_interrupted_publication(run_dir)
+        yield
+
+
+def _require_every_stale_role_named(plan: artifact_plan.ArtifactPlan, roles: Sequence[ArtifactDatasetRole]) -> None:
+    """Refuse a rebuild that would leave a published role of other analysis code beside the roles it replaces."""
+    from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader  # noqa: PLC0415
+
+    stale = [artifact_plan.dataset_role_of(split) for split in _splits_of_other_analysis(run_dir=plan.run_dir, plan=plan, task_id=plan.task)]
+    unnamed = [role for role in stale if role not in roles]
+    if unnamed:
+        affected: tuple[ArtifactDatasetRole, ...] = tuple(
+            role.dataset_role for role in plan.roles if role.dataset_role in roles or role.dataset_role in stale
+        )
+        command = artifact_loader.artifact_command(run_dir=plan.run_dir, roles=affected, rebuild=True)
+        msg = (
+            f"Rebuilding {list(roles)} of {plan.run_dir.name} would leave its {unnamed} artifacts of other analysis code beside them, "
+            f"two analysis producers in one run; rebuild every affected role together:\n  {command}"
+        )
+        raise ArtifactCacheError(msg)
+
+
+def _rebuild_run_roles(
+    *,
+    plan: artifact_plan.ArtifactPlan,
+    roles: Sequence[ArtifactDatasetRole],
+    device_resolution: DeviceResolution,
+    dataset_root: Path,
+) -> dict[str, pd.DataFrame]:
+    """
+    Rebuild the named roles of one run so that it keeps one analysis producer; return their frames by artifact split.
+
+    The rebuild must name every published role of other analysis code (refused before any inference otherwise). Each
+    named target is regenerated and validated in its stage; only when every stage is valid are they published together,
+    all or none, so a failed role never leaves a new artifact beside a stale sibling: its validated sibling stages stay
+    unpublished. A target a concurrent builder republished after this request was observed wins and is validated instead.
+    """
+    run_dir = plan.run_dir
+    selected = [role for role in plan.roles if role.dataset_role in roles]
+    save_roots = {role.split: _artifact_save_root(run_dir=run_dir, dataset_name=role.dataset_name, split=role.split) for role in selected}
+    observed = {split: _completion_marker_identity(contracts.artifact_provenance_path(root)) for split, root in save_roots.items()}
+    with _run_artifact_locks(run_dir, tuple(save_roots.values())):
+        _require_every_stale_role_named(plan, roles)
+        outcomes: dict[str, pd.DataFrame | _StagedTarget] = {}
+        for role in selected:
+            current = _completion_marker_identity(contracts.artifact_provenance_path(save_roots[role.split]))
+            outcomes[role.split] = _load_or_stage_locked(
+                run_dir=run_dir,
+                dataset_name=role.dataset_name,
+                split=role.split,
+                device_resolution=device_resolution,
+                dataset_root=dataset_root,
+                rebuild=current is None or current == observed[role.split],
+            )
+        published = iter(_publish_and_admit(run_dir, [outcome for outcome in outcomes.values() if isinstance(outcome, _StagedTarget)]))
+        return {split: outcome if isinstance(outcome, pd.DataFrame) else next(published) for split, outcome in outcomes.items()}
 
 
 @dataclass(frozen=True)
@@ -1395,179 +1537,48 @@ class ScopedTransientArtifact:
 @dataclass(frozen=True)
 class PreparedRunArtifacts:
     """
-    Report path-based artifact loading and any explicit local generation.
+    Report read-only, path-based artifact loading.
 
     Parameters
     ----------
     loaded_run : LoadedRunArtifacts
         Validated run and the selected role-local artifacts.
     role_actions : dict[str, str]
-        Selected role to ``reused``, ``generated``, or ``rebuilt`` action.
-    artifact_device : str | None
-        Exact concrete device supplied to or resolved for generation. ``None``
-        means every role was reused without a supplied device decision.
+        Selected role to ``reused`` or, for an explicit scoped root, ``reused_scoped_partial``.
 
     """
 
     loaded_run: LoadedRunArtifacts
     role_actions: dict[str, str]
-    artifact_device: str | None
 
 
-def invalid_prediction_note(*runs: PreparedRunArtifacts) -> str | None:
-    """Return ``valid V of N`` over the selected roles of ``runs`` when any prediction is invalid, else ``None``."""
-    return validity_contract.invalid_prediction_note(
-        artifact.frame.attrs["artifact_provenance"] for run in runs for artifact in run.loaded_run.role_artifacts().values()
-    )
-
-
-def load_or_build_run_artifacts(
+def load_prepared_run_artifacts(
     run_dir: Path | str,
     *,
     artifact_roles: tuple[ArtifactDatasetRole, ...] | None = None,
     artifact_root_overrides: Mapping[ArtifactDatasetRole, Path | str] | None = None,
-    dataset_root: Path | str | None = None,
-    auto_build_missing: bool = True,
-    rebuild_incompatible: bool = False,
-    device_policy: str = "cpu",
-    device_resolution: DeviceResolution | None = None,
 ) -> PreparedRunArtifacts:
     """
-    Load selected valid artifacts or generate only missing roles locally.
+    Load the selected valid artifacts of one run read-only; preparation never builds, rebuilds or runs inference.
 
-    Existing valid roles are admitted through the read-only path loader before
-    any model reconstruction. Missing roles use ``device_resolution`` unchanged
-    when supplied; otherwise the explicit device policy is resolved once. Partial,
-    corrupt, stale, or incompatible roles fail unless ``rebuild_incompatible``
-    deliberately authorizes exact-target replacement. Existing roles are read as
-    historical evidence, but the selected roles of one run must share one analysis
-    producer: when they disagree, or when a missing role would be generated beside
-    a role of other analysis code, that role is rebuilt first under
-    ``rebuild_incompatible`` and the preparation is refused before any build
-    otherwise. This service
-    never changes lifecycle status.
+    Every role is a held-out evaluation released only by the explicit artifact build, so a missing, partial, corrupt,
+    stale or incompatible role is refused by the path loader with the artifact command that builds exactly that role.
+    Existing roles are read as historical evidence whatever analysis code produced them, but the roles read from one
+    run must share one producer. This service never changes lifecycle status.
     """
-    from src import learning  # noqa: PLC0415
     from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader  # noqa: PLC0415
 
     path = Path(run_dir).expanduser().resolve()
-    if not auto_build_missing and not rebuild_incompatible:
-        loaded = artifact_loader.load_run_artifacts(
-            path,
-            artifact_roles=artifact_roles,
-            artifact_root_overrides=artifact_root_overrides,
-        )
-        overrides = {} if artifact_root_overrides is None else dict(artifact_root_overrides)
-        return PreparedRunArtifacts(
-            loaded_run=loaded,
-            role_actions={role: "reused_scoped_partial" if role in overrides else "reused" for role in loaded.role_artifacts()},
-            artifact_device=None,
-        )
-    plan = load_run_artifact_plan(path)
-    roles: tuple[ArtifactDatasetRole, ...] = artifact_roles if artifact_roles is not None else plan.dataset_roles
-    if not roles or len(set(roles)) != len(roles) or set(roles).difference(artifact_plan.ARTIFACT_DATASET_ROLES):
-        msg = f"artifact_roles must contain unique values from {list(artifact_plan.ARTIFACT_DATASET_ROLES)}."
-        raise ValueError(msg)
-    unplanned = [role for role in roles if role not in plan.dataset_roles]
-    if unplanned:
-        msg = f"Completed run has no saved {unplanned[0]} artifact role."
-        raise ValueError(msg)
+    loaded = artifact_loader.load_run_artifacts(
+        path,
+        artifact_roles=artifact_roles,
+        artifact_root_overrides=artifact_root_overrides,
+    )
     overrides = {} if artifact_root_overrides is None else dict(artifact_root_overrides)
-    if set(overrides).difference(roles):
-        msg = "Artifact root overrides must belong to selected roles."
-        raise ValueError(msg)
-    if overrides:
-        if auto_build_missing or rebuild_incompatible:
-            msg = "Scoped artifact overrides require read-only load policy."
-            raise ValueError(msg)
-        loaded = artifact_loader.load_run_artifacts(
-            path,
-            artifact_roles=roles,
-            artifact_root_overrides=overrides,
-        )
-        return PreparedRunArtifacts(
-            loaded_run=loaded,
-            role_actions={role: ("reused_scoped_partial" if role in overrides else "reused") for role in roles},
-            artifact_device=None,
-        )
-    current_dataset_root = Path(dataset_root) if dataset_root is not None else common.paths.get_datasets_root()
-    actions: dict[str, str] = {}
-    if device_resolution is not None and not isinstance(device_resolution, learning.device.DeviceResolution):
-        msg = f"device_resolution must be a DeviceResolution, got {device_resolution!r}."
-        raise TypeError(msg)
-    resolution = device_resolution
-
-    for _attempt in range(len(roles) + 1):
-        selected_role: ArtifactDatasetRole | None
-        try:
-            loaded = artifact_loader.load_run_artifacts(path, artifact_roles=roles)
-        except artifact_loader.MissingEvaluationArtifactsError as error:
-            selected_role = _failed_role(error)
-            if not auto_build_missing or selected_role is None or selected_role not in roles:
-                raise
-            rebuild = False
-            action = "generated"
-            older = _older_sibling_to_rebuild(
-                path=path, plan=plan, split=artifact_plan.split_of(selected_role), roles=roles, rebuild_incompatible=rebuild_incompatible
-            )
-            if older is not None:
-                selected_role, rebuild, action = older, True, "rebuilt"
-        except artifact_loader.IncompatibleEvaluationArtifactsError as error:
-            selected_role = _failed_role(error)
-            if not rebuild_incompatible or selected_role not in roles:
-                raise
-            rebuild = True
-            action = "rebuilt"
-        else:
-            # Existing roles are historical evidence; building beside them must not leave one run with two analysis producers.
-            selected_role = _role_from_other_analysis(loaded, plan.task)
-            if selected_role is None:
-                for role in roles:
-                    actions.setdefault(role, "reused")
-                return PreparedRunArtifacts(
-                    loaded_run=loaded,
-                    role_actions=actions,
-                    artifact_device=(str(resolution.device) if resolution is not None else None),
-                )
-            if not rebuild_incompatible:
-                raise _two_producers_error(path, selected_role)
-            rebuild = True
-            action = "rebuilt"
-
-        if selected_role is None:
-            msg = "Artifact load failure did not identify a selected role."
-            raise RuntimeError(msg)
-        if resolution is None:
-            resolution = learning.device.resolve_device(device_policy, path="device_policy")
-        run_or_load_artifacts(
-            run_dir=path,
-            dataset_name=plan.role(artifact_plan.split_of(selected_role)).dataset_name,
-            split=artifact_plan.split_of(selected_role),
-            device_resolution=resolution,
-            dataset_root=current_dataset_root,
-            rebuild=rebuild,
-        )
-        actions[selected_role] = action
-    msg = f"Artifact preparation did not converge for selected roles {roles}: {path}"
-    raise RuntimeError(msg)
-
-
-def _role_from_other_analysis(loaded: LoadedRunArtifacts, task_id: str) -> ArtifactDatasetRole | None:
-    """Return a loaded role not produced by the running analysis code when the loaded roles disagree, otherwise None."""
-    recorded: dict[ArtifactDatasetRole, str] = {
-        role: contracts.validate_analysis_producer(artifact.frame.attrs["artifact_provenance"].get("producer"))["analysis_sha256"]
-        for role, artifact in loaded.role_artifacts().items()
-    }
-    if len(set(recorded.values())) <= 1:
-        return None
-    current = contracts.ANALYSIS_PROJECTIONS[task_id].sha256()
-    return next(role for role, digest in recorded.items() if digest != current)
-
-
-def _failed_role(error: Exception) -> ArtifactDatasetRole | None:
-    """Return the Dataset role a role-local artifact load failure names, if it names one."""
-    split_role = getattr(error, "role", None)
-    return artifact_plan.dataset_role_of(split_role) if split_role in artifact_plan.ARTIFACT_SPLITS else None
+    return PreparedRunArtifacts(
+        loaded_run=loaded,
+        role_actions={role: "reused_scoped_partial" if role in overrides else "reused" for role in loaded.role_artifacts()},
+    )
 
 
 def _sibling_from_other_analysis(
@@ -1578,42 +1589,22 @@ def _sibling_from_other_analysis(
     split: ArtifactSplit,
 ) -> ArtifactSplit | None:
     """Return another published split of the run whose recorded analysis implementation is not the running one, otherwise None."""
+    return next((sibling for sibling in _splits_of_other_analysis(run_dir=run_dir, plan=plan, task_id=task_id) if sibling != split), None)
+
+
+def _splits_of_other_analysis(*, run_dir: Path, plan: artifact_plan.ArtifactPlan, task_id: str) -> tuple[ArtifactSplit, ...]:
+    """Return every published split of the run, in plan order, whose recorded analysis implementation is not the running one."""
     current = contracts.ANALYSIS_PROJECTIONS[task_id].sha256()
-    for sibling in (role for role in plan.roles if role.split != split):
-        root = _artifact_save_root(run_dir=run_dir, dataset_name=sibling.dataset_name, split=sibling.split)
-        marker = contracts.artifact_provenance_path(root)
+    stale: list[ArtifactSplit] = []
+    for role in plan.roles:
+        marker = contracts.artifact_provenance_path(_artifact_save_root(run_dir=run_dir, dataset_name=role.dataset_name, split=role.split))
         if not marker.is_file():
             continue
         recorded = _recorded_marker(marker)
         producer = recorded.get("producer") if isinstance(recorded, Mapping) else None
         if (producer.get("analysis_sha256") if isinstance(producer, Mapping) else None) != current:
-            return sibling.split
-    return None
-
-
-def _older_sibling_to_rebuild(
-    *,
-    path: Path,
-    plan: artifact_plan.ArtifactPlan,
-    split: ArtifactSplit,
-    roles: tuple[ArtifactDatasetRole, ...],
-    rebuild_incompatible: bool,
-) -> ArtifactDatasetRole | None:
-    """Return the selected role of other analysis code to rebuild before a missing split is generated beside it; refuse when not authorized."""
-    sibling = _sibling_from_other_analysis(run_dir=path, plan=plan, task_id=plan.task, split=split)
-    if sibling is None:
-        return None
-    role = artifact_plan.dataset_role_of(sibling)
-    if not rebuild_incompatible or role not in roles:
-        raise _two_producers_error(path, role)
-    return role
-
-
-def _two_producers_error(path: Path, role: str) -> ArtifactCacheError:
-    """Return the refusal of a preparation that would leave one run with two analysis producers."""
-    return ArtifactCacheError(
-        f"Preparing the artifacts of {path} would leave the run with two analysis producers; rebuild its {role} role with --rebuild."
-    )
+            stale.append(role.split)
+    return tuple(stale)
 
 
 def _publish_scoped_transient_stage(*, target: Path, stage: Path) -> None:
@@ -1768,12 +1759,13 @@ def build_artifacts(
     *,
     runs_root: Path,
     dataset_root: Path,
+    roles: Sequence[ArtifactDatasetRole],
     run_names: Iterable[str] | None = None,
     device_policy: str = "auto",
     rebuild: bool = False,
 ) -> dict[str, dict[str, pd.DataFrame]]:
     """
-    Build or validate saved ID/OOD roles keyed by each exact resolved run path.
+    Build or validate exactly the named held-out roles of each selected run, keyed by its exact resolved path.
 
     Parameters
     ----------
@@ -1781,25 +1773,30 @@ def build_artifacts(
         One evaluable run or a container of run directories.
     dataset_root : Path
         Derived raw root containing immutable final task datasets.
+    roles : Sequence[{"id", "material_ood", "parameter_ood"}]
+        The held-out roles this call releases (``id`` is the ID test). There is
+        no default: every role is evaluated only when its caller names it.
     run_names : Iterable[str] | None, optional
         Persisted scientific run names below ``runs_root``.
     device_policy : {"auto", "cuda", "cpu"}, optional
         Runtime policy. Auto selects usable CUDA and then CPU. CUDA is strict.
         CPU avoids CUDA queries.
     rebuild : bool, optional
-        Stage and validate a replacement for each exact selected target. A newer
-        concurrent publication is preserved and validated instead.
+        Stage and validate a replacement for each exact selected target and publish the run's replacements together,
+        all or none. It must name every published role of other analysis code, or the run is refused before
+        inference. A newer concurrent publication is preserved and validated instead.
 
     Returns
     -------
     dict[str, dict[str, pandas.DataFrame]]
-        Validated ``eval`` and any saved ``material_ood`` and ``parameter_ood`` frames keyed by run name.
+        Validated frames of the named roles, by artifact split (``eval`` for the ID test), keyed by run path.
 
     Raises
     ------
     FileNotFoundError, ArtifactCacheError, TypeError, ValueError, RuntimeError
-        If device resolution, run admission, saved dataset identity, cache
-        validation, inference, or publication fails.
+        If no or an unknown role is named, a selected run has no saved named role,
+        or device resolution, run admission, saved dataset identity, cache
+        validation, inference, or publication fails. Role refusals come before any build.
 
     Notes
     -----
@@ -1808,33 +1805,39 @@ def build_artifacts(
     """
     from src import learning  # noqa: PLC0415
 
+    named = tuple(roles)
+    if not named or len(set(named)) != len(named) or set(named).difference(artifact_plan.ARTIFACT_DATASET_ROLES):
+        msg = f"A canonical artifact build names no held-out role or repeats one; name roles from {list(artifact_plan.ARTIFACT_DATASET_ROLES)}."
+        raise ValueError(msg)
+    plans = [load_run_artifact_plan(run_dir) for run_dir in iter_run_dirs(runs_root, run_names=run_names)]
+    # Every selected run must have every named role before the first inference; plan.role refuses one a run lacks.
+    selected = [(plan, [role for role in plan.roles if role.dataset_role in named]) for plan in plans]
+    for plan in plans:
+        for role in named:
+            plan.role(artifact_plan.split_of(role))
+        if rebuild:
+            # Checked again under the run's locks; here it refuses before the first run is rebuilt.
+            _require_every_stale_role_named(plan, named)
     device_resolution = learning.device.resolve_device(
         device_policy,
         path="device_policy",
     )
     results: dict[str, dict[str, pd.DataFrame]] = {}
-    for run_dir in iter_run_dirs(runs_root, run_names=run_names):
-        plan = load_run_artifact_plan(run_dir)
+    for plan, plan_roles in selected:
         common.paths.record_job_log_owner(plan.run_dir)
-        id_frame = run_or_load_artifacts(
-            run_dir=plan.run_dir,
-            dataset_name=plan.id_role.dataset_name,
-            split="eval",
-            device_resolution=device_resolution,
-            dataset_root=dataset_root,
-            rebuild=rebuild,
-        )
-        ood_frames: dict[ArtifactSplit, pd.DataFrame] = {
-            split: run_or_load_artifacts(
-                run_dir=plan.run_dir,
-                dataset_name=role.dataset_name,
-                split=split,
-                device_resolution=device_resolution,
-                dataset_root=dataset_root,
-                rebuild=rebuild,
-            )
-            for split, role in plan.ood_roles.items()
-        }
-        results[str(run_dir.resolve())] = {"eval": id_frame} | ood_frames
+        if rebuild:
+            frames = _rebuild_run_roles(plan=plan, roles=named, device_resolution=device_resolution, dataset_root=dataset_root)
+        else:
+            frames = {
+                role.split: run_or_load_artifacts(
+                    run_dir=plan.run_dir,
+                    dataset_name=role.dataset_name,
+                    split=role.split,
+                    device_resolution=device_resolution,
+                    dataset_root=dataset_root,
+                )
+                for role in plan_roles
+            }
+        results[str(plan.run_dir.resolve())] = frames
         cleanup_runtime(device_resolution.device)
     return results

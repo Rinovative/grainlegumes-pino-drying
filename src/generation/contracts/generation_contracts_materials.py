@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 
 _MATERIAL_FAMILY_PATTERN: Final = re.compile(r"[a-z][a-z0-9_]*")
 _MATERIAL_CONFIG_PARTS: Final = ("configs", "01_generation", "physical_model", "materials")
+# Practical target moistures sit on a grid of half wet-basis percentage points (the swiss granum 13.5 % limit is one).
+_TARGET_MOISTURE_GRID_PERCENT: Final = Decimal("0.5")
 POROSITY_GENERATOR_PARAMETERS: Final = (
     "porosity.smooth_len_rel",
     "porosity.texture_amp",
@@ -328,7 +330,7 @@ def resolve_value_record(
 
 
 def practical_target_moisture_wb(exact_reference_wb: float) -> float:
-    """Round one safe-storage reference to a whole wet-basis percentage point."""
+    """Round one safe-storage reference to the nearest half wet-basis percentage point, ties upward."""
     reference = _finite(
         exact_reference_wb,
         label="exact safe-storage moisture reference",
@@ -336,8 +338,8 @@ def practical_target_moisture_wb(exact_reference_wb: float) -> float:
     if not 0 < reference < 1:
         message = "Exact safe-storage moisture reference must lie inside (0, 1)."
         raise ValueError(message)
-    percentage = Decimal(str(reference)) * Decimal(100)
-    return float(percentage.quantize(Decimal(1), rounding=ROUND_HALF_UP) / Decimal(100))
+    half_points = Decimal(str(reference)) * Decimal(100) / _TARGET_MOISTURE_GRID_PERCENT
+    return float(half_points.quantize(Decimal(1), rounding=ROUND_HALF_UP) * _TARGET_MOISTURE_GRID_PERCENT / Decimal(100))
 
 
 def _resolve_synthetic_ood_provenance(
@@ -1059,7 +1061,7 @@ def resolve_material_definition(
         message = f"Material {family!r} target moisture must lie inside (0, 1)."
         raise ValueError(message)
     if practical_target_moisture_wb(target_wb) != target_wb:
-        message = f"Material {family!r} target moisture must use a whole wet-basis percentage point."
+        message = f"Material {family!r} target moisture must use a whole or half wet-basis percentage point."
         raise ValueError(message)
     target_db = target_wb / (1.0 - target_wb)
     target = {

@@ -69,7 +69,7 @@ Options of `run`: `--materials`, `--duration-hours`, `--revision`, `--max-admiss
 <summary><strong>Driver and node jobs</strong></summary>
 
 - **Node-job slots:** one Slurm job per slot (`gen-seat-1` to `gen-seat-4`, Slurm singleton, at most `run.node_jobs` across all Generation runs of the user). Slurm picks a `standard` node with at least `site.cores_per_node` cores; node jobs are not exclusive, so the remaining CPUs of a larger node stay available to other jobs.
-- **Node worker:** a generic worker inside each node job starts the cases as job steps of `cores_per_case` cores each, floor(32/k) at a time, and refills a free slot as soon as a step ends.
+- **Node worker:** a generic worker inside each node job starts the cases as job steps of `cores_per_case` cores each, `node_job.cores_per_node // run.cores_per_case` at a time (16 // 4 = 4 with the shipped `execution.yaml`), and refills a free slot as soon as a step ends.
 - **Dispatch:** the driver dispatches each case as a ticket into a node job and records the dispatch in `_record/execution/run.json` before the ticket exists. It reconciles every dispatch from the step's own Slurm accounting (state, exit code, times, node), so an out-of-memory or failed step is attributed to its case and a step that never started is dispatched again without consuming an attempt.
 - **End of a node job:** when no case remains, the driver ends each node job with a stop ticket; an orphaned node job ends after 15 idle minutes.
 - **Driver lifetime:** it runs until the campaign is complete, staged at its admission cap, or stopped by an error; its log is the `log_path`. Node jobs and `run.json` survive the driver, so rerunning the same command adopts the open node jobs and continues the campaign after an error or after the driver's time limit.
@@ -89,12 +89,16 @@ stateDiagram-v2
   running --> failed
   running --> license_blocked: licence window exhausted
   license_blocked --> scheduler_pending: redispatch after backoff
-  license_blocked --> license_wait_exhausted: wait cap reached
   failed --> never_started: replacement takes the slot
   successful --> [*]
   note right of failed
     reason_code: stalled, timed_out,
     solver_error or unclassified
+  end note
+  note right of license_blocked
+    at the wait cap the case stays license_blocked
+    with license_wait_exhausted set, and the
+    campaign settles as license_wait_exhausted
   end note
 ```
 
@@ -262,7 +266,7 @@ Once $n\ge1$ and $U(k,n)<s$, every batch of the material is stopped: it admits n
 <details>
 <summary><strong>Replacement mechanics, amendments and admission cap</strong></summary>
 
-- **Points:** a batch of N points holds points 0 to N − 1, and its replacements take points N, N + 1, … in `candidate_position` order. They are prefix-stable and every per-case seed still derives from the design seed and the point index. Each replacement keeps its target slot and `parent_failed_case_id`. Originals come before replacements in the selected pool, and every failure stays in the Source as a candidate. Replacements are fresh admissions.
+- **Points:** a batch of N points holds points 0 to N − 1, and its replacements take points N, N + 1, … in `candidate_position` order. They are prefix-stable and every per-case seed still derives from the design seed and the point index. Each replacement keeps its target slot and `parent_failed_case_id`. Originals come before replacements in the selected pool, and every failure stays in the Source as a candidate. Replacements are fresh admissions. A replacement's identity binds its parent batch science, design point, seeds, failed case and slot, but not the code fingerprint or the plan bytes, so it stays stable under code changes like a primary's.
 - **Counts:** $k$ and $n$ count the batch's material over all its design kinds; undecided candidates, licence waits and cases without a decision do not count.
 - **Evaluation:** every feed evaluates the stop from the recorded decisions, so a success recorded meanwhile lifts a stop at once and never blocks. A decision recorded while a replacement is planned that stops its batch or closes its deficit ends planning for that batch only, and the feed goes on.
 - **One value per material:** the stop is decided per material, and every original batch of a material reads the same $s$, the rate of the material's latest amendment record in `materials/MATERIAL/_record/amendments/` ($s=1$ without one).
@@ -334,6 +338,8 @@ Sources live under `storage/01_generation/TASK/SOURCE_NAME/`. A campaign holds e
   .state/                     # the stage's only state; no task or campaign folder keeps any
     locks/                    # empty lock anchors, one file per lock (names below)
     staging/TASK~SOURCE_NAME/ # MATERIAL/reservation-staging/ and MATERIAL/REGIME/{publications,quarantine,input-transactions,cleanup_failures}/
+                              # record-staging/: every immutable JSON record (plan, epoch, reservation, attempt, decision,
+                              # amendment, selected pool) is written here, then hard-linked to its name
 ```
 
 </details>
@@ -360,7 +366,7 @@ A lock file name joins its identity with `~`, which no task, Source, material or
 
 Operational records below `_record/execution/` are keyed by `MATERIAL-REGIME`, the regime being the design kind or a replacement batch's `KIND_replacement_NNNN` (for example `license/lentil-train/case_0001/`), which must be unique among the frozen batches of one Source.
 
-Each atomic publication is one rename of a complete directory: a case appears with its `_record/reservation.json` (staged in `.state/staging/`), `inputs/` and `result/` are each renamed into the existing case, and an attempt bundle `run_NNNN/` is renamed inside `_record/attempts/`. Locks, reservation, result and input staging and quarantine stay in the stage's single `01_generation/.state/` (staging by task and Source, then material and regime), never inside a campaign folder, so every rename stays on one file system. Inputs and results have separate recovery boundaries:
+Each atomic publication is one rename of a complete directory: a case appears with its `_record/reservation.json` (staged in `.state/staging/`), `inputs/` and `result/` are each renamed into the existing case, and an attempt bundle `run_NNNN/` is renamed inside `_record/attempts/`. Every immutable JSON record is written in `record-staging/` of its task and Source and then hard-linked to its name: the link never replaces an existing record (a second writer must hold identical bytes), a record's directory never holds anything but final names, and a writer that dies leaves its temporary only in staging; a publication whose staging and target are on different file systems fails before it writes. Locks, record, reservation, result and input staging and quarantine stay in the stage's single `01_generation/.state/` (staging by task and Source, then material and regime), never inside a campaign folder, so every rename and link stays on one file system. Inputs and results have separate recovery boundaries:
 
 - **Inputs:** an input generation stages its new cases and batch metadata in its transaction, writes the journal `transaction.json` (manifest hash, new case IDs) before any final path changes, renames each new `inputs/` into its case, admits the staged metadata and only then publishes `input_generation_manifest.json`. A transaction without a journal is abandoned staging and is deleted; one with a journal is completed (missing renames, then the manifest) by the next input generation of that batch under its input lock.
 - **Results:** a staged `result/` is renamed in only after an incomplete `result/` without `_SUCCESS` has been moved into the batch's quarantine in `.state/staging/`; a complete one is never replaced. Quarantined directories are kept and counted, never published.
@@ -384,7 +390,7 @@ Each atomic publication is one rename of a complete directory: a case appears wi
 | `_record/execution/slurm/` | Phase and counters per dispatch (`JOB-SUBMISSION_INDEX.json`, for example `7001-3.json`) for live status |
 | `_record/execution/interruptions/` | Worker-interruption receipts per dispatch (`JOB-SUBMISSION_INDEX.json`) |
 | `_record/execution/license/` | Per case below `MATERIAL-REGIME/case_NNNN/`: the licence wait `wait.json`, checkout windows `windows/DISPATCH.json` and status recoveries `status_recoveries/` |
-| `01_generation/.state/` (stage level, outside every campaign) | Lock anchors in `locks/` and staging in `staging/TASK~SOURCE_NAME/` (reservations, publications, input transactions, quarantine), named by task, Source, material and regime |
+| `01_generation/.state/` (stage level, outside every campaign) | Lock anchors in `locks/` and staging in `staging/TASK~SOURCE_NAME/` (immutable records, reservations, publications, input transactions, quarantine), named by task, Source, material and regime |
 | `case_NNNN/inputs/` | Case definition, sampled and derived parameters, seeds, rejection evidence, input reference and hashes in `case.json`; the spatial, scalar and schedule inputs in `inputs.h5` |
 | `case_NNNN/_record/attempts/attempt_NNNN.json`, `case_NNNN/_record/decision.json` | Append-only classified attempts (a solver attempt's `reason_code` is `stalled`, `timed_out`, `solver_error` or `unclassified`) and immutable terminal decisions |
 | `case_NNNN/_record/attempts/run_NNNN/` | Evidence bundle of one failed execution: receipt, retained payload and predecessor hashes |

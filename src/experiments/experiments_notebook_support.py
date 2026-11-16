@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Resolve steady and transient protocol children, TaskSpec, metadata, and pure paths
-  - List the built Datasets of a configuration's task and apply explicit training-Dataset and Stage-B-seconds selections
+  - List the built Datasets of a configuration's task and apply explicit training-Dataset selection
   - Prepare deterministic table specifications from already resolved values
   - Inspect saved configuration, summary, and split identities with truthful artifact paths
   - Represent optional completed-run inspection and validation displays
@@ -154,20 +154,14 @@ def prepare_notebook_context(
     *,
     stage: str | None = None,
     train_dataset: str | None = None,
-    train_seconds: float | None = None,
 ) -> NotebookContext:
     """Resolve configuration, TaskSpec, metadata summaries, and paths atomically.
 
-    ``train_dataset`` replaces ``data.train_dataset`` of every stage and ``train_seconds``
-    sets Stage B's measured target of a matched plan, exactly as the ``--train-dataset``
-    and ``--train-seconds`` training options do; ``None`` keeps the configured value.
+    ``train_dataset`` replaces ``data.train_dataset`` of every stage, exactly as the
+    ``--train-dataset`` training option does; ``None`` keeps the configured value.
     """
     selected_path = Path(config_path)
-    raw = config_loader.apply_training_overrides(
-        config_loader.load_authored_config(selected_path),
-        train_dataset=train_dataset,
-        train_seconds=train_seconds,
-    )
+    raw = config_loader.apply_training_overrides(config_loader.load_authored_config(selected_path), train_dataset=train_dataset)
     config_source = config_naming.config_source_from_path(selected_path)
     if transient_plan.is_matched_a1_b_config(raw):
         plan = transient_plan.resolve_matched_a1_b_plan(raw, source=config_source)
@@ -253,10 +247,9 @@ def prepare_run_inspection(run_dir: Path | str) -> RunInspection:
         [
             ("wandb/", selected_run / "wandb"),
             ("analysis/id/", common.paths.resolve_id_analysis_dir(selected_run)),
+            ("history.json", learning.training.history.history_path(selected_run)),
         ]
     )
-    if config["task"] == "transient_drying":
-        expected_paths.append(("history.json", selected_run / "history.json"))
     if not common.paths.resolve_split_indices_path(selected_run).is_file():
         split_state = "not saved"  # A run that ended before its split was persisted has no OOD role.
     else:
@@ -292,13 +285,13 @@ def prepare_protocol_table(context: NotebookContext) -> NotebookTable:
                 config["run"]["name"],
                 training.get("budget_epochs"),
                 teacher["source_run_name"] if teacher else "none",
-                matched.get("train_seconds"),
+                "units" if "budget_epochs" in training else "supervised_transitions",
                 matched.get("receipt_source_run_name"),
             )
         )
     return _table(
         title=f"Training protocol: {context.protocol}",
-        columns=("Arm", "Run name", "Budget epochs", "Teacher source", "B train seconds", "Measured budget source"),
+        columns=("Arm", "Run name", "Budget epochs", "Teacher source", "Budget unit", "Receipt source"),
         rows=rows,
     )
 
@@ -406,15 +399,15 @@ def _prepare_transient_configuration_tables(context: NotebookContext) -> tuple[N
                 (
                     "Budget epochs",
                     training.get("budget_epochs"),
-                    "A0 budget in passes over the full Train set, counted in units; B and A1 train measured seconds",
+                    "A0 budget K in passes over the full Train set, counted in units; B trains K x N and A1 B's supervised transitions",
                 ),
                 ("Curriculum", training.get("curriculum"), "Stage-B rollout lengths and milestones; teacher-forced Stage A has none"),
                 ("Teacher handoff", training["teacher_handoff"], "Common Stage-A checkpoint dependency"),
-                ("Matched protocol", training.get("matched_a1_b"), "A1 consumes B measured train-time receipt"),
+                ("Matched protocol", training.get("matched_a1_b"), "A1 trains the supervised transitions of B's receipt"),
                 (
                     "Validation points",
                     learning.training.budget.VALIDATION_POINTS,
-                    "Validation at each 1/20 of the budget selects the checkpoint; OOD and physics follow",
+                    "Validation at each 1/20 of the budget selects the checkpoint; physics follows; ID test and OOD only as artifacts",
                 ),
             ),
         ),
@@ -572,7 +565,7 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
                 (
                     "Validation points",
                     learning.training.budget.VALIDATION_POINTS,
-                    "Validation at each 1/20 of the budget for objective and checkpoint selection; OOD and physics follow",
+                    "Validation at each 1/20 of the budget selects objective and checkpoint; physics follows; ID test and OOD only as artifacts",
                 ),
                 ("Seed", config["run"]["seed"], "Root deterministic seed"),
                 ("Deterministic", config["run"]["deterministic"], "Deterministic runtime policy"),
@@ -685,7 +678,7 @@ def prepare_run_preview_table(
         (
             "Budget epochs",
             config["training"].get("budget_epochs"),
-            "Steady and A0: passes over the full Train set, counted in seen units; B and A1 train measured seconds",
+            "Steady and A0: passes over the full Train set, counted in seen units; B and A1 count supervised transitions",
         ),
         ("ID dataset", config["data"]["train_dataset"], "Train and evaluation source"),
         (
@@ -771,12 +764,9 @@ _RUN_OUTPUT_ROWS = (
 
 def prepare_run_output_inventory_table(*, task_id: str = "steady_flow") -> NotebookTable:
     """Prepare the maintained saved-run file inventory."""
-    rows: tuple[tuple[str, str, str, str], ...] = _RUN_OUTPUT_ROWS
-    if task_id == "transient_drying":
-        rows = (
-            *rows,
-            ("history.json", "Durable completed-epoch transient history", "yes", "Training and Evaluation"),
-        )
+    # Completed transient admission requires the history; a steady run needs it to resume, and runs before it have none.
+    required = "yes" if task_id == "transient_drying" else "resume"
+    rows = (*_RUN_OUTPUT_ROWS, ("history.json", "Durable completed-epoch training history", required, "Resume, training curves, transient admission"))
     return _table(
         columns=("File or directory", "Purpose", "Required", "Consumer"),
         rows=rows,

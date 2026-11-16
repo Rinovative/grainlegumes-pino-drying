@@ -264,12 +264,8 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
         "19",
         "--lr-scale",
         "0.5",
-        "--train-seconds",
-        "25",
         "--revision",
         "fixed-loss",
-        "--artifacts",
-        "none",
     )
 
     assert result.returncode == 0, result.stderr
@@ -278,7 +274,7 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
     assert "--gres" not in " ".join(arguments)
     assert f"--output={harness.runtime}/logs/ml/train-%j.out" in arguments
     assert f"--error={harness.runtime}/logs/ml/train-%j.err" in arguments
-    assert arguments[-19:] == [
+    assert arguments[-15:] == [
         "/workspace/repo/config.yaml",
         "--epochs",
         "5",
@@ -290,12 +286,8 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
         "19",
         "--lr-scale",
         "0.5",
-        "--train-seconds",
-        "25",
         "--revision",
         "fixed-loss",
-        "--artifacts",
-        "none",
         "--device",
         "cpu",
     ]
@@ -315,8 +307,6 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
         "19",
         "--lr-scale",
         "0.5",
-        "--train-seconds",
-        "25",
         "--revision",
         "fixed-loss",
     ]
@@ -326,7 +316,7 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
         "python",
         "-m",
         "src.experiments.cli.cli_train",
-        *arguments[-19:],
+        *arguments[-15:],
     ]
     provenance = json.loads(harness.provenance_capture.read_text(encoding="utf-8"))
     assert provenance["mode"] == "cpu"
@@ -346,9 +336,13 @@ def test_config_combined_with_resume_is_rejected_before_submission(harness: _Har
     assert not harness.sbatch_capture.exists()
 
 
-def test_train_stage_selection_reaches_the_preflight_but_the_artifact_selection_does_not(harness: _Harness) -> None:
-    """Only the trained stages decide which leaves bind the source tree, so the preflight sees --train-stages alone."""
-    result = _submit(harness, *_resources("cpu"), "train", "config.yaml", "--artifacts", "all", "--train-stages", "b,a1")
+def test_train_stage_selection_reaches_the_preflight_and_training_takes_no_artifact_request(harness: _Harness) -> None:
+    """The trained stages decide which leaves bind the source tree; training builds no artifacts, so --artifacts is refused before submission."""
+    refused = _submit(harness, *_resources("cpu"), "train", "config.yaml", "--artifacts", "none")
+    assert refused.returncode == 2
+    assert not harness.sbatch_capture.exists()
+
+    result = _submit(harness, *_resources("cpu"), "train", "config.yaml", "--train-stages", "b,a1")
 
     assert result.returncode == 0, result.stderr
     assert _args(harness.preflight_capture) == [
@@ -360,10 +354,8 @@ def test_train_stage_selection_reaches_the_preflight_but_the_artifact_selection_
         "--train-stages",
         "b,a1",
     ]
-    assert _args(harness.sbatch_capture)[-7:] == [
+    assert _args(harness.sbatch_capture)[-5:] == [
         "/workspace/repo/config.yaml",
-        "--artifacts",
-        "all",
         "--train-stages",
         "b,a1",
         "--device",
@@ -581,7 +573,6 @@ def test_invalid_shared_ml_arguments_fail_before_submission(
         [*_resources("gpu"), "--gres", "gpu:0:1", "train", "config.yaml"],
         [*_resources("gpu"), "--gres", "gpu:v100:1", "train", "config.yaml", "--device", "cpu"],
         [*_resources("cpu"), "train", "--resume"],
-        [*_resources("cpu"), "train", "config.yaml", "--train-seconds", "0"],
         [*_resources("cpu"), "train", "config.yaml", "--rollout-length", "0"],
         *[[*_resources("cpu"), "train", "config.yaml", "--lr-scale", value] for value in ("0", "0.0", "-1", "nan", "x")],
         [*_resources("cpu"), "train", "config.yaml", "--lr-scale", "0.5", "--lr-scale", "0.25"],

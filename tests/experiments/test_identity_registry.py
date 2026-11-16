@@ -163,7 +163,7 @@ def test_train_cli_reports_an_identical_experiment_as_a_rejected_admission(tmp_p
     experiments.run.prepare_fresh_run(configs.resolve(raw))
     request = _write_request(tmp_path, raw, family="copy")
 
-    assert cli_train.main([str(request), "--artifacts", "none"]) == 1
+    assert cli_train.main([str(request)]) == 1
 
     stderr = capsys.readouterr().err
     assert "Run admission rejected: The identical experiment already exists at" in stderr

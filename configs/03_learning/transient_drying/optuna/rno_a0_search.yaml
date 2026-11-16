@@ -2,7 +2,7 @@
 # Tunes the teacher-forced A0 of the matched plan alone, without B's budget; copy the selected values into the matched experiment config under experiments/architecture_comparison/.
 
 study:
-  n_trials: 24  # Maximum number of trials requested for the study.
+  n_trials: 24  # Total trial allocation of the study, its configured base first; a rerun runs only the trials left.
   mode: stage_a_only  # Transient protocol searched by this study: the plan's A0 alone.
   role: production  # Study role used by the experiment workflow.
   seed: 9  # Seed controlling Optuna sampling/pruning randomness.
@@ -18,12 +18,17 @@ study:
     interval_steps: 1  # Validation-point interval between pruning checks.
 
 # One entry per searched config path: name (Optuna parameter name), kind (categorical or float) and its values or low, high and log (default false).
-# Only transient drying has an RNO study; its ranges are not yet filtered by the GPU probe.
+# Admission rule (decided 13.11., before the HPO): every corner of this space must train within 2x the cost per supervised transition
+# of the configured experiment (experiments/architecture_comparison/rno_*) and fit B with one unit at horizon 32 on the longest
+# Train trajectory, with warm Adam state and validation, in at most 85 % of the usable GPU memory; the axes are cut until the corners pass.
+# Only transient drying has an RNO study. Cut by the GPU probes (169 D3; jobs 882530 on the A6000 and 882591): 32 channels and
+# 4 layers exceed 85 % in B or run out of memory, alone or together with any other axis; 24 channels with 3 layers is the widest
+# admitted corner.
 search_space:
   model.params.n_modes.0: {name: modes_y, kind: categorical, values: [16, 24, 32]}
   model.params.n_modes.1: {name: modes_x, kind: categorical, values: [16, 24, 32]}
-  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [16, 24, 32]}
-  model.params.n_layers: {name: n_layers, kind: categorical, values: [2, 3, 4]}
+  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [16, 24]}
+  model.params.n_layers: {name: n_layers, kind: categorical, values: [2, 3]}
   optimizer.lr: {name: lr, kind: float, low: 1.0e-4, high: 1.0e-2, log: true}
   training.units_per_update: {name: k, kind: categorical, values: [1, 2, 4, 8, 16]}  # Whole trajectories per update.
 
@@ -40,6 +45,7 @@ experiment:
   training:
     units_per_update: 4  # Search base value: k, whole trajectories per optimizer update.
     a0:
+      memory_batch: 1  # The matched experiment's A0 memory batch; it changes only floating-point rounding.
       sampling:
         mode: trajectory  # RNO trains on whole trajectories cut into consecutive windows in temporal order, the last a shorter rest window.
         rollout_length: 32  # Window length; the hidden state carries across windows while gradients stop at each boundary.

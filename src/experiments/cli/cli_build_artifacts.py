@@ -6,6 +6,8 @@ Responsibilities:
   - Request atomic target replacement only through explicit ``--rebuild``
 
 Design principles:
+  - This explicit call is the only evaluation of the held-out roles (ID test and OOD), and it evaluates only the roles
+    ``--split`` names; a bounded build names exactly one
   - Parser and dispatch code stays thin, import-light, and service-agnostic
   - Runtime device policy is forwarded unchanged for service-owned resolution
   - Material service failures remain observable through the process exit code
@@ -23,11 +25,16 @@ from pathlib import Path
 
 from . import cli_device
 
+_HELD_OUT_ROLES = ("id", "material_ood", "parameter_ood")
+
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the artifact-generation parser."""
     parser = argparse.ArgumentParser(
-        description="Generate or validate split-aware artifacts for terminal evaluable runs.",
+        description=(
+            "Generate or validate the held-out artifacts (ID test, material OOD, parameter OOD) of terminal evaluable runs; "
+            "training never evaluates these roles, so this explicit call is their release."
+        ),
     )
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument(
@@ -83,9 +90,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--split",
-        choices=("id", "material_ood", "parameter_ood"),
+        dest="splits",
+        action="append",
+        choices=_HELD_OUT_ROLES,
         default=None,
-        help="Selected transient role for bounded generation; requires --one-case or --case-id.",
+        help=(
+            "Held-out role this call releases (id is the ID test); repeat it for several roles. Required: no role is "
+            "evaluated unless named, and a bounded build (--one-case or --case-id) names exactly one."
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -138,6 +150,10 @@ def main(argv: list[str] | None = None) -> int:
             selected_roots = [runs_root]
         else:
             parser.error("artifact selection unexpectedly lacks a run root")
+        if not args.splits:
+            parser.error(f"an artifact build evaluates a held-out role only when --split names it; choose from {', '.join(_HELD_OUT_ROLES)}")
+        if len(set(args.splits)) != len(args.splits):
+            parser.error("--split names each held-out role at most once")
         bounded = bool(args.one_case or args.case_ids)
         if bounded:
             if args.run_dirs is None or len(args.run_dirs) != 1:
@@ -146,25 +162,28 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("bounded generation requires --output-root")
             if args.rebuild:
                 parser.error("bounded generation never replaces an existing output; omit --rebuild")
+            if len(args.splits) != 1:
+                parser.error("bounded generation names exactly one held-out role with --split")
             scoped = analysis.artifacts.service.build_scoped_transient_artifact(
                 run_dir=args.run_dirs[0],
                 dataset_root=dataset_root,
                 output_root=args.output_root,
-                split="id" if args.split is None else args.split,
+                split=args.splits[0],
                 case_ids=args.case_ids,
                 one_case=args.one_case,
                 device_policy=args.device,
             )
             print(f"artifacts done: scoped transient artifact for {len(scoped.case_ids)} case(s) in {scoped.root}")
             return 0
-        if args.split is not None or args.output_root is not None:
-            parser.error("--split and --output-root require --one-case or --case-id")
+        if args.output_root is not None:
+            parser.error("--output-root requires --one-case or --case-id")
 
         result_count = 0
         for selected_root in selected_roots:
             results = analysis.artifacts.service.build_artifacts(
                 runs_root=selected_root,
                 dataset_root=dataset_root,
+                roles=tuple(args.splits),
                 run_names=args.run_names,
                 device_policy=args.device,
                 rebuild=args.rebuild,

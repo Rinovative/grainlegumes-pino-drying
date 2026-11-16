@@ -5,7 +5,6 @@ Responsibilities:
   - Validate each Optuna study against the study contract (shared cadence, pruner, search-space candidates)
   - Load each Dataset plan under configs/02_datasets and derive its Generation campaign
   - Resolve the documented matched A0/B/A1 command for every transient experiment
-  - Pass the B target that matched experiments leave open, as the documented command does
 
 Design principles:
   - Maintained configurations are mutable scientific inputs: only admission is checked,
@@ -48,9 +47,8 @@ def _admission_failures(paths: list[Path], admit: Callable[[Path], object]) -> l
 
 
 def _preflight_with_documented_overrides(path: Path) -> preflight.ConfigPreflight:
-    """Preflight one YAML with the train Dataset and, for matched plans, the B target the YAML leaves open."""
-    matched = plan_service.is_matched_a1_b_config(loader.load_authored_config(path))
-    return preflight.inspect_config(path, train_dataset="synthetic_dataset", train_seconds=600.0 if matched else None)
+    """Preflight one YAML with the train Dataset the YAML leaves open."""
+    return preflight.inspect_config(path, train_dataset="synthetic_dataset")
 
 
 def _admit_within_the_name_limit(path: Path) -> None:
@@ -59,7 +57,7 @@ def _admit_within_the_name_limit(path: Path) -> None:
     names = [path.stem, result.run_label]
     raw = loader.load_authored_config(path)
     if plan_service.is_matched_a1_b_config(raw):
-        requested = loader.apply_training_overrides(raw, train_dataset="synthetic_dataset", train_seconds=600.0)
+        requested = loader.apply_training_overrides(raw, train_dataset="synthetic_dataset")
         plan = plan_service.resolve_matched_a1_b_plan(requested, source=naming.config_source_from_path(path))
         names += [stage["run"]["name"] for stage in plan.stages]
     for name in names:
@@ -110,7 +108,6 @@ def test_documented_matched_command_resolves_for_every_transient_experiment() ->
                 path,
                 train_dataset="synthetic_dataset",
                 epochs=16,
-                train_seconds=600.0,
                 rollout_length=4,
             ),
         )

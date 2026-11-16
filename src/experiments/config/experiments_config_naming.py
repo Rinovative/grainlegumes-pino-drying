@@ -201,7 +201,6 @@ _STAGE_LEAVES = {
     "rl": ("sampling.rollout_length",),
     "ws": ("sampling.window_stride",),
     "wo": ("sampling.window_offset",),
-    "ts": ("train_seconds",),
     "lrs": ("lr_scale",),
 }
 
@@ -217,7 +216,7 @@ def _stage_tokens(*stages: str) -> dict[str, tuple[str, ...]]:
 
 
 # The pair key's fixed part already shows these B/A1 leaves.
-_PAIR_SHOWN = ("training.b.train_seconds", "training.b.sampling.rollout_length", "training.b.lr_scale", "training.a1.lr_scale")
+_PAIR_SHOWN = ("training.b.sampling.rollout_length", "training.b.lr_scale", "training.a1.lr_scale")
 # The tables of name tokens, in name order: token -> the authored leaves whose values it shows. The config name takes the
 # shared, single-stage and A0 tokens; the pair folder takes the B/A1 tokens, so editing a B/A1 setting never renames the config that holds A0.
 _PAIR_TOKENS: dict[str, tuple[str, ...]] = {token: paths for token, paths in _stage_tokens("b", "a1").items() if not set(paths) & set(_PAIR_SHOWN)}
@@ -254,7 +253,6 @@ _UNNAMED = (
     *(f"loss.physics.{term}.warmup.kind" for term in _PHYSICS_TERMS),  # one admitted kind
     "optimizer.kind",  # one admitted kind
     "training.mode",  # the matched plan's one admitted protocol
-    "training.a1.match_to",  # one admitted value
     "training.stage_schedule",  # stage markers derived from the plan or the study mode
     "training.stage",
     "training.comparison_arm",
@@ -270,7 +268,9 @@ _UNNAMED = (
     "data.pin_memory",
     "data.persistent_workers",
     "data.evaluation_batch_size",  # evaluation memory only; metrics accumulate over the whole role
-    "training.memory_batch",  # memory split of one update; changes only floating-point rounding
+    # Memory split of one update (steady, stage-A-only and each matched stage); changes only floating-point rounding.
+    "training.memory_batch",
+    *(f"training.{stage}.memory_batch" for stage in ("a0", "b", "a1")),
 )
 
 
@@ -370,15 +370,15 @@ def pair_key(b_config: Mapping[str, Any], a1_config: Mapping[str, Any], authored
     Parameters
     ----------
     b_config, a1_config : Mapping[str, Any]
-        Resolved B and A1 children of one matched plan. B carries the measured
-        ``train_seconds`` budget and the rollout window; both carry their ``lr_scale``.
+        Resolved B and A1 children of one matched plan. B carries the rollout window;
+        both carry their ``lr_scale``. Their budgets follow from A0's K, which the seed group names.
     authored : Mapping[str, Any] | None
         The plan file's own mapping (``ConfigSource.authored``); ``None`` for a source without a file.
 
     Returns
     -------
     str
-        ``b-a1__budget-<seconds>s__rollout-<k>__lr-<x>``; unequal learning-rate scales
+        ``b-a1__rollout-<k>__lr-<x>``; unequal learning-rate scales
         read ``lr-b-<x>__lr-a1-<y>``. One ``__<token>-<value>`` follows for every other B/A1 leaf
         the file authors (``_PAIR_TOKENS``), so the pair folder, not the config folder holding A0, shows them.
 
@@ -396,7 +396,7 @@ def pair_key(b_config: Mapping[str, Any], a1_config: Mapping[str, Any], authored
     scale_b, scale_a1 = protocol["b"]["lr_scale"], protocol["a1"]["lr_scale"]
     scales = number(scale_b) if scale_b == scale_a1 else f"b-{number(scale_b)}__lr-a1-{number(scale_a1)}"
     rollout = b_config.get("temporal", {}).get("sampling", {}).get("rollout_length", 1)
-    fixed = f"b-a1__budget-{number(protocol['b']['train_seconds'])}s__rollout-{number(rollout)}__lr-{scales}"
+    fixed = f"b-a1__rollout-{number(rollout)}__lr-{scales}"
     key = "__".join([fixed, *_token_texts(_PAIR_TOKENS, _flatten(authored or {}))])
     try:
         return common.paths.validate_logical_name(key, label="pair key")

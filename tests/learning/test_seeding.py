@@ -97,22 +97,29 @@ def test_process_seed_reproduces_python_numpy_torch_and_model_init() -> None:
     assert torch.equal(first[3], second[3])
 
 
-def test_run_deterministic_controls_torch_settings() -> None:
+def test_run_numerics_keep_float32_and_follow_the_deterministic_setting(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Toggle deterministic orchestration on and then off in one CPU process.
+    Toggle deterministic orchestration on and then off in one CPU process after spoiling every numeric flag.
 
-    Torch algorithm and cuDNN flags must follow the setting in both directions,
-    proving the persisted flag controls implemented runtime behavior.
+    Torch algorithm flags must follow the setting in both directions, while TF32 and cuDNN autotuning stay
+    off either way, proving the persisted flag and the numerics owner control runtime behavior.
     """
-    experiments.run.configure_determinism(True)
-    assert torch.are_deterministic_algorithms_enabled()
-    assert torch.backends.cudnn.deterministic
-    assert not torch.backends.cudnn.benchmark
-
-    experiments.run.configure_determinism(False)
-    assert not torch.are_deterministic_algorithms_enabled()
-    assert not torch.backends.cudnn.deterministic
-    assert torch.backends.cudnn.benchmark
+    # monkeypatch restores every process flag and the cuBLAS variable afterwards, so later tests see the state they started with.
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", torch.backends.cudnn.deterministic)
+    previous_algorithms = torch.are_deterministic_algorithms_enabled()
+    try:
+        for deterministic in (True, False):
+            monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+            monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", True)
+            monkeypatch.setattr(torch.backends.cudnn, "benchmark", True)
+            experiments.run.configure_numerics(deterministic)
+            assert torch.are_deterministic_algorithms_enabled() is deterministic
+            assert torch.backends.cudnn.deterministic is deterministic
+            assert not torch.backends.cudnn.benchmark
+            assert (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32) == (False, False)
+    finally:
+        torch.use_deterministic_algorithms(previous_algorithms)
 
 
 class _Processor:

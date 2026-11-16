@@ -340,7 +340,7 @@ def evaluate_residual_fields(
     pressure_x, pressure_y = operator.gradient(values["p"], spacing_x, spacing_y)
     divergence = operator.divergence(values["u"], values["v"], spacing_x, spacing_y)
     porosity = values["eps_bed"]
-    coefficient = brinkman.AIR_DYNAMIC_VISCOSITY / porosity.clamp_min(brinkman.POROSITY_FLOOR)
+    coefficient = domain.physics.contracts.AIR_DYNAMIC_VISCOSITY / porosity.clamp_min(brinkman.POROSITY_FLOOR)
     trace_x, trace_y = operator.gradient(coefficient * divergence, spacing_x, spacing_y)
     porous_divergence = operator.divergence(porosity * values["u"], porosity * values["v"], spacing_x, spacing_y)
 
@@ -970,7 +970,7 @@ def flow_regime(reference: SteadyReference, *, dtype: torch.dtype = torch.float6
     values = _bind(inputs, reference.input_fields) | _bind(outputs, reference.output_fields)
     spacing_x, _ = domain.physics.derivatives.infer_uniform_spacing(values["x"], values["y"])
     scales = input_scales(inputs, reference.input_fields)
-    geometric = scales.velocity * domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY / scales.pressure_gradient
+    geometric = scales.velocity * domain.physics.contracts.AIR_DYNAMIC_VISCOSITY / scales.pressure_gradient
     brinkman_length = torch.sqrt(geometric / values["eps_bed"].mean(dim=(-2, -1)))
     return pd.DataFrame(
         {

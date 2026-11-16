@@ -106,6 +106,7 @@ _DATASET_IDENTITY_KEYS: Final = {"artifact_dataset_name", "source_dataset_id", "
 _TARGET_KEYS: Final = {
     "criterion",
     "limit",
+    "target_moisture_wb",
     "reference_evidence_scope",
     "predicted_evidence_scope",
     "reference_available",
@@ -531,15 +532,19 @@ def _validate_target(value: Mapping[str, Any]) -> dict[str, Any]:
     """Admit distinct canonical-reference and regular-grid prediction evidence."""
     target = _json_copy(value, label="target evidence")
     if set(target) != _TARGET_KEYS:
-        message = "Target evidence fields do not match the transient sequence schema."
+        message = (
+            "Target evidence fields do not match the transient sequence schema: "
+            f"missing {sorted(_TARGET_KEYS - set(target))}, unexpected {sorted(set(target) - _TARGET_KEYS)}."
+        )
         raise TransientSequenceArtifactError(message)
     if target["criterion"] != TARGET_CRITERION:
         message = "Target evidence must use the canonical transient stopping criterion."
         raise TransientSequenceArtifactError(message)
-    limit = target["limit"]
-    if isinstance(limit, bool) or not isinstance(limit, Real) or not math.isfinite(float(limit)) or not 0.0 < float(limit) < 1.0:
-        message = "Target limit must be finite and lie strictly inside (0, 1)."
-        raise ValueError(message)
+    for name, label in (("limit", "limit"), ("target_moisture_wb", "moisture (wet basis)")):
+        number = target[name]
+        if isinstance(number, bool) or not isinstance(number, Real) or not math.isfinite(float(number)) or not 0.0 < float(number) < 1.0:
+            message = f"Target {label} must be finite and lie strictly inside (0, 1)."
+            raise ValueError(message)
     scopes = {
         "reference": {"canonical_completed_case", "unavailable_partial_interval"},
         "predicted": {"regular_sequence_grid"},

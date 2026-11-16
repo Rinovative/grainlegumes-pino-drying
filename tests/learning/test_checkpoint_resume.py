@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import itertools
 import math
 import random
@@ -28,11 +29,11 @@ from torch import nn
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
 
-from src import domain, experiments, learning
+from src import common, domain, experiments, learning
 from src.datasets.runtime.dataset_runtime_units import UnitSampler
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
     from torch.optim.optimizer import Optimizer
@@ -166,9 +167,9 @@ class _StatefulLoss(nn.Module):
         """Persist the completed training epoch in module state."""
         self.epoch_index.fill_(epoch_index)
 
-    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
+    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor, reference: object = None) -> dict[str, torch.Tensor]:
         """Return every case's mean squared error while retaining serializable epoch state."""
-        del x
+        del x, reference
         return {"total": (pred - y).square().flatten(1).mean(dim=1)}
 
 
@@ -192,9 +193,9 @@ class _DivergingLoss(_StatefulLoss):
         super().__init__()
         self.diverge_at_epoch = diverge_at_epoch
 
-    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
+    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor, reference: object = None) -> dict[str, torch.Tensor]:
         """Return the MSE until the divergence epoch, then NaN on the prediction graph."""
-        components = super().unit_components(pred, x=x, y=y)
+        components = super().unit_components(pred, x=x, y=y, reference=reference)
         if int(self.epoch_index.item()) >= self.diverge_at_epoch:
             return {"total": components["total"] * math.nan}
         return components
@@ -215,9 +216,9 @@ class _NonFiniteTrainingLoss(nn.Module):
         super().__init__()
         self.value = value
 
-    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
+    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor, reference: object = None) -> dict[str, torch.Tensor]:
         """Attach the prescribed non-finite value of every case to the prediction graph."""
-        del x, y
+        del x, y, reference
         return {"total": pred.flatten(1).sum(dim=1) * 0.0 + self.value}
 
 
@@ -255,7 +256,7 @@ def _budget(epochs: int) -> learning.training.budget.StageBudget:
     The sampler updates once per epoch, so every epoch end crosses at least one of the
     20 validation points and validates exactly once, and the global step equals the epoch.
     """
-    return learning.training.budget.StageBudget(unit="units", total=learning.training.budget.units_budget(epochs, len(_MappingDataset())))
+    return learning.training.budget.StageBudget(unit="units", total=learning.training.budget.passes_budget(epochs, len(_MappingDataset())))
 
 
 def _identity(run: str = "synthetic", *, direction: str = "minimize") -> dict[str, Any]:
@@ -643,6 +644,111 @@ def test_interrupted_run_resumes_from_its_newest_last_and_trains_later_epochs_ag
     _assert_nested_equal(full_optimizer.state_dict(), resumed_optimizer.state_dict())
 
 
+def _history_loop(
+    run_dir: Path,
+    objectives: list[float],
+    *,
+    units_per_update: int,
+    resume: bool = False,
+    event_callback: Callable[[int, dict[str, float]], None] | None = None,
+) -> dict[str, Any]:
+    """Train two epochs of ``units_per_update``-case groups through the real history writer, reconciled to ``last`` on resume."""
+    identity = _identity("history")
+    binding: dict[str, Any] = {"task": "steady_flow", "run_name": "history", "checkpoint_identity": identity}
+    last_path = run_dir / "last_checkpoint.pt"
+    saved = (
+        learning.training.checkpoint.load_checkpoint(
+            last_path, expected_identity=identity, expected_role="last", payload_kind="full", scheduler_expected=False, require_best=False
+        )
+        if resume
+        else None
+    )
+    initial = learning.training.history.reconcile_history(
+        run_dir,
+        **binding,
+        completed_epoch=0 if saved is None else learning.training.checkpoint.recorded_history_epochs(saved),
+        validations=[] if saved is None else saved["objective_history"],
+    )
+    experiments.run.seed_process(41, device=torch.device("cpu"))
+    dataset = _MappingDataset()
+    sampler = UnitSampler(unit_kind="case", cases=range(12), keys=None, units_per_update=units_per_update, memory_batch=units_per_update, seed=42)
+    model = nn.Linear(2, 2)
+    return learning.training.loop.train_loop(
+        config=_config(2),
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=SGD(model.parameters(), lr=0.05),
+        train_loader=DataLoader(dataset, batch_sampler=sampler),
+        eval_loader=DataLoader(dataset, batch_size=4, shuffle=False),
+        train_loss=_StatefulLoss(),
+        eval_metrics={"mse": _ObjectiveStreamMetric(objectives)},
+        save_dir=run_dir,
+        resume_from=last_path if resume else None,
+        event_callback=event_callback,
+        epoch_state_callback=learning.training.history.make_epoch_state_callback(run_dir, **binding, initial_history=initial),
+        checkpoint_identity=identity,
+        budget=_budget(2),
+    )
+
+
+def _completed_history(run_dir: Path, *, epochs: int, validations: Sequence[Mapping[str, Any]] | Sequence[int]) -> dict[str, Any]:
+    """Admit the history of ``_history_loop`` exactly at ``epochs`` epoch records and its objective history or bare points."""
+    return learning.training.history.validate_completed_history(
+        run_dir, task="steady_flow", run_name="history", checkpoint_identity=_identity("history"), completed_epoch=epochs, validations=validations
+    )
+
+
+@pytest.mark.parametrize(
+    ("units_per_update", "points"),
+    [(6, [5, 10, 15, 20]), (4, [3, 6, 10, 13, 16, 20])],
+    ids=("one-validation-inside-each-epoch", "two-validations-inside-each-epoch"),
+)
+def test_the_history_records_every_validation_point_once_also_inside_an_epoch(tmp_path: Path, units_per_update: int, points: list[int]) -> None:
+    """Every validation point, also one inside an epoch, has one record at its epoch and step beside one record per epoch."""
+    result = _history_loop(tmp_path, [1.0] * len(points), units_per_update=units_per_update)
+
+    # The producer's records bind to the objective history the loop returns: points, epochs, eligibility and values.
+    history = _completed_history(tmp_path, epochs=2, validations=result["objective_history"])
+    assert [(record["validation/point"], record["epoch"]) for record in history["validations"]] == [
+        (float(point), 1.0 + (point > 10)) for point in points
+    ]
+    assert all("id/mse" in record and "global_step" in record for record in history["validations"])
+    assert [record["epoch"] for record in history["epochs"]] == [1.0, 2.0]
+    assert not any("validation/point" in record for record in history["epochs"])
+
+
+def test_resume_from_a_last_inside_an_epoch_restores_exactly_the_validations_it_counts(tmp_path: Path) -> None:
+    """
+    A new best at point 6 publishes ``last`` inside epoch 1 after its second validation; the run stops after point 10.
+
+    Point 10 and epoch 1 are recorded ahead of that ``last``: the resume truncates them, trains them again and
+    records every point once.
+    """
+
+    def stop_at_the_first_epoch_end(step: int, _values: dict[str, float]) -> None:
+        if step == 3:
+            raise _StopRunError
+
+    with pytest.raises(_StopRunError):
+        _history_loop(tmp_path, [3.0, 2.0, 2.5], units_per_update=4, event_callback=stop_at_the_first_epoch_end)
+    saved = torch.load(tmp_path / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    points = [entry["point"] for entry in saved["objective_history"]]
+    assert (points, learning.training.checkpoint.recorded_history_epochs(saved)) == ([3, 6], 0)
+    _completed_history(tmp_path, epochs=1, validations=[3, 6, 10])
+
+    result = _history_loop(tmp_path, [2.5, 2.4, 2.3, 2.2], units_per_update=4, resume=True)
+
+    history = _completed_history(tmp_path, epochs=2, validations=result["objective_history"])
+    assert [(record["validation/point"], record["epoch"]) for record in history["validations"]] == [
+        (3.0, 1.0),
+        (6.0, 1.0),
+        (10.0, 1.0),
+        (13.0, 2.0),
+        (16.0, 2.0),
+        (20.0, 2.0),
+    ]
+
+
 def _streamed_loop(run_dir: Path, values: list[float], **kwargs: Any) -> dict[str, Any]:
     """Train one evaluation-every-epoch segment whose objective stream fixes every new best."""
     model, optimizer, _scheduler, loss, train_loader, eval_loader = _components(37)
@@ -914,6 +1020,17 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
         )
 
 
+def test_the_training_identity_binds_the_held_out_evaluation_gate() -> None:
+    """Every checkpoint identity and training fingerprint records that training and tuning never evaluate held-out roles.
+
+    The rule is part of the identity contract, so a checkpoint of the earlier protocol carries another contract digest
+    and is refused (``former_resume_contract`` below), and analysis never mixes the two protocols silently.
+    """
+    contract = learning.training.checkpoint._TRAINING_IDENTITY_CONTRACT
+    assert contract["held_out_evaluation"] == "never_in_training_or_tuning; id_test_and_ood_only_through_the_explicit_artifacts_call"
+    assert common.serialization.canonical_json_sha256(contract) == learning.training.checkpoint.TRAINING_IDENTITY_CONTRACT_DIGEST
+
+
 @pytest.mark.parametrize("mismatch", ["config", "numerical_environment", "former_resume_contract", "other_a0_lineage"])
 def test_schema_or_identity_failure_precedes_runtime_mutation(tmp_path: Path, mismatch: str) -> None:
     """
@@ -1121,7 +1238,7 @@ def test_late_restore_failure_rolls_back_every_runtime_state() -> None:
     scheduler.advance(0.5)
     loss.set_epoch(7)
     budget = _budget(4)
-    budget.record_group(units=12, train_seconds=1.0)
+    budget.record_group(units=12, supervised_transitions=12, train_seconds=1.0)
     before = {
         "model": copy.deepcopy(model.state_dict()),
         "optimizer": copy.deepcopy(optimizer.state_dict()),
@@ -1400,7 +1517,7 @@ def test_full_payloads_bind_the_unit_sampler_state_and_refuse_loader_generator_p
         _MappingDataset(), batch_sampler=UnitSampler(unit_kind="case", cases=range(12), keys=None, units_per_update=3, memory_batch=2, seed=30)
     )
     budget = _budget(4)
-    budget.record_group(units=3, train_seconds=1.0)
+    budget.record_group(units=3, supervised_transitions=3, train_seconds=1.0)
     assert budget.record_validation() == 1
     common: dict[str, Any] = {
         "identity": _identity(),
@@ -1500,19 +1617,27 @@ def test_completed_epoch_callback_preserves_evaluation_cadence(
     assert result["completed_epoch"] == 1
 
 
-def test_id_ood_and_physics_follow_the_same_validation_points(
+_HELD_OUT_ROLES = ("id_test", "material_ood", "parameter_ood")
+
+
+def _held_out_keys(payload: Mapping[str, Any]) -> list[str]:
+    """Return the keys of ``payload`` that name a held-out role."""
+    return [key for key in payload if any(role in key for role in _HELD_OUT_ROLES)]
+
+
+def test_validation_and_physics_follow_the_validation_points_and_no_held_out_role_is_evaluated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Compute ID, OOD and the physics monitor once at every validation point and forward them in one event payload."""
+    """Validate and run the physics monitor on validation membership once per point; the loop takes no held-out loader."""
+    assert "ood_loaders" not in inspect.signature(learning.training.loop.train_loop).parameters
     run_dir = tmp_path / "shared-points"
     run_dir.mkdir()
     model, optimizer, scheduler, loss, train_loader, eval_loader = _components(101)
-    ood_loader = DataLoader(_MappingDataset(), batch_size=4, shuffle=False)
     config = _config(3)
     config["tracking"]["wandb"]["monitor"] = {"enabled": True, "max_cases": 2}
     id_epochs: list[int] = []
-    ood_epochs: list[int] = []
+    evaluated_loaders: list[Any] = []
     physics_calls = 0
     active_epoch = 0
     observed: dict[int, dict[str, float]] = {}
@@ -1525,12 +1650,13 @@ def test_id_ood_and_physics_follow_the_same_validation_points(
         _scaling: Any,
         **_kwargs: Any,
     ) -> dict[str, float]:
-        target = id_epochs if loader is eval_loader else ood_epochs
-        target.append(active_epoch)
+        evaluated_loaders.append(loader)
+        id_epochs.append(active_epoch)
         return {"mse": float(active_epoch), "nonfinite_cases": 0.0}
 
-    def record_physics(*_args: Any, **_kwargs: Any) -> dict[str, float]:
+    def record_physics(_model: nn.Module, loader: DataLoader[Any], *_args: Any, **_kwargs: Any) -> dict[str, float]:
         nonlocal physics_calls
+        evaluated_loaders.append(loader)
         physics_calls += 1
         return {
             "physics/id/momentum_residual_mse": float(physics_calls),
@@ -1553,7 +1679,6 @@ def test_id_ood_and_physics_follow_the_same_validation_points(
         optimizer=optimizer,
         train_loader=train_loader,
         eval_loader=eval_loader,
-        ood_loaders={"material_ood": ood_loader, "parameter_ood": None},
         train_loss=loss,
         eval_metrics={"mse": _DatasetMSE()},
         scheduler=scheduler,
@@ -1563,65 +1688,22 @@ def test_id_ood_and_physics_follow_the_same_validation_points(
         budget=_budget(3),
     )
 
-    assert id_epochs == ood_epochs == [1, 2, 3]
+    assert id_epochs == [1, 2, 3]
     assert physics_calls == 3
-    for key in ("id/mse", "material_ood/mse", "physics/id/momentum_residual_mse"):
+    # Validation and the physics monitor read only the validation membership.
+    assert all(loader is eval_loader for loader in evaluated_loaders)
+    for key in ("id/mse", "physics/id/momentum_residual_mse"):
         assert [epoch for epoch, payload in observed.items() if key in payload] == [1, 2, 3]
-    # An empty part is not evaluated: no metric, objective difference or duration key of it.
-    assert not any("parameter_ood" in key for payload in observed.values() for key in payload)
+    assert not [key for payload in observed.values() for key in _held_out_keys(payload)]
     assert [observed[epoch]["physics/id/momentum_residual_mse"] for epoch in (1, 2, 3)] == [1.0, 2.0, 3.0]
-
-
-def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) -> None:
-    """Evaluate ID, then material and parameter OOD as separate parts, while retaining ID as the sole objective source."""
-    run_dir = tmp_path / "id-ood-selection"
-    run_dir.mkdir()
-    model, optimizer, scheduler, loss, train_loader, eval_loader = _components(41)
-    observed: list[dict[str, float]] = []
-    result = learning.training.loop.train_loop(
-        config=_config(2),
-        device=torch.device("cpu"),
-        model=model,
-        optimizer=optimizer,
-        train_loader=train_loader,
-        eval_loader=eval_loader,
-        ood_loaders={"parameter_ood": eval_loader, "material_ood": eval_loader},
-        train_loss=loss,
-        eval_metrics={"mse": _ObjectiveStreamMetric([0.4, 0.1, 0.7, 0.3, 0.9, 0.2])},
-        scheduler=scheduler,
-        save_dir=run_dir,
-        event_callback=lambda _epoch, values: observed.append(dict(values)),
-        checkpoint_identity=_identity("id-ood-selection"),
-        budget=_budget(2),
-    )
-
-    assert [entry["value"] for entry in result["objective_history"]] == [0.4, 0.3]
-    assert result["best_epoch"] == 2
-    assert result["best_metric"] == 0.3
-    assert [values["id/mse"] for values in observed] == [0.4, 0.3]
-    assert [values["material_ood/mse"] for values in observed] == [0.1, 0.9]
-    assert [values["material_ood/objective_difference"] for values in observed] == pytest.approx([-0.3, 0.6])
-    assert [values["parameter_ood/mse"] for values in observed] == [0.7, 0.2]
-    assert [values["parameter_ood/objective_difference"] for values in observed] == pytest.approx([0.3, -0.1])
-    assert result["terminal_epoch"] == 2
-    assert set(result["terminal_metrics"]) == {
-        "train/loss_total",
-        "train/loss_data",
-        "train/updates",
-        "train/units_per_update",
-        "train/distinct_cases_per_update",
-        "train/supervised_transitions_per_update",
-        "train/last_group_units",
-        "train/microbatches",
-        "train/forward_transitions",
-    }
 
 
 def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reload best_checkpoint.pt before ID, OOD, physics, and selected weights."""
+    """Reload best_checkpoint.pt before validation, physics and selected weights; no held-out role is evaluated."""
+    assert "ood_loaders" not in inspect.signature(learning.training.loop.evaluate_selected_checkpoint).parameters
     run_dir = tmp_path / "selected-best"
     run_dir.mkdir()
     model, optimizer, scheduler, _loss, train_loader, eval_loader = _components(43)
@@ -1650,11 +1732,9 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         require_best=True,
     )
     best_state = best["model_state_dict"]
-    ood_loader = DataLoader(_MappingDataset(), batch_size=4, shuffle=False)
     task = domain.tasks.registry.get_task("steady_flow")
     science_metric_ids = tuple(metric.id for metric in task.default_metrics)
     id_science_metrics = {metric_id: 0.11 + 0.01 * index for index, metric_id in enumerate(science_metric_ids)}
-    ood_science_metrics = {metric_id: 0.51 + 0.01 * index for index, metric_id in enumerate(science_metric_ids)}
 
     def assert_best_state(current: nn.Module) -> None:
         for name, value in current.state_dict().items():
@@ -1668,9 +1748,8 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         _scaling: Any,
     ) -> dict[str, float]:
         assert_best_state(current)
-        if loader is eval_loader:
-            return {"mse": 0.2, "nonfinite_cases": 0.0, **id_science_metrics}
-        return {"mse": 0.6, "nonfinite_cases": 0.0, **ood_science_metrics}
+        assert loader is eval_loader
+        return {"mse": 0.2, "nonfinite_cases": 0.0, **id_science_metrics}
 
     def selected_physics(
         current: nn.Module,
@@ -1706,7 +1785,6 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         model=model,
         train_loss=train_loss,
         eval_loader=eval_loader,
-        ood_loaders={"material_ood": ood_loader},
         eval_metrics={
             "mse": _DatasetMSE(),
             **{metric_id: _DatasetMSE() for metric_id in science_metric_ids},
@@ -1721,10 +1799,8 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
     assert selected["selected_epoch"] == 1
     metrics = selected["selected_metrics"]
     assert metrics["selected/id/mse"] == 0.2
-    assert metrics["selected/material_ood/mse"] == 0.6
     assert {metric_id: metrics[f"selected/id/{metric_id}"] for metric_id in science_metric_ids} == id_science_metrics
-    assert {metric_id: metrics[f"selected/material_ood/{metric_id}"] for metric_id in science_metric_ids} == ood_science_metrics
-    assert metrics["selected/material_ood/objective_difference"] == pytest.approx(0.4)
+    assert not _held_out_keys(metrics)
     assert metrics["selected/physics/flux_balance_mse"] == 2.0
     for term in ("momentum", "continuity", "boundary"):
         assert metrics[f"selected/training/{term}_weight"] == 0.0
@@ -1737,7 +1813,6 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         model=model,
         train_loss=train_loss,
         eval_loader=eval_loader,
-        ood_loaders={"material_ood": ood_loader},
         eval_metrics={"mse": _DatasetMSE()},
         device=torch.device("cpu"),
         scaling=None,
@@ -1893,7 +1968,7 @@ def _subset_run(
         resume_from=resume_from,
         event_callback=record,
         checkpoint_identity=_identity("subset-warmup"),
-        budget=learning.training.budget.StageBudget(unit="units", total=learning.training.budget.units_budget(2, 18)),
+        budget=learning.training.budget.StageBudget(unit="units", total=learning.training.budget.passes_budget(2, 18)),
     )
 
 

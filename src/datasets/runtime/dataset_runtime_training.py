@@ -8,8 +8,8 @@ Responsibilities:
   - Report the startup phases both tasks share and obtain Train-only scaling through the shared scaling service
   - Serve every role in the configured endpoint-preserving grid view and refuse an OOD source on another grid view or
     coordinate grid
-  - Seed workers and construct the unit-sampled train loader and the validation, ID-test, material-OOD and
-    parameter-OOD loaders (none for an empty part)
+  - Seed workers and construct the unit-sampled train loader and the validation loader; the ID-test, material-OOD
+    and parameter-OOD loaders (none for an empty part) only on the explicit full-data acceptance request
 
 Design principles:
   - Membership comes from Dataset manifests; run seeds never repartition data
@@ -145,6 +145,7 @@ def create_dataloaders(
     scaling_artifact: Mapping[str, Any] | None = None,
     split_persist_callback: Callable[[Mapping[str, Any]], None] | None = None,
     startup_callback: scaling.StartupCallback | None = None,
+    held_out_loaders: bool = False,
 ) -> tuple[DataLoader[Any], dict[str, DataLoader[Any] | None], normalization.TrainScaling, dict[str, Any], dict[str, Any]]:
     """
     Create steady-flow loaders from the Dataset-owned fixed case partition.
@@ -192,12 +193,16 @@ def create_dataloaders(
         Persist a newly resolved split before the scaling is fitted.
     startup_callback : Callable or None, optional
         Receives the startup phase events both tasks report.
+    held_out_loaders : bool, optional
+        Also build the ``id_test``, ``material_ood`` and ``parameter_ood`` loaders; only the explicit full-data
+        acceptance asks, never training or tuning. Their membership is in the split either way.
 
     Returns
     -------
     tuple[DataLoader, dict[str, DataLoader | None], TrainScaling, dict[str, Any], dict[str, Any]]
-        A train loader driven by a ``UnitSampler`` of cases, the ``eval`` (validation), ``id_test``, ``material_ood`` and ``parameter_ood`` loaders
-        (``None`` for an empty OOD part), the admitted scaling, the split payload and the scaling artifact.
+        A train loader driven by a ``UnitSampler`` of cases, the ``eval`` (validation) loader and, when requested, the
+        ``id_test``, ``material_ood`` and ``parameter_ood`` loaders (``None`` for an empty OOD part), the admitted
+        scaling, the split payload and the scaling artifact.
 
     Raises
     ------
@@ -313,11 +318,14 @@ def create_dataloaders(
     evaluation_settings = runtime_factory.LoaderSettings(batch_size=evaluation_batch_size)
     evaluation_loaders: dict[str, DataLoader[Any] | None] = {
         "eval": runtime_factory.make_data_loader(Subset(full_train, list(split_contract.validation.index_values)), evaluation_settings),
-        "id_test": runtime_factory.make_data_loader(Subset(full_train, list(split_contract.id_test.index_values)), evaluation_settings),
     }
-    for role in splits.OOD_SPLIT_ROLES:
-        ood_dataset = _ood_dataset(parts[role], role=role)
-        evaluation_loaders[role] = None if ood_dataset is None else runtime_factory.make_data_loader(ood_dataset, evaluation_settings)
+    if held_out_loaders:
+        evaluation_loaders["id_test"] = runtime_factory.make_data_loader(
+            Subset(full_train, list(split_contract.id_test.index_values)), evaluation_settings
+        )
+        for role in splits.OOD_SPLIT_ROLES:
+            ood_dataset = _ood_dataset(parts[role], role=role)
+            evaluation_loaders[role] = None if ood_dataset is None else runtime_factory.make_data_loader(ood_dataset, evaluation_settings)
     if startup_callback is not None:
         startup_callback("dataloader_ready", {"workers": num_workers, "seconds": time.perf_counter() - loader_started})
     return train_loader, evaluation_loaders, train_scaling, split_info, artifact

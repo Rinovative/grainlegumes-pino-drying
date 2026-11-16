@@ -102,12 +102,12 @@ def _line(text: str, *, to_stderr: bool = False) -> None:
 
 
 def _budget_text(training: Mapping[str, Any]) -> str:
-    """Describe a stage budget: epochs of the full Train set, or B/A1 optimisation seconds."""
+    """Describe a stage budget: epochs of the full Train set, B's K x N or A1's receipt in supervised transitions."""
     if "budget_epochs" in training:
         return f"budget {training['budget_epochs']} epochs"
-    seconds = training["matched_a1_b"]["train_seconds"]
-    budget = "B's receipt" if seconds is None else common.console.format_duration(float(seconds))
-    return f"budget {budget} train_seconds"
+    if training["matched_a1_b"]["role"] == "a1":
+        return "budget B's receipt supervised_transitions"
+    return f"budget {training['stage_schedule']['a0_budget_epochs']} x N supervised_transitions"
 
 
 def _loss_composition(config: Mapping[str, Any]) -> str:
@@ -218,9 +218,6 @@ class ConsoleReporter:
         id_key = f"id/{self.objective_id}"
         if id_key in metrics:
             parts.append(f"val {_num(metrics[id_key])}{' *best' if metrics.get('checkpoint/new_best') == 1.0 else ''}")
-        for role, label in (("material_ood", "ood"), ("parameter_ood", "pood")):
-            if f"{role}/{self.objective_id}" in metrics:
-                parts.append(f"{label} {_num(metrics[f'{role}/{self.objective_id}'])}")
         if "physics/id/momentum_residual_mse" in metrics:
             residuals = (metrics[f"physics/id/{name}"] for name in ("momentum_residual_mse", "flux_balance_mse", "pressure_boundary_mse"))
             parts.append("phys mom/flux/bnd " + "/".join(_num(value, digits=2) for value in residuals))
@@ -243,11 +240,8 @@ class ConsoleReporter:
     def final(self, result: Mapping[str, Any], *, total_wall_seconds: float) -> dict[str, float]:
         """Print the end line with the epochs run, the budget spent and the duration parts; return the parts."""
         budget = result["budget"]
-        spent = (
-            f"{budget['units']} of {budget['total']} units"
-            if budget["unit"] == "units"
-            else f"{common.console.format_duration(budget['train_seconds'])} of {common.console.format_duration(budget['total'])} train_seconds"
-        )
+        seconds = common.console.format_duration(budget["train_seconds"])
+        spent = f"{budget[budget['unit']]} of {budget['total']} {budget['unit']}, {seconds} optimisation"
         parts = {"training": self._training_seconds, "validation": self._validation_seconds}
         if "training_start" in self._phases:
             parts = {"startup": self._phases["training_start"]["elapsed_seconds"], **parts}

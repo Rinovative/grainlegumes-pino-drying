@@ -6,6 +6,13 @@ Responsibilities:
   - Check that the comparison ranking and the B/A pipeline error reduce cases exactly as checkpoint selection does
   - Check that water densities show as wet-basis percent with masked unphysical cells, errors in percentage points,
     bulk means on shared valid cells and unchanged normalized errors
+  - Check the time windows of the mean and error over time: the windows, the last 24 h before each case's end, the
+    difference and case-count rows, the target lines and the one figure legend
+  - Check the error over normalized time τ: equal bins no narrower than any case's step, cases aligned at τ = 1, and the
+    refusal of a case that does not start at t = 0 or holds no time after its origin
+  - Check series styles resolved once per comparison and looked up by record identity and summary provenance, one shade
+    per run in every view also where only some runs have evidence, and the duration-ratio error bars with their refusal of
+    ratios that are not positive and finite
 
 Design principles:
   - Unequal support, unavailable metrics, and material summaries retain distinct meanings
@@ -18,11 +25,13 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import json
 import math
 import warnings
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from inspect import Parameter, signature
 from io import BytesIO
+from itertools import pairwise
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -32,9 +41,12 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
-from matplotlib.colors import BoundaryNorm
+from matplotlib.colors import BoundaryNorm, to_hex
+from matplotlib.container import BarContainer
 from matplotlib.figure import Figure
-from support.transient_evaluation import GRID_SHAPE, production_frame, scaling_state, sequence_frame, sequence_record
+from matplotlib.text import Annotation, Text
+from support.transient_evaluation import GRID_SHAPE, production_frame, scaling_state, sequence_frame
+from support.transient_evaluation import sequence_record as support_sequence_record
 
 from src import analysis, domain, learning
 from src.analysis.evaluation import evaluation_panel
@@ -45,10 +57,47 @@ from src.analysis.presentation import analysis_compute as compute
 from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator, Sequence
     from pathlib import Path
 
 _RHO_CHANNEL = analysis.evaluation.transient_artifact.STATIC_ORDER.index("rho_bu_dry")
+
+
+def sequence_record(*args: Any, dataset_role: str = "id", **kwargs: Any) -> SimpleNamespace:
+    """
+    Return the shared synthetic record with the entity identity of a produced one: its Dataset role and selected checkpoint.
+
+    The checkpoint is the one ``production_frame`` names as the run's, so a record view and a summary view share the run.
+    """
+    record = support_sequence_record(*args, **kwargs)
+    record.identity.update(dataset_role=dataset_role, checkpoint_identity={"best_checkpoint_sha256": "d" * 64})
+    return record
+
+
+# The comparison styles of the one FNO run that every record of ``sequence_record`` belongs to, in every role and material.
+_STYLES = analysis.evaluation.plots.series.comparison_styles(
+    ("fno", role, material, "d" * 64) for role in ("id", "parameter_ood", "material_ood") for material in ("lentil", "chickpea", "kidney_bean")
+)
+
+
+def _comparison_of(*records: SimpleNamespace) -> Any:
+    """Return the comparison styles of the runs, roles and materials of ``records``, as a session resolves its frames'."""
+    return analysis.evaluation.plots.series.comparison_styles(
+        (
+            record.identity["model_kind"],
+            record.identity["dataset_role"],
+            record.identity["material_family"],
+            record.identity["checkpoint_identity"]["best_checkpoint_sha256"],
+        )
+        for record in records
+    )
+
+
+def _table_styles(rows: pd.DataFrame) -> Any:
+    """Return the comparison styles of every run, role and material of hand-made summary rows, as a session resolves its frames'."""
+    return analysis.evaluation.plots.series.comparison_styles(
+        rows[["model_kind", "dataset_role", "material_family", "checkpoint_sha256"]].itertuples(index=False, name=None)
+    )
 
 
 def _wet_basis_percent(water: np.ndarray, rho_bu_dry: np.ndarray) -> np.ndarray:
@@ -569,18 +618,19 @@ def test_a_requested_horizon_no_case_reaches_still_yields_zero_case_rows_with_th
     assert set(cells["normalized_drying_group_macro_rmse"]) == {"unavailable (no cases at this horizon; 1 missing)"}
 
 
-def test_zero_case_rows_are_left_out_of_the_horizon_plot_and_named_in_the_summary_table() -> None:
+def test_zero_case_rows_are_left_out_of_the_horizon_plot_and_named_in_the_summary_table(tmp_path: Path) -> None:
     """A material without records at a horizon draws no point there and its table cell names the missing cases."""
     reached = sequence_record("rolling_origin", 4, case_id="lentil_long", offset=2.0, material_family="lentil")
     short = sequence_record("rolling_origin", 2, case_id="chickpea_short", offset=2.0, material_family="chickpea")
-    frame = sequence_frame((reached, short))
+    frame = production_frame((reached, short), artifact_root=str(tmp_path / "artifact"))
     frame.attrs["transient_unavailable_horizons"] = ({"case_id": "chickpea_short", "requested_horizon": 4, "reason": "short"},)
     evaluation = session.TransientEvaluationSession({"id": frame})
 
-    figure = analysis.evaluation.plots.transient.plot_horizon_error(evaluation.dataset_dataframe(modes=("rolling_origin",)))
+    summary, styles = evaluation.dataset_dataframe(modes=("rolling_origin",)), evaluation.series_styles()
+    figure = analysis.evaluation.plots.transient.plot_horizon_error(summary, styles=styles)
     table = analysis.evaluation.panel._transient_summary_table(evaluation)
     cells = table.query("material_family == 'chickpea' and requested_horizon == 4 and scope == 'cumulative'")
-    endpoint = analysis.evaluation.plots.transient.plot_endpoint_vs_cumulative(evaluation.dataset_dataframe(modes=("rolling_origin",)))
+    endpoint = analysis.evaluation.plots.transient.plot_endpoint_vs_cumulative(summary, styles=styles)
     plt.close(figure)
     plt.close(endpoint)
 
@@ -630,9 +680,7 @@ def test_transient_registry_invokes_every_visible_entry(
         }
     )
 
-    outer = analysis.evaluation.panel.build_transient_panel(
-        session=evaluation,
-    )
+    outer = analysis.evaluation.panel.build_transient_panel(session=evaluation, training_histories=_stage_histories)
 
     lazy = analysis.evaluation.panel._LAZY_PANELS[outer]
     captured: list[tuple[str, Callable[..., object], str]] = [entry for section in lazy.sections for entry in section.entries]
@@ -674,6 +722,199 @@ def test_transient_registry_invokes_every_visible_entry(
     assert not [record.getMessage() for record in caplog.records if "View failed" in record.getMessage()]
     evaluation.close()
     plt.close("all")
+
+
+def _stage_history() -> analysis.evaluation.run_discovery.StageHistory:
+    """Return a two-epoch A0 history validated at the end of each epoch."""
+    return analysis.evaluation.run_discovery.StageHistory(
+        run_name="a0",
+        stage="A0",
+        model_family="fno",
+        pipeline="a0",
+        start_epoch=0,
+        objective_id="rmse",
+        objective_direction="minimize",
+        selected_point=2,
+        epochs=({"epoch": 1.0, "global_step": 10.0, "train/loss_total": 1.0}, {"epoch": 2.0, "global_step": 20.0, "train/loss_total": 0.5}),
+        validations=(
+            {"epoch": 1.0, "global_step": 10.0, "validation/point": 1.0, "validation/eligible": 1.0, "id/rmse": 0.4},
+            {"epoch": 2.0, "global_step": 20.0, "validation/point": 2.0, "validation/eligible": 1.0, "id/rmse": 0.2},
+        ),
+    )
+
+
+def _stage_histories() -> dict[str, Any]:
+    """Return the histories of one loaded A0 stage."""
+    return {"A0": _stage_history()}
+
+
+def test_the_runtime_and_matched_stage_sections_offer_break_even_and_lazy_training_curves(tmp_path: Path) -> None:
+    """The runtime section costs the run against COMSOL, training curves load their histories only when opened, and tables are styled."""
+    frame = production_frame((sequence_record("autonomous_full", "full"),), artifact_root=str(tmp_path / "artifact"))
+    summary = frame.attrs[analysis.evaluation.dataframe.COMPLETED_RUN_SUMMARY_ATTR]
+    summary.update(model_kind="fno", elapsed_seconds=7200.0, training_units={"train_cases": 4}, terminal_controller={"arm": "A0"})
+    evaluation = session.TransientEvaluationSession({"id": frame})
+    loads: list[str] = []
+
+    def histories() -> dict[str, Any]:
+        loads.append("read")
+        return {"A0": _stage_history()}
+
+    registry = evaluation_panel._build_transient_sections(
+        session=evaluation,
+        comparison=False,
+        selection_state=None,
+        evaluation_compute_device="cpu",
+        training_histories=histories,
+    )
+    entries = {section: {title: factory for title, factory, _stem in section_entries} for section, (section_entries, _name) in registry.items()}
+
+    assert "Break-even" in entries["runtime"]
+    assert "Training curves" in entries["matched_stages"]
+    assert loads == []
+    try:
+        curves = entries["matched_stages"]["Training curves"]()
+        assert loads == ["read"]
+        assert len([axis for axis in curves.axes if axis.lines]) == 2
+        assert len([axis for axis in entries["runtime"]["Break-even"]().axes if axis.lines]) == 1
+        assert isinstance(entries["overview"]["Summary table"](), widgets.VBox)
+    finally:
+        plt.close("all")
+        evaluation.close()
+
+
+_HANDOFF_CHECKPOINT = "d" * 64  # the selected checkpoint of the A0 a B stage starts from: the support frame's own
+
+
+def _staged_session(tmp_path: Path, a0_stages: tuple[tuple[str, float], ...]) -> session.TransientEvaluationSession:
+    """Open a session of a B stage (1 h) from the A0 of checkpoint ``_HANDOFF_CHECKPOINT`` and the given A0 stages of one run name."""
+    frames = {}
+    for name, arm, checkpoint, seconds in (
+        *((f"A0 {index}", "A0", sha, elapsed) for index, (sha, elapsed) in enumerate(a0_stages)),
+        ("B", "B", _HANDOFF_CHECKPOINT, 3600.0),
+    ):
+        frame = production_frame((sequence_record("autonomous_full", "full"),), artifact_root=str(tmp_path / name))
+        frame.attrs["artifact_provenance"]["run"]["best_checkpoint_sha256"] = checkpoint
+        summary = frame.attrs[analysis.evaluation.dataframe.COMPLETED_RUN_SUMMARY_ATTR]
+        summary.update(
+            run_name="pipeline",
+            ended_at=f"2026-11-11T0{len(frames)}:00:00+00:00",
+            model_kind="fno",
+            elapsed_seconds=seconds,
+            training_units={"train_cases": 4},
+            terminal_controller={"arm": arm},
+        )
+        if arm == "B":
+            summary["teacher_handoff"] = {"source_run_name": "pipeline", "best_epoch": 3, "files": {"checkpoint": {"sha256": _HANDOFF_CHECKPOINT}}}
+        frames[name] = frame
+    return session.TransientEvaluationSession(frames)
+
+
+def _break_even_entry(evaluation: session.TransientEvaluationSession) -> Any:
+    """Return the factory of the transient runtime section's Break-even entry."""
+    registry = evaluation_panel._build_transient_sections(
+        session=evaluation, comparison=True, selection_state=None, evaluation_compute_device="cpu", training_histories=_stage_histories
+    )
+    return {title: factory for title, factory, _stem in registry["runtime"][0]}["Break-even"]
+
+
+def test_a_continuation_stage_costs_its_a0_seconds_and_its_own(tmp_path: Path) -> None:
+    """B's training cost is A0's 2 h plus its own 1 h; the A0 is the one whose selected checkpoint the handoff records, not another of its name."""
+    evaluation = _staged_session(tmp_path, (("e" * 64, 36000.0), (_HANDOFF_CHECKPOINT, 7200.0)))
+    figure = _break_even_entry(evaluation)()
+    try:
+        texts = "\n".join(text.get_text() for text in figure.artists if hasattr(text, "get_text"))
+        assert "B: " in texts
+        assert "C_train = 3 h" in texts
+        assert "C_train = 11 h" not in texts  # the same-named A0 of another checkpoint
+        assert "A0 + stage" in texts
+    finally:
+        plt.close("all")
+        evaluation.close()
+
+
+@pytest.mark.parametrize(
+    "a0_stages",
+    [(("e" * 64, 7200.0),), ((_HANDOFF_CHECKPOINT, 7200.0), (_HANDOFF_CHECKPOINT, 9000.0))],
+    ids=["only another A0", "two A0 of the handoff checkpoint"],
+)
+def test_a_continuation_stage_without_a_unique_a0_is_named_as_lacking_evidence(tmp_path: Path, a0_stages: tuple[tuple[str, float], ...]) -> None:
+    """B is never costed from its own seconds or another A0's: without exactly one A0 of its handoff checkpoint it is named."""
+    evaluation = _staged_session(tmp_path, a0_stages)
+
+    figure = _break_even_entry(evaluation)()
+    try:
+        assert "B (no training seconds" in figure.get_supxlabel()
+    finally:
+        plt.close("all")
+        evaluation.close()
+
+
+def test_a_break_even_passes_each_available_clock_so_the_unpaired_cases_are_counted(tmp_path: Path) -> None:
+    """A run with one paired case and two cases that only have the surrogate clock reports two unpaired cases."""
+    frame = production_frame((sequence_record("autonomous_full", "full"),), artifact_root=str(tmp_path / "artifact"))
+    timing = analysis.evaluation.transient_timing
+
+    def timed(case_id: str, repetitions: dict[str, tuple[float, ...]]) -> Any:
+        return timing.TransientTimingCase(
+            case_id=case_id,
+            repetitions=repetitions,
+            device="cpu",
+            precision="float32",
+            pt_payload_identity="a" * 64,
+            warmup_passes=1,
+            solver_hostname="solver-node",
+            solver_requested_cores=8,
+            cpu="test-cpu",
+            software_versions={"python": "test", "pytorch": "test", "numpy": "test"},
+        )
+
+    surrogate_only = {"drying_no_rollout_model_seconds": (0.01, 0.02)}
+    paired = timed("first", {**surrogate_only, "comsol_transient_drying_seconds": (0.3,)})
+    report = timing.build_transient_timing_report((paired, timed("second", surrogate_only), timed("third", surrogate_only)))
+    frame.attrs["artifact_provenance"]["timing"]["report"] = json.loads(json.dumps(asdict(report)))
+    frame.attrs[analysis.evaluation.dataframe.COMPLETED_RUN_SUMMARY_ATTR].update(
+        model_kind="fno", elapsed_seconds=7200.0, training_units={"train_cases": 4}, terminal_controller={"arm": "A0"}
+    )
+    evaluation = session.TransientEvaluationSession({"id": frame})
+    figure = _break_even_entry(evaluation)()
+    try:
+        note = " ".join(" ".join(text.get_text() for text in figure.artists if hasattr(text, "get_text")).split())  # a long note wraps
+        assert "over 1 paired cases (2 unpaired)" in note
+    finally:
+        plt.close("all")
+        evaluation.close()
+
+
+def test_only_the_error_over_time_view_offers_the_tau_switch_and_passes_it_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hours is the default, the switch reaches the error-over-time builder, and no other scoped view has it."""
+    records = (sequence_record("autonomous_full", "full", case_id="low", offset=1.0),)
+    evaluation = session.TransientEvaluationSession({"id": production_frame(records, artifact_root=str(tmp_path / "artifact"))})
+    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
+    seen: list[dict[str, Any]] = []
+
+    def record_call(_series: dict[str, Any], **kwargs: Any) -> Figure:
+        seen.append(kwargs)
+        return plt.figure()
+
+    monkeypatch.setattr(analysis.evaluation.plots.transient, "plot_error_over_physical_time", record_call)
+
+    def switch(plot_kind: str) -> widgets.ToggleButtons | None:
+        viewer = analysis.evaluation.panel._make_transient_scope_viewer(session=evaluation, fields=fields, plot_kind=plot_kind, comparison=False)
+        found = [item for item in _widget_tree(viewer.widget) if isinstance(item, widgets.ToggleButtons) and item.value == "hours"]
+        return found[0] if found else None
+
+    try:
+        assert switch("trajectory") is None
+        assert switch("target_magnitude") is None
+        control = switch("error_time")
+        assert control is not None
+        assert seen[-1]["time_axis"] == "hours"
+        control.value = "tau"
+        assert seen[-1]["time_axis"] == "tau"
+    finally:
+        plt.close("all")
+        evaluation.close()
 
 
 def test_transient_controls_expose_admitted_state_and_derived_channels(
@@ -734,7 +975,9 @@ def test_transient_tabs_follow_the_decided_order_and_numbers_follow_the_position
     )
     layouts = {}
     for keys, is_comparison in ((single, False), (comparison, True)):
-        tabs, views = _tab_layout(analysis.evaluation.panel.build_transient_panel(session=evaluation, comparison=is_comparison))
+        tabs, views = _tab_layout(
+            analysis.evaluation.panel.build_transient_panel(session=evaluation, comparison=is_comparison, training_histories=_stage_histories)
+        )
         assert tabs == tuple(f"{number}. {titles[key]}" for number, key in enumerate(keys, start=1))
         for number, labels in enumerate(views, start=1):
             assert all(label.startswith(f"{number}-{position}. ") for position, label in enumerate(labels, start=1))
@@ -750,10 +993,12 @@ def test_transient_numbers_leave_no_gap_for_filtered_or_selected_sections(tmp_pa
     """Number the tabs that are displayed: no temporal evidence closes its gap and a sample-only panel starts at one."""
     evaluation = _transient_evaluation(tmp_path, sequence_record("teacher_forced_one_step", 1))
     titles = analysis.evaluation.panel.EVALUATION_SECTION_TITLES
-    tabs, _views = _tab_layout(analysis.evaluation.panel.build_transient_panel(session=evaluation))
+    tabs, _views = _tab_layout(analysis.evaluation.panel.build_transient_panel(session=evaluation, training_histories=_stage_histories))
     assert not any(titles["temporal_rollout"] in title for title in tabs)
     assert [title.partition(".")[0] for title in tabs] == [str(number) for number in range(1, len(tabs) + 1)]
-    sample_tabs, sample_views = _tab_layout(analysis.evaluation.panel.build_transient_panel(session=evaluation, sections=("sample_viewer",)))
+    sample_tabs, sample_views = _tab_layout(
+        analysis.evaluation.panel.build_transient_panel(session=evaluation, sections=("sample_viewer",), training_histories=_stage_histories)
+    )
     assert sample_tabs == (f"1. {titles['sample_viewer']}",)
     assert [label.partition(".")[0] for label in sample_views[0]] == ["1-1"]
     evaluation.close()
@@ -776,7 +1021,9 @@ def test_closing_a_panel_closes_its_rendered_views_and_silences_compute_callback
 
     monkeypatch.setattr(analysis.evaluation.panel, "_make_transient_aggregate_viewer", capture)
     preference = compute.AnalysisComputePreference("cpu")
-    panel = analysis.evaluation.panel.build_transient_panel(session=evaluation, evaluation_compute_device=preference)
+    panel = analysis.evaluation.panel.build_transient_panel(
+        session=evaluation, evaluation_compute_device=preference, training_histories=_stage_histories
+    )
     lazy = analysis.evaluation.panel._LAZY_PANELS[panel]
     lazy.open()
     lazy.tabs.selected_index = 1
@@ -976,8 +1223,81 @@ def test_aggregate_spatial_plots_use_exact_values_and_reuse_loaded_records(
     time_control.value = 1.0
     temperature.value = False
     assert calls == [("id", "low"), ("id", "high")]
-    assert "channel_phi-w_surf-w_int" in str(export_state["filename_stem"])
+    assert "__channel_phi__" in str(export_state["filename_stem"])
     assert "t_1h" in str(export_state["filename_stem"])
+    evaluation.close()
+
+
+def test_only_the_mean_error_maps_offer_the_error_mode_and_pass_it_with_the_scales(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mean maps carry the transient error-mode control, its value reaches the builder, and the normalized mode adds each context's scales."""
+    records = (sequence_record("autonomous_full", "full", case_id="low", offset=1.0),)
+    evaluation = session.TransientEvaluationSession({"id": production_frame(records, artifact_root=str(tmp_path / "artifact"))})
+    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
+    seen: list[dict[str, Any]] = []
+
+    def record_call(series: dict[str, Any], **kwargs: Any) -> Figure:
+        seen.append({**kwargs, "shown": set(series)})
+        return plt.figure()
+
+    monkeypatch.setattr(analysis.evaluation.plots.transient, "plot_aggregate_error_maps", record_call)
+    monkeypatch.setattr(
+        analysis.evaluation.panel, "_transient_reference_scales", lambda _session, _frame, names, _record: dict.fromkeys(names, "scale")
+    )
+
+    def mode_control(plot_kind: str) -> tuple[Any, widgets.ToggleButtons | None]:
+        viewer = analysis.evaluation.panel._make_transient_aggregate_viewer(session=evaluation, fields=fields, plot_kind=plot_kind, comparison=False)
+        found = [item for item in _widget_tree(viewer.widget) if isinstance(item, widgets.ToggleButtons) and item.description == "Error mode"]
+        return viewer, found[0] if found else None
+
+    assert mode_control("std_error")[1] is None
+    viewer, control = mode_control("mean_error")
+    assert control is not None
+    assert seen[-1]["error_mode"] == "Signed error"
+    assert "reference_scales" not in seen[-1]
+    control.value = error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
+    assert seen[-1]["error_mode"] == control.value
+    assert seen[-1]["shown"]
+    assert set(seen[-1]["reference_scales"]) == seen[-1]["shown"]
+    assert viewer is not None
+    plt.close("all")
+    evaluation.close()
+
+
+def test_normalized_mean_maps_take_each_series_scale_from_its_own_frame_and_refuse_a_foreign_scaler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each «dataset · frame» series takes its scales from its own frame, once per render; a scaler other than the records' refuses."""
+    frames = {
+        name: production_frame((sequence_record("autonomous_full", "full", case_id="low", offset=1.0),), artifact_root=str(tmp_path / name))
+        for name in ("first", "second")
+    }
+    evaluation = session.TransientEvaluationSession(frames)
+    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
+    seen: list[dict[str, Any]] = []
+    reads: list[str] = []
+
+    def record_call(_series: dict[str, Any], **kwargs: Any) -> Figure:
+        seen.append(kwargs)
+        return plt.figure()
+
+    def scales_of(_session: object, frame: str, names: tuple[str, ...]) -> dict[str, Any]:
+        reads.append(frame)
+        value, scaler = (1.0, "c" * 64) if frame == "first" else (2.0, "e" * 64)  # the records carry the scaler identity "c" * 64
+        return {name: error_diagnostics.ReferenceScale(name, "K", value, "s", "train", "d", scaler) for name in names}
+
+    monkeypatch.setattr(analysis.evaluation.plots.transient, "plot_aggregate_error_maps", record_call)
+    monkeypatch.setattr(analysis.evaluation.panel, "_frame_reference_scales", scales_of)
+    viewer = analysis.evaluation.panel._make_transient_aggregate_viewer(session=evaluation, fields=fields, plot_kind="mean_error", comparison=True)
+    (control,) = [item for item in _widget_tree(viewer.widget) if isinstance(item, widgets.ToggleButtons) and item.description == "Error mode"]
+    reads.clear()
+    control.value = error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
+
+    by_frame = {label.rsplit(" · ", 1)[1]: scales for label, scales in seen[-1]["reference_scales"].items()}
+    assert set(by_frame) == {"first", "second"}
+    assert {scale.value for scale in by_frame["first"].values()} == {1.0}
+    assert all(isinstance(scale, str) for scale in by_frame["second"].values())
+    assert sorted(reads) == ["first", "second"]  # once per frame and render
+    plt.close("all")
     evaluation.close()
 
 
@@ -1086,17 +1406,17 @@ def test_transient_temporal_union_preserves_short_tails_counts_and_nonfinite_una
     assert exact.mean[1] == 2.0
     assert np.isnan(exact.lower).all()
 
-    trajectory = analysis.evaluation.plots.transient.plot_state_trajectory_summary({"ID": (long, short)}, state_fields=("T",))
+    trajectory = analysis.evaluation.plots.transient.plot_state_trajectory_summary({"ID": (long, short)}, state_fields=("T",), styles=_STYLES)
     trajectory_times = np.asarray(trajectory.axes[0].lines[0].get_xdata())
     assert trajectory_times.size == 3
-    np.testing.assert_array_equal(trajectory.axes[1].lines[0].get_ydata(), [2, 2, 1])
+    np.testing.assert_array_equal(trajectory.axes[-1].lines[0].get_ydata(), [2, 2, 1])  # the case-count row is the last
     plt.close(trajectory)
     error = analysis.evaluation.plots.transient.plot_error_over_physical_time(
-        {"ID": (long, short)}, scaling_states={"ID": scaling_state()}, state_fields=("T",)
+        {"ID": (long, short)}, scaling_states={"ID": scaling_state()}, state_fields=("T",), styles=_STYLES
     )
     error_times = np.asarray(error.axes[0].lines[0].get_xdata())
     assert error_times.size == 2
-    np.testing.assert_array_equal(error.axes[1].lines[0].get_ydata(), [2, 1])
+    np.testing.assert_array_equal(error.axes[-1].lines[0].get_ydata(), [2, 1])
     plt.close(error)
 
     empty_context = analysis.evaluation.plots.transient.plot_aggregate_error_maps(
@@ -1104,6 +1424,291 @@ def test_transient_temporal_union_preserves_short_tails_counts_and_nonfinite_una
     )
     assert any("No case at this exact time" in text.get_text() for text in empty_context.axes[1].texts)
     plt.close(empty_context)
+
+
+@pytest.fixture(autouse=True)
+def _close_figures() -> Iterator[None]:
+    """Close every figure a test of this module opened, passed or failed."""
+    yield
+    plt.close("all")
+
+
+def _timed_record(case_id: str, steps: int, *, target: float = 0.12, stop_after_grid: float = 0.0) -> SimpleNamespace:
+    """
+    Return one full-autonomous record on a regular two-hour grid (``2 * (steps - 1)`` hours long) with its wet-basis target moisture.
+
+    Its recorded final reference time (the exact stop) lies ``stop_after_grid`` hours after the last grid time.
+    """
+    record = sequence_record("autonomous_full", "full", case_id=case_id, length=steps, target_moisture_wb=target)
+    record.physical_times = np.arange(steps, dtype=np.float64) * 2.0
+    record.target["reference_final_time"] = float(record.physical_times[-1]) + stop_after_grid
+    return record
+
+
+def _water_nan(record: SimpleNamespace, index: int) -> None:
+    """Make the predicted water of one stored time non-finite everywhere, so the grain moisture (not T) is unavailable there."""
+    states = analysis.evaluation.transient_artifact.STATE_ORDER
+    record.predicted_states[index, [states.index("w_surf"), states.index("w_int")]] = np.nan
+
+
+def _crosses(axis: Any) -> list[Any]:
+    """Return the lines of one axis that mark non-finite times with an x."""
+    return [line for line in axis.get_lines() if line.get_marker() == "x"]
+
+
+def test_mean_and_error_over_time_show_one_window_for_a_short_run_and_three_for_a_long_one() -> None:
+    """Below 72 h the whole run is one window; a long run shows its first 24 h, the middle in days and its last 24 h."""
+    transient = analysis.evaluation.plots.transient
+    for steps, titles in ((20, ["whole run, 38 h"]), (60, ["first 24 h", "day 1 to 3.9", "last 24 h"])):
+        series = {"ID": (_timed_record("a", steps), _timed_record("b", steps))}
+        mean = transient.plot_state_trajectory_summary(series, state_fields=("T",), styles=_STYLES)
+        error = transient.plot_error_over_physical_time(series, scaling_states={"ID": scaling_state()}, state_fields=("T",), styles=_STYLES)
+        assert [axis.get_title() for axis in mean.axes if axis.get_title()] == titles
+        assert [axis.get_title() for axis in error.axes if axis.get_title()] == titles
+        assert (len(mean.axes), len(error.axes)) == (3 * len(titles), 2 * len(titles))  # state, difference, count rows; state, count rows
+
+
+def test_the_last_24_hours_are_hours_before_each_end_only_for_cases_of_different_duration() -> None:
+    """Cases ending at 118 h and 98 h share the last window as -24 to 0 h before their end; cases ending together keep the clock."""
+    transient = analysis.evaluation.plots.transient
+
+    def last_window(records: tuple[SimpleNamespace, ...]) -> tuple[np.ndarray, str, np.ndarray]:
+        figure = transient.plot_state_trajectory_summary({"ID": records}, state_fields=("T",), styles=_STYLES)
+        last, count = figure.axes[2], figure.axes[-1]
+        reference = next(line for line in last.get_lines() if line.get_label() == "ID · Reference")
+        return np.asarray(reference.get_xdata()), count.get_xlabel(), np.asarray(count.lines[0].get_ydata())
+
+    time, label, count = last_window((_timed_record("long", 60), _timed_record("short", 50)))
+    assert (time.min(), time.max(), label) == (-22.0, 0.0, "Time before end [h]")  # (-24, 0] h on a two-hour grid
+    np.testing.assert_array_equal(count, 2.0)  # both cases have all of their last 24 h
+    time, label, _count = last_window((_timed_record("a", 60), _timed_record("b", 60)))
+    assert (time.min(), time.max(), label) == (96.0, 118.0, "Time [h]")  # (94, 118] h
+
+
+def test_the_middle_window_of_cases_of_different_duration_stops_at_each_cases_end_minus_24_hours() -> None:
+    """A case that ends at 98 h is in the middle window up to 74 h and in the last window from there, never in both beyond that hour."""
+    transient = analysis.evaluation.plots.transient
+    records = (_timed_record("long", 60), _timed_record("short", 50))
+    figure = transient.plot_state_trajectory_summary({"ID": records}, state_fields=("T",), styles=_STYLES)
+    clock = np.asarray(next(line for line in figure.axes[1].get_lines() if line.get_label() == "ID · Reference").get_xdata())
+    assert clock.max() == 94.0  # the long case, 118 h minus 24 h
+    middle_count = figure.axes[-2].lines[0]  # the case-count row: first, middle and last window
+    time, count = np.asarray(middle_count.get_xdata()), np.asarray(middle_count.get_ydata())
+    np.testing.assert_array_equal(count[time <= 74.0], 2.0)
+    np.testing.assert_array_equal(count[time > 74.0], 1.0)  # the short case is in the last window from there on
+    np.testing.assert_array_equal(figure.axes[-1].lines[0].get_ydata(), 2.0)  # both cases have all of their last 24 h
+
+
+def test_cases_under_48_hours_are_in_one_window_per_stored_hour_and_the_count_is_the_true_coverage() -> None:
+    """A 40 h case is in the first window to 24 h and in the last after it, a 20 h case only in the first; the long case alone fills the middle."""
+    transient = analysis.evaluation.plots.transient
+    records = (_timed_record("long", 60), _timed_record("mid", 21), _timed_record("short", 11))  # 118 h, 40 h and 20 h
+    figure = transient.plot_state_trajectory_summary({"ID": records}, state_fields=("T",), styles=_STYLES)
+    first, middle, last = ((np.asarray(axis.lines[0].get_xdata()), np.asarray(axis.lines[0].get_ydata())) for axis in figure.axes[-3:])
+    assert (first[1][first[0] <= 20.0] == 3.0).all()
+    assert (first[1][first[0] > 20.0] == 2.0).all()  # the 20 h case has ended; the 40 h case is still in its first window
+    assert middle[0].max() == 94.0
+    assert (middle[1] == 1.0).all()  # the 40 h case's middle (24 h to its end minus 24 h) is empty
+    assert (last[1][last[0] < -14.0] == 1.0).all()
+    assert (last[1][last[0] >= -14.0] == 2.0).all()  # the 40 h case joins the last window with its first hour after 24 h, 14 h before its end
+
+
+def test_records_of_one_case_with_different_target_moistures_are_refused() -> None:
+    """The target moisture is a property of the case: two records of one case that disagree are refused, two cases may differ."""
+    transient = analysis.evaluation.plots.transient
+    plt.close(
+        transient.plot_state_trajectory_summary(
+            {"ID": (_timed_record("a", 20, target=0.12), _timed_record("b", 20, target=0.135))}, state_fields=("w_gr",), styles=_STYLES
+        )
+    )
+    disagreeing = {"ID": (_timed_record("a", 20, target=0.12),), "OOD": (_timed_record("a", 20, target=0.135),)}
+    open_figures = set(plt.get_fignums())
+    with pytest.raises(ValueError, match=r"case 'a' carry different target_moisture_wb"):
+        transient.plot_state_trajectory_summary(disagreeing, state_fields=("w_gr",), styles=_STYLES)
+    assert set(plt.get_fignums()) == open_figures
+
+
+def test_the_last_window_aligns_on_each_cases_last_stored_time_so_cases_with_off_grid_stops_still_aggregate() -> None:
+    """Exact stops 0.4, 0.8 and 1.2 h after the last grid times do not move the offsets: the three cases share every point of the last window."""
+    transient = analysis.evaluation.plots.transient
+    records = (_timed_record("a", 60, stop_after_grid=0.4), _timed_record("b", 50, stop_after_grid=0.8), _timed_record("c", 55, stop_after_grid=1.2))
+    figure = transient.plot_state_trajectory_summary({"ID": records}, state_fields=("T",), styles=_STYLES)
+    reference = next(line for line in figure.axes[2].get_lines() if line.get_label() == "ID · Reference")
+    time = np.asarray(reference.get_xdata())
+    assert (time.min(), time.max()) == (-22.0, 0.0)  # offsets before each case's last stored time
+    np.testing.assert_array_equal(figure.axes[-1].lines[0].get_ydata(), 3.0)  # n(t) = 3 in the last window
+
+
+def test_time_numbers_and_the_time_label_stand_under_the_bottom_row_of_every_window_only() -> None:
+    """The rows above the case-count row carry neither tick numbers nor a time label, in the mean and the error plot alike."""
+    transient = analysis.evaluation.plots.transient
+    series = {"ID": (_timed_record("a", 60), _timed_record("b", 50))}
+    mean = transient.plot_state_trajectory_summary(series, state_fields=("T", "phi"), styles=_STYLES)
+    error = transient.plot_error_over_physical_time(series, scaling_states={"ID": scaling_state()}, state_fields=("T", "phi"), styles=_STYLES)
+    for figure, rows in ((mean, 5), (error, 3)):  # T and phi with a difference row each and the count row; T, phi and the count row
+        upper, bottom = figure.axes[: 3 * (rows - 1)], figure.axes[3 * (rows - 1) :]
+        assert all(axis.get_xlabel() == "" and not axis.xaxis.get_tick_params()["labelbottom"] for axis in upper)
+        assert all(axis.get_xlabel().startswith("Time") and axis.xaxis.get_tick_params()["labelbottom"] for axis in bottom)
+
+
+def test_the_difference_row_is_prediction_minus_reference_in_the_difference_unit() -> None:
+    """Each state has a row of prediction minus reference in its difference unit: percent becomes percentage points."""
+    transient = analysis.evaluation.plots.transient
+    fields = ("T", "phi", "w_gr")
+    figure = transient.plot_state_trajectory_summary({"ID": (_timed_record("a", 20),)}, state_fields=fields, styles=_STYLES)
+    quantity_rows, difference_rows = figure.axes[0:6:2], figure.axes[1:6:2]  # one window: state, difference, state, difference, ...
+    labels = [axis.get_ylabel() for axis in difference_rows]
+    assert labels == [f"pred \N{MINUS SIGN} ref [{transient._display_unit(field, difference=True)}]" for field in fields]
+    assert [label.endswith("[pp]") for label in labels] == [False, True, True]
+    assert [axis.get_ylabel() for axis in quantity_rows] == [transient._display_label(field) for field in fields]
+    difference = np.asarray(difference_rows[0].lines[0].get_ydata(), dtype=np.float64)
+    np.testing.assert_allclose(difference, [0.0] + [2.0] * 19)  # the offset of the record after its origin
+
+
+def test_the_case_count_is_the_stored_times_and_a_non_finite_value_marks_only_its_own_fields_row() -> None:
+    """n(t) counts the cases with a stored time and is the same for every state; an x stands on the difference row of the state it voids."""
+    transient = analysis.evaluation.plots.transient
+    records = (_timed_record("a", 20), _timed_record("b", 20))
+    _water_nan(records[0], -1)
+    figure = transient.plot_state_trajectory_summary({"ID": records}, state_fields=("T", "w_gr"), styles=_STYLES)
+    temperature_difference, moisture_difference, count = figure.axes[1], figure.axes[3], figure.axes[4]  # one window: T, d, w_gr, d, n(t)
+    assert _crosses(temperature_difference) == _crosses(count) == []
+    (cross,) = _crosses(moisture_difference)
+    assert list(cross.get_xdata()) == [38.0]  # the last stored time, where one case has no finite water
+    np.testing.assert_array_equal(count.lines[0].get_ydata(), 2.0)  # both cases still have that time
+
+
+def test_the_one_figure_legend_stands_outside_the_right_edge_without_growing_a_row() -> None:
+    """Many entries do not change any row height; the legend starts at the top frame, right of the last window, and gathers every axis."""
+    transient = analysis.evaluation.plots.transient
+    few = transient.plot_state_trajectory_summary({"ID": (_timed_record("a", 60),)}, state_fields=("T",), styles=_STYLES)
+    many_records = {f"Context {index}": (_timed_record(f"c{index}", 60),) for index in range(15)}
+    many_records["Context 0"][0].predicted_states[-1] = np.nan  # a non-finite last time, drawn in the last window only
+    many = transient.plot_state_trajectory_summary(many_records, state_fields=("T",), styles=_STYLES)
+    for figure in (few, many):
+        figure.canvas.draw()
+    few_heights = [axis.get_window_extent().height for axis in few.axes]
+    assert [axis.get_window_extent().height for axis in many.axes] == pytest.approx(few_heights, abs=0.5)  # the legend grows the figure, not a row
+    assert len(many.legends) == 1
+    legend = many.legends[0]
+    assert legend.get_window_extent().y1 == pytest.approx(many.axes[0].get_window_extent().y1, abs=1.0)
+    assert legend.get_window_extent().x0 > many.axes[2].get_window_extent().x1
+    labels = [text.get_text() for text in legend.get_texts()]
+    assert len(labels) == len(set(labels)) == 15 * 3 + 1  # reference, prediction and n(t) of 15 contexts, one non-finite entry
+    assert "non-finite, unavailable" in labels  # drawn in the last window only
+
+
+def test_the_grain_moisture_mean_draws_each_distinct_target_moisture_once() -> None:
+    """One line per distinct wet-basis target of all shown cases, one legend entry, and each value at the left end of the first window."""
+    transient = analysis.evaluation.plots.transient
+    series = {
+        "ID": (_timed_record("a", 60, target=0.12), _timed_record("b", 60, target=0.12), _timed_record("c", 60, target=0.135)),
+        "OOD": (_timed_record("d", 60, target=0.12),),
+    }
+    figure = transient.plot_state_trajectory_summary(series, state_fields=("T", "w_gr"), styles=_STYLES)
+    temperature, moisture = figure.axes[0:3], figure.axes[6:9]  # rows: T, difference, w_gr, difference, count; three windows
+    for axis in moisture:
+        levels = [float(np.asarray(line.get_ydata())[0]) for line in axis.get_lines() if line.get_linestyle() == ":"]
+        assert levels == pytest.approx([12.0, 13.5])
+    assert not any(line.get_linestyle() == ":" for axis in temperature for line in axis.get_lines())
+    assert [text.get_text() for text in figure.legends[0].get_texts() if text.get_text().startswith("Target")] == [
+        f"Target {transient._display_symbol('w_gr')}"
+    ]
+    assert [[text.get_text() for text in axis.texts] for axis in moisture] == [["12 %", "13.5 %"], [], []]
+    without_target = _timed_record("e", 20)
+    without_target.target = {name: value for name, value in without_target.target.items() if name != "target_moisture_wb"}
+    transient.plot_state_trajectory_summary({"ID": (without_target,)}, state_fields=("T",), styles=_STYLES)  # no moisture row needs it
+    open_figures = set(plt.get_fignums())
+    with pytest.raises(ValueError, match="target_moisture_wb"):
+        transient.plot_state_trajectory_summary({"ID": (without_target,)}, state_fields=("w_gr",), styles=_STYLES)
+    assert set(plt.get_fignums()) == open_figures  # the refused plot closed its figure
+
+
+def test_close_target_values_are_pushed_apart_and_stay_one_per_line() -> None:
+    """Six targets half a percentage point apart get six values that do not overlap, each joined to its own line."""
+    transient = analysis.evaluation.plots.transient
+    records = tuple(_timed_record(f"t{index}", 20, target=0.12 + 0.005 * index) for index in range(6))
+    figure = transient.plot_state_trajectory_summary({"ID": records}, state_fields=("w_gr",), styles=_STYLES)
+    figure.canvas.draw()
+    values = figure.axes[0].texts
+    assert [text.get_text() for text in values] == ["12 %", "12.5 %", "13 %", "13.5 %", "14 %", "14.5 %"]
+    boxes = [Text.get_window_extent(text) for text in values]
+    assert all(upper.y0 >= lower.y1 for lower, upper in pairwise(boxes))
+    assert all(isinstance(text, Annotation) and text.arrow_patch is not None for text in values)
+
+
+def test_aggregate_mean_maps_are_signed_by_default_with_a_locked_scale_per_row_and_a_unit_on_every_bar() -> None:
+    """The mean is the signed pooled error (absolute on request), one scale per field row serves all contexts, and the figure grows by column."""
+    transient = analysis.evaluation.plots.transient
+    low, high = (sequence_record("autonomous_full", "full", case_id=name, offset=offset) for name, offset in (("low", 1.0), ("high", -3.0)))
+    series = {"Low": (low,), "High": (high,)}
+    fields = ("T", "phi")
+    figure = transient.plot_aggregate_error_maps(series, state_fields=fields, physical_time=1.0, statistic="mean")
+    maps, bars = figure.axes[:4], figure.axes[4:]
+    for axis, expected in zip(maps, (1.0, -3.0, 100.0, -300.0), strict=True):  # row-major: T, then phi in pp
+        np.testing.assert_allclose(cast("Any", axis.collections[0].get_array()), expected)
+    for row in (0, 1):
+        left, right = (cast("BoundaryNorm", maps[2 * row + column].collections[0].norm).boundaries for column in (0, 1))
+        np.testing.assert_array_equal(left, right)
+        assert left[0] == pytest.approx(-left[-1])
+    assert [bar.get_ylabel() for bar in bars] == [f"[{transient._display_unit(field, difference=True)}]" for field in fields for _ in series]
+    single = transient.plot_aggregate_error_maps({"Low": (low,)}, state_fields=fields, physical_time=1.0, statistic="mean")
+    assert single.get_figwidth() < figure.get_figwidth()
+    plt.close(single)
+    plt.close(figure)
+    pooled = {"Pooled": (low, high)}
+    signed = transient.plot_aggregate_error_maps(pooled, state_fields=("T",), physical_time=1.0, statistic="mean")
+    absolute = transient.plot_aggregate_error_maps(pooled, state_fields=("T",), physical_time=1.0, statistic="mean", error_mode="Absolute error")
+    np.testing.assert_allclose(cast("Any", signed.axes[0].collections[0].get_array()), -1.0)
+    np.testing.assert_allclose(cast("Any", absolute.axes[0].collections[0].get_array()), 2.0)
+    unit = transient._display_unit("T", difference=True)
+    # One mean line above each mean map: the mean of |shown values| (the signed map shows -1, the absolute one 2).
+    for figure, mean in ((signed, 1), (absolute, 2)):
+        assert [text.get_text() for text in figure.axes[0].texts if text.get_text().startswith("mean")] == [f"mean |e| = {mean} {unit}"]
+    plt.close(signed)
+    plt.close(absolute)
+    std = transient.plot_aggregate_error_maps(pooled, state_fields=("T",), physical_time=1.0, statistic="std")
+    assert not any(text.get_text().startswith("mean") for text in std.axes[0].texts)
+    plt.close(std)
+    with pytest.raises(ValueError, match="at least one"):  # no context has a case at all: refused before any map is built
+        transient.plot_aggregate_error_maps({"ID": ()}, state_fields=("T",), physical_time=1.0, statistic="mean")
+
+
+def test_aggregate_normalized_mean_maps_need_one_train_sigma_over_the_shown_contexts() -> None:
+    """The absolute mean over the train sigma is refused for scales of different provenance, for water and without scales."""
+    transient = analysis.evaluation.plots.transient
+    record = sequence_record("autonomous_full", "full", offset=3.0)
+    scales = {
+        name: {
+            "T": error_diagnostics.transient_reference_scale(scaling_state(membership_digest=digest), field="T", unit="K", dataset_identity=digest)
+        }
+        for name, digest in (("A", "a" * 64), ("B", "b" * 64))
+    }
+    arguments: dict[str, Any] = {
+        "state_fields": ("T",),
+        "physical_time": 1.0,
+        "statistic": "mean",
+        "error_mode": error_diagnostics.NORMALIZED_ABSOLUTE_ERROR,
+    }
+    shown = {"A": (record,), "B": (record,)}
+    with pytest.raises(ValueError, match="incompatible"):
+        transient.plot_aggregate_error_maps(shown, reference_scales=scales, **arguments)
+    with pytest.raises(ValueError, match="No valid train reference scale"):
+        transient.plot_aggregate_error_maps(shown, **arguments)
+    with pytest.raises(ValueError, match="stored states"):
+        transient.plot_aggregate_error_maps(shown, reference_scales=scales, **{**arguments, "state_fields": ("w_gr",)})
+    for field, unit in (("phi", "K"), ("T", "degC")):  # a scale of another field, or of T in another unit, is no sigma for T in K
+        foreign = error_diagnostics.transient_reference_scale(scaling_state(), field=field, unit=unit, dataset_identity="a" * 64)
+        with pytest.raises(ValueError, match="different physical field or unit"):
+            transient.plot_aggregate_error_maps({"A": (record,)}, reference_scales={"A": {"T": foreign}}, **arguments)
+    with pytest.raises(
+        ValueError, match="No valid train reference scale"
+    ):  # an unavailable scale of any shown context refuses, even without a reason
+        transient.plot_aggregate_error_maps(shown, reference_scales={"A": scales["A"], "B": {"T": ""}}, **arguments)
+    sigma = cast("Any", scales["A"]["T"]).value
+    figure = transient.plot_aggregate_error_maps({"A": (record,)}, reference_scales=scales, **arguments)
+    np.testing.assert_allclose(cast("Any", figure.axes[0].collections[0].get_array()), 3.0 / sigma)
+    plt.close(figure)
 
 
 def test_error_over_time_line_is_the_root_of_the_material_case_mean_squared_error() -> None:
@@ -1119,10 +1724,231 @@ def test_error_over_time_line_is_the_root_of_the_material_case_mean_squared_erro
         sequence_record("autonomous_full", "full", case_id="c", offset=2.0, material_family="chickpea"),
     )
     figure = analysis.evaluation.plots.transient.plot_error_over_physical_time(
-        {"ID": records}, scaling_states={"ID": scaling_state()}, state_fields=("T",)
+        {"ID": records}, scaling_states={"ID": scaling_state()}, state_fields=("T",), styles=_STYLES
     )
     np.testing.assert_allclose(np.asarray(figure.axes[0].lines[0].get_ydata(), dtype=np.float64), [math.sqrt(1.5)] * 2)
     plt.close(figure)
+
+
+def test_each_case_is_averaged_inside_a_tau_bin_before_the_cases_are_reduced() -> None:
+    """
+    In the two τ bins (0, 1/2] and (1/2, 1], each case's bin value is the mean of its own values there, drawn at the bin's upper edge.
+
+    A 4 h case stored at 1, 2 and 4 h after its origin gives 1.5 and 3, an 8 h case on an hourly grid (1, ..., 8) gives 2.5 and 6.5;
+    one non-finite value voids only its case's bin.
+    """
+    transient = analysis.evaluation.plots.transient
+    rows = ((np.asarray((0.25, 0.5, 1.0)), np.asarray((1.0, 2.0, 3.0))), (np.arange(1.0, 9.0) / 8.0, np.arange(1.0, 9.0)))
+    (short_tau, short), (long_tau, long) = transient._tau_binned(rows, 2)
+    np.testing.assert_array_equal(short_tau, [0.5, 1.0])
+    np.testing.assert_array_equal(long_tau, [0.5, 1.0])
+    np.testing.assert_array_equal(short, [1.5, 3.0])
+    np.testing.assert_array_equal(long, [2.5, 6.5])
+    ((_tau, voided),) = transient._tau_binned(((np.asarray((0.25, 0.5, 1.0)), np.asarray((np.nan, 2.0, 3.0))),), 2)
+    assert np.isnan(voided[0])
+    assert voided[1] == 3.0
+
+
+def test_error_over_tau_aligns_cases_of_different_length_at_one_with_every_case_in_every_bin() -> None:
+    """Cases of 118 h and 98 h on a 2 h grid end together at τ = 1; the bins are one 2 h step of the 98 h case wide, so n(τ) = 2 in all 49."""
+    transient = analysis.evaluation.plots.transient
+    series = {"ID": (_timed_record("long", 60), _timed_record("short", 50))}
+    scales = {"ID": scaling_state()}
+    figure = transient.plot_error_over_physical_time(series, scaling_states=scales, state_fields=("T",), styles=_STYLES, time_axis="tau")
+    error, count = figure.axes[0], figure.axes[-1]
+    tau = np.asarray(error.lines[0].get_xdata(), dtype=np.float64)
+    np.testing.assert_allclose(tau, np.arange(1.0, 50.0) / 49.0)
+    assert tau[-1] == 1.0
+    np.testing.assert_array_equal(count.lines[0].get_ydata(), 2.0)
+    assert (count.get_xlabel(), count.get_xlim(), count.get_ylabel()) == ("τ = t / t_stop [-]", (0.0, 1.0), "n(τ)")
+    with pytest.raises(ValueError, match="time_axis"):
+        transient.plot_error_over_physical_time(
+            series, scaling_states={"ID": scaling_state()}, state_fields=("T",), styles=_STYLES, time_axis=cast("Any", "days")
+        )
+
+
+def test_error_over_tau_keeps_every_case_of_an_uneven_grid_and_refuses_a_case_that_does_not_start_at_zero() -> None:
+    """
+    A case stored at 0, 1, 2 and 4 h (widest τ step 1/2) and an hourly 8 h case share both τ bins; a case first stored at 4 h is refused.
+
+    A late start would leave the case out of the early bins and silently shrink their cohort.
+    """
+    transient = analysis.evaluation.plots.transient
+    uneven, hourly, late = _timed_record("uneven", 4), _timed_record("hourly", 9), _timed_record("late", 7)
+    uneven.physical_times, hourly.physical_times, late.physical_times = np.asarray((0.0, 1.0, 2.0, 4.0)), np.arange(9.0), np.arange(4.0, 11.0)
+    tau: dict[str, Any] = {"scaling_states": {"ID": scaling_state()}, "state_fields": ("T",), "styles": _STYLES, "time_axis": "tau"}
+    count = transient.plot_error_over_physical_time({"ID": (uneven, hourly)}, **tau).axes[-1].lines[0]
+    np.testing.assert_array_equal(count.get_xdata(), [0.5, 1.0])
+    np.testing.assert_array_equal(count.get_ydata(), [2, 2])
+    with pytest.raises(ValueError, match="t = 0"):
+        transient.plot_error_over_physical_time({"ID": (late, hourly)}, **tau)
+
+
+def test_error_over_time_refuses_a_record_without_a_time_after_its_origin_instead_of_dropping_it() -> None:
+    """A one-point record beside longer ones would silently leave the cohort, in hours and in τ alike."""
+    transient = analysis.evaluation.plots.transient
+    single = _timed_record("single", 1)
+    for time_axis in ("hours", "tau"):
+        with pytest.raises(ValueError, match="after its origin"):
+            transient.plot_error_over_physical_time(
+                {"ID": (single, _timed_record("long", 20))},
+                scaling_states={"ID": scaling_state()},
+                state_fields=("T",),
+                styles=_STYLES,
+                time_axis=time_axis,
+            )
+
+
+def test_a_run_keeps_its_shade_in_every_view_of_a_comparison_of_two_runs_also_where_only_one_has_evidence(tmp_path: Path) -> None:
+    """
+    Two FNO runs of one comparison (06) get the two FNO shades by checkpoint in the record, summary and relative-norm views.
+
+    Only A has rolling-origin records, so the horizon view shows A alone, still in its FNO shade. The session frames carry each
+    run's model kind; the run names sort the other way round than the checkpoints and must not matter.
+    """
+    transient = analysis.evaluation.plots.transient
+    semantics = analysis.presentation.visual_semantics
+    frames = {}
+    for name, run_name, checkpoint in (("A ID", "z-run", "a" * 64), ("B ID", "a-run", "b" * 64)):
+        # Chickpea: its material colour differs from both FNO shades, so a single-run style would show (lentil's is the FNO hue).
+        modes = (("autonomous_full", "full"), ("rolling_origin", 2))[: 2 if name == "A ID" else 1]
+        records = tuple(sequence_record(mode, horizon, material_family="chickpea") for mode, horizon in modes)
+        records[0].target.update(reference_time_to_target=2.0)
+        for record in records:
+            record.identity["checkpoint_identity"] = {"best_checkpoint_sha256": checkpoint}
+        frames[name] = production_frame(records, artifact_root=str(tmp_path / name))
+        frames[name].attrs["artifact_provenance"]["run"].update(name=run_name, best_checkpoint_sha256=checkpoint)
+    evaluation = session.TransientEvaluationSession(frames)
+    summary, cases, styles = evaluation.dataset_dataframe(), evaluation.case_dataframe(modes=("autonomous_full",)), evaluation.series_styles()
+    assert set(summary["model_kind"]) == set(cases["model_kind"]) == {"fno"}
+    accuracy = cases.loc[cases["scope"] == "cumulative"]
+    reports = {name: evaluation.timing_report(name) for name in frames}
+    targets = {name: evaluation.full_autonomous_summaries(name) for name in frames}
+    curves = {name: evaluation.relative_norm_curve(name) for name in frames}
+    shades = [to_hex(semantics.architecture_shade("fno", index, 2)) for index in range(2)]  # A's checkpoint sorts first
+    views = {
+        "target": (transient.plot_target_time(targets, styles=styles), "collections", shades),
+        "channel": (transient.plot_channel_error(summary, state_fields=("T",), styles=styles), "patches", shades),
+        "distribution": (transient.plot_error_distributions(cases, state_fields=("T",), styles=styles), "patches", shades),
+        "horizon": (transient.plot_horizon_error(summary, styles=styles), "lines", shades[:1]),
+        "endpoint": (transient.plot_endpoint_vs_cumulative(summary, styles=styles), "collections", shades),
+        "runtime": (transient.plot_accuracy_runtime_comparison(accuracy, reports, styles=styles), "collections", shades),
+        "relative norms": (transient.plot_relative_norms_over_time(curves, styles=styles), "lines", shades),
+    }
+
+    def colour(artist: Any) -> str:
+        face = artist.get_facecolor() if hasattr(artist, "get_facecolor") else artist.get_color()  # a line has no face
+        return to_hex(face[0] if np.ndim(face) == 2 else face)  # a collection holds one face colour per point
+
+    for view, (figure, artists, expected) in views.items():
+        assert list(dict.fromkeys(colour(artist) for artist in getattr(figure.axes[0], artists))) == expected, view
+
+
+def test_record_series_take_the_material_colour_and_role_line_style_of_one_run_and_the_architecture_colour_of_several() -> None:
+    """One checkpoint: lentil and chickpea in their colours, the parameter-OOD series dashed; FNO and U-NO checkpoints: their colours."""
+    transient = analysis.evaluation.plots.transient
+    semantics = analysis.presentation.visual_semantics
+    lentil, chickpea = _timed_record("a", 20), _timed_record("b", 20)
+    chickpea.identity = {**chickpea.identity, "material_family": "chickpea", "dataset_role": "parameter_ood"}
+    figure = transient.plot_state_trajectory_summary({"Lentil": (lentil,), "Chickpea": (chickpea,)}, state_fields=("T",), styles=_STYLES)
+    looks = {line.get_label(): (line.get_color(), line.get_linestyle()) for line in figure.axes[0].get_lines()}
+    assert looks["Lentil · Prediction"] == (semantics.material_color("lentil"), "-")
+    assert looks["Chickpea · Prediction"] == looks["Chickpea · Reference"] == (semantics.material_color("chickpea"), "--")
+    fno, uno = _timed_record("a", 20), _timed_record("a", 20)
+    fno.identity = {**fno.identity, "checkpoint_identity": {"best_checkpoint_sha256": "f"}}
+    uno.identity = {**uno.identity, "model_kind": "uno", "checkpoint_identity": {"best_checkpoint_sha256": "u"}}
+    scales = {"FNO": scaling_state(), "U-NO": scaling_state()}
+    error = transient.plot_error_over_physical_time(
+        {"FNO": (fno,), "U-NO": (uno,)}, scaling_states=scales, state_fields=("T",), styles=_comparison_of(fno, uno)
+    )
+    colours = {line.get_label(): line.get_color() for line in error.axes[0].get_lines()}
+    assert colours["FNO · material-case RMSE"] == semantics.architecture_color("fno")
+    assert colours["U-NO · material-case RMSE"] == semantics.architecture_color("uno")
+
+
+def test_four_runs_of_one_architecture_take_one_run_colour_each_and_say_so_in_the_context_line() -> None:
+    """Four FNO checkpoints exceed the FNO shades: each run takes its run colour in checkpoint order, noted «colour = run»."""
+    transient = analysis.evaluation.plots.transient
+    semantics = analysis.presentation.visual_semantics
+    records = {}
+    for checkpoint in "dcba":  # the series order differs from the checkpoint order
+        record = _timed_record(checkpoint, 20)
+        record.identity["checkpoint_identity"] = {"best_checkpoint_sha256": checkpoint}
+        records[f"Run {checkpoint}"] = (record,)
+    styles, scales = _comparison_of(*(record for (record,) in records.values())), dict.fromkeys(records, scaling_state())
+    figure = transient.plot_error_over_physical_time(records, scaling_states=scales, state_fields=("T",), styles=styles)
+    colours = {line.get_label(): to_hex(line.get_color()) for line in figure.axes[0].get_lines()}
+    assert [colours[f"Run {checkpoint} · material-case RMSE"] for checkpoint in "abcd"] == [to_hex(colour) for colour in semantics.RUN_COLORS[:4]]
+    assert any(isinstance(text, Text) and text.get_text().splitlines()[-1] == "colour = run" for text in figure.artists)
+
+
+def test_summary_bars_take_the_material_colour_and_role_hatch_and_rows_need_their_model_kind() -> None:
+    """One run: a bar per frame and material in its colour, the parameter-OOD one hatched; several runs: by model_kind; rows without it: refused."""
+    transient = analysis.evaluation.plots.transient
+    semantics = analysis.presentation.visual_semantics
+
+    def rows(frame: str, material: str, role: str, run: str, kind: str = "fno") -> pd.DataFrame:
+        row = {"frame": frame, "material_family": material, "mode": "autonomous_full", "requested_horizon": "full", "scope": "cumulative"}
+        values = pd.DataFrame([{**row, "normalized_drying_group_macro_rmse": 0.1, "normalized_rmse_T": 0.2}])
+        return _with_provenance(values, role=role, run=run, model_kind=kind)
+
+    one_run = pd.concat((rows("M ID", "lentil", "id", "m"), rows("M OOD", "chickpea", "parameter_ood", "m")), ignore_index=True)
+    bars = transient.plot_channel_error(one_run, state_fields=("T",), styles=_table_styles(one_run)).axes[0].patches
+    assert [(to_hex(bar.get_facecolor()), bar.get_hatch() or "") for bar in bars] == [
+        (to_hex(semantics.material_color("lentil")), ""),
+        (to_hex(semantics.material_color("chickpea")), "//"),
+    ]
+    with pytest.raises(ValueError, match="model_kind"):
+        transient.plot_channel_error(one_run.drop(columns="model_kind"), state_fields=("T",), styles=_table_styles(one_run))
+    two_runs = pd.concat((rows("F ID", "lentil", "id", "f", "fno"), rows("U ID", "lentil", "id", "u", "uno")), ignore_index=True)
+    bars = transient.plot_channel_error(two_runs, state_fields=("T",), styles=_table_styles(two_runs)).axes[0].patches
+    assert [to_hex(bar.get_facecolor()) for bar in bars] == [to_hex(semantics.architecture_color(kind)) for kind in ("fno", "uno")]
+
+
+def _paired_timing_report(seconds: Sequence[float]) -> Any:
+    """Return a timing report of one case per reference duration, each against a 0.01 s model call."""
+    transient_timing = analysis.evaluation.transient_timing
+    cases = tuple(
+        transient_timing.TransientTimingCase(
+            case_id=f"c{index}",
+            repetitions={"comsol_transient_drying_seconds": (value,), "drying_no_rollout_model_seconds": (0.01,)},
+            device="cpu",
+            precision="float32",
+            pt_payload_identity="a" * 64,
+            warmup_passes=1,
+            solver_hostname="solver-node",
+            solver_requested_cores=8,
+        )
+        for index, value in enumerate(seconds)
+    )
+    return transient_timing.build_transient_timing_report(cases)
+
+
+def test_duration_ratio_bars_are_the_median_with_the_10th_to_90th_percentile_of_the_paired_case_ratios() -> None:
+    """Five paired cases give one neutral bar at the median of their ratios with a P10-P90 error bar; formulas without pairs say so."""
+    seconds = (0.3, 0.5, 1.1, 2.0, 7.0)
+    figure = analysis.evaluation.plots.transient.plot_timing_speedups(_paired_timing_report(seconds))
+    axis = figure.axes[0]
+    ratios = np.asarray(seconds) / 0.01
+    (bars,) = [container for container in axis.containers if isinstance(container, BarContainer)]
+    assert bars.patches[0].get_width() == pytest.approx(np.median(ratios))
+    assert bars.errorbar is not None
+    (segment,) = bars.errorbar.lines[2][0].get_segments()
+    np.testing.assert_allclose(sorted(segment[:, 0]), np.quantile(ratios, (0.1, 0.9)))
+    assert axis.get_xscale() == "log"
+    assert [text.get_text() for text in axis.texts] == ["no paired case"] * 4
+
+
+def test_a_duration_ratio_that_is_not_positive_and_finite_is_named_unavailable_and_keeps_the_scale_linear() -> None:
+    """A zero median, a negative 10th or an infinite 90th percentile has no place on a log scale: no bar, a note, a linear axis."""
+    report = _paired_timing_report((0.3, 0.5, 1.1))
+    name = next(name for name, summary in report.speedups.items() if summary.median is not None)
+    for invalid in ({"median": 0.0}, {"q10": -1.0}, {"q90": math.inf}):
+        broken = replace(report, speedups={**report.speedups, name: replace(report.speedups[name], **invalid)})
+        axis = analysis.evaluation.plots.transient.plot_timing_speedups(broken).axes[0]
+        assert not axis.patches
+        assert axis.get_xscale() == "linear"
+        assert sorted(text.get_text() for text in axis.texts) == ["no paired case"] * 4 + ["no positive finite ratio"], invalid
 
 
 def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
@@ -1137,6 +1963,7 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
             "full",
             case_id=case_id,
             material_family=material,
+            dataset_role="material_ood" if material == "kidney_bean" else "id",
         )
         record.identity["dataset_identity"] = {
             "artifact_dataset_name": f"dataset_{material}",
@@ -1213,6 +2040,10 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
         counted,
     )
     fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
+    # Before any view chose channels, a transient view checks T, phi and w_gr where offered (the owner's default, as in EDA).
+    channels = analysis.evaluation.panel._Channels("Channels", fields, None)
+    assert set(channels.checks.options) == {"T", "phi", "w_surf", "w_int"}
+    assert channels.checks.selected == ("T", "phi")
     with monkeypatch.context() as stubbed:
         stubbed.setattr(analysis.ui.viewers, "render_view", lambda *_args, **_kwargs: True)
         viewer = analysis.evaluation.panel._make_transient_sample_viewer(
@@ -1423,25 +2254,25 @@ def test_horizon_error_uses_one_global_axis_for_sparse_frame_inventories() -> No
         )
     )
 
+    summary = _with_provenance(summary)
     summary["contributing_record_count"] = 1
-    figure = analysis.evaluation.plots.transient.plot_horizon_error(summary)
+    figure = analysis.evaluation.plots.transient.plot_horizon_error(summary, styles=_table_styles(summary))
     horizon_axis = figure.axes[0]
     lines = {line.get_label(): line for line in horizon_axis.lines}
 
     assert [label.get_text() for label in horizon_axis.get_xticklabels()] == ["1", "2", "full"]
-    np.testing.assert_array_equal(lines["Lentil · A — cumulative"].get_xdata(), np.asarray([0, 2]))
-    np.testing.assert_array_equal(lines["Lentil · B — cumulative"].get_xdata(), np.asarray([1, 2]))
+    np.testing.assert_array_equal(lines["Lentil · ID · A — cumulative"].get_xdata(), np.asarray([0, 2]))
+    np.testing.assert_array_equal(lines["Lentil · ID · B — cumulative"].get_xdata(), np.asarray([1, 2]))
     plt.close(figure)
+
+
+def _with_provenance(summary: pd.DataFrame, *, role: str = "id", run: str = "run", model_kind: str = "fno") -> pd.DataFrame:
+    """Return hand-made summary rows with the provenance columns a session frame carries: role, run checkpoint and model kind."""
+    return summary.assign(dataset_role=role, run_name=run, checkpoint_sha256=f"{run}-checkpoint", model_kind=model_kind)
 
 
 def test_evaluation_physical_time_axes_reuse_shared_units_and_export() -> None:
     """Format simulated time centrally while leaving rollout indices distinct."""
-    record = sequence_record("autonomous_full", "full")
-    record.physical_times = np.asarray((0.0, 84.0, 168.0))
-    central = analysis.evaluation.plots.transient.plot_central_error_vs_time(
-        record,
-        scaling_state=scaling_state(),
-    )
     summary = pd.DataFrame.from_records(
         (
             {
@@ -1464,29 +2295,16 @@ def test_evaluation_physical_time_axes_reuse_shared_units_and_export() -> None:
             },
         )
     )
+    summary = _with_provenance(summary)
     summary["contributing_record_count"] = 1
-    horizon = analysis.evaluation.plots.transient.plot_horizon_error(summary)
-    targets = analysis.evaluation.plots.transient.plot_target_time(
-        (
-            SimpleNamespace(
-                target={
-                    "reference_available": True,
-                    "predicted_available": True,
-                    "reference_time_to_target": 24.0,
-                    "predicted_time_to_target": 48.0,
-                }
-            ),
-            SimpleNamespace(
-                target={
-                    "reference_available": True,
-                    "predicted_available": True,
-                    "reference_time_to_target": 168.0,
-                    "predicted_time_to_target": 144.0,
-                }
-            ),
-        )
-    )
-    figures = (central, horizon, targets)
+    horizon = analysis.evaluation.plots.transient.plot_horizon_error(summary, styles=_table_styles(summary))
+    reached = []
+    for reference_time, predicted_time in ((24.0, 48.0), (168.0, 144.0)):
+        record = sequence_record("autonomous_full", "full")
+        record.target.update(reference_available=True, reference_time_to_target=reference_time, predicted_time_to_target=predicted_time)
+        reached.append(record)
+    targets = analysis.evaluation.plots.transient.plot_target_time(tuple(reached), styles=_STYLES)
+    figures = (horizon, targets)
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -1495,7 +2313,6 @@ def test_evaluation_physical_time_axes_reuse_shared_units_and_export() -> None:
                 buffer = BytesIO()
                 figure.savefig(buffer, format="pdf", bbox_inches="tight")
                 assert buffer.getbuffer().nbytes > 0
-        assert central.axes[0].get_xlabel() == "Time [d]"
         assert horizon.axes[0].get_xlabel() == "Requested horizon [transitions]"
         assert horizon.axes[1].get_xlabel() == "Median elapsed physical time [d]"
         assert targets.axes[0].get_xlabel() == "Reference time to target [d]"
@@ -1548,7 +2365,7 @@ def test_transient_panel_plots_and_pipeline_remain_sequence_aware(tmp_path: Path
     case_row, channel_row, _display_row, time_row = (cast("widgets.Box", row) for row in viewer.rows)
     assert tuple(getattr(control, "description", None) for control in cast("widgets.Box", case_row.children[1]).children) == ("Case", "◀", "▶")
     boxes = {box.tooltip: box for box in cast("widgets.Box", channel_row.children[0]).children if isinstance(box, widgets.Checkbox)}
-    assert all(box.value is True for box in boxes.values())
+    assert {key for key, box in boxes.items() if box.value} == {"T", "phi", "w_gr"} & set(boxes)
     gif_fps, gif_button = time_row.children[1], time_row.children[2]
     assert isinstance(gif_fps, widgets.BoundedIntText)
     assert (gif_fps.value, gif_fps.min, gif_fps.max) == (3, 1, 10)
@@ -1613,7 +2430,7 @@ def test_transient_panel_plots_and_pipeline_remain_sequence_aware(tmp_path: Path
     plt.close(figure)
 
     summary_frame = evaluation.dataset_dataframe()
-    channel_figure = analysis.evaluation.plots.transient.plot_channel_error(summary_frame)
+    channel_figure = analysis.evaluation.plots.transient.plot_channel_error(summary_frame, styles=evaluation.series_styles())
     assert channel_figure.axes[0].get_ylabel() == "Normalized RMSE [-]"
     assert len(channel_figure.axes[0].patches) == len(analysis.evaluation.transient_artifact.STATE_ORDER)
     plt.close(channel_figure)
@@ -1622,9 +2439,14 @@ def test_transient_panel_plots_and_pipeline_remain_sequence_aware(tmp_path: Path
     assert len(degradation) == 1
     assert degradation[0].c_available is False
     assert degradation[0].complete_pipeline_error is None
-    runtime_figure = analysis.evaluation.plots.transient.plot_timing_distributions(evaluation.timing_report("id"))
-    assert all(axis.get_ylabel() == "Recorded duration [s]" for axis in runtime_figure.axes)
-    plt.close(runtime_figure)
+    stages = analysis.evaluation.plots.transient.plot_pipeline_degradation(degradation).axes[0]
+    legend = stages.get_legend()
+    assert legend is not None  # one panel: the stage colours are named inside it
+    assert [text.get_text() for text in legend.get_texts()] == ["B/A", "C/A", "C/B"]
+    assert len({to_hex(bar.get_facecolor()) for bar in stages.patches}) == 3
+    stacked = analysis.evaluation.plots.transient.plot_pipeline_degradation(degradation * 2)
+    assert stacked.axes[0].get_legend() is not None  # several panels: still inside the first (L10)
+    assert not stacked.legends
     evaluation.close()
 
 
@@ -1709,7 +2531,7 @@ def test_water_shows_as_wet_basis_percent_with_negative_predicted_water_masked_a
     normalized_error = np.abs(grain_prediction - grain_reference) / scale.value
     np.testing.assert_allclose(cast("Any", normalized.axes[2].collections[0].get_array()), normalized_error)
     plt.close(normalized)
-    trajectory = transient.plot_state_trajectory_summary({"case": [record]}, state_fields=("w_gr",))
+    trajectory = transient.plot_state_trajectory_summary({"case": [record]}, state_fields=("w_gr",), styles=_STYLES)
     lines = {line.get_label(): cast("Any", line.get_ydata()) for line in trajectory.axes[0].get_lines()}
     for label, water in (("case · Reference", grain_reference), ("case · Prediction", grain_prediction)):
         assert lines[label][1] == pytest.approx(100.0 * water[valid].sum() / (rho[valid].sum() + water[valid].sum()))
@@ -1717,11 +2539,11 @@ def test_water_shows_as_wet_basis_percent_with_negative_predicted_water_masked_a
     plt.close(trajectory)
     aggregate = transient.plot_aggregate_error_maps([record], state_fields=("w_gr",), physical_time=1.0, statistic="mean")
     pooled = np.asarray(cast("Any", aggregate.axes[0].collections[0].get_array()))
-    np.testing.assert_allclose(pooled[valid], np.abs(prediction_percent - reference_percent[valid]))
+    np.testing.assert_allclose(pooled[valid], prediction_percent - reference_percent[valid])  # the default mean map is the signed one
     assert np.isnan(pooled[~valid]).all()
     plt.close(aggregate)
-    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("w_gr",))
-    assert trend.axes[0].get_lines()[0].get_label() == "case · 4 of 72 values non-finite, excluded"
+    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("w_gr",), styles=_STYLES)
+    assert [text.get_text() for text in trend.axes[0].texts] == ["case · 4 of 72 values non-finite, excluded"]
     plt.close(trend)
     assert transient.maximum_error_physical_time(record, state_fields=("w_gr",)) in {1.0, 2.0}
 
@@ -1744,7 +2566,7 @@ def test_relative_humidity_shows_in_percent_rh_with_errors_in_percentage_points_
     )
     np.testing.assert_allclose(cast("Any", normalized.axes[2].collections[0].get_array()), np.abs(prediction - reference) / scale.value, rtol=1e-6)
     plt.close(normalized)
-    trajectory = transient.plot_state_trajectory_summary({"case": [record]}, state_fields=("phi",))
+    trajectory = transient.plot_state_trajectory_summary({"case": [record]}, state_fields=("phi",), styles=_STYLES)
     lines = {line.get_label(): cast("Any", line.get_ydata()) for line in trajectory.axes[0].get_lines()}
     assert lines["case · Reference"][1] == pytest.approx(100.0 * reference.mean())
     assert trajectory.axes[0].get_ylabel() == r"$\varphi$ [%]"
@@ -1768,24 +2590,25 @@ def test_a_partly_diverging_prediction_masks_only_its_cells_and_is_named_in_ever
     maps = transient.plot_state_maps(record, state_fields=("T",), physical_time=1.0, error_mode="Absolute error")
     assert np.ma.count_masked(maps.axes[2].collections[0].get_array()) == 1
     plt.close(maps)
-    _x, _y, mean_error, std_error, _reference_means, prediction_means = transient._aggregate_snapshot_evidence(
+    _x, _y, mean_error, signed_mean, std_error, _reference_means, prediction_means = transient._aggregate_snapshot_evidence(
         [record], state_field="T", physical_time=1.0
     )
     assert np.isnan(mean_error[3, 3])
+    assert np.isnan(signed_mean[3, 3])
     assert np.isnan(std_error[3, 3])
     assert np.count_nonzero(np.isfinite(mean_error)) == mean_error.size - 1
     assert not np.isfinite(prediction_means).any()
     plt.close(transient.plot_aggregate_error_maps([record], state_fields=("T",), physical_time=1.0, statistic="mean"))
-    parity = transient.plot_predicted_vs_reference_channels([record], state_fields=("T",), physical_time=1.0)
+    parity = transient.plot_predicted_vs_reference_channels([record], state_fields=("T",), physical_time=1.0, styles=_STYLES)
     assert any(text.get_text().startswith("1 non-finite") for text in parity.axes[0].texts)
     plt.close(parity)
-    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T",))
-    assert trend.axes[0].get_lines()[0].get_label() == "case · 2 of 72 values non-finite, excluded"
+    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T",), styles=_STYLES)
+    assert [text.get_text() for text in trend.axes[0].texts] == ["case · 2 of 72 values non-finite, excluded"]
     plt.close(trend)
     record.predicted_states[1:, 0] = np.nan
-    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T",))
+    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T",), styles=_STYLES)
     (line,) = trend.axes[0].get_lines()
-    assert line.get_label() == "case · 72 of 72 values non-finite, excluded"
+    assert [text.get_text() for text in trend.axes[0].texts] == ["case · 72 of 72 values non-finite, excluded"]
     assert len(cast("Any", line.get_ydata())) == 0
     plt.close(trend)
 
@@ -1802,8 +2625,8 @@ def test_thinned_error_trends_name_the_exact_non_finite_share(monkeypatch: pytes
     assert (finite_counts, counts) == ([0, 72], [36, 72])
     np.testing.assert_array_equal(centers, finite_centers)
     np.testing.assert_array_equal(medians, finite_medians)
-    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T",))
-    assert trend.axes[0].get_lines()[0].get_label() == "case · 36 of 72 values non-finite, excluded"
+    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T",), styles=_STYLES)
+    assert [text.get_text() for text in trend.axes[0].texts] == ["case · 36 of 72 values non-finite, excluded"]
     plt.close(trend)
 
 
@@ -1815,7 +2638,7 @@ def test_the_error_trend_xlabel_is_the_plot_label_of_the_field_in_the_active_sty
     try:
         for style in ("symbol", "name"):
             analysis.presentation.field_labels.set_label_style(style)
-            trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T", "w_gr"))
+            trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T", "w_gr"), styles=_STYLES)
             labels[style] = [axis.get_xlabel() for axis in trend.axes]
             plt.close(trend)
     finally:
@@ -1946,8 +2769,8 @@ def _gif_viewer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[sessio
         comparison=False,
     )
     boxes = {box.tooltip: box for box in _children(_children(viewer.rows[1])[0]) if isinstance(box, widgets.Checkbox)}
+    boxes["w_surf"].value = True
     boxes["phi"].value = False
-    boxes["w_int"].value = False
     return evaluation, cast("widgets.Button", _children(viewer.rows[3])[2]), viewer
 
 

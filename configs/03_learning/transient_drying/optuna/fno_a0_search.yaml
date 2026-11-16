@@ -2,7 +2,7 @@
 # Tunes the teacher-forced A0 of the matched plan alone, without B's budget; copy the selected values into the matched experiment config under experiments/architecture_comparison/.
 
 study:
-  n_trials: 24  # Maximum number of trials requested for the study.
+  n_trials: 24  # Total trial allocation of the study, its configured base first; a rerun runs only the trials left.
   mode: stage_a_only  # Transient protocol searched by this study: the plan's A0 alone.
   role: production  # Study role used by the experiment workflow.
   seed: 9  # Seed controlling Optuna sampling/pruning randomness.
@@ -18,12 +18,16 @@ study:
     interval_steps: 1  # Validation-point interval between pruning checks.
 
 # One entry per searched config path: name (Optuna parameter name), kind (categorical or float) and its values or low, high and log (default false).
-# Modes and widths are the union of both tasks' FNO studies, not yet filtered by the GPU probe.
+# Admission rule (decided 13.11., before the HPO): every corner of this space must train within 2x the cost per supervised transition
+# of the configured experiment (experiments/architecture_comparison/fno_*) and fit B with one unit at horizon 32 on the longest
+# Train trajectory, with warm Adam state and validation, in at most 85 % of the usable GPU memory; the axes are cut until the corners pass.
+# Cut by the GPU probes on the A6000 (169 D3; jobs 882530 and 882587): 96 channels and every 4-layer combination with 64 channels
+# exceed 85 % in B or run out of memory, and 128 x 160 modes need 85.4 % even with 64 channels and 3 layers; n_layers is fixed at the
+# configured 3. X = 80 of the configured experiment stays, which is the study's first trial.
 search_space:
-  model.params.n_modes.0: {name: modes_y, kind: categorical, values: [32, 48, 64, 96, 128]}
-  model.params.n_modes.1: {name: modes_x, kind: categorical, values: [64, 96, 128, 160]}
-  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [32, 64, 96]}
-  model.params.n_layers: {name: n_layers, kind: categorical, values: [3, 4]}
+  model.params.n_modes.0: {name: modes_y, kind: categorical, values: [32, 48, 64, 96]}
+  model.params.n_modes.1: {name: modes_x, kind: categorical, values: [64, 80, 96, 128]}
+  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [32, 64]}
   optimizer.lr: {name: lr, kind: float, low: 1.0e-4, high: 1.0e-2, log: true}
   training.units_per_update: {name: k, kind: categorical, values: [2, 4, 8, 16, 32]}  # Transitions per update.
 
@@ -31,13 +35,14 @@ experiment:
   model:
     kind: fno  # Architecture family; its params below are interpreted by that family.
     params:
-      n_modes: [64, 160]  # Search base value: Fourier modes along each spatial axis.
+      n_modes: [64, 80]  # Search base value: Fourier modes along each spatial axis, the configured experiment's.
       hidden_channels: 64  # Search base value: width of the hidden feature representation.
       n_layers: 3  # Search base value: number of Fourier layers.
   optimizer:
     lr: 3.883614530748613e-4  # Search base value: initial learning rate.
   training:
     a0:
+      memory_batch: 16  # The matched experiment's A0 memory batch; it changes only floating-point rounding.
       sampling:
         mode: one_step_transition  # Teacher-forced single-transition training examples.
   run:

@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Keep view keys, labels, and order explicit in one immutable registry
-  - Omit transient schedules and moisture views when unavailable
+  - Omit transient schedules and moisture views when unavailable, and the paired template comparison unless two campaigns share a design
   - Delegate display numbering to the shared presentation contract
 
 Design principles:
@@ -31,6 +31,7 @@ _TRANSIENT_ONLY_VIEW_KEYS: Final = frozenset(
         "moisture_sorption",
     }
 )
+_TEMPLATE_VIEW_KEY: Final = "template_comparison"
 
 GENERATION_INPUT_SECTIONS: Final = (
     shared_registry.SectionPresentation(
@@ -96,6 +97,7 @@ GENERATION_INPUT_SECTIONS: Final = (
         name="Dataset overview",
         plots=(
             shared_registry.PlotPresentation("campaign_outcomes", "Campaign candidate outcomes"),
+            shared_registry.PlotPresentation("template_comparison", "Template comparison (paired)"),
             shared_registry.PlotPresentation(
                 "dataset_cases_parameters",
                 "Dataset cases and parameters",
@@ -111,12 +113,16 @@ GENERATION_INPUT_SECTIONS: Final = (
 
 def sections_for_profiles(
     profile_ids: Iterable[str],
+    *,
+    template_comparison: bool = False,
 ) -> tuple[shared_registry.SectionPresentation, ...]:
     """
     Return the ordered views supported by available maintained profiles.
 
-    Transient schedules and moisture/sorption are the only capability-gated
-    views. All other sections preserve the same scientific responsibilities.
+    Transient schedules and moisture/sorption are the only profile-gated
+    views. The paired template comparison is shown only when ``template_comparison``
+    says two campaigns of one task share a design. All other sections preserve the
+    same scientific responsibilities.
     """
     available = frozenset(profile_ids)
     if not available:
@@ -129,7 +135,11 @@ def sections_for_profiles(
         shared_registry.SectionPresentation(
             key=section.key,
             name=section.name,
-            plots=tuple(plot for plot in section.plots if has_transient or plot.key not in _TRANSIENT_ONLY_VIEW_KEYS),
+            plots=tuple(
+                plot
+                for plot in section.plots
+                if (has_transient or plot.key not in _TRANSIENT_ONLY_VIEW_KEYS) and (template_comparison or plot.key != _TEMPLATE_VIEW_KEY)
+            ),
         )
         for section in GENERATION_INPUT_SECTIONS
     )

@@ -258,26 +258,26 @@ def validate_matched_a1_b_lineage_comparison(
     for item in (a0, b, a1):
         _validate_arm_end(item)
     for item in available:
-        planned = _positive(item.planned_post_handoff_compute, label=f"{item.arm} planned train_seconds")
-        actual = _positive(item.actual_post_handoff_compute, label=f"{item.arm} actual train_seconds")
+        planned = _positive(item.planned_post_handoff_compute, label=f"{item.arm} planned supervised_transitions")
+        actual = _positive(item.actual_post_handoff_compute, label=f"{item.arm} actual supervised_transitions")
         overrun = float(item.safe_boundary_overrun)
         # A diverged arm ends before its budget, so only its signed difference actual - planned may be negative.
         ended = item.budget_complete and actual >= planned
         if (
-            item.clock_kind != "train_seconds"
+            item.clock_kind != "supervised_transitions"
             or not math.isfinite(overrun)
             or abs(overrun - (actual - planned)) > _COMPUTE_TOLERANCE
             or not (ended or item.training_status == "diverged")
             or not item.best_within_budget_checkpoint_id
         ):
-            msg = f"{item.arm} lacks completed or diverged matched train_seconds evidence."
+            msg = f"{item.arm} lacks completed or diverged matched supervised-transition evidence."
             raise ValueError(msg)
     if (
         isinstance(b, TrainingArmEvidence)
         and isinstance(a1, TrainingArmEvidence)
         and b.actual_post_handoff_compute != a1.planned_post_handoff_compute
     ):
-        msg = "A1 planned train_seconds must equal B's receipt-backed committed train_seconds."
+        msg = "A1 planned supervised transitions must equal B's receipt-backed committed supervised transitions."
         raise ValueError(msg)
     return LineageComparison(a0, a1, b, "B_vs_A1", "B_vs_A0")
 

@@ -60,24 +60,22 @@ def test_explicit_train_dataset_selection_reaches_every_stage(
     monkeypatch: pytest.MonkeyPatch,
     matched: bool,
 ) -> None:
-    """Bind a notebook-selected Dataset and Stage-B seconds like the CLI when the YAML leaves them null."""
+    """Bind a notebook-selected Dataset like the CLI when the YAML leaves it null; B and A1 count supervised transitions."""
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "absent_storage"))
     raw = configs.transient_matched_config() if matched else configs.direct_config()
     raw["data"]["train_dataset"] = None
-    if matched:
-        raw["training"]["b"]["train_seconds"] = None
     path = configs.write_config(tmp_path, raw)
 
-    seconds = 7.0 if matched else None
     with pytest.raises(ValueError, match="train_dataset"):
-        support.prepare_notebook_context(path, train_seconds=seconds)
-    context = support.prepare_notebook_context(path, train_dataset="selected", train_seconds=seconds)
+        support.prepare_notebook_context(path)
+    context = support.prepare_notebook_context(path, train_dataset="selected")
 
     assert len(context.stage_configs) == (3 if matched else 1)
     assert {config["data"]["train_dataset"] for config in context.stage_configs} == {"selected"}
     assert context.dataset_previews[0].dataset_id == "selected"
     if matched:
-        assert support.prepare_protocol_table(context).rows[1][4] == 7.0
+        units = [row[4] for row in support.prepare_protocol_table(context).rows]
+        assert units == ["units", "supervised_transitions", "supervised_transitions"]
 
 
 def test_list_built_datasets_names_only_published_datasets_of_the_task(
@@ -138,7 +136,7 @@ def test_matched_plan_preview_requires_no_material_ood_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bind A1 to measured B evidence while preserving explicit empty OOD roles."""
+    """Bind A1 to B's receipt while preserving explicit empty OOD roles."""
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "absent_storage"))
     raw = configs.transient_matched_config()
     raw["data"]["material_ood_datasets"] = []
@@ -148,8 +146,8 @@ def test_matched_plan_preview_requires_no_material_ood_dataset(
     assert len(context.dataset_previews) == 1
     protocol = support.prepare_protocol_table(context)
     assert tuple(row[0] for row in protocol.rows) == ("a0", "b", "a1")
-    assert protocol.rows[1][4] == 0.25
-    assert protocol.rows[2][4] is None
+    assert protocol.rows[1][4] == protocol.rows[2][4] == "supervised_transitions"
+    assert protocol.rows[1][5] is None
     assert protocol.rows[2][5] == context.stage_configs[1]["run"]["name"]
     assert protocol.rows[1][3] == protocol.rows[2][3] == protocol.rows[0][1]
     support.prepare_configuration_tables(context)
@@ -217,15 +215,14 @@ def test_training_notebook_executes_inspection_only_for_a_test_owned_experiment(
 
     for index, cell in enumerate(notebook["cells"]):
         if cell["cell_type"] == "code":
-            source = "".join(cell["source"]).replace("TRAIN_SECONDS = None", "TRAIN_SECONDS = 7.0")
+            source = "".join(cell["source"])
             exec(compile(source, f"04_training_pipeline:cell{index}", "exec"), namespace)  # noqa: S102 -- execute only maintained notebook code
 
     assert namespace["CONTEXT"].task.id == "transient_drying"
     assert namespace["CONTEXT"].protocol == "matched_a1_b"
     assert {config["data"]["train_dataset"] for config in namespace["CONTEXT"].stage_configs} == {"selected_dataset"}
-    assert support.prepare_protocol_table(namespace["CONTEXT"]).rows[1][4] == 7.0
+    assert support.prepare_protocol_table(namespace["CONTEXT"]).rows[1][4] == "supervised_transitions"
     assert "--train-dataset selected_dataset" in namespace["train_command"]
-    assert "--train-seconds 7.0" in namespace["train_command"]
     assert not (tmp_path / "storage").exists()
 
 

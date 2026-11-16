@@ -24,31 +24,36 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from numbers import Integral, Real
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
-import ipywidgets as widgets
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.ticker import MaxNLocator
 
 from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_run_discovery as run_discovery
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
+from src.analysis.evaluation.evaluation_plot import evaluation_plot_series as series
 from src.analysis.presentation import analysis_field_labels as field_labels
+from src.analysis.ui import analysis_ui_figure_layout as figure_layout
+from src.analysis.ui import analysis_ui_tables as tables
 
 if TYPE_CHECKING:
+    import ipywidgets as widgets
     from matplotlib.figure import Figure
 
+    from src.analysis.evaluation import evaluation_datasets as dataset_cuts
     from src.analysis.evaluation import evaluation_transient_timing as transient_timing
 
 _PHYSICS_LABELS = {
-    "momentum_residual_mse": (r"momentum mean($(R_x^2+R_y^2)/G^2$)", "1"),
+    "momentum_residual_mse": (r"momentum mean($R_x^2+R_y^2$)", "1"),
     "flux_balance_mse": (r"flux balance mean($((q-\bar q)/Q)^2$)", "1"),
     "pressure_boundary_mse": (r"pressure boundary diagnostic$/\Delta p^2$", "1"),
 }
-_ROLE_MARKERS = {"ID": "o", "OOD": "s", "unspecified": "D"}
-_MINIMUM_SCOREBOARD_DATASETS = 2
+_PHYSICS_TITLES = {"momentum_residual_mse": "Momentum residual", "flux_balance_mse": "Flux balance", "pressure_boundary_mse": "Pressure boundary"}
+_PARETO_ERROR_TICKS = 4
+_MINIMUM_SCOREBOARD_MODELS = 2
 _SPATIAL_PAIR_LENGTH = 2
 
 
@@ -66,35 +71,6 @@ def _finite_quantile(frame: pd.DataFrame, column: str, quantile: float) -> float
 def _optional_value(value: float | None) -> float | str:
     """Return a saved value, or ``unavailable`` (never zero) when its evidence is missing."""
     return "unavailable" if value is None else float(value)
-
-
-def model_metadata(frame: pd.DataFrame) -> tuple[str, int, bool]:
-    """
-    Read model family, exact trainable count, and PI flag.
-
-    Values come only from complete provenance. Missing/non-typed parameter counts
-    or physics enablement fail rather than being inferred from labels,
-    configuration paths, or architecture names.
-    """
-    provenance = _provenance(frame)
-    model = provenance.get("model")
-    if not isinstance(model, Mapping):
-        msg = "Artifact provenance model must be a mapping."
-        raise TypeError(msg)
-    counts = model.get("parameter_counts")
-    if not isinstance(counts, Mapping):
-        msg = "Artifact provenance model.parameter_counts must be a mapping."
-        raise TypeError(msg)
-    family = model.get("kind")
-    trainable = counts.get("trainable")
-    if not isinstance(family, str) or not family or isinstance(trainable, bool) or not isinstance(trainable, int):
-        msg = "Run summary requires model kind and exact trainable parameter count."
-        raise TypeError(msg)
-    physics_enabled = model.get("physics_enabled")
-    if type(physics_enabled) is not bool:
-        msg = "Run summary requires a boolean model.physics_enabled provenance value."
-        raise TypeError(msg)
-    return family, trainable, physics_enabled
 
 
 def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
@@ -136,7 +112,7 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
         unavailable = None if aggregate["available"] else validity_contract.unavailable_text(aggregate)
         fields = tuple(frame.attrs["output_fields"])
         units = dataframe.field_units(frame)
-        family, trainable, physics_enabled = model_metadata(frame)
+        family, trainable, physics_enabled = series.model_metadata(frame)
         row: dict[str, Any] = {
             "label": label,
             "dataset_role": dataframe.dataset_role(frame),
@@ -178,44 +154,10 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
             )
         for metric in dataframe.STEADY_PHYSICS_METRICS:
             if metric in frame.columns:
-                unit = _PHYSICS_LABELS[metric][1]
+                unit = field_labels.display_unit(_PHYSICS_LABELS[metric][1])
                 row[f"{metric}_median [{unit}]"] = _finite_quantile(frame, metric, 0.5)
         rows.append(row)
     return pd.DataFrame(rows).set_index("label")
-
-
-def _blue_style(table: pd.DataFrame) -> pd.DataFrame:
-    """Return quantile-bounded blue numeric cell fills."""
-    styles = pd.DataFrame("", index=table.index, columns=table.columns)
-    cmap = plt.get_cmap("Blues")
-    for column in table.columns:
-        numeric = np.asarray(pd.to_numeric(table[column], errors="coerce"), dtype=float)
-        finite = numeric[np.isfinite(numeric)]
-        if finite.size == 0:
-            continue
-        low, high = np.quantile(finite, (0.05, 0.95))
-        for row, value in enumerate(numeric):
-            if not np.isfinite(value):
-                continue
-            fraction = 0.0 if np.isclose(low, high) else float(np.clip((value - low) / (high - low), 0.0, 1.0))
-            red, green, blue, _alpha = cmap(0.05 + 0.90 * fraction)
-            column_index = cast("int", styles.columns.get_loc(column))
-            styles.iloc[row, column_index] = f"background-color: rgba({int(red * 255)}, {int(green * 255)}, {int(blue * 255)}, 0.55)"
-    return styles
-
-
-def _cell_text(value: object) -> str:
-    """Format a number to four significant digits and keep text, such as an unavailable metric, verbatim."""
-    return f"{value:.4g}" if isinstance(value, Real) and not isinstance(value, bool) else str(value)
-
-
-def _styled_table(table: pd.DataFrame, *, title: str) -> widgets.VBox:
-    """Render one automatically displayed blue table."""
-    styles = _blue_style(table)
-    styler = table.style
-    styler.format(_cell_text)
-    styler.apply(lambda _table: styles, axis=None)
-    return widgets.VBox((widgets.HTML(f"<h2>{title}</h2>"), widgets.HTML(styler.to_html())))
 
 
 def plot_run_summary_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.VBox:
@@ -238,7 +180,15 @@ def plot_run_summary_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.V
     )
     if any(count_headings.values()):
         visible = visible.rename(index={label: count_headings[label] for label in datasets})
-    return _styled_table(visible, title=title)
+    return tables.styled_dataframe(visible, title=title)
+
+
+def runtime_hardware(report: Mapping[str, Any]) -> tuple[str, str]:
+    """Return the surrogate and the solver hardware text of one steady runtime report, as the runtime table and the break-even name them."""
+    runtime = report["neural_runtime"]
+    surrogate = f"{runtime['resolved_device']} · {runtime.get('cuda_device_name') or runtime['processor']}"
+    solver = "; ".join(f"{item['hostname']}, {item['requested_cores']} cores ({item['case_count']} cases)" for item in report["solver_hardware"])
+    return surrogate, solver
 
 
 def build_runtime_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
@@ -251,18 +201,16 @@ def build_runtime_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for label, frame in datasets.items():
         report = _provenance(frame)["timing"]["report"]
-        runtime = report["neural_runtime"]
+        surrogate_hardware, solver_hardware = runtime_hardware(report)
         row: dict[str, Any] = {
             "label": label,
             "dataset_role": dataframe.dataset_role(frame),
             "batch_size": report["measurement"]["batch_size"],
-            "surrogate_hardware": f"{runtime['resolved_device']} · {runtime.get('cuda_device_name') or runtime['processor']}",
-            "solver_hardware": "; ".join(
-                f"{item['hostname']}, {item['requested_cores']} cores ({item['case_count']} cases)" for item in report["solver_hardware"]
-            ),
+            "surrogate_hardware": surrogate_hardware,
+            "solver_hardware": solver_hardware,
         }
         for name, speedup in report["speedups"].items():
-            row[f"{name} [-]"] = _optional_value(speedup["ratio_of_sums"])
+            row[f"{name} [{field_labels.display_unit('1')}]"] = _optional_value(speedup["ratio_of_sums"])
             row[f"{name} paired cases"] = speedup["paired_case_count"]
             row[f"{name} unavailable cases"] = speedup["unavailable_case_count"]
             row[f"{name} Σ {speedup['reference_component']}"] = _optional_value(speedup["reference_seconds_sum"])
@@ -273,7 +221,7 @@ def build_runtime_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
 
 def plot_runtime_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.VBox:
     """Show the steady speed-ups with their paired and unavailable case counts, batch size and hardware."""
-    return _styled_table(build_runtime_table(datasets), title="Runtime and speed-up (ratio of sums over paired cases)")
+    return tables.styled_dataframe(build_runtime_table(datasets), title="Runtime and speed-up (ratio of sums over paired cases)")
 
 
 def transient_inference_seconds(report: transient_timing.TransientTimingReport) -> float | None:
@@ -303,15 +251,7 @@ def build_frame_work_table(frames: Mapping[str, pd.DataFrame], inference: Callab
     The frames of one run (its roles) carry the summary the loader attached; the row takes the
     inference seconds per case of that first frame's artifact.
     """
-    stages: dict[str, tuple[Mapping[str, Any], float | None]] = {}
-    runs: set[tuple[object, object]] = set()
-    for label, frame in frames.items():
-        summary = frame.attrs[dataframe.COMPLETED_RUN_SUMMARY_ATTR]
-        run = (summary.get("run_name"), summary.get("ended_at"))
-        if run not in runs:
-            runs.add(run)
-            stages[label] = (summary, inference(label, frame))
-    return build_work_table(stages)
+    return build_work_table({label: (summary, inference(label, frames[label])) for label, summary in run_discovery.distinct_runs(frames).items()})
 
 
 def _steady_inference_seconds(_label: str, frame: pd.DataFrame) -> float:
@@ -322,87 +262,71 @@ def _steady_inference_seconds(_label: str, frame: pd.DataFrame) -> float:
 
 def plot_work_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.VBox:
     """Show the work quantities of every steady run, with its mean batch-amortized forward seconds per case."""
-    return _styled_table(build_frame_work_table(datasets, _steady_inference_seconds), title="Work per stage")
+    return tables.styled_dataframe(build_frame_work_table(datasets, _steady_inference_seconds), title="Work per stage")
 
 
-def plot_relative_comparison_scoreboard(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
-    """Plot each current normalized aggregate relative to its displayed best."""
+def plot_relative_comparison_scoreboard(*, datasets: dataset_cuts.DisplayFrames) -> Figure:
+    """Plot each current normalized aggregate relative to its displayed best: a panel per dataset, the diagnostics as groups of one bar per model."""
     dataframe.validate_comparison(datasets)
-    if len(datasets) < _MINIMUM_SCOREBOARD_DATASETS:
-        msg = "Relative comparison scoreboard requires at least two datasets."
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
+    if not groups or any(len(models) < _MINIMUM_SCOREBOARD_MODELS for models in groups.values()):
+        msg = "Relative comparison scoreboard requires at least two models per dataset."
         raise ValueError(msg)
-
-    labels = tuple(datasets)
-    figure_title, count_headings = layout.aggregate_title_context(
-        "Comparison-relative normalized error",
-        layout.effective_case_counts(datasets),
+    figure_title, count_headings = layout.dataset_title_context(
+        "Comparison-relative normalized error", groups, {key: len(frame) for key, frame in datasets.items()}
     )
-    group_ids = tuple(str(group_id) for group_id, _fields in datasets[labels[0]].attrs["output_groups"])
+    group_ids = tuple(str(group_id) for group_id, _fields in datasets[next(iter(datasets))].attrs["output_groups"])
     diagnostic_labels = ("Task macro", *(f"Group: {group_id}" for group_id in group_ids))
-    # An unavailable aggregate stays NaN: it gets no bar and its tick names the support counts instead.
-    raw = np.full((len(labels), len(diagnostic_labels)), np.nan)
-    tick_labels = [count_headings[label] or label for label in labels]
-    for row, label in enumerate(labels):
-        aggregate = datasets[label].attrs["normalized_group_macro_rmse"]
-        if not aggregate["available"]:
-            tick_labels[row] += f"\n{validity_contract.unavailable_text(aggregate)}"
-            continue
-        groups = aggregate["group_statistics"]
-        if tuple(str(group_id) for group_id in groups) != group_ids:
-            msg = "Relative comparison scoreboard requires identical ordered task groups."
-            raise dataframe.ComparisonCompatibilityError(msg)
-        raw[row] = [float(aggregate["value"]), *(float(groups[group_id]["normalized_rmse"]) for group_id in group_ids)]
-    available = np.isfinite(raw)
-    if np.any(raw[available] < 0.0):
-        msg = "Relative comparison scoreboard requires non-negative normalized errors."
-        raise ValueError(msg)
-
-    relative = np.full_like(raw, np.nan)
-    for column in range(raw.shape[1]):
-        if not available[:, column].any():
-            continue
-        best = float(np.nanmin(raw[:, column]))
-        if best == 0.0:
-            relative[raw[:, column] == 0.0, column] = 1.0
-        else:
-            relative[:, column] = raw[:, column] / best
-    tied_diagnostics = bool(available.all() and np.allclose(relative, 1.0, rtol=1e-6, atol=1e-12, equal_nan=False))
-
-    figure = plt.figure(figsize=(max(12.5, 3.5 * len(labels) + 2.5), 5.3))
-    grid = figure.add_gridspec(1, 2, width_ratios=(1.0, 0.28), wspace=0.18)
-    axis = figure.add_subplot(grid[0, 0])
-    legend_axis = figure.add_subplot(grid[0, 1])
-    legend_axis.axis("off")
-    positions = np.arange(len(labels), dtype=float)
-    width = min(0.8 / len(diagnostic_labels), 0.24)
-    offsets = (np.arange(len(diagnostic_labels)) - (len(diagnostic_labels) - 1) / 2.0) * width
-    for offset, diagnostic, values in zip(offsets, diagnostic_labels, relative.T, strict=True):
-        shown = np.isfinite(values)
-        axis.bar(positions[shown] + offset, values[shown], width, label=diagnostic)
-    axis.axhline(1.0, color="black", linestyle="--", linewidth=1.0, alpha=0.65)
-    axis.set_xticks(positions)
-    axis.set_xticklabels(tick_labels, rotation=25, ha="right")
-    axis.set_ylabel("Ratio to displayed best per metric (lower is better)")
-    subtitle = (
-        "Displayed models are tied across all shown normalized diagnostics\nThis is a descriptive comparison, not an overall ranking"
-        if tied_diagnostics
-        else "Each diagnostic is normalized independently to its displayed best\nThis is a descriptive comparison, not an overall ranking"
+    figure, axes = figure_layout.panel_figure(1, len(groups), sharey="row")
+    positions = np.arange(len(diagnostic_labels), dtype=float)
+    width = 0.8 / max(len(models) for models in groups.values())
+    unavailable: list[str] = []
+    tied_panels = []
+    for axis, (dataset, models) in zip(axes[0], groups.items(), strict=True):
+        # An unavailable aggregate stays NaN: it gets no bar and the note names its support counts instead.
+        raw = np.full((len(models), len(diagnostic_labels)), np.nan)
+        for row, (model, key) in enumerate(models.items()):
+            aggregate = datasets[key].attrs["normalized_group_macro_rmse"]
+            if not aggregate["available"]:
+                unavailable.append(f"{model} on {dataset}: {validity_contract.unavailable_text(aggregate)}")
+            else:
+                statistics = aggregate["group_statistics"]
+                if tuple(str(group_id) for group_id in statistics) != group_ids:
+                    msg = "Relative comparison scoreboard requires identical ordered task groups."
+                    raise dataframe.ComparisonCompatibilityError(msg)
+                raw[row] = [float(aggregate["value"]), *(float(statistics[group_id]["normalized_rmse"]) for group_id in group_ids)]
+        available = np.isfinite(raw)
+        if np.any(raw[available] < 0.0):
+            msg = "Relative comparison scoreboard requires non-negative normalized errors."
+            raise ValueError(msg)
+        relative = np.full_like(raw, np.nan)
+        for column in range(raw.shape[1]):
+            if not available[:, column].any():
+                continue
+            best = float(np.nanmin(raw[:, column]))
+            if best == 0.0:
+                relative[raw[:, column] == 0.0, column] = 1.0
+            else:
+                relative[:, column] = raw[:, column] / best
+        tied_panels.append(bool(available.all() and np.allclose(relative, 1.0, rtol=1e-6, atol=1e-12, equal_nan=False)))
+        for row, key in enumerate(models.values()):
+            shown = np.isfinite(relative[row])
+            offset = (row - (len(models) - 1) / 2.0) * width
+            axis.bar(positions[shown] + offset, relative[row, shown], width, color=styles[key].color, edgecolor="white", hatch=styles[key].hatch)
+        axis.axhline(1.0, color="black", linestyle="--", linewidth=1.0, alpha=0.65)
+        axis.set_xticks(positions, diagnostic_labels, rotation=25, ha="right")
+        axis.grid(True, axis="y", linestyle="--", alpha=0.3)
+        figure_layout.set_panel_title(axis, count_headings[dataset] or dataset)
+    figure_layout.label_rows_once(axes, f"Ratio to displayed best per metric [{field_labels.display_unit('1')}]\n(lower is better)")
+    normalization = (
+        "Displayed models are tied across all shown normalized diagnostics"
+        if all(tied_panels)
+        else "Each diagnostic is normalized independently to its displayed best"
     )
-    axis.grid(True, axis="y", linestyle="--", alpha=0.3)
-    handles, legend_labels = axis.get_legend_handles_labels()
-    legend_axis.legend(handles, legend_labels, title="Normalized diagnostics", loc="upper left", frameon=True)
-    figure.subplots_adjust(left=0.08, right=0.98, bottom=0.17, top=0.82)
-    layout.title_over_axes(figure, figure_title, (axis,), y=0.975)
-    layout.text_over_axes(
-        figure,
-        subtitle,
-        (axis,),
-        y=0.91,
-        ha="center",
-        va="top",
-        fontsize=9.5,
-        linespacing=1.25,
-    )
+    layout.add_series_legend(figure, axes, datasets, groups, styles, bars=True)
+    not_plotted = ["Not plotted: " + "; ".join(unavailable)] if unavailable else []
+    note = layout.series_note(styles, normalization, *not_plotted, "This is a descriptive comparison, not an overall ranking")
+    figure_layout.set_figure_title(figure, axes, figure_title, note=note)
     return figure
 
 
@@ -709,22 +633,22 @@ def build_architecture_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFra
 def plot_architecture_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.VBox:
     """Show compact grouped architecture, optimization, and PI evidence."""
     table = build_architecture_table(datasets)
-    return _styled_table(table.transpose(), title="Model-family configuration")
+    return tables.styled_dataframe(table.transpose(), title="Model-family configuration", row_local=True)
 
 
-def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
+def plot_accuracy_physics_pareto(*, datasets: dataset_cuts.DisplayFrames) -> Figure:
     """
     Plot authoritative accuracy against four separate physics diagnostics.
 
     Parameters
     ----------
-    datasets : Mapping[str, pandas.DataFrame]
-        Compatible steady-flow frames with exact aggregate and residual evidence.
+    datasets : DisplayFrames
+        Compatible steady-flow frames with exact aggregate and residual evidence, labelled with their dataset and model.
 
     Returns
     -------
     matplotlib.figure.Figure
-        Three panels pairing ``normalized_group_macro_rmse`` with the median
+        A row per dataset of three panels pairing ``normalized_group_macro_rmse`` with the median
         dimensionless momentum, flux-balance, or pressure-boundary diagnostic.
 
     Raises
@@ -736,63 +660,56 @@ def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Fig
     Notes
     -----
     Axes remain separate because diagnostic units/meanings differ. Filled markers
-    disclose physics-enabled models. Marker shapes disclose ID/OOD role. No
+    disclose physics-enabled models. The marker is the material where a run spans several. No
     composite Pareto rank or parameter-efficiency score is calculated.
 
     """
     dataframe.validate_comparison(datasets, require_physics=True)
-    figure_title, count_headings = layout.aggregate_title_context(
-        "Accuracy versus physical consistency",
-        layout.effective_case_counts(datasets),
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
+    figure_title, count_headings = layout.dataset_title_context(
+        "Accuracy versus physical consistency", groups, {key: len(frame) for key, frame in datasets.items()}
     )
-    figure = plt.figure(figsize=(19.0, 5.5))
-    grid = figure.add_gridspec(1, 4, width_ratios=(1.0, 1.0, 1.0, 0.32), wspace=0.30)
-    axes = tuple(figure.add_subplot(grid[0, column]) for column in range(len(dataframe.STEADY_PHYSICS_METRICS)))
-    legend_axis = figure.add_subplot(grid[0, 3])
-    legend_axis.axis("off")
-    colors = plt.get_cmap("tab10")
-    aggregates = {label: frame.attrs["normalized_group_macro_rmse"] for label, frame in datasets.items()}
-    unavailable = [f"{label}: {validity_contract.unavailable_text(item)}" for label, item in aggregates.items() if not item["available"]]
-    for axis, metric in zip(axes, dataframe.STEADY_PHYSICS_METRICS, strict=True):
-        metric_label, unit = _PHYSICS_LABELS[metric]
-        for index, (label, frame) in enumerate(datasets.items()):
-            if not aggregates[label]["available"]:
+    figure, axes = figure_layout.panel_figure(
+        len(groups), len(dataframe.STEADY_PHYSICS_METRICS), panel_in=(4.2, 3.6)
+    )  # taller for the long diagnostic labels
+    unavailable: list[str] = []
+    for row, (dataset, models) in enumerate(groups.items()):
+        for model, key in models.items():
+            aggregate = datasets[key].attrs["normalized_group_macro_rmse"]
+            if not aggregate["available"]:
+                unavailable.append(f"{model} on {dataset}: {validity_contract.unavailable_text(aggregate)}")
                 continue
-            primary = float(aggregates[label]["value"])
-            physics_value = _finite_quantile(frame, metric, 0.5)
-            if primary < 0.0 or physics_value < 0.0:
-                msg = f"Pareto metrics must be non-negative. {label!r} supplied {primary}, {physics_value}."
-                raise ValueError(msg)
-            _family, _count, physics_enabled = model_metadata(frame)
-            role = dataframe.dataset_role(frame)
-            color = colors(index % colors.N)
-            axis.scatter(
-                primary,
-                physics_value,
-                marker=_ROLE_MARKERS[role],
-                s=80,
-                facecolors=color if physics_enabled else "none",
-                edgecolors=color,
-                linewidths=1.5,
-                label=f"{count_headings[label] or label} ({role})",
-            )
-            axis.annotate(
-                label,
-                (primary, physics_value),
-                xytext=(5, 5),
-                textcoords="offset points",
-                fontsize=8,
-            )
-        axis.set_yscale("log")
-        axis.set_xlabel(f"Normalized task error [{field_labels.display_unit('1')}]")
-        axis.set_ylabel(f"Median {metric_label} [{field_labels.display_unit(unit)}]")
-        axis.set_title(metric)
-        axis.grid(True, which="both", linestyle="--", alpha=0.3)
-    handles, labels = axes[0].get_legend_handles_labels()
-    if handles:
-        legend_axis.legend(handles, labels, loc="upper left", title="Model / dataset", frameon=True)
-    if unavailable:
-        legend_axis.text(0.0, 0.0, "Not plotted:\n" + "\n".join(unavailable), transform=legend_axis.transAxes, fontsize=8, va="bottom", wrap=True)
-    figure.subplots_adjust(top=0.84, bottom=0.14, left=0.06, right=0.98)
-    layout.title_over_axes(figure, figure_title, axes, y=0.96)
+            primary = float(aggregate["value"])
+            _family, _count, physics_enabled = series.model_metadata(datasets[key])
+            style = styles[key]
+            marker = style.marker or "o"
+            for axis, metric in zip(axes[row], dataframe.STEADY_PHYSICS_METRICS, strict=True):
+                physics_value = _finite_quantile(datasets[key], metric, 0.5)
+                if primary < 0.0 or physics_value < 0.0:
+                    msg = f"Pareto metrics must be non-negative. {key!r} supplied {primary}, {physics_value}."
+                    raise ValueError(msg)
+                if np.isnan(physics_value):
+                    unavailable.append(f"{model} on {dataset}: no finite {metric}")
+                axis.scatter(
+                    primary,
+                    physics_value,
+                    marker=marker,
+                    s=80,
+                    facecolors=style.color if physics_enabled else "none",
+                    edgecolors=style.color,
+                    linewidths=1.5,
+                )
+        for axis, metric in zip(axes[row], dataframe.STEADY_PHYSICS_METRICS, strict=True):
+            metric_label, unit = _PHYSICS_LABELS[metric]
+            figure_layout.set_log_scale(axis, "y")
+            axis.set_xlabel(f"Normalized task error [{field_labels.display_unit('1')}]")
+            axis.set_ylabel(f"Median {metric_label}\n[{field_labels.display_unit(unit)}]")
+            axis.xaxis.set_major_locator(MaxNLocator(nbins=_PARETO_ERROR_TICKS))  # long decimals crowd a narrow error range
+            axis.grid(True, which="both", linestyle="--", alpha=0.3)
+            if row == 0:
+                figure_layout.set_panel_title(axis, _PHYSICS_TITLES[metric])
+    figure_layout.set_row_headers(figure, axes, [count_headings[dataset] or dataset for dataset in groups])
+    layout.add_series_legend(figure, axes, datasets, groups, styles, name_roles=False)  # the panel row names the dataset and so its role
+    not_plotted = "Not plotted: " + "; ".join(unavailable) if unavailable else None
+    figure_layout.set_figure_title(figure, axes, figure_title, note=layout.series_note(styles, not_plotted))
     return figure

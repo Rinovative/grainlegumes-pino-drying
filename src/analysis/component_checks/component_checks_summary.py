@@ -34,16 +34,16 @@ STRIDE_FLOOR_MAX: Final = 1e-3
 NOT_MEASURED: Final = "not measured"
 
 
-def _row(component: str, measured: str, criterion: str, status: str) -> dict[str, str]:
-    """Return one summary row with the criterion marked as proposed."""
-    return {"component": component, "measured": measured, "criterion": f"{criterion} ({CRITERIA_STATE})", "status": status}
+def _row(component: str, measured: str, criterion: str, status: str, *, failing: bool = False) -> dict[str, str | bool]:
+    """Return one summary row with the criterion marked as proposed; ``failing`` only orders the table and is not a column."""
+    return {"component": component, "measured": measured, "criterion": f"{criterion} ({CRITERIA_STATE})", "status": status, "failing": failing}
 
 
-def _backend_row(crop: pd.DataFrame | None, timing: pd.DataFrame | None) -> dict[str, str]:
+def _backend_row(crop: pd.DataFrame | None, timing: pd.DataFrame | None) -> dict[str, str | bool]:
     """Return the FC-arm row from the crop floors and the measured batch cost."""
     criterion = f"FC crop-{FC_CROP} floor <= {FC_FLOOR_RATIO_MAX:g} x FD and batch cost <= {FC_COST_RATIO_MAX:g} x FD"
     measured = timing[timing["status"] == "measured"] if timing is not None else None
-    if crop is None or measured is None or measured.empty:
+    if crop is None or crop.empty or measured is None or measured.empty:
         return _row("Derivative backend: FC arm", NOT_MEASURED, criterion, NOT_MEASURED)
     floors = crop["momentum_floor_median"].xs(FC_CROP, level="crop")
     floor = float(floors["fc"]) / float(floors["fd"])
@@ -56,30 +56,39 @@ def _backend_row(crop: pd.DataFrame | None, timing: pd.DataFrame | None) -> dict
         f"floor ratio {floor:.3g}, cost ratio {cost:.3g} ({device})",
         criterion,
         "keep FC arm" if keep else "drop FC arm",
+        failing=not keep,
     )
 
 
-def _crop_row(crop: pd.DataFrame | None) -> dict[str, str]:
+def _crop_row(crop: pd.DataFrame | None) -> dict[str, str | bool]:
     """Return the smallest crop per backend whose case-median smooth 1 % ratio reaches the threshold."""
     criterion = f"smallest crop with smooth 1 % momentum ratio >= {CROP_SENSITIVITY_MIN:g}"
     if crop is None:
         return _row("Interior crop", NOT_MEASURED, criterion, NOT_MEASURED)
-    measured, status = [], []
+    measured, status, reached = [], [], []
     for backend, rows in crop.groupby(level="backend", sort=False):
         ratios = rows["smooth_1pct_ratio_median"].droplevel("backend")
         passing = ratios[ratios >= CROP_SENSITIVITY_MIN]
         measured.append(f"{backend}: " + ", ".join(f"crop {index} {value:.3g}" for index, value in ratios.items()))
         status.append(f"{backend}: crop {passing.index.min()}" if not passing.empty else f"{backend}: none")
-    return _row("Interior crop", "; ".join(measured), criterion, "; ".join(status))
+        reached.append(not passing.empty)
+    if not reached:
+        return _row("Interior crop", NOT_MEASURED, criterion, NOT_MEASURED)
+    return _row("Interior crop", "; ".join(measured), criterion, "; ".join(status), failing=not any(reached))
 
 
-def _smallest(curve: pd.Series, threshold: float) -> str:
-    """Return the smallest mode count whose worst error stays within ``threshold``."""
+def _smallest(curve: pd.Series, threshold: float) -> int | None:
+    """Return the smallest mode count whose worst error stays within ``threshold``, or None when no count does."""
     passing = curve[curve <= threshold]
-    return str(int(passing.index.min())) if not passing.empty else "none"
+    return int(passing.index.min()) if not passing.empty else None
 
 
-def _mode_rows(task: str, errors: pd.DataFrame | None) -> list[dict[str, str]]:
+def _count(modes: int | None) -> str:
+    """Return a mode count for display, ``none`` where no count qualified."""
+    return "none" if modes is None else str(modes)
+
+
+def _mode_rows(task: str, errors: pd.DataFrame | None) -> list[dict[str, str | bool]]:
     """Return per-axis mode bounds from the worst relative error over cases, fields, and quantities."""
     criterion = f"smallest count with error <= {MODES_LOWER_BOUND_ERROR:g} bounds HPO from below; <= {MODES_SUFFICIENT_ERROR:g} sufficient"
     if errors is None:
@@ -87,18 +96,23 @@ def _mode_rows(task: str, errors: pd.DataFrame | None) -> list[dict[str, str]]:
     rows = []
     for axis in ("y", "x"):
         curves = errors[errors["axis"] == axis]
-        measured, status = [], []
+        measured, status, bounds = [], [], []
         for padding, group in curves.groupby("padding"):
             worst = group.groupby(f"modes_{axis}")["relative_l2"].max()
             worst.index = worst.index.astype(int)
             lower, sufficient = _smallest(worst, MODES_LOWER_BOUND_ERROR), _smallest(worst, MODES_SUFFICIENT_ERROR)
             measured.append(f"padding {padding:g}: worst error {worst.min():.2g} at {worst.idxmin()} modes")
-            status.append(f"padding {padding:g}: lower bound {lower}, sufficient {sufficient}")
-        rows.append(_row(f"n_modes {task}, axis {axis}", "; ".join(measured), criterion, "; ".join(status)))
+            status.append(f"padding {padding:g}: lower bound {_count(lower)}, sufficient {_count(sufficient)}")
+            bounds.append((lower, sufficient))
+        if not bounds:
+            rows.append(_row(f"n_modes {task}, axis {axis}", NOT_MEASURED, criterion, NOT_MEASURED))
+            continue
+        failing = all(lower is None for lower, _sufficient in bounds) or all(sufficient is None for _lower, sufficient in bounds)
+        rows.append(_row(f"n_modes {task}, axis {axis}", "; ".join(measured), criterion, "; ".join(status), failing=failing))
     return rows
 
 
-def _padding_row(task: str, errors: pd.DataFrame | None) -> dict[str, str]:
+def _padding_row(task: str, errors: pd.DataFrame | None) -> dict[str, str | bool]:
     """Return the largest relative edge-band difference between paddings at the maintained mode pairs."""
     criterion = f"no effect if edge-band errors differ by < {PADDING_NO_EFFECT_RELATIVE:.0%}"
     configured = None if errors is None else errors[errors["axis"] == "config"]
@@ -114,21 +128,25 @@ def _padding_row(task: str, errors: pd.DataFrame | None) -> dict[str, str]:
     return _row(f"Domain padding {task}", f"largest relative edge-band difference {largest:.3g}", criterion, status)
 
 
-def _stride_row(stride: pd.DataFrame | None) -> dict[str, str]:
+def _stride_row(stride: pd.DataFrame | None) -> dict[str, str | bool]:
     """Return the worst full-grid stride floor per stride."""
     criterion = f"stride admissible if floor <= {STRIDE_FLOOR_MAX:g} normalized RMSE (full-grid evaluation only)"
     if stride is None:
         return _row("Spatial stride", NOT_MEASURED, criterion, NOT_MEASURED)
-    measured, status = [], []
+    measured, status, admissible = [], [], []
     for value, rows in stride.groupby("stride"):
         if (rows["status"] != "admissible").any():
             measured.append(f"stride {value}: refused by the tiling rule")
             status.append(f"stride {value}: refused")
+            admissible.append(False)
             continue
         worst = float(rows["max_normalized_rmse"].max())
+        admissible.append(worst <= STRIDE_FLOOR_MAX)
         measured.append(f"stride {value}: {worst:.3g}")
-        status.append(f"stride {value}: {'admissible' if worst <= STRIDE_FLOOR_MAX else 'not admissible'}")
-    return _row("Spatial stride", "; ".join(measured), criterion, "; ".join(status))
+        status.append(f"stride {value}: {'admissible' if admissible[-1] else 'not admissible'}")
+    if not admissible:
+        return _row("Spatial stride", NOT_MEASURED, criterion, NOT_MEASURED)
+    return _row("Spatial stride", "; ".join(measured), criterion, "; ".join(status), failing=not any(admissible))
 
 
 def summary_table(
@@ -156,7 +174,8 @@ def summary_table(
     -------
     pandas.DataFrame
         Columns ``component``, ``measured``, ``criterion`` and ``status``;
-        a missing table yields ``not measured``.
+        a missing or empty table yields ``not measured``. Rows whose check
+        leaves no admissible option come first, the others keep the component order.
 
     """
     transient_modes = None if transient is None else transient.spectral
@@ -169,4 +188,5 @@ def summary_table(
         _padding_row("transient", transient_modes),
         _stride_row(None if transient is None else transient.stride),
     ]
-    return pd.DataFrame(rows).set_index("component")
+    table = pd.DataFrame(rows).sort_values("failing", ascending=False, kind="stable")
+    return table.drop(columns="failing").set_index("component")

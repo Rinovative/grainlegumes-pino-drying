@@ -4,16 +4,20 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  scripts/slurm_ml.sh [RESOURCES] train CONFIG [--epochs N] [--train-dataset ID] [--seed N] [--train-seconds N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--train-stages a0,b,a1] [--artifacts selected|none|all|a0,b,a1] [--continue-with-current-code]
+  scripts/slurm_ml.sh [RESOURCES] train CONFIG [--epochs N] [--train-dataset ID] [--seed N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--train-stages a0,b,a1] [--continue-with-current-code]
   scripts/slurm_ml.sh [RESOURCES] train --resume STAGE [--continue-with-current-code]
   scripts/slurm_ml.sh [RESOURCES] optuna CONFIG [--epochs N] [--train-dataset ID] [--revision LABEL] [Optuna CLI options] [--continue-with-current-code]
   scripts/slurm_ml.sh [RESOURCES] artifacts [artifact CLI options]
   scripts/slurm_ml.sh [RESOURCES] probe
 
+Training and Optuna never evaluate ID test or OOD and build no artifacts; the artifacts operation is
+their only, explicit evaluation, and it evaluates only the roles named by repeated --split id|material_ood|parameter_ood.
+
 RESOURCES are all optional: [--mode cpu|gpu] [--partition PARTITION] [--cpus-per-task N] [--mem SIZE] [--time HH:MM:SS] [--gres gpu:TYPE:1].
 Defaults: mode gpu (probe: cpu); 4 CPUs; cpu: partition standard, 16G; gpu: partition gpu,
 32G, gres gpu:rtx6000ada:1; time 04:00:00 (train, optuna), 02:00:00 (artifacts), 00:10:00 (probe).
-GPU TYPE is v100, rtxa6000, or rtx6000ada. The probe checks the allocated
+GPU TYPE is v100, rtxa6000, or rtx6000ada. B and A1 of one pair run on one GPU
+type (training refuses another); A0 and Optuna trials may use any. The probe checks the allocated
 container and ML CLIs without opening datasets or starting workloads.
 Rerunning train CONFIG continues an interrupted run automatically; a finished
 run is never extended, and another --epochs trains a separate run beside it;
@@ -180,11 +184,9 @@ elif [[ "${operation}" == train || "${operation}" == optuna ]]; then
     preflight_override_args+=("--resume" "${resume_only_container}")
   fi
   revision_seen=false
-  artifacts_seen=false
   train_stages_seen=false
   epochs_seen=false
   train_dataset_seen=false
-  train_seconds_seen=false
   lr_scale_seen=false
   rollout_length_seen=false
   seed_seen=false
@@ -243,20 +245,15 @@ elif [[ "${operation}" == train || "${operation}" == optuna ]]; then
         continue_with_current_code=true
         shift
         ;;
-      --train-stages|--artifacts)
+      --train-stages)
         [[ "${operation}" == train ]] || fail 2 "$1 is training-only."
         (( $# >= 2 )) || fail 2 "$1 requires a selection."
-        if [[ "$1" == --train-stages ]]; then
-          [[ "${train_stages_seen}" == false ]] || fail 2 "Duplicate --train-stages."
-          train_stages_seen=true
-        else
-          [[ "${artifacts_seen}" == false ]] || fail 2 "Duplicate --artifacts."
-          artifacts_seen=true
-        fi
-        [[ "$2" =~ ^(all|selected|none|a0|b|a1)(,(a0|b|a1))*$ ]] || fail 2 "Invalid stage selection."
+        [[ "${train_stages_seen}" == false ]] || fail 2 "Duplicate --train-stages."
+        train_stages_seen=true
+        [[ "$2" =~ ^(all|a0|b|a1)(,(a0|b|a1))*$ ]] || fail 2 "Invalid stage selection."
         semantic_args+=("$1" "$2")
         # Only the trained stages' leaves bind the source tree; unselected stages are read-only prerequisites.
-        [[ "$1" != --train-stages ]] || preflight_override_args+=("$1" "$2")
+        preflight_override_args+=("$1" "$2")
         shift 2
         ;;
       --epochs)
@@ -276,17 +273,6 @@ elif [[ "${operation}" == train || "${operation}" == optuna ]]; then
         semantic_args+=("$1" "$2")
         preflight_override_args+=("--train-dataset" "$2")
         train_dataset_seen=true
-        shift 2
-        ;;
-      --train-seconds)
-        [[ "${operation}" == train ]] || fail 2 "--train-seconds is training-only."
-        (( $# >= 2 )) || fail 2 "--train-seconds requires a positive number."
-        [[ "$2" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 2 "--train-seconds requires a positive number."
-        [[ ! "$2" =~ ^0+([.]0+)?$ ]] || fail 2 "--train-seconds requires a positive number."
-        [[ "${train_seconds_seen}" == false ]] || fail 2 "Duplicate --train-seconds."
-        semantic_args+=("$1" "$2")
-        preflight_override_args+=("--train-seconds" "$2")
-        train_seconds_seen=true
         shift 2
         ;;
       --rollout-length)

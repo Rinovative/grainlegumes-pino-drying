@@ -1,7 +1,7 @@
 """Compose the compact input-generated EDA panel.
 
 Responsibilities:
-  - Bind the four-section registry to A/B comparison and dataset views
+  - Bind the four-section registry to A/B comparison and dataset views, and the paired template comparison when two campaigns share a design
   - Place each view's local Dataset A/Case A and Dataset B/Case B controls in its panel rows
   - Preserve automatic first rendering, lazy tabs, and current-figure PDF export
   - Keep transient capability filtering and notebook output ownership explicit
@@ -20,6 +20,7 @@ This module does NOT:
 from __future__ import annotations
 
 import json
+from collections import Counter
 from html import escape
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -30,6 +31,7 @@ from src.analysis.generation_inputs import generation_input_controls as controls
 from src.analysis.generation_inputs import generation_input_presentation as presentation
 from src.analysis.generation_inputs import generation_input_selection as selection_service
 from src.analysis.generation_inputs import generation_input_sources as source_service
+from src.analysis.generation_inputs import generation_input_template_comparison as template_service
 from src.analysis.generation_inputs import plots
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import registry as shared_presentation
@@ -79,13 +81,9 @@ def _live_view(
     """
     export: dict[str, Any] = {"export_state": export_state, "export_plot_name": export_plot_name, "export_title": export_title}
 
-    def draw() -> Any:
-        with ui.plot_layout.eda_typography():
-            return render()
-
     def update() -> None:
         """Render the current selection; only the newest request publishes."""
-        ui.viewers.render_view(view, draw, **export)
+        ui.viewers.render_view(view, render, **export)
 
     def refresh() -> None:
         """Follow a control change while the view is shown."""
@@ -179,7 +177,7 @@ def _view_factories(
             selection.case_a, selection.mean_a, selection.case_b, selection.mean_b, same_dataset=selection.same_dataset
         )
 
-    return {
+    factories: dict[str, Callable[..., Any]] = {
         "campaign_outcomes": _outcome_factory(catalog.outcomes),
         "field_atlas": _atlas_factory(catalog, selection_state, display_spatial_stride=display_spatial_stride),
         "case_context": pair(comparison(plots.overview.case_context)),
@@ -194,6 +192,22 @@ def _view_factories(
         "dataset_cases_parameters": _dataset_factory(catalog, plots.overview.dataset_cases_parameters),
         "dataset_field_summaries": _dataset_factory(catalog, plots.overview.dataset_field_summaries),
     }
+    partners = template_service.comparable_campaigns(catalog.outcomes.rows)
+    if partners:
+        factories["template_comparison"] = _template_factory(catalog.outcomes, partners)
+    return factories
+
+
+def _template_factory(
+    catalog: source_service.CampaignOutcomeCatalog, partners: Mapping[template_service.Campaign, tuple[template_service.Campaign, ...]]
+) -> Callable[..., Any]:
+    """Bind one cached paired template comparison of the campaigns in ``partners``."""
+
+    def build() -> tuple[_LocalControls, Callable[[], Any]]:
+        local = controls.TemplateComparisonControls(catalog, partners)
+        return local, lambda: plots.template.template_comparison(local.comparison())
+
+    return _factory(build)
 
 
 def _atlas_factory(
@@ -250,7 +264,8 @@ def build_generation_input_eda_panel(
     export_state: dict[str, Any] = {"fig": None, "figures": (), "plot_name": None, "title": None}
     sections: list[ui.notebook.ViewSection] = []
     titles: list[str] = []
-    for _section, section_label, numbered_views in shared_presentation.numbered_registry(presentation.sections_for_profiles(datasets.profiles)):
+    sections_for_view = presentation.sections_for_profiles(datasets.profiles, template_comparison="template_comparison" in factories)
+    for _section, section_label, numbered_views in shared_presentation.numbered_registry(sections_for_view):
         entries = []
         for view, view_label in numbered_views:
             try:
@@ -280,7 +295,9 @@ def _outcome_factory(catalog: source_service.CampaignOutcomeCatalog) -> Callable
                 f"<p>{len(rows)} matching candidates; showing the first 200 rows. "
                 "Rates use all terminal outcomes in the selected campaign/material/origin scope. "
                 "Pending and technical attempts remain separate. Failed candidates never satisfy supervised success counts. "
-                "Parameter plots include admitted finite scalar values with the chosen unit; n reports actual support.</p>"
+                "Parameter plots draw, for every chosen parameter, the candidates of the selected campaign/material/origin scope with "
+                "an admitted finite scalar value in the chosen unit; the legend counts are those of the whole scope, "
+                "and a panel that draws fewer names its own n.</p>"
             )
             result: list[object] = [
                 message,
@@ -300,10 +317,12 @@ def _outcome_factory(catalog: source_service.CampaignOutcomeCatalog) -> Callable
                         f"<pre>{evidence}</pre></details>"
                     )
                 )
-            if local.parameter.value is not None:
-                name, unit = local.parameter.value
-                values = source_service.outcome_parameter_values(scope, name, unit)
-                result.append(plots.overview.outcome_parameter_distribution(values, name=name, unit=unit))
+            chosen = local.chosen_parameters()
+            if chosen:
+                values = {parameter: source_service.outcome_parameter_values(scope, *parameter) for parameter in chosen}
+                counts = Counter(str(row["outcome"]) for row in scope)
+                result.append(plots.overview.outcome_parameter_distributions(values, counts))
+                result.append(plots.overview.failures_by_parameter(scope, chosen))
             return tuple(result)
 
         return local, render

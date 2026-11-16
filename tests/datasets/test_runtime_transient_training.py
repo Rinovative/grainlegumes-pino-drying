@@ -3,6 +3,7 @@
 Responsibilities:
   - Check that the persisted Dataset contract names the tensors a runtime item carries
   - Check design-kind partitions, Train subsets, exact source membership, spatial views, loaders, and declared OOD assignments
+  - Check the full Train role's unit and transition counts N that the stage budgets read, over unequal trajectory lengths
 
 Design principles:
   - Case splits precede transition expansion; role leakage is the shared split contract's test
@@ -20,7 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
-from torch.utils.data import ConcatDataset, TensorDataset
+from torch.utils.data import TensorDataset
 
 from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_partition as partition
@@ -443,28 +444,26 @@ def _batches(loader: Any) -> list[list[int]]:
     return [list(batch) for batch in loader.batch_sampler]
 
 
-def test_trajectory_batches_never_mix_lengths_or_evaluation_parts() -> None:
+def test_trajectory_batches_never_mix_lengths() -> None:
     """
     Batch whole trajectories that stop at different drying times.
 
-    Evaluation batches keep their item order within one length of one Dataset
-    part; Train microbatches of the unit sampler hold one length, cover every
-    item once per epoch and replay from the sampler seed. The sampler names the
-    unit kind of the sampling mode.
+    Evaluation batches keep their item order within one length; Train
+    microbatches of the unit sampler hold one length, cover every item once per
+    epoch and replay from the sampler seed. The sampler names the unit kind of
+    the sampling mode.
     """
     settings = training.factory.LoaderSettings(batch_size=2)
-    first = _trajectory_dataset(EVALUATION_SAMPLING, lengths=(6, 5, 6, 6))
-    second = _trajectory_dataset(EVALUATION_SAMPLING, lengths=(6,))
-    evaluation = training._loader(ConcatDataset([first, second]), settings, batches=None, loader_seed=0, worker_seed=0)
-    assert _batches(evaluation) == [[0, 2], [1], [3], [4]]
+    validation = _trajectory_dataset(EVALUATION_SAMPLING, lengths=(6, 5, 6, 6, 6))
+    evaluation = training._loader(validation, settings, batches=None, loader_seed=0, worker_seed=0)
+    assert _batches(evaluation) == [[0, 2], [1], [3, 4]]
 
     train_sampling = TransientSamplingSpec(mode="trajectory", rollout_length=2)
     lengths = (6, 5, 6, 5, 6)
 
     def train_epochs(seed: int) -> list[list[list[int]]]:
-        sampler = training._unit_sampler(
-            _trajectory_dataset(train_sampling, lengths=lengths), full_set_units=len(lengths), units_per_update=4, memory_batch=2, seed=seed
-        )
+        dataset = _trajectory_dataset(train_sampling, lengths=lengths)
+        sampler = training._unit_sampler(dataset, full_set=dataset, units_per_update=4, memory_batch=2, seed=seed)
         epochs = []
         for epoch in range(2):
             sampler.begin_epoch(epoch)
@@ -479,7 +478,29 @@ def test_trajectory_batches_never_mix_lengths_or_evaluation_parts() -> None:
         assert all(len({lengths[item] for item in batch}) == 1 and len(batch) <= 2 for batch in batches)
     assert train_epochs(5) == epochs
     trajectories = _trajectory_dataset(train_sampling, lengths=lengths)
-    sampler = training._unit_sampler(trajectories, full_set_units=len(trajectories), units_per_update=4, memory_batch=2, seed=0)
+    sampler = training._unit_sampler(trajectories, full_set=trajectories, units_per_update=4, memory_batch=2, seed=0)
     assert sampler.unit_kind == "trajectory"
     windows = _trajectory_dataset(TransientSamplingSpec(mode="rollout_window", rollout_length=2, window_stride=2, window_offset=0), lengths=(6, 5))
-    assert training._unit_sampler(windows, full_set_units=len(windows), units_per_update=4, memory_batch=2, seed=0).unit_kind == "window"
+    assert training._unit_sampler(windows, full_set=windows, units_per_update=4, memory_batch=2, seed=0).unit_kind == "window"
+
+
+def test_the_transition_count_n_sums_unequal_trajectory_lengths_whatever_the_sampling_cuts() -> None:
+    """
+    N of B's budget K x N is the full Train role's regular transitions, sum L_i over unequal lengths.
+
+    Whole trajectories and end-aligned windows (whose overlap repeats transitions) give the same N;
+    a Train subset keeps the full role's units and N, so a learning-curve point trains as long as a full run.
+    """
+    lengths = (6, 5, 3)
+    trajectories = _trajectory_dataset(TransientSamplingSpec(mode="trajectory", rollout_length=2), lengths=lengths)
+    windows = _trajectory_dataset(TransientSamplingSpec(mode="rollout_window", rollout_length=2, window_stride=2, window_offset=0), lengths=lengths)
+    subset = _trajectory_dataset(TransientSamplingSpec(mode="rollout_window", rollout_length=2, window_stride=2, window_offset=0), lengths=(6,))
+
+    def counts(dataset: transient.TransientPhysicalDataset, full_set: transient.TransientPhysicalDataset) -> tuple[int, int]:
+        sampler = training._unit_sampler(dataset, full_set=full_set, units_per_update=1, memory_batch=1, seed=0)
+        return sampler.full_set_units, sampler.full_set_transitions
+
+    # (6, 5, 3) cut into windows of 2 at stride 2 end-aligned: 3 + 3 + 2 windows hold 16 transitions, 2 of them repeated.
+    assert counts(trajectories, trajectories) == (3, 14)
+    assert counts(windows, windows) == (8, 14)
+    assert counts(subset, windows) == (8, 14)

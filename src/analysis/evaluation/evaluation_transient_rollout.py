@@ -675,6 +675,7 @@ def _target_evidence(
     return {
         "criterion": TARGET_CRITERION,
         "limit": float(target_fraction_limit),
+        "target_moisture_wb": float(target_wet_basis),
         **reference,
         "predicted_evidence_scope": "regular_sequence_grid",
         "predicted_available": predicted_available,

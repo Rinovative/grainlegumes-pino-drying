@@ -147,6 +147,7 @@ def test_completed_loader_uses_admitted_scaling_and_best_checkpoint(monkeypatch:
     config: dict[str, Any] = {
         "task": "transient_drying",
         "producer": _producer(),
+        "run": {"deterministic": False},
         "input_profile": "canonical_physics_complete",
         "temporal": {"temporal_conditioning": {"kind": "none"}},
         "model": {"kind": "fno", "params": {}},
@@ -185,6 +186,47 @@ def test_completed_loader_uses_admitted_scaling_and_best_checkpoint(monkeypatch:
         transient.load_transient_inference_context(run_dir="synthetic")
 
 
+def test_context_applies_the_run_numerics_before_building_the_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Artifact generation can build a context in a fresh process, so the context itself sets float32 and no autotuning."""
+    scaling = _scaling()
+    model = _IncrementModel()
+    config: dict[str, Any] = {
+        "task": "transient_drying",
+        "producer": _producer(),
+        "run": {"deterministic": False},
+        "input_profile": "canonical_physics_complete",
+        "temporal": {"temporal_conditioning": {"kind": "none"}},
+        "model": {"kind": "fno", "params": {}},
+    }
+    completed = {
+        "scientific_run_name": "run",
+        "config": config,
+        "normalizer_state": scaling.state_dict(),
+        "best_checkpoint": {"model_state_dict": model.state_dict()},
+    }
+    flags_at_build: list[tuple[bool, bool, bool]] = []
+
+    def build(_cfg: object, *, device: torch.device) -> nn.Module:
+        backends = torch.backends
+        flags_at_build.append((backends.cuda.matmul.allow_tf32, backends.cudnn.allow_tf32, backends.cudnn.benchmark))
+        return model.to(device)
+
+    monkeypatch.setattr(transient.model_factory, "validate_transient_model_spatial_shape", lambda _cfg, _shape: None)
+    monkeypatch.setattr(transient.model_factory, "build_model", build)
+    # monkeypatch restores every process flag the policy changes, so later tests see the state they started with.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", True)
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", True)
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", torch.backends.cudnn.deterministic)
+    previous_algorithms = torch.are_deterministic_algorithms_enabled()
+    try:
+        transient.build_transient_inference_context(completed=completed)
+    finally:
+        torch.use_deterministic_algorithms(previous_algorithms)
+
+    assert flags_at_build == [(False, False, False)]
+
+
 def test_stride_two_trained_rno_admits_original_grid_without_refitting_scaling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -202,6 +244,7 @@ def test_stride_two_trained_rno_admits_original_grid_without_refitting_scaling(
     config: dict[str, Any] = {
         "task": "transient_drying",
         "producer": _producer(),
+        "run": {"deterministic": False},
         "input_profile": "canonical_physics_complete",
         "temporal": {"temporal_conditioning": {"kind": "none"}},
         "model": {

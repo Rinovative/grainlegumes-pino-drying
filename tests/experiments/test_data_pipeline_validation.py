@@ -4,6 +4,7 @@ Responsibilities:
   - Check split persistence before fitting and complete Dataset/normalizer/loader validation
   - Check that loader construction caps the worker count at the CPUs available to the process
   - Check that the validator refuses a transient request instead of checking it partially
+  - Check that a training run gets no ID-test or OOD loader and only the explicit acceptance asks for them
 
 Design principles:
   - Tiny fixtures preserve real admission boundaries while replacing external I/O
@@ -23,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import torch
 from support import configs
-from support.scaling import steady_scaling
+from support.scaling import steady_inputs, steady_scaling
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, Subset
 
@@ -36,6 +37,12 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 validation = experiments.validation.data_pipeline
+
+
+def _close_dataset(dataset: Dataset[Any]) -> None:
+    """Close the transient physical dataset a training loader holds."""
+    assert isinstance(dataset, datasets.runtime.transient.TransientPhysicalDataset)
+    dataset.close()
 
 
 class _SyntheticDataset(Dataset[dict[str, Any]]):
@@ -112,6 +119,24 @@ def _task() -> SimpleNamespace:
     )
 
 
+def _steady_tensors(task: domain.tasks.spec.TaskSpec, *, offset: float, inlet_pressure: float | None = None) -> tuple[Tensor, Tensor]:
+    """
+    Return four 2 x 2 steady cases on a coordinate grid with distinct static fields, positive inlet pressures and outputs.
+
+    With ``inlet_pressure`` every case has that constant P and a velocity ``v`` whose physical Train std (about 2e-4)
+    lies above the scale floor while its dimensionless std (about 2e-9) lies below it.
+    """
+    inputs = steady_inputs(4, (2, 2))
+    values = torch.arange(16, dtype=torch.float32).reshape(4, 2, 2) + offset
+    for factor, name in enumerate(("Kxx", "Kxy", "Kyy", "eps_bed", "p_in_bc"), start=1):
+        inputs[:, task.input_names.index(name)] = 1.0 + factor * values
+    outputs = torch.stack([values.mul(2).add(3), values.mul(0.5), values.neg()], dim=1)
+    if inlet_pressure is not None:
+        inputs[:, task.input_names.index("p_in_bc")] = inlet_pressure
+        outputs[:, task.output_names.index("v")] = 1.0e-4 * values
+    return inputs, outputs
+
+
 def _fit_scaling(source: _SyntheticDataset, indices: tuple[int, ...]) -> datasets.preprocessing.normalization.TrainScaling:
     """Fit the production steady scaling on the given Train membership of one steady-shaped source."""
     normalization = datasets.preprocessing.normalization
@@ -155,6 +180,7 @@ def _ood_partition(ood_source: _SyntheticDataset) -> dict[str, Any]:
 
 _ASSIGNMENT = {"dataset_id": "ood_data", "role": "material_ood", "relation": "Dataset-declared material holdout", "assumptions": []}
 _PRODUCER = {"training_sha256": "a" * 64, "model_sha256": "b" * 64}
+_HELD_OUT_ROLES = ("id_test", "material_ood", "parameter_ood")
 
 
 def _bind(source: _SyntheticDataset, *, material: str, partition: Mapping[str, Any]) -> dict[str, Any]:
@@ -259,6 +285,15 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
         return dataclasses.replace(steady_scaling((2, 2)), **identity)
 
     monkeypatch.setattr(datasets.preprocessing.normalization, "fit_steady_scaling", fit)
+    create = training.create_dataloaders
+    built_roles: list[set[str]] = []
+
+    def record_roles(**kwargs: Any) -> Any:
+        built = create(**kwargs)
+        built_roles.append(set(built[1]))
+        return built
+
+    monkeypatch.setattr(training, "create_dataloaders", record_roles)
     config = {
         "task": task.id,
         "run": {"seed": 9},
@@ -282,8 +317,23 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
         split_persist_callback=persist,
     )
     assert events == ["persist", "fit"]
-    assert {"train", "eval", "id_test", "material_ood", "scaling_artifact"}.issubset(loaders)
+    # A training run gets Train and validation loaders only; ID-test and OOD stay membership in the saved split.
+    assert {"train", "eval", "scaling_artifact"}.issubset(loaders)
+    assert not set(loaders).intersection(_HELD_OUT_ROLES)
     assert loaders["split_indices"]["case_partition"] == manifests["id_data"]["case_partition"]
+    # Only the explicit data-pipeline acceptance asks for the held-out loaders.
+    held_out = experiments.config.loader.create_dataloaders_from_config(
+        config,
+        seed_plan=experiments.run.build_seed_plan(9, stage=None),
+        split_indices=loaders["split_indices"],
+        scaling_artifact=loaders["scaling_artifact"],
+        held_out_loaders=True,
+    )
+    assert held_out["id_test"] is not None
+    assert held_out["material_ood"] is not None
+    assert held_out["parameter_ood"] is None
+    # The factory itself builds the held-out loaders only on that explicit request.
+    assert built_roles == [{"eval"}, {"eval", *_HELD_OUT_ROLES}]
 
 
 @pytest.mark.parametrize(("configured", "available", "effective"), [(8, 4, 4), (0, 4, 0)])
@@ -331,13 +381,17 @@ def test_dataloader_workers_never_exceed_the_cpus_available_to_the_process(
     assert config["data"]["num_workers"] == configured
 
 
-def test_full_validator_checks_complete_datasets_split_normalizer_and_loaders(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Return typed PASS evidence while using the maintained scientific owners."""
+@pytest.mark.parametrize("inlet_pressure", [None, 1.0e5], ids=("varying-inlet-pressure", "dimensionless-v-below-the-floor"))
+def test_full_validator_checks_complete_datasets_split_normalizer_and_loaders(monkeypatch: pytest.MonkeyPatch, inlet_pressure: float | None) -> None:
+    """
+    Return typed PASS evidence while using the maintained scientific owners.
+
+    The second case checks the normalized outputs against the dimensionless statistics that encode them: its
+    v is degenerate after the division by P although its physical std lies above the floor.
+    """
     task = domain.tasks.registry.get_task("steady_flow")
-    id_inputs = torch.arange(4 * task.in_channels * 4, dtype=torch.float32).reshape(4, task.in_channels, 2, 2)
-    id_outputs = id_inputs[:, : task.out_channels].mul(2).add(3)
-    ood_inputs = id_inputs.add(200.0)
-    ood_outputs = ood_inputs[:, : task.out_channels].mul(2).add(3)
+    id_inputs, id_outputs = _steady_tensors(task, offset=0.0, inlet_pressure=inlet_pressure)
+    ood_inputs, ood_outputs = _steady_tensors(task, offset=200.0, inlet_pressure=inlet_pressure)
     fields = {"input_fields": task.input_names, "output_fields": task.output_names}
     id_source = _SyntheticDataset(
         dataset_id="id_data",
@@ -364,9 +418,11 @@ def test_full_validator_checks_complete_datasets_split_normalizer_and_loaders(mo
         },
     }
     build_calls: list[dict[str, int]] = []
+    held_out_requests: list[bool] = []
 
-    def build_loaders(_config: dict[str, Any], *, seed_plan: dict[str, int]) -> dict[str, Any]:
+    def build_loaders(_config: dict[str, Any], *, seed_plan: dict[str, int], held_out_loaders: bool = False) -> dict[str, Any]:
         """Create fresh loaders, Train scaling, and split state for each production call."""
+        held_out_requests.append(held_out_loaders)
         build_calls.append(seed_plan)
         split = _split_info(id_source=id_source, ood_source=ood_source)
         contract = datasets.preprocessing.splits.admit_split(split)
@@ -405,6 +461,8 @@ def test_full_validator_checks_complete_datasets_split_normalizer_and_loaders(mo
 
     assert isinstance(result, validation.FullDataValidationResult)
     assert len(build_calls) == 2
+    # The acceptance checks every role's loader coverage, so it asks for the held-out loaders explicitly; its repeat checks membership only.
+    assert held_out_requests == [True, False]
     assert len(result.dataset_membership) == 5
     assert len(result.channels) == task.in_channels + task.out_channels
     assert len(result.coverage) == 4
@@ -428,6 +486,66 @@ def test_full_validator_refuses_a_transient_request_before_loading_data(monkeypa
         validation.validate_full_data_pipeline(configs.resolve(configs.transient_stage_a_only_config()))
 
 
+def test_transient_training_factory_opens_only_the_training_dataset_and_builds_no_held_out_loader(
+    transient_package: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The transient factory opens the training package only and returns Train and validation loaders; ID-test stays split membership."""
+    factory = datasets.runtime.transient_training.factory
+    create = factory.create_dataset
+    opened: list[str] = []
+
+    def record_open(request: Any) -> Any:
+        opened.append(request.dataset_id)
+        return create(request)
+
+    monkeypatch.setattr(factory, "create_dataset", record_open)
+    loaders = datasets.runtime.transient_training.create_transient_training_loaders(
+        train_dataset_id=transient_package["train_dataset"],
+        material_ood_dataset_ids=[],
+        train_subset=None,
+        tensorizer=TransientTensorizerSpec(input_profile="canonical_physics_complete", temporal_conditioning=TemporalConditioningSpec("none")),
+        train_sampling=datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition"),
+        loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
+        units_per_update=2,
+        memory_batch=1,
+        model_sha256="a" * 64,
+        storage_root=str(transient_package["root"]),
+    )
+    _close_dataset(loaders.train.dataset)
+    _close_dataset(loaders.evaluation.dataset)
+
+    assert set(opened) == {transient_package["train_dataset"]}
+    assert not {field.name for field in dataclasses.fields(loaders)}.intersection(_HELD_OUT_ROLES)
+    assert loaders.split["roles"]["id_test"]["case_ids"] == transient_package["case_partition"]["id_test"]
+
+
+def test_transient_training_gets_no_held_out_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient run gets Train and validation loaders only; a request for held-out loaders is refused before loading data."""
+    config = configs.resolve(configs.transient_stage_a_only_config())
+    seed_plan = {"loader": 1, "worker": 2}
+    monkeypatch.setattr(
+        datasets.runtime.transient_training,
+        "create_transient_training_loaders",
+        lambda **_kwargs: pytest.fail("a refused held-out request loaded data"),
+    )
+    with pytest.raises(ValueError, match="held-out"):
+        experiments.config.loader.create_dataloaders_from_config(config, seed_plan=seed_plan, held_out_loaders=True)
+
+    built = SimpleNamespace(
+        train="train",
+        evaluation="validation",
+        scaling="scaling",
+        scaling_artifact={},
+        split={},
+        spatial_view={},
+    )
+    monkeypatch.setattr(datasets.runtime.transient_training, "create_transient_training_loaders", lambda **_kwargs: built)
+    loaders = experiments.config.loader.create_dataloaders_from_config(config, seed_plan=seed_plan)
+
+    assert (loaders["train"], loaders["eval"]) == ("train", "validation")
+    assert not set(loaders).intersection(_HELD_OUT_ROLES)
+
+
 @pytest.mark.parametrize(
     ("field", "foreign"),
     [("dataset_identity", {"dataset_id": "foreign"}), ("train_membership_digest", "b" * 64)],
@@ -447,10 +565,8 @@ def test_saved_transient_scaling_state_must_repeat_the_envelope_identity(transie
         model_sha256="a" * 64,
         storage_root=str(transient_package["root"]),
     )
-    owned: tuple[Any, ...] = (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test)
-    for loader in owned:
-        if loader is not None:
-            loader.dataset.close()
+    for loader in (loaders.train, loaders.evaluation):
+        _close_dataset(loader.dataset)
     config = {
         "task": "transient_drying",
         "task_contract": domain.tasks.registry.get_task("transient_drying").resolved_contract(),

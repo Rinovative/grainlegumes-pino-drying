@@ -55,7 +55,6 @@ REQUIRED_PATHS: dict[str, tuple[str, ...]] = {
         "data.num_workers",
         "data.persistent_workers",
         "training.units_per_update",
-        "training.memory_batch",
         "loss.data.kind",
         "loss.data.weight",
         "loss.physics.enabled",

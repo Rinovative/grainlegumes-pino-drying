@@ -215,6 +215,21 @@ def checkbox(description: str, *, value: bool = True, tooltip: str = "") -> widg
     )
 
 
+def int_field(description: str, *, value: int, minimum: int, maximum: int) -> widgets.BoundedIntText:
+    """Return an integer field bounded to ``minimum`` to ``maximum``, as wide as its label plus its widest value, on the grid."""
+    label = style.text_px(description)
+    widest = style.text_px(str(maximum), allowance_ch=style.FIELD_ALLOWANCE_CH)
+    return widgets.BoundedIntText(
+        value=value,
+        min=minimum,
+        max=maximum,
+        description=description,
+        continuous_update=False,
+        style={"description_width": f"{label}px"},
+        layout=widgets.Layout(width=f"{style.GRID.snap(label + style.LABEL_GAP_PX + widest)}px", flex="0 0 auto"),
+    )
+
+
 def choice_group(options: Sequence[Option], *, description: str = "", value: Any = None) -> widgets.ToggleButtons:
     """Return a one-line group of equally wide buttons for a small exclusive choice (rule 18)."""
     resolved = _require_options(options, kind="choice group")
@@ -337,16 +352,21 @@ class ChannelChecks:
         *,
         labels: Mapping[str, str] | None = None,
         retained: Sequence[str] | None = None,
+        checked: Sequence[str] | None = None,
     ) -> tuple[str, ...]:
         """
         Replace the channels and return the retained choices that the new set no longer offers.
 
-        ``retained`` defaults to the current selection. Observers are not called; the caller redraws once.
+        ``retained`` defaults to the current selection. ``checked`` instead names exactly the checked channels (a
+        subset of ``options``). Observers are not called; the caller redraws once.
         """
         kept = tuple(self.selected if retained is None else retained)
         new = tuple(options)
-        checked = {name for name in new if name in kept or name not in self._known}
-        self._build(new, labels, checked=checked)
+        if checked is not None and not set(checked) <= set(new):
+            message = "Checked channels must be a subset of the offered channels."
+            raise ValueError(message)
+        initial = set(checked) if checked is not None else {name for name in new if name in kept or name not in self._known}
+        self._build(new, labels, checked=initial)
         return tuple(name for name in kept if name not in new)
 
     def _build(self, options: Sequence[str], labels: Mapping[str, str] | None, *, checked: set[str] | None) -> None:

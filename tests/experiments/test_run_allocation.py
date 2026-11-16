@@ -1054,7 +1054,7 @@ def test_a_finished_run_is_never_extended_and_another_budget_is_another_run(
         config, longer = (configs.resolve(item, output_root=tmp_path) for item in (raw, longer_raw))
     else:
         raw, longer_raw = configs.transient_matched_config(), configs.transient_matched_config()
-        longer_raw["training"]["b"]["train_seconds"] *= 2
+        longer_raw["training"]["a0"]["budget_epochs"] *= 2  # the one K sizes B's K x N transitions
         config, longer = (dict(configs.resolve_plan(item, output_root=tmp_path).b) for item in (raw, longer_raw))
     run_dir = common.paths.resolve_config_run_dir(config)
     run_state.write_lightweight_run_state(run_dir, config, status=status, completed_epoch=1)

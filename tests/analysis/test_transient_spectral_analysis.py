@@ -18,6 +18,7 @@ import pandas as pd
 
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda.plots import eda_plot_spectral_analysis as spectra
+from src.analysis.eda.plots import eda_plot_transient as transient_plots
 
 
 def _transient_frame() -> pd.DataFrame:
@@ -206,5 +207,110 @@ def test_position_resolved_spectral_plot_builds_without_mutating_temperature() -
             frame.iloc[0]["state_trajectories"]["T"],
             source,
         )
+    finally:
+        plt.close(figure)
+
+
+def test_directional_spectra_label_each_axis_once_per_row_and_keep_one_color_per_dataset() -> None:
+    """Power and cumulative y labels appear once per row; both line styles of a dataset share its color; one legend sits at the right."""
+    label = "Drying · Lentil · ID"
+    figure = spectra.plot_directional_spectral_case(
+        datasets={label: _transient_frame()}, styles=transient_plots.batch_styles({label: None}), case_number=1, channels=("T", "phi")
+    )
+    try:
+        labels = [axis.get_ylabel() for axis in figure.axes]
+        assert sum(label.startswith("Mean spectral power") for label in labels) == 2
+        assert labels.count("Cumulative energy [-]") == 2
+        lines = [line for axis in figure.axes for line in axis.get_lines()]
+        assert {line.get_color() for line in lines} == {lines[0].get_color()}
+        assert {line.get_linestyle() for line in lines} == {"-"}
+        assert len({line.get_linewidth() for line in lines}) == 2  # power and the thinner cumulative line
+        assert len(figure.legends) == 1
+    finally:
+        plt.close(figure)
+
+
+def _without_phi(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of ``frame`` that stores only T."""
+    row = dict(frame.iloc[0])
+    row["state_trajectories"] = {"T": row["state_trajectories"]["T"]}
+    reduced = pd.DataFrame((row,), index=frame.index)
+    reduced.attrs.update(frame.attrs)
+    reduced.attrs["field_names"] = ("T",)
+    reduced.attrs["field_categories"] = {**frame.attrs["field_categories"], "dynamic_state": ("T",)}
+    return reduced
+
+
+def test_directional_colors_are_resolved_once_per_figure_and_batches_differ_in_line_style() -> None:
+    """A field that one dataset lacks does not shift the others' colors; batches of one material share its color and differ in line style."""
+    full = _transient_frame()
+    datasets = {"A": _without_phi(full), "B": full, "C": full.copy()}
+    figure = spectra.plot_directional_spectral_case(
+        datasets=datasets, styles=transient_plots.batch_styles(dict.fromkeys(datasets)), case_number=1, channels=("T", "phi")
+    )
+    try:
+        power = [axis for axis in figure.axes if axis.get_ylabel().startswith("Mean spectral power")]
+        colors = [{line.get_label(): line.get_color() for line in axis.get_lines()} for axis in power]
+        assert colors[0]["B power"] == colors[1]["B power"]
+        assert colors[0]["C power"] == colors[1]["C power"]
+    finally:
+        plt.close(figure)
+    figure = spectra.plot_directional_spectral_case(
+        datasets={"A": full, "B": full.copy()}, styles=transient_plots.batch_styles({"A": "lentil", "B": "lentil"}), case_number=1, channels=("T",)
+    )
+    try:
+        lines = {line.get_label(): line for axis in figure.axes for line in axis.get_lines()}
+        assert lines["A power"].get_color() == lines["B power"].get_color()
+        assert lines["A power"].get_linestyle() != lines["B power"].get_linestyle()
+        assert lines["A cumulative"].get_linestyle() == lines["A power"].get_linestyle()
+        assert lines["A cumulative"].get_linewidth() < lines["A power"].get_linewidth()
+    finally:
+        plt.close(figure)
+
+
+def test_a_dataset_is_drawn_in_the_style_it_is_given_whatever_the_selection() -> None:
+    """The builder never resolves styles from the frames it gets: selecting batch B alone draws it in B's given dashed style."""
+    full = _transient_frame()
+    datasets = {"A": full, "B": full.copy()}
+    styles = transient_plots.batch_styles({"A": "lentil", "B": "lentil"})
+    figure = spectra.plot_directional_spectral_case(datasets=datasets, styles=styles, case_number=1, dataset_names=["B"], channels=("T",))
+    try:
+        lines = {line.get_label(): line.get_linestyle() for axis in figure.axes for line in axis.get_lines()}
+        assert lines["B power"] == styles["B"].linestyle != "-"
+    finally:
+        plt.close(figure)
+
+
+def test_spectral_evolution_row_label_skips_an_unavailable_panel() -> None:
+    """A panel of a missing field is axis-off and carries no y label; the row's label stands on the first panel that shows data."""
+    full = _transient_frame()
+    figure = spectra.plot_vertical_spectral_case(datasets={"A": _without_phi(full), "B": full}, case_number=1, channels=("T", "phi"))
+    try:
+        assert all(axis.get_ylabel() == "" for axis in figure.axes if not axis.axison)
+        row_labels = [axis for axis in figure.axes if axis.axison and axis.get_ylabel() and "power fraction" not in axis.get_ylabel()]
+        assert len(row_labels) == 2  # one per field row, though phi is missing in the first column
+    finally:
+        plt.close(figure)
+
+
+def test_spectral_evolution_column_title_and_x_label_stand_on_available_panels() -> None:
+    """A column whose lowest cell is unavailable still carries its x label, and each column its title, on available panels."""
+    full = _transient_frame()
+    figure = spectra.plot_vertical_spectral_case(datasets={"A": _without_phi(full), "B": full}, case_number=1, channels=("T", "phi"))
+    try:
+        shown = [axis for axis in figure.axes if axis.axison]
+        assert sum(bool(axis.get_xlabel()) for axis in shown) == 2  # one per dataset column, A's on its only panel
+        assert sum(bool(axis.get_title()) for axis in shown) == 2
+    finally:
+        plt.close(figure)
+
+
+def test_spectral_evolution_colorbars_each_carry_the_power_fraction_unit() -> None:
+    """Every colour bar of the position-resolved spectra names its quantity and unit."""
+    frame = _transient_frame()
+    figure = spectra.plot_vertical_spectral_case(datasets={"A": frame, "B": frame.copy()}, case_number=1, channels=("T",))
+    try:
+        labels = [axis.get_ylabel() for axis in figure.axes if "power fraction" in axis.get_ylabel()]
+        assert labels == ["Row-normalized power fraction [-]"] * 2
     finally:
         plt.close(figure)

@@ -24,7 +24,7 @@ import h5py
 import numpy as np
 import pytest
 
-from src import common, generation
+from src import common, domain, generation
 from src.generation import generation_campaign_lifecycle as lifecycle
 from src.generation.contracts import generation_contracts_profiles as profile_contract
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
@@ -1282,6 +1282,11 @@ def test_compact_case_uses_solved_output_but_omits_model_from_publication(
         raw_input_files: Any = input_files_dataset[()]
     raw_case = generation.runtime.raw_case_directory(config, 1, storage_root=storage)
     raw_payload = json.loads((raw_case / "case.json").read_text(encoding="utf-8"))
+    spatial, sampled = raw_payload["spatial_diagnostics"], raw_payload["sampled_values"]
+    viscosity = domain.physics.contracts.AIR_DYNAMIC_VISCOSITY
+    darcy_base = sampled["airflow.superficial_velocity"] * viscosity * spatial["geometry"]["Ly"] / sampled["kappa_mean"]
+    assert spatial["pressure_boundary"]["base"] == pytest.approx(darcy_base, rel=1e-12)
+    assert spatial["pressure_boundary"]["base_formula"].startswith("airflow.superficial_velocity*mu*Ly/kappa_mean")
     published_input_files = raw_input_files.decode("utf-8") if isinstance(raw_input_files, bytes) else str(raw_input_files)
     assert json.loads(published_input_files) == raw_payload["input_files"]
     assert set(raw_payload["input_files"]) == {"fields.csv"}

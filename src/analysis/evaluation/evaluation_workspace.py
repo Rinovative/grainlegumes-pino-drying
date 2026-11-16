@@ -2,7 +2,8 @@
 
 Responsibilities:
   - Discover persisted experiments once and retain the normalized catalog
-  - Offer the runs as one collapsed selector grouped by architecture, one run (single) or several compatible runs (comparison)
+  - Offer the runs as one open selector grouped by architecture: one run (single, closes after the pick) or several compatible (comparison)
+  - Label every run once over the catalog (``FNO · B · seed 9``) for the selector header, the legends and the details
   - Load validated artifacts read-only only for artifact-ready selections
   - Present lifecycle, provenance, compatibility, and recovery status without tracebacks, as one summary line with details on demand
   - Delegate task-aware scientific panels to maintained Evaluation sessions
@@ -40,6 +41,7 @@ from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+import ipywidgets as widgets
 from IPython.display import HTML
 
 from src import analysis, common
@@ -53,11 +55,11 @@ from . import evaluation_workflow as workflow
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    import ipywidgets as widgets
-
 WorkspaceKind = Literal["single", "comparison"]
 
 _MINIMUM_COMPARISON_RUNS = 2
+_LABEL_CELL = "font-weight:bold;text-align:left;vertical-align:top;white-space:nowrap;padding-right:1.25em"
+_VALUE_CELL = "text-align:left;vertical-align:top"
 ArtifactRole = transient_artifact.DatasetRole
 _ARTIFACT_ROLES: tuple[ArtifactRole, ...] = transient_artifact.DATASET_ROLES
 _GPU_NOTE = "GPU work is limited to transient aggregate error reductions under a Slurm GPU allocation; other views use CPU."
@@ -108,16 +110,25 @@ def _role_label(role: str) -> str:
     return analysis.presentation.display_labels.evaluation_role_display_label(role)
 
 
-def _model_labels(runs: Sequence[run_discovery.EvaluationRunDiscovery]) -> tuple[str, ...]:
-    """Return short unique model labels for the panel's frames; the selector shows the full run names."""
+def _run_labels(runs: Sequence[run_discovery.EvaluationRunDiscovery]) -> tuple[str, ...]:
+    """
+    Return one short label per run, unique across ``runs`` (``FNO · B · seed 9``, ``PI-U-NO · seed 9``); the selector lists the full names.
+
+    When no facet separates some runs, every label takes its full run name instead, and its directory where even that repeats.
+    """
+    families = {spec.family: spec.label for spec in analysis.presentation.visual_semantics.ARCHITECTURES}
     bases = []
     for run in runs:
-        parts = [run.model_label, f"seed {run.seed}" if run.seed is not None else "seed unavailable"]
-        if run.stage is not None and run.stage.lower() not in run.model_label.lower():
-            parts.append(run.stage)
-        bases.append(" · ".join(parts))
+        # The display name of the model family; a run whose family does not resolve keeps its architecture descriptor.
+        model = families.get(run.model_family or "") or run.model_label
+        stage = [] if run.stage is None else [run.stage]  # discovery normalizes the stage (A0, B, A1)
+        bases.append(" · ".join([model, *stage, f"seed {run.seed}" if run.seed is not None else "seed unavailable"]))
     facets = tuple((run.pair_label, run.config_label, run.dataset_id, run.run_name, str(run.run_dir)) for run in runs)
-    return analysis.presentation.display_labels.unique_display_labels(bases, facets)
+    try:
+        return analysis.presentation.display_labels.unique_display_labels(bases, facets)
+    except ValueError:  # The workspace must still open: name the runs by their full names.
+        named = [f"{base} · {run.run_name}" for base, run in zip(bases, runs, strict=True)]
+        return tuple(f"{name} · {run.run_dir}" if named.count(name) > 1 else name for name, run in zip(named, runs, strict=True))
 
 
 def _artifact_state_label(
@@ -139,8 +150,9 @@ def _artifact_state_label(
 
 def _compatibility_issues(
     runs: Sequence[run_discovery.EvaluationRunDiscovery],
+    labels: Mapping[Path, str],
 ) -> tuple[str, ...]:
-    """Return explicit persisted-metadata incompatibilities before artifact loading."""
+    """Return explicit persisted-metadata incompatibilities before artifact loading, naming each run by its short label from ``labels``."""
     if len(runs) < _MINIMUM_COMPARISON_RUNS:
         return ("Select at least two runs.",)
     fields = {
@@ -149,7 +161,7 @@ def _compatibility_issues(
         "evaluation protocol": "evaluation_config_identity",
         "spatial stride": "spatial_stride",
     }
-    issues = [f"{run.model_label}: {reason}" for run in runs for reason in run.metadata_issues]
+    issues = [f"{labels[run.run_dir]}: {reason}" for run in runs for reason in run.metadata_issues]
     for label, field in fields.items():
         values = {getattr(run, field) for run in runs}
         if len(values) > 1:
@@ -198,16 +210,23 @@ class _EvaluationWorkspaceController:
         )
         self._workflow: workflow.PreparedEvaluationWorkflow | None = None
         self.detail_slot = ui.panel.PlotSlot()
+        # One label per run over the whole catalog, so a run reads the same in the selector header, the legends and the details.
+        self._labels = dict(zip((run.run_dir for run in catalog.runs), _run_labels(catalog.runs), strict=True))
+        by_name: dict[tuple[str, str | None, str | None], str] = {(run.task, run.dataset_id, run.run_name): str(run.run_dir) for run in catalog.runs}
         options = [
             ui.selectors.RunOption(
                 name=run.run_name,
                 family=run.model_family,
                 key=str(run.run_dir),
                 issue="; ".join(run.metadata_issues) or None,
+                label=self._labels[run.run_dir],
+                parent=by_name.get((run.task, run.dataset_id, run.a0_run_name)),  # a B or A1 run stands below its A0 when that is listed
             )
             for run in catalog.runs
         ]
-        self.runs = ui.selectors.RunSelector(options, multiple=kind == "comparison", selected=self._initial_runs())
+        self.runs = ui.selectors.RunSelector(
+            options, multiple=kind == "comparison", selected=self._initial_runs(), opened=True, close_on_pick=kind == "single"
+        )
         self.runs.observe(self._render)
         details_header, details_body = ui.panel.disclosure("Details", self.detail_slot.widget)
         self.view = ui.panel.ViewPanel(
@@ -215,8 +234,9 @@ class _EvaluationWorkspaceController:
             slot=ui.panel.PlotSlot(),
             popovers=[(self.runs.header, self.runs.body), (details_header, details_body)],
         )
-        self.view.widget.children = (ui.style.stylesheet_widget(), *self.view.widget.children)
-        self.panel = self.view.widget
+        self.panel = widgets.VBox((ui.style.stylesheet_widget(), self.view.widget))
+        self.panel.add_class(ui.style.ROOT_CLASS)
+        self.panel.add_class("glp-host")
         self._render()
 
     def close(self) -> None:
@@ -235,7 +255,7 @@ class _EvaluationWorkspaceController:
         for left_index, left in enumerate(runs):
             for right in runs[left_index + 1 :]:
                 candidate = (left, right)
-                if not _compatibility_issues(candidate) and self._common_dataset_bindings(candidate):
+                if not _compatibility_issues(candidate, self._labels) and self._common_dataset_bindings(candidate):
                     return tuple(str(run.run_dir) for run in candidate)
         return ()
 
@@ -374,7 +394,7 @@ class _EvaluationWorkspaceController:
         for role in _ARTIFACT_ROLES:
             if role in shared:
                 continue
-            lacking = [run.label for run in runs if (artifact := _artifact_for_role(run, role)) is None or artifact.state != "ready"]
+            lacking = [self._labels[run.run_dir] for run in runs if (artifact := _artifact_for_role(run, role)) is None or artifact.state != "ready"]
             if len(lacking) < len(runs):
                 refused[role] = f"nicht bereit in {', '.join(lacking)}" if lacking else "andere Datensatzbindung je Lauf"
         return refused
@@ -389,6 +409,7 @@ class _EvaluationWorkspaceController:
     ) -> str:
         """Return one compact EDA-aligned overview and lifecycle action."""
         del selected_roles
+        label = self._labels[run.run_dir]
         coverage_roles = _ARTIFACT_ROLES
         coverage = (
             "; ".join(
@@ -410,7 +431,7 @@ class _EvaluationWorkspaceController:
                     run.task,
                 ),
             ),
-            ("Model", run.model_label),
+            ("Model", label if label.startswith(run.model_label) else f"{label} ({run.model_label})"),
             ("Stage", run.stage or "—"),
             ("Seed", "—" if run.seed is None else str(run.seed)),
             ("Metadata", "; ".join(run.metadata_issues) if run.metadata_issues else "Available"),
@@ -427,15 +448,16 @@ class _EvaluationWorkspaceController:
             ("Run state", run.status),
             ("Artifact coverage", coverage),
         )
+        # Labels bold on one line, values left-aligned right behind the widest label, all starting at the top of their row.
         table = "".join(
-            f"<tr><th style='text-align:left;padding-right:1.25em'>{escape(label)}</th><td>{escape(value)}</td></tr>" for label, value in rows
+            f"<tr><th style='{_LABEL_CELL}'>{escape(label)}</th><td style='{_VALUE_CELL}'>{escape(value)}</td></tr>" for label, value in rows
         )
         states = {artifact.state for artifact in run.artifacts()}
         command = ""
         if states.intersection({"missing", "scoped_partial"}):
             command = f"<p><b>Generate full artifact coverage</b><br><code>{escape(run.artifact_command)}</code></p>"
         extra = "" if detail is None else f"<p>{escape(detail)}</p>"
-        return f"<h3>Run overview</h3><table style='overflow-wrap:anywhere'>{table}</table>{extra}{command}"
+        return f"<h3>Run overview</h3><table style='overflow-wrap:anywhere;margin-left:0'>{table}</table>{extra}{command}"
 
     def _publish(self, load: Callable[[], _Outcome]) -> None:
         """
@@ -510,12 +532,10 @@ class _EvaluationWorkspaceController:
         try:
             prepared = workflow.prepare_single_model_evaluation_workspace(
                 run.run_dir,
-                label=run.label,
+                label=self._labels[run.run_dir],
                 expected_task=run.task,
                 artifact_roles=selected_roles,
                 artifact_roots=artifact_roots or None,
-                auto_build_missing=False,
-                rebuild_incompatible=False,
                 sections=sections,
                 selection_state=self.state,
                 evaluation_compute_device=self.compute_preference,
@@ -579,7 +599,7 @@ class _EvaluationWorkspaceController:
             )
         return _Outcome(
             prepared,
-            f"{run.run_name}: {len(selected_roles)} of {len(_ARTIFACT_ROLES)} dataset roles loaded.",
+            f"{self._labels[run.run_dir]}: {len(selected_roles)} of {len(_ARTIFACT_ROLES)} dataset roles loaded.",
             "normal",
             self._status_html(run, selected_roles=selected_roles, detail=availability_detail, material_coverage=material_coverage),
         )
@@ -587,7 +607,7 @@ class _EvaluationWorkspaceController:
     def _render_comparison(self) -> None:
         """Render one task-compatible comparison over every dataset role the selected runs share."""
         selected = tuple(self._run_by_path(str(key)) for key in self.runs.selected())
-        issues = list(_compatibility_issues(selected))
+        issues = list(_compatibility_issues(selected, self._labels))
         bindings = self._common_dataset_bindings(selected)
         if selected and not bindings:
             issues.append("Selected runs share no available Material/Dataset artifact.")
@@ -608,11 +628,9 @@ class _EvaluationWorkspaceController:
         try:
             prepared = workflow.prepare_model_comparison_evaluation_workspace(
                 tuple(run.run_dir for run in selected),
-                labels=_model_labels(selected),
+                labels=tuple(self._labels[run.run_dir] for run in selected),
                 expected_task=selected[0].task,
                 artifact_roles=roles,
-                auto_build_missing=False,
-                rebuild_incompatible=False,
                 sections="all",
                 selection_state=self.state,
                 evaluation_compute_device=self.compute_preference,

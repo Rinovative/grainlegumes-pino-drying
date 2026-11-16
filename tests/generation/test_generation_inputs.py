@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check config-owned sampling, source sentinels, scalar handoff, startup, and retry policy
+  - Check the base inlet pressure derived from the sampled target superficial velocity and its OOD tail
 
 Design principles:
   - Scientific identity excludes operational provenance and binds active physical controls
@@ -24,7 +25,7 @@ import numpy as np
 import pytest
 import yaml
 
-from src import common, generation
+from src import common, domain, generation
 from src.generation.cases import generation_cases_fields as fields
 from src.generation.cases import generation_cases_sampling as sampling
 from src.generation.cases import generation_cases_seeding as seeding
@@ -799,12 +800,39 @@ def test_admission_rejects_identity_valid_stale_four_column_schedule(
         )
 
 
-def test_practical_safe_storage_rounding_uses_whole_percent_wb() -> None:
-    """Round exact safe-storage evidence deterministically for operation."""
+def test_practical_safe_storage_rounding_uses_half_percent_wb() -> None:
+    """Round exact safe-storage evidence deterministically to the half wet-basis percentage-point grid."""
     rounding = generation.contracts.materials.practical_target_moisture_wb
 
     assert rounding(0.11894) == pytest.approx(0.12)
-    assert rounding(0.14315) == pytest.approx(0.14)
+    assert rounding(0.14315) == pytest.approx(0.145)
+    assert rounding(0.1325) == pytest.approx(0.135)  # the quarter point is a tie and rounds half up
+    assert rounding(0.135) == 0.135
+
+
+@pytest.mark.parametrize(
+    ("target_wb", "admitted"),
+    [(0.135, True), (0.1325, False), (0.13, True)],
+    ids=["half-point", "quarter-point", "whole-point"],
+)
+def test_loader_admits_target_moisture_on_the_half_point_grid(
+    generation_config_factory: Any,
+    target_wb: float,
+    admitted: bool,
+) -> None:
+    """Admit whole and half wet-basis percentage points as the target; reject any finer step."""
+    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    material_path = config_path.parents[2] / "physical_model/materials/lentil.yaml"
+    authored = yaml.safe_load(material_path.read_text(encoding="utf-8"))
+    authored["target_moisture"]["target_moisture_wb"] = target_wb
+    material_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
+    batch_name = generation.cases.config.build_batch_name("transient_drying", "lentil", "test")
+
+    if admitted:
+        assert generation.cases.config.load_generation_config(config_path, only_batch=batch_name).material_family == "lentil"
+    else:
+        with pytest.raises(ValueError, match="half wet-basis percentage point"):
+            generation.cases.config.load_generation_config(config_path, only_batch=batch_name)
 
 
 def test_target_reaches_scalar_handoff_and_scientific_identity(
@@ -1036,6 +1064,96 @@ def test_anisotropy_max_ratio_is_the_principal_permeability_ratio_with_preserved
     np.testing.assert_allclose(np.sqrt(eigenvalues[..., 0] * eigenvalues[..., 1]), kappa, rtol=1e-9)
 
 
+def _steady_lentil_batch(generation_config_factory: Any) -> Any:
+    """Load the compact natural steady-flow lentil batch."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    return generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=generation.cases.config.build_batch_name("steady_flow", "lentil", "test"),
+    )
+
+
+def _steady_fields(batch: Any, values: dict[str, Any], *, active_ood_unit: str | None = None) -> fields.SpatialFields:
+    """Generate one steady spatial input set with fixed test-owned seeds."""
+    return fields.generate_spatial_fields(
+        "steady_flow",
+        batch.scientific_values["grid"],
+        values,
+        seeds={"bed": 101, "pressure_bc": 202, "packing_scatter": 303},
+        family_bounds=None,
+        porosity_coupling=batch.scientific_values["material"]["porosity_coupling"],
+        active_ood_unit=active_ood_unit,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kappa_mean", "active_ood_unit", "expected_base"),
+    [(4.0e-9, None, 485.8), (1.4e-8, "kappa_mean", 138.8)],
+    ids=["nominal-lentil", "permeable-kappa-ood"],
+)
+def test_base_inlet_pressure_is_darcy_on_the_drawn_mean_permeability(
+    generation_config_factory: Any, kappa_mean: float, active_ood_unit: str | None, expected_base: float
+) -> None:
+    """Derive the persisted base pressure v_s*mu*L_y/kappa_mean, so a more permeable bed gets a lower pressure."""
+    batch = _steady_lentil_batch(generation_config_factory)
+    values = {**sampling.sample_case(batch, 1).values, "airflow.superficial_velocity": 0.14, "kappa_mean": kappa_mean}
+    boundary = _steady_fields(batch, values, active_ood_unit=active_ood_unit).metadata["pressure_boundary"]
+    length_y = float(batch.scientific_values["grid"]["Ly"])
+    assert boundary["base"] == pytest.approx(0.14 * domain.physics.contracts.AIR_DYNAMIC_VISCOSITY * length_y / kappa_mean, rel=1e-12)
+    assert boundary["base"] == pytest.approx(expected_base, rel=1e-3)
+
+
+def test_inlet_profile_is_the_base_pressure_times_one_plus_shape(generation_config_factory: Any) -> None:
+    """Scale an unchanged shape by the derived base: a pure linear shape is exact, a doubled target doubles the profile."""
+    batch = _steady_lentil_batch(generation_config_factory)
+    values = dict(sampling.sample_case(batch, 1).values)
+
+    def inlet(**overrides: float) -> tuple[np.ndarray, float]:
+        generated = _steady_fields(batch, {**values, **overrides})
+        return generated.columns["p_in_bc"][0], float(generated.metadata["pressure_boundary"]["base"])
+
+    amplitude = 0.03
+    linear, linear_base = inlet(**{"pressure_bc.sin_amp": 0.0, "pressure_bc.gauss_amp": 0.0, "pressure_bc.linear_amp": amplitude})
+    normalized_x = np.linspace(0.0, 1.0, int(batch.scientific_values["grid"]["nx"]))
+    np.testing.assert_allclose(linear, linear_base * (1.0 + amplitude * (2.0 * normalized_x - 1.0)), rtol=1e-13, atol=0.0)
+    shaped, base = inlet()
+    doubled, doubled_base = inlet(**{"airflow.superficial_velocity": 2.0 * float(values["airflow.superficial_velocity"])})
+    assert doubled_base == pytest.approx(2.0 * base, rel=1e-14)
+    assert float(np.ptp(shaped / base)) > 0.0
+    np.testing.assert_allclose(doubled / doubled_base, shaped / base, rtol=1e-14, atol=0.0)
+
+
+def test_operation_ood_case_draws_the_superficial_velocity_from_its_high_tail(generation_config_factory: Any) -> None:
+    """Allocate the target velocity as one operation-OOD unit whose case draws from 0.40-0.65 m/s."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow", designs={"train": 1, "validation": 1, "test": 1, "parameter_ood": 64}
+    )
+    batch = generation.cases.config.load_campaign_config(config_path).require_batch(material_family="lentil", sampling_regime="parameter_ood")
+    name = "airflow.superficial_velocity"
+    case_index = next(index for index in batch.case_indices if batch.case_assignment(index)["ood_unit_id"] == name)
+    sample = sampling.sample_case(batch, case_index)
+    (tail,) = batch.scientific_values["material"]["parameter_registry"][name]["ood"]
+    assert (tail["lower"], tail["upper"]) == (0.4, 0.65)
+    assert (sample.ood_provenance["active_unit_id"], sample.ood_provenance["active_ood_group"]) == (name, "operation")
+    assert 0.4 <= float(sample.values[name]) <= 0.65
+
+
+def test_the_former_sampled_inlet_pressure_level_is_rejected_as_unknown(generation_config_factory: Any) -> None:
+    """Fail closed on the retired pressure_bc.mean coordinate; no alias or legacy reader admits it."""
+    config_path, _template = generation_config_factory()
+
+    def restore_old_name(bed_fields: dict[str, Any]) -> None:
+        parameter_values = bed_fields["parameter_values"]
+        parameter_values["pressure_bc.mean"] = parameter_values.pop("airflow.superficial_velocity")
+
+    _edit_layer(config_path, "bed_fields.yaml", restore_old_name)
+    with pytest.raises(
+        generation.cases.config.GenerationConfigError,
+        match=r"missing=\['airflow\.superficial_velocity'\], unknown=\['pressure_bc\.mean'\]",
+    ):
+        generation.cases.config.load_campaign_config(config_path)
+
+
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [
@@ -1166,7 +1284,9 @@ def test_operation_provenance_does_not_change_scientific_identity(
     _edit_layer(
         config_path,
         "bed_fields.yaml",
-        lambda bed_fields: bed_fields["parameter_values"]["pressure_bc.mean"]["provenance"].update(note="Changed evidence description only."),
+        lambda bed_fields: bed_fields["parameter_values"]["airflow.superficial_velocity"]["provenance"].update(
+            note="Changed evidence description only."
+        ),
     )
 
     changed = generation.cases.config.load_campaign_config(config_path)

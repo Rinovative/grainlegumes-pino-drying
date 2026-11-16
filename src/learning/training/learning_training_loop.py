@@ -1,18 +1,19 @@
 """Run the custom training and evaluation loop with checkpoint support.
 
 Responsibilities:
-  - Train each stage until its budget is complete and validate ID, OOD and the bounded physics monitor
-    right after the group that reaches one of the budget's validation points, also inside an epoch
+  - Train each stage until its budget is complete and evaluate validation and the bounded physics monitor on validation
+    membership right after the group that reaches one of the budget's validation points, also inside an epoch
   - Keep the optimizer at the schedule's rate of the committed budget fraction: at stage start, after a
     restore and after every committed group
   - Consume the resolved semantic objective for plateau-schedule and best-metric updates
   - Manage checkpoints, histories, and reproducibility state
   - Run one update path for both tasks: per update group, weight each unit's loss by its case weight,
     accumulate the memory microbatches, average over the group's units, then step once
-  - Measure every group on the one optimisation clock and commit it to the unit sampler and the stage budget
+  - Measure every group on the one optimisation clock and commit its units, supervised transitions and seconds to the
+    unit sampler and the stage budget
   - Count each run's committed optimizer groups, units, per-update distinct cases and gradient-carrying predictions
   - Hand the caller an attempt's committed work at its start and in its newest durable state, and its precision
-  - Describe the stage's units: kind, Train and full-set counts, cases seen, k and the last-group rule
+  - Describe the stage's units: kind, Train and full-set counts, full-set transitions, cases seen, k and the last-group rule
   - Invoke optional event callbacks for local lifecycle observers
 
 Design principles:
@@ -20,6 +21,7 @@ Design principles:
   - Data, model and loss objects are caller-provided
   - The task part of an update is only how a unit's loss is computed
   - Controller behavior stays independent of model architecture
+  - Training never sees a held-out role: ID-test and OOD are evaluated only by the separate artifact step
 
 This module does NOT:
   - Load or resolve configs. ``experiments.config.loader`` owns semantic admission
@@ -60,7 +62,8 @@ TensorBatch = dict[str, torch.Tensor]
 _TRANSIENT_VIEW_RANK = 5
 LAST_CHECKPOINT_INTERVAL_SECONDS = 30 * 60  # bounds training lost to a crash; a multi-GB full-state write per event costs more
 EventCallback = Callable[[int, dict[str, float]], None]
-EpochStateCallback = Callable[[int, dict[str, float]], None]
+# The epoch in progress, the training values of an event that ends an epoch, and the complete values of a validating event.
+EpochStateCallback = Callable[[int, dict[str, float] | None, dict[str, float] | None], None]
 # Every evaluation reports its cases with a non-finite prediction; one of them leaves the evaluation without metric values.
 NONFINITE_CASES_KEY = "nonfinite_cases"
 # An epoch's last group holds the units left over, and its loss is their mean (see train_update_groups).
@@ -88,13 +91,14 @@ class AttemptWork:
 
 
 def attempt_precision(model: nn.Module) -> dict[str, Any]:
-    """Return the numerical precision an attempt trains with: parameter dtypes, autocast (never used: ``None``) and the TF32 flags."""
+    """Return the numerics an attempt trains with: parameter dtypes, autocast (never used: ``None``), the TF32 flags and cuDNN autotuning."""
     dtypes = sorted({str(parameter.dtype).removeprefix("torch.") for parameter in model.parameters()})
     return {
         "parameter_dtypes": dtypes,
         "autocast_dtype": None,
         "tf32_matmul": bool(torch.backends.cuda.matmul.allow_tf32),
         "tf32_cudnn": bool(torch.backends.cudnn.allow_tf32),
+        "cudnn_autotune": bool(torch.backends.cudnn.benchmark),
     }
 
 
@@ -120,11 +124,12 @@ def train_unit_sampler(train_loader: Any) -> datasets.runtime.units.UnitSampler:
 
 
 def unit_evidence(sampler: datasets.runtime.units.UnitSampler) -> dict[str, Any]:
-    """Return a stage's unit kind, Train and full-set unit counts, Train cases and cases seen so far, k and the last-group rule."""
+    """Return a stage's unit kind, Train and full-set units, full-set transitions, Train and seen cases, k and the last-group rule."""
     return {
         "unit_kind": sampler.unit_kind,
         "train_units": sampler.size,
         "full_set_units": sampler.full_set_units,
+        "full_set_transitions": sampler.full_set_transitions,
         "train_cases": sampler.case_count,
         "seen_cases": sampler.seen_cases,
         "units_per_update": sampler.units_per_update,
@@ -151,7 +156,7 @@ class _SteadyUnits:
         if units != len(positions):
             msg = "A steady microbatch must hold exactly the cases its update group assigned to it."
             raise ValueError(msg)
-        components = loss.unit_components(model(batch["x"]), x=batch["x"], y=batch["y"])
+        components = loss.unit_components(model(batch["x"]), x=batch["x"], y=batch["y"], reference=batch.get("reference"))
         yield UnitLosses(components=dict(components), supervised_transitions=units, forward_transitions=units)
 
 
@@ -174,16 +179,6 @@ def _loader_case_count(loader: Any) -> int:
         return len(dataset)
     except TypeError:
         return 0
-
-
-def _configured_ood_loaders(ood_loaders: Mapping[str, DataLoader | None] | None) -> dict[str, DataLoader]:
-    """Return the non-empty OOD Evaluation loaders in canonical role order; an empty part is never evaluated."""
-    supplied = dict(ood_loaders or {})
-    unknown = set(supplied).difference(datasets.preprocessing.splits.OOD_SPLIT_ROLES)
-    if unknown:
-        msg = f"OOD Evaluation loaders name unknown roles {sorted(unknown)}."
-        raise ValueError(msg)
-    return {role: loader for role in datasets.preprocessing.splits.OOD_SPLIT_ROLES if (loader := supplied.get(role)) is not None}
 
 
 @contextmanager
@@ -234,14 +229,18 @@ def _prepare_batch(
 
     Model inputs are always standardized; targets are standardized for training
     and stay physical for evaluation, whose views derive the standardized target
-    once. The final batch contains tensor ``x`` and ``y`` keys on the device.
+    once. The final batch contains tensor ``x`` and ``y`` keys on the device and,
+    with a scaling, the per-case ``reference`` P derived once from the physical inputs,
+    which every later encode or decode of the batch takes.
     """
     batch = _move_batch_to_device(raw_batch, device)
     if scaling is None:
         return batch
-    batch["x"] = scaling.encode_inputs(batch["x"])
+    reference = scaling.state_reference(batch["x"])
+    batch["reference"] = reference
+    batch["x"] = scaling.encode_inputs(batch["x"], reference=reference)
     if training:
-        batch["y"] = scaling.encode_state(batch["y"])
+        batch["y"] = scaling.encode_state(batch["y"], reference=reference)
     return batch
 
 
@@ -370,7 +369,7 @@ def train_update_groups(
     each unit's loss share is multiplied by its weight and divided by the group's unit count
     (``units_per_update``, or the actual count of an epoch's last group) before backward,
     so the microbatch split changes only rounding. After the step the sampler commits the
-    group, the budget records its units and optimisation seconds, the schedule sets the rate
+    group, the budget records its units, supervised transitions and optimisation seconds, the schedule sets the rate
     of the new committed budget fraction and the adapter, if any, records its work.
     Training stops after the group that reaches a validation point or completes the
     budget, or at the epoch end.
@@ -491,7 +490,7 @@ def train_update_groups(
         microbatches += len(group.microbatches)
         group_wall = time.perf_counter() - group_started
         sampler.advance(len(group.items))
-        budget.record_group(units=len(group.items), train_seconds=max(0.0, group_wall - loader_wait))
+        budget.record_group(units=len(group.items), supervised_transitions=group_supervised, train_seconds=max(0.0, group_wall - loader_wait))
         # The optimizer always holds η(p) of the committed progress: the next group trains with it, and
         # a checkpoint or validation after this group records it.
         if scheduler is not None:
@@ -674,7 +673,7 @@ def evaluate_physics_monitor(
                 )
                 try:
                     pred = model(batch["x"])
-                    diagnostics = cast("Any", compute(pred, x=batch["x"]))
+                    diagnostics = cast("Any", compute(pred, x=batch["x"], reference=batch.get("reference")))
                     values = {
                         "physics/id/momentum_residual_mse": diagnostics.momentum_mse,
                         "physics/id/flux_balance_mse": diagnostics.continuity_mse,
@@ -776,7 +775,7 @@ def eval_one_epoch(
             batch = _prepare_batch(raw_batch, device, scaling, training=False)
             pred_normalized = model(batch["x"])
             # A finite normalized prediction can still overflow on decoding; either view makes the case non-finite.
-            pred_physical = scaling.decode_state(pred_normalized) if scaling is not None and requires_physical else None
+            pred_physical = scaling.decode_state(pred_normalized, reference=batch["reference"]) if scaling is not None and requires_physical else None
             finite = pred_normalized.flatten(1).isfinite().all(1)
             if pred_physical is not None:
                 finite &= pred_physical.flatten(1).isfinite().all(1)
@@ -788,7 +787,7 @@ def eval_one_epoch(
             if scaling is None:
                 views["normalized"] = (pred_normalized, batch["y"])
             else:
-                views["normalized"] = (pred_normalized, scaling.encode_state(batch["y"]))
+                views["normalized"] = (pred_normalized, scaling.encode_state(batch["y"], reference=batch["reference"]))
                 if pred_physical is not None:
                     views["physical"] = (pred_physical, batch["y"])
 
@@ -975,7 +974,6 @@ def evaluate_selected_checkpoint(
     model: nn.Module,
     train_loss: nn.Module,
     eval_loader: DataLoader,
-    ood_loaders: Mapping[str, DataLoader | None] | None = None,
     eval_metrics: dict[str, Any],
     device: torch.device,
     scaling: Any | None,
@@ -985,7 +983,7 @@ def evaluate_selected_checkpoint(
     max_physics_cases: int,
     adapter: Any | None = None,
 ) -> dict[str, Any]:
-    """Load and evaluate the authoritative best checkpoint on one shared science state."""
+    """Load and evaluate the authoritative best checkpoint on one shared science state, on validation membership only."""
     payload = checkpoints.load_checkpoint(
         best_checkpoint_path,
         expected_identity=checkpoint_identity,
@@ -1004,21 +1002,14 @@ def evaluate_selected_checkpoint(
         raise RuntimeError(msg)
     extra = () if adapter is None else (adapter,)
     id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, scaling, *extra)
-    diagnostic_metrics = {
-        role: eval_one_epoch(model, loader, eval_metrics, device, scaling, *extra) for role, loader in _configured_ood_loaders(ood_loaders).items()
-    }
     objective_id = str(cast("Mapping[str, Any]", config["evaluation"])["objective"]["id"])
-    # The selected checkpoint's ID validation was eligible; an OOD role may hold non-finite cases and then reports no value.
+    # The selected checkpoint's ID validation was eligible.
     if not validation_eligible(id_metrics, objective_id):
         msg = f"Selected checkpoint evaluation did not reproduce its eligible ID objective {objective_id!r}."
         raise RuntimeError(msg)
 
     # One rule for every event and summary: a metric without a finite value is absent.
     selected: dict[str, float] = {f"selected/id/{name}": float(value) for name, value in id_metrics.items() if math.isfinite(value)}
-    for role, metrics in diagnostic_metrics.items():
-        selected.update({f"selected/{role}/{name}": float(value) for name, value in metrics.items() if math.isfinite(value)})
-        if math.isfinite(metrics.get(objective_id, math.nan)):
-            selected[f"selected/{role}/objective_difference"] = float(metrics[objective_id]) - float(id_metrics[objective_id])
     if adapter is None:
         physics = evaluate_physics_monitor(
             model,
@@ -1070,7 +1061,6 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     eval_loader: DataLoader,
     train_loss: nn.Module,
     eval_metrics: dict[str, Any],
-    ood_loaders: Mapping[str, DataLoader | None] | None = None,
     scaling: Any | None = None,
     scheduler: LearningRateSchedule | None = None,
     save_dir: Path | str | None = None,
@@ -1089,7 +1079,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     Training runs epoch after epoch until the stage budget is complete. An event ends
     every stretch of training: the group that reaches a validation point (also inside an
     epoch), the epoch end or the budget end. At a reached point the
-    model is validated once on ID, the OOD roles and the bounded physics monitor; points
+    model is validated once and the bounded physics monitor runs on the validation prefix; points
     the same group also crossed are recorded as skipped in the budget. ``last_checkpoint.pt``
     is published at an event that (1) brought a new best, (2) ends the loop, (3) finds no
     ``last`` in the run directory yet (the first event of a run or stage), or (4) comes at
@@ -1115,9 +1105,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         Concrete indexed runtime device resolved at the service boundary.
     model, optimizer, train_loader, eval_loader, train_loss, eval_metrics : Any
         Already constructed runtime components. Fresh-run seeding must occur
-        before their construction.
-    ood_loaders : Mapping[str, torch.utils.data.DataLoader | None] | None, optional
-        Saved ``material_ood`` and ``parameter_ood`` memberships; an absent or ``None`` part is not evaluated.
+        before their construction; ``eval_loader`` holds the validation membership.
     scaling : Any | None, optional
         Admitted Train scaling of the run (steady); the transient adapter owns its own.
     scheduler : LearningRateSchedule | None, optional
@@ -1128,16 +1116,19 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         Exact ``last_checkpoint.pt`` continuation source.
     event_callback : Callable | None, optional
         Callback invoked with the run's committed optimizer step after every event once its
-        evidence is durable: a new best is published, adapter history is written, and
+        evidence is durable: a new best is published, the epoch history is written, and
         ``last`` is published when a new best, the first event, the loop's end, or the
         interval calls for it (``checkpoint/last_published``). ``epoch`` names the epoch in
-        progress; ID, OOD and physics values and ``validation/point`` are present only at a
+        progress; validation and physics values and ``validation/point`` are present only at a
         validation point.
     epoch_state_callback : Callable | None, optional
-        Adapter-only callback invoked once per completed epoch, and at a budget end inside
-        an epoch, after all of that event's evidence is known and before its
-        ``last_checkpoint.pt`` publication. It owns durable local history that resume
-        truncates to the restored checkpoint.
+        Callback of either task, invoked once per event that validates or ends an epoch
+        (also a budget end or divergence inside an epoch), before that event's
+        ``last_checkpoint.pt`` publication, with the epoch, the event's training values
+        when it ends the epoch and its complete values when it validated. A ``last``
+        therefore never counts a record that was not written
+        (:func:`checkpoints.recorded_history_epochs` and its ``objective_history``).
+        It owns the durable history, which resume reconciles to the restored checkpoint.
     checkpoint_identity : Mapping[str, Any] | None, optional
         Immutable task/config/dataset/split/objective identity.
 
@@ -1212,7 +1203,6 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     if not isinstance(budget, StageBudget):
         msg = "Canonical training requires the stage's StageBudget."
         raise TypeError(msg)
-    diagnostic_loaders = _configured_ood_loaders(ood_loaders)
     monitor_settings = config["tracking"]["wandb"]["monitor"]
     physics_monitor_enabled = bool(monitor_settings["enabled"])
     physics_monitor_max_cases = int(monitor_settings["max_cases"])
@@ -1323,8 +1313,12 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         nonlocal best_metric, best_epoch
         point = budget.record_validation()
         _synchronize_device(device)
+        if device.type == "cuda":
+            # Item 175: return training's cached blocks before validation's differently shaped batches; the memory
+            # admission rule (85 % of the reserved peak) is measured with this release in place.
+            torch.cuda.empty_cache()
         id_started = time.perf_counter()
-        # The point keeps the ID role's per-case bound evidence; the OOD diagnostic roles keep their aggregates.
+        # The point keeps the validation role's per-case bound evidence.
         bound_cases: dict[str, dict[str, float]] = {}
         with _training_phase("id_evaluation", completed_epoch):
             id_metrics = eval_one_epoch(
@@ -1374,18 +1368,6 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             best_epoch = completed_epoch
             with _checkpoint_publication_timer(timing, device):
                 best_payload = capture("best", best_kind, completed_epoch)
-        # OOD roles and the physics monitor follow the validation points.
-        for diagnostic_role, diagnostic_loader in diagnostic_loaders.items():
-            _synchronize_device(device)
-            diagnostic_started = time.perf_counter()
-            with _training_phase(f"{diagnostic_role}_evaluation", completed_epoch):
-                diagnostic_metrics = eval_one_epoch(model, diagnostic_loader, eval_metrics, device, scaling, *(() if adapter is None else (adapter,)))
-            _synchronize_device(device)
-            evaluated[f"system/{diagnostic_role}_evaluation_duration_seconds"] = time.perf_counter() - diagnostic_started
-            evaluated[f"system/{diagnostic_role}_evaluation_case_count"] = float(_loader_case_count(diagnostic_loader))
-            evaluated.update({f"{diagnostic_role}/{name}": value for name, value in diagnostic_metrics.items() if math.isfinite(value)})
-            if current_metric is not None and math.isfinite(diagnostic_metrics.get(objective_id, math.nan)):
-                evaluated[f"{diagnostic_role}/objective_difference"] = float(diagnostic_metrics[objective_id]) - current_metric
         # The steady physics monitor rejects non-finite predictions, so it follows complete ID validations only.
         if physics_monitor_enabled and not id_metrics[NONFINITE_CASES_KEY]:
             _synchronize_device(device)
@@ -1400,7 +1382,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     # The terminal epoch of a finalize-only resume is the one its last checkpoint recorded.
     completed_epoch = int(last_payload["completed_epoch"]) if finalize_only else start_epoch_index
     epoch_index = start_epoch_index
-    # A zero seconds budget (an A1 matched to a B that diverged before its first committed group) admits no group.
+    # A zero transitions budget (an A1 matched to a B that diverged before its first committed group) admits no group.
     ends_loop = finalize_only or budget.complete
     while not ends_loop:
         completed_epoch = epoch_index + 1
@@ -1450,7 +1432,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             train_metrics["epoch"] = float(completed_epoch)
             train_metrics["global_step"] = float(global_step)
             train_metrics["optimization/learning_rate"] = float(optimizer.param_groups[0]["lr"])
-            train_metrics.update({f"budget/{key}": float(value) for key, value in budget.state_dict().items() if key in {"units", "train_seconds"}})
+            committed = budget.state_dict()
+            train_metrics.update({f"budget/{key}": float(committed[key]) for key in ("units", "supervised_transitions", "train_seconds")})
             train_metrics["budget/progress"] = budget.progress
             event_duration = time.perf_counter() - event_started
             if not math.isfinite(event_duration) or event_duration <= 0.0:
@@ -1466,13 +1449,16 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             if adapter is not None:
                 train_metrics.update({f"transient/{key}": float(value) for key, value in adapter.telemetry_state().items() if value is not None})
             event_metrics = {**train_metrics, **evaluated}
-            # The epoch history holds one record per completed epoch, and one for a budget end or divergence inside an epoch.
-            if epoch_state_callback is not None and (epoch_complete or budget.complete or divergence is not None) and not recorded_end:
-                if adapter is None:
-                    msg_0 = "epoch_state_callback is reserved for task-owned adapter training."
-                    raise ValueError(msg_0)
+            # The history holds one record per validation point, also inside an epoch, and one per completed epoch,
+            # also for a budget end or divergence inside an epoch; both precede the event's last publication.
+            ends_epoch = (epoch_complete or ends_loop) and not recorded_end
+            if epoch_state_callback is not None and (ends_epoch or evaluated):
                 with _training_phase("epoch_state", completed_epoch):
-                    epoch_state_callback(completed_epoch, copy.deepcopy(event_metrics))
+                    epoch_state_callback(
+                        completed_epoch,
+                        copy.deepcopy(train_metrics) if ends_epoch else None,
+                        copy.deepcopy(event_metrics) if evaluated else None,
+                    )
 
             # A new best is published only together with its last, so a published best is never newer than the
             # newest last; the first event of a run or stage gets one, so an early crash leaves a resumable run.

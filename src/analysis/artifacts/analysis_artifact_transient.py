@@ -542,13 +542,13 @@ def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
             message = "A1 and B lineage require checkpoint-persisted teacher-handoff identity."
             raise TypeError(message)
         parent = dict(teacher_handoff)
-    strategy = "rollout" if arm == "b" else "teacher_forced_matched_train_seconds" if arm == "a1" else "stage_a_teacher_forced"
+    strategy = "rollout" if arm == "b" else "teacher_forced_matched_supervised_transitions" if arm == "a1" else "stage_a_teacher_forced"
     # The last checkpoint's budget is authoritative; validate_completed_run already required the summary to equal it.
     budget = learning.training.budget.StageBudget(**learning.training.budget.validate_state(last_checkpoint["budget_state_dict"]))
     # validate_completed_run admitted the outcome; a diverged stage ends before its budget with its best eligible checkpoint.
     outcome = cast("Mapping[str, Any]", summary["training_outcome"])
-    if (not budget.complete and outcome["status"] != "diverged") or budget.unit != ("units" if arm == "a0" else "train_seconds"):
-        msg = "Completed transient lineage requires A0's unit budget or B/A1's train_seconds budget, complete unless the stage diverged."
+    if (not budget.complete and outcome["status"] != "diverged") or budget.unit != ("units" if arm == "a0" else "supervised_transitions"):
+        msg = "Completed transient lineage requires A0's unit budget or B/A1's supervised-transition budget, complete unless the stage diverged."
         raise ValueError(msg)
     manifest: dict[str, Any] = {
         "planned": None if matched is None else dict(matched),
@@ -566,10 +566,10 @@ def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
         else:
             receipt = _matched_budget_receipt(completed, parent)
             planned = budget.total
-            actual = budget.train_seconds
-            if (arm == "b" and actual != receipt["budget_value"]) or (
+            actual = budget.supervised_transitions
+            if (arm == "b" and actual != receipt["supervised_transitions"]) or (
                 arm == "a1"
-                and (planned != receipt["budget_value"] or checkpoint_controller.get("matched_receipt_sha256") != receipt["receipt_sha256"])
+                and (planned != receipt["supervised_transitions"] or checkpoint_controller.get("matched_receipt_sha256") != receipt["receipt_sha256"])
             ):
                 msg = "Matched branch terminal budget contradicts the immutable B receipt."
                 raise ValueError(msg)

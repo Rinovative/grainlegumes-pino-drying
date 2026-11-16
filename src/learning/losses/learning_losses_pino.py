@@ -35,12 +35,12 @@ PHYSICS_TERMS = ("momentum", "continuity", "boundary")
 class PhysicalScaling(StateScaling, Protocol):
     """Define the Train-scaling surface that the data and physics terms need."""
 
-    def decode_inputs(self, value: Tensor) -> Tensor:
-        """Return physical model inputs from standardized ones."""
+    def decode_inputs(self, value: Tensor, *, reference: Tensor | None = None) -> Tensor:
+        """Return physical model inputs from standardized ones and the per-case reference."""
         ...
 
-    def decode_state(self, value: Tensor) -> Tensor:
-        """Return physical states from standardized ones."""
+    def decode_state(self, value: Tensor, *, reference: Tensor | None = None) -> Tensor:
+        """Return physical states from standardized ones and the per-case reference."""
         ...
 
 
@@ -249,9 +249,10 @@ class SemanticComposedLoss(nn.Module):
         pred: Tensor,
         *,
         x: Tensor,
+        reference: Tensor | None = None,
     ) -> domain.physics.brinkman.BrinkmanDiagnostics:
         """
-        Evaluate domain-owned physics from normalized model tensors.
+        Evaluate domain-owned physics on the physical views of normalized model tensors.
 
         Parameters
         ----------
@@ -259,6 +260,8 @@ class SemanticComposedLoss(nn.Module):
             Normalized model outputs.
         x : torch.Tensor
             Normalized model inputs.
+        reference : torch.Tensor or None, optional
+            Per-case reference ``[B]`` the batch was encoded with; the steady scaling requires it.
 
         Returns
         -------
@@ -269,8 +272,8 @@ class SemanticComposedLoss(nn.Module):
         if self.scaling is None:
             msg = "Physics diagnostics require the run's Train scaling."
             raise RuntimeError(msg)
-        inputs_physical = self.scaling.decode_inputs(x)
-        outputs_physical = self.scaling.decode_state(pred)
+        inputs_physical = self.scaling.decode_inputs(x, reference=reference)
+        outputs_physical = self.scaling.decode_state(pred, reference=reference)
         return self._physics_evaluator(
             inputs_physical,
             outputs_physical,
@@ -288,6 +291,7 @@ class SemanticComposedLoss(nn.Module):
         x: Tensor | None,
         y: Tensor,
         epoch: int | None = None,
+        reference: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """
         Compute named weighted loss components for every case of a batch.
@@ -300,6 +304,8 @@ class SemanticComposedLoss(nn.Module):
             Normalized task inputs, required only when physics is enabled.
         y : torch.Tensor
             Normalized supervised target tensor.
+        reference : torch.Tensor or None, optional
+            Per-case reference ``[U]`` of the batch's encoding, used only to decode for the physics terms.
         epoch : int or None, optional
             Explicit warmup position. Defaults to ``current_epoch``.
 
@@ -328,7 +334,7 @@ class SemanticComposedLoss(nn.Module):
             if x is None:
                 msg = "Physics-informed loss requires the normalized input tensor x."
                 raise ValueError(msg)
-            diagnostics = self.compute_physics_diagnostics(pred, x=x)
+            diagnostics = self.compute_physics_diagnostics(pred, x=x, reference=reference)
             terms = {
                 "momentum": diagnostics.momentum_mse.expand(units),
                 "continuity": diagnostics.continuity_mse.expand(units),
@@ -346,9 +352,10 @@ class SemanticComposedLoss(nn.Module):
         *,
         x: Tensor | None = None,
         epoch: int | None = None,
+        reference: Tensor | None = None,
     ) -> Tensor:
-        """Return the scalar total averaged over the batch; ``y`` is mandatory and physics also needs ``x``."""
+        """Return the scalar total averaged over the batch; ``y`` is mandatory and physics also needs ``x`` and ``reference``."""
         if y is None:
             msg = "SemanticComposedLoss requires a target tensor y."
             raise ValueError(msg)
-        return self.unit_components(pred, x=x, y=y, epoch=epoch)["total"].mean()
+        return self.unit_components(pred, x=x, y=y, epoch=epoch, reference=reference)["total"].mean()

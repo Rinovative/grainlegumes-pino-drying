@@ -25,7 +25,8 @@ permeability:
   provenance:
     evidence: literature_transfer
     source_refs:
-    - ba
+    - cgc_airflow_resistance_charts
+    method: The thesis has no pea measurement. The Canadian Grain Commission airflow-resistance charts give apparent permeabilities of 2.3, 1.75, 1.3 and 1.1e-08 m^2 for rising air velocity; the value is kept.
     applicability:
       packing: Only for packing bands in each complete density record; generated mean
         eps must pass the material band.
@@ -53,6 +54,7 @@ thermal_properties:
       evidence: literature_transfer
       source_refs:
       - matouk_thermal
+      method: Transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover; no pea data exist and the value is unchanged.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -75,6 +77,7 @@ thermal_properties:
       evidence: literature_transfer
       source_refs:
       - matouk_thermal
+      method: Transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover; no pea data exist and the value is unchanged.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -84,19 +87,20 @@ thermal_properties:
 # Initial moisture is dry basis (kg water/kg dry solids); amplitude controls field variation and field_support bounds generated values.
 initial_moisture:
   mean_db:
-    nominal: 0.25
+    nominal: 0.2345679012345679
     support:
       lower: 0.1904761904761905
-      upper: 0.3157894736842105
+      upper: 0.28205128205128205
     transform: linear
     distribution: uniform
     ood_supports:
-    - lower: 0.36
-      upper: 0.45
+    - lower: 0.3
+      upper: 0.35
     provenance:
       evidence: engineering_estimate
       source_refs:
-      - pea_drying
+      - ba
+      method: Transferred from the other pulses; the field-pea drying record of Ganesh and Sokhansanj (1997) measures only 80 degC and gives no initial moisture.
       note: Natural material-dependent starting moisture in dry basis; range is an
         explicit engineering envelope around project or product-compatible drying
         evidence, not a market-target transfer.
@@ -127,15 +131,14 @@ initial_moisture:
         gap and width policy.
       verification: mathematically_reproduced
   field_support:
-    lower: 0.1904761904761905
-    upper: 0.3157894736842105
+    lower: 0.16606936416184973
+    upper: 0.32205128205128203
     unit: kg/kg
     provenance:
-      evidence: derived
+      evidence: engineering_estimate
       source_refs:
-      - pea_drying
-      method: X_db=X_wb/(1-X_wb)
-      verification: mathematically_reproduced
+      - ba
+      method: Transferred from the other pulses, X_db=X_wb/(1-X_wb); lower bound is the target 0.135/0.865 plus margin_above_target_db 0.01, upper bound is the upper mean_db 0.22/0.78 plus the upper amplitude_db 0.04.
   margin_above_target_db: 0.01
 # Dimensionless support for generated bed-mean porosity; density calibration stores a compatible paired reference state.
 packing_porosity_mean_support:
@@ -218,14 +221,12 @@ oswin:
       before production.
 # Single operational drying target on a wet basis; it is a material target, not an initial-moisture support.
 target_moisture:
-  target_moisture_wb: 0.12
+  target_moisture_wb: 0.135
   provenance:
-    evidence: derived
+    evidence: official_industry_target
     source_refs:
     - swiss_crops
-    method: Exact safe-storage reference 0.11894 wb, rounded to the nearest whole
-      wet-basis percentage point.
-    verification: mathematically_reproduced
+    method: swiss granum (2026-03-12) chapter 1.1 lists 13.5 % wb for protein peas.
     note: Single practical safe-storage drying target; market acceptance is not
       an operational target.
 # Surface/internal moisture-transfer prior: r_surf_0 is a rate, r_int_surf a rate ratio, f_surf a fraction; the loader derives the two OOD records from the nominals.
@@ -233,10 +234,10 @@ two_compartment_kinetics:
   record_id: field_pea_two_compartment_kinetics_v1
   components:
     r_surf_0:
-      nominal: 1.4e-05
+      nominal: 7.7e-05
       support:
-        lower: 7.0e-06
-        upper: 2.2e-05
+        lower: 3.85e-05
+        upper: 1.21e-04
       transform: log
     r_int_surf:
       nominal: 0.16
@@ -255,13 +256,12 @@ two_compartment_kinetics:
     evidence: calibration_prior
     source_refs:
     - pea_drying
+    - lentil_drying_tahmasebi_2025
+    method: r_surf_0 and its support are the earlier design values multiplied by 5.5, the factor of lentil (Tahmasebi et al. 2025, calibrated at 35 degC and 20 % relative humidity), transferred because pea_drying measures only 80 degC and is context only; r_int_surf and f_surf are unchanged.
     applicability:
       evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
         at known T, RH/omega, airflow and product state; T(t) if available
-      limitation: Kinetics were conservatively aligned using a limited numerical pilot
-        to reduce seven-day right-censoring and produce informative neural-operator
-        transients; they were not fitted to experiments or validated as real drying-time
-        predictions.
+      limitation: The rate prior is transferred from lentil, not fitted to experiments of this bed, and the drying times were not validated as real predictions.
   ood_provenance:
     evidence: synthetic_design
     source_refs: []

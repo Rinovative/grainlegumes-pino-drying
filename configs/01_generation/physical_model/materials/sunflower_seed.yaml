@@ -11,24 +11,22 @@ material_scope:
   description: Cleaned whole mature high-oleic sunflower achene
 # The permeability scale kappa_mean is in m^2. Natural support and transform define sampling; ood_supports are separate synthetic stress intervals.
 permeability:
-  nominal: 8.0e-08
+  nominal: 8.0e-09
   support:
-    lower: 4.0e-08
-    upper: 1.5e-07
+    lower: 4.0e-09
+    upper: 1.6e-08
   transform: log
   distribution: uniform_in_log_space
   ood_supports:
-  - lower: 1.2e-08
-    upper: 2.6e-08
-  - lower: 2.4e-07
-    upper: 4.125e-07
+  - lower: 1.2e-09
+    upper: 2.6e-09
+  - lower: 2.4e-08
+    upper: 4.125e-08
   provenance:
     evidence: engineering_estimate
     source_refs:
-    - sunflower_airflow_canada_1990
-    method: Kozeny-Carman-scale and airflow-envelope inversion for a loose bed of
-      large elongated hull-intact achenes; exact fill pressure-drop data were not
-      available.
+    - airflow_friesen_huminicki_1986
+    method: Field measurements of Friesen and Huminicki (1986, Table II) give 6.7, 5.5 and 4.0e-09 m^2 at 0.05, 0.1 and 0.3 m/s; the lower bound is the field value, the upper bound the laboratory estimate of about five times the field value (1.6e-08 m^2, not rechecked), and the nominal value is their geometric mean. The earlier conversion from the Agriculture Canada handbook could not be reproduced and is not cited.
     applicability:
       packing: Only for packing bands in each complete density record; generated mean
         eps must pass the material band.
@@ -66,24 +64,22 @@ thermal_properties:
         gap and width policy.
       verification: mathematically_reproduced
   cp_gr_dry:
-    nominal: 700.0
+    nominal: 1650.0
     support:
-      lower: 500.0
-      upper: 1000.0
+      lower: 1400.0
+      upper: 1900.0
     transform: log
     distribution: uniform_in_log_space
     ood_supports:
-    - lower: 300
-      upper: 400
-    - lower: 1200
-      upper: 1500
+    - lower: 1000.0
+      upper: 1250.0
+    - lower: 2100.0
+      upper: 2500.0
     provenance:
-      evidence: engineering_conversion
+      evidence: engineering_estimate
       source_refs:
       - sunflower_thermal_ince_2008
-      method: The source reports wet-product heat capacity. The nominal was converted
-        to the model dry-solid basis after removing the explicit X_db*cp_w contribution
-        at low moisture and 25-40 degC; this avoids double counting water heat capacity.
+      method: Realistic dry-solid specific heat of sunflower seed is 1400-1900 J/(kg*K) from a composition-based estimate that was not independently verified. Ince et al. (2008) report 865-1930 J/(kg*K) for the wet product, about 1300-1500 on a dry basis; the earlier value of 700 J/(kg*K) is physically impossible.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -242,10 +238,10 @@ two_compartment_kinetics:
   record_id: sunflower_seed_two_compartment_kinetics_v1
   components:
     r_surf_0:
-      nominal: 1.0e-05
+      nominal: 5.5e-05
       support:
-        lower: 5.0e-06
-        upper: 1.8e-05
+        lower: 2.75e-05
+        upper: 9.9e-05
       transform: log
     r_int_surf:
       nominal: 0.15
@@ -264,13 +260,12 @@ two_compartment_kinetics:
     evidence: hierarchical_engineering_prior
     source_refs:
     - sunflower_sorption_drying_munder_2019
+    - lentil_drying_tahmasebi_2025
+    method: r_surf_0 and its support are the earlier design values multiplied by 5.5, the factor of lentil (Tahmasebi et al. 2025, calibrated at 35 degC and 20 % relative humidity), transferred as a placeholder because Munder et al. (2019) could not be read and no sunflower literature drying time is known; r_int_surf and f_surf are unchanged.
     applicability:
       evidence_scope: A desired nominal drying duration, or preferably independent
         whole-seed X_db(t) curves at known T, RH/omega and airflow.
-      limitation: Kinetics were conservatively aligned using a limited numerical pilot
-        to reduce seven-day right-censoring and produce informative neural-operator
-        transients; they were not fitted to experiments or validated as real drying-time
-        predictions, and sunflower remains an engineering stress-test material.
+      limitation: The rate prior is transferred from lentil, not fitted to experiments, and the drying times were not validated as real predictions; sunflower remains an engineering stress-test material.
   ood_provenance:
     evidence: synthetic_design
     source_refs: []

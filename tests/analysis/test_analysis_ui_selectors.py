@@ -3,6 +3,7 @@
 Responsibilities:
   - Check the summary «k von n gewählt» for single and multiple choice, observer counts, and single-choice exclusivity
   - Check the architecture grouping and the disabled «Metadaten fehlen» group of the run selector
+  - Check the single-choice run header «Lauf: <label>», the indent of derived runs and the shared button width of a group
   - Check the dataset groups, the unavailable group, and the enabled, disabled, and absent pooling switch
 
 Design principles:
@@ -83,6 +84,64 @@ def test_runs_group_by_architecture_and_missing_metadata_stays_disabled() -> Non
     assert all(len(row.children) == 1 for row in cast("widgets.Box", selector.body).children if isinstance(row, widgets.HBox))
     with pytest.raises(ValueError, match="not selectable"):
         selectors.RunSelector(runs, multiple=False, selected=["x"])
+    assert selectors.RunSelector(runs, multiple=True).header.value is False
+    opened = selectors.RunSelector(runs, multiple=True, opened=True)
+    assert opened.header.value is True
+    assert opened.body.layout.display != "none"
+
+
+def test_run_header_names_the_selected_run_for_a_single_choice_and_counts_for_a_multiple_choice() -> None:
+    runs = [selectors.RunOption("fno_a", "fno", "a", label="FNO · A0 · seed 9"), selectors.RunOption("fno_b", "fno", "b", label="FNO · B · seed 9")]
+    single = selectors.RunSelector(runs, multiple=False, selected=["a"])
+    assert single.header.summary == "Lauf: FNO · A0 · seed 9"
+    single.boxes["b"].value = True
+    assert single.header.summary == "Lauf: FNO · B · seed 9"
+    single.select(["a"])
+    assert single.header.summary == "Lauf: FNO · A0 · seed 9"
+    assert selectors.RunSelector(runs, multiple=False).header.summary == "Lauf: FNO · A0 · seed 9"
+    assert selectors.RunSelector([selectors.RunOption("fno_a", "fno", "a")], multiple=False).header.summary == "Lauf: fno_a"
+    assert selectors.RunSelector(runs, multiple=True, selected=["a", "b"]).header.summary == "Läufe: 2 von 2 gewählt"
+
+
+def test_a_run_with_a_listed_parent_stands_indented_directly_below_it_and_an_orphan_stands_unindented() -> None:
+    runs = [
+        selectors.RunOption("fno__a0", "fno", "a0"),
+        selectors.RunOption("fno__a0x", "fno", "x"),
+        selectors.RunOption("fno__b-a1__long_suffix__a1", "fno", "a1", parent="a0"),
+        selectors.RunOption("fno__b-a1__long_suffix__b", "fno", "b", parent="a0"),
+        selectors.RunOption("fno__z", "fno", "orphan", parent="missing"),
+    ]
+    selector = selectors.RunSelector(runs, multiple=False)
+    rows = [row for row in cast("widgets.Box", selector.body).children if isinstance(row, widgets.HBox)]
+    margin = {key: next(row.layout.margin for row in rows if row.children == (box,)) for key, box in selector.boxes.items()}
+    assert list(selector.boxes) == ["a0", "a1", "b", "x", "orphan"]
+    indent = f"0 0 0 {selectors._INDENT_PX}px"
+    assert margin == {"a0": None, "a1": indent, "b": indent, "x": None, "orphan": None}
+    widths = {key: int(str(box.layout.width)[:-2]) for key, box in selector.boxes.items()}
+    assert widths["a0"] == widths["a1"] + selectors._INDENT_PX == widths["b"] + selectors._INDENT_PX
+
+
+def test_indented_applies_to_per_line_choices_only() -> None:
+    with pytest.raises(ValueError, match="indented"):
+        selectors.ChoiceBlock("Läufe", GROUPS, multiple=False, selected=[], indented=[2])
+
+
+def test_close_on_pick_closes_a_single_choice_before_its_observers_run() -> None:
+    runs = [selectors.RunOption("fno_a", "fno", "a"), selectors.RunOption("fno_b", "fno", "b")]
+    selector = selectors.RunSelector(runs, multiple=False, selected=["a"], opened=True, close_on_pick=True)
+    seen: list[bool] = []
+    selector.observe(lambda: seen.append(selector.header.value))
+    selector.boxes["b"].value = True
+    assert seen == [False]
+    selector.header.value = True
+    selector.boxes["b"].value = False  # pressing the selected button again keeps it and closes the list
+    assert selector.selected() == ("b",)
+    assert selector.header.value is False
+    selector.header.value = True
+    selector.select(["a"])
+    assert selector.header.value is True
+    with pytest.raises(ValueError, match="close_on_pick"):
+        selectors.RunSelector(runs, multiple=True, close_on_pick=True)
 
 
 def _inventory(*, poolable: bool = True) -> presentation.dataset_selection.DatasetInventory:

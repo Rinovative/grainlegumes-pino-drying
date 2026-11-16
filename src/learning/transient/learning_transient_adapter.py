@@ -23,8 +23,6 @@ This module does NOT:
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -36,6 +34,7 @@ from torch import nn
 from src import datasets
 from src.domain.tasks import domain_task_transient_drying as drying
 from src.learning.training import learning_training_adapter as training_adapter
+from src.learning.training import learning_training_checkpoint as training_checkpoint
 
 from .learning_transient_contracts import TransientTensorizerSpec
 from .learning_transient_curriculum import (
@@ -635,14 +634,10 @@ def build_transient_training_adapter(
         msg = "Resolved transient adapter config lacks its temporal sampling."
         raise TypeError(msg)
     trajectory_window = int(sampling["rollout_length"]) if sampling.get("mode") == "trajectory" else None
-    # The stage's budget belongs to its controller identity like every other setting: a run is never extended.
-    semantic_config = {key: value for key, value in config.items() if key not in {"paths", "_transient_tensorizer"}}
-    try:
-        encoded_config = json.dumps(semantic_config, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
-    except (TypeError, ValueError) as error:
-        msg = "Resolved transient adapter semantics must be canonical JSON."
-        raise ValueError(msg) from error
-    config_digest = hashlib.sha256(encoded_config).hexdigest()
+    # The controller binds the stage's one training identity, the digest of resume and admission: its budget belongs to it
+    # like every other scientific setting (a run is never extended), while execution settings such as the memory batch,
+    # loader workers or the device stay outside it, so a resume may change them.
+    config_digest = training_checkpoint.config_digest(config)
     if (arm == "A1") != (matched_receipt_sha256 is not None):
         msg = "Exactly A1 is built with an admitted exact B time receipt."
         raise ValueError(msg)

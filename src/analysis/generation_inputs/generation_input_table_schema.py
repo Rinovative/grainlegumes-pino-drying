@@ -5,6 +5,7 @@ Responsibilities:
   - Shorten repeated parameter, field-summary, and boundary labels
   - Expand schedule component weights into independently comparable rows
   - Preserve deterministic category and row ordering across table views
+  - Group sampled campaign parameters by those sections for the parameter choice and plots
 
 Design principles:
   - Presentation metadata never changes persisted names or scientific values
@@ -20,7 +21,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+type Parameter = tuple[str, str]  # sampled parameter name and its unit
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,9 +102,13 @@ _PARAMETER_ROWS: Final = (
     ),
     *_rows(
         AIRFLOW_SECTION,
-        "Inlet pressure",
+        "Flow target",
+        (("airflow.superficial_velocity", "Superficial velocity"),),
+    ),
+    *_rows(
+        AIRFLOW_SECTION,
+        "Inlet pressure shape",
         (
-            ("pressure_bc.mean", "Base level"),
             ("pressure_bc.sin_amp", "Sine amplitude"),
             ("pressure_bc.sin_freq", "Sine frequency"),
             ("pressure_bc.sin_phase", "Sine phase"),
@@ -189,9 +199,9 @@ _FIELD_ROWS: Final = (
         AIRFLOW_SECTION,
         "Permeability tensor",
         (
-            ("Kxx median", "Kxx — median"),
-            ("Kxy median", "Kxy — median"),
-            ("Kyy median", "Kyy — median"),
+            ("Kxx median", "κₓₓ — median"),
+            ("Kxy median", "κₓᵧ — median"),
+            ("Kyy median", "κᵧᵧ — median"),
         ),
     ),
     *_rows(
@@ -296,6 +306,15 @@ def _fallback(name: str) -> TableRowSpec:
 def parameter_row_spec(name: str) -> TableRowSpec:
     """Return compact presentation metadata for one parameter row."""
     return _PARAMETER_SPECS.get(name, _fallback(name))
+
+
+def grouped_parameters(parameters: Iterable[Parameter]) -> dict[str, list[Parameter]]:
+    """Group sampled parameters by table section, in table order within and across sections; unlisted names follow, as ``Other``."""
+    rank = {name: index for index, name in enumerate(PARAMETER_ORDER)}
+    groups: dict[str, list[Parameter]] = {}
+    for parameter in sorted(set(parameters), key=lambda item: (rank.get(item[0], len(rank)), item)):
+        groups.setdefault(parameter_row_spec(parameter[0]).section, []).append(parameter)
+    return groups
 
 
 def field_summary_row_spec(quantity: str, statistic: str) -> TableRowSpec:

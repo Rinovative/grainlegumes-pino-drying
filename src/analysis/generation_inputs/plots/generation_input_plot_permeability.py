@@ -51,7 +51,6 @@ def tensor_comparison(
         title="Permeability tensor",
         lock_scale=lock_scale,
         display_spatial_stride=display_spatial_stride,
-        include_distributions=True,
     )
 
 
@@ -74,5 +73,4 @@ def derived_comparison(
         title="Derived permeability",
         lock_scale=lock_scale,
         display_spatial_stride=display_spatial_stride,
-        include_distributions=True,
     )

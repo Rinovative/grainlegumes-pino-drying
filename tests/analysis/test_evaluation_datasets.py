@@ -209,6 +209,20 @@ def test_comparison_cut_keeps_the_shared_cases_per_material_and_recomputes_each_
         datasets.comparison_frames({}, pooled[0])
 
 
+def test_cuts_name_their_dataset_panel_and_model_series() -> None:
+    run_a = _frame([("l1", "lentil", 1.0), ("c1", "chickpea", 5.0)])
+    run_b = _frame([("l1", "lentil", 3.0), ("c1", "chickpea", 7.0)])
+    inventory = datasets.comparison_inventory({"id": {"run a": run_a, "run b": run_b}}, refused={})
+    choice = selection.resolve_choices(inventory, [("lentil", "id")], pooled=False)[0]
+
+    compared = datasets.comparison_frames({"run a": run_a, "run b": run_b}, choice)
+    single = datasets.steady_frames({"id": run_a}, [choice], model="run a")
+
+    assert dict(compared.labels) == {"run a": (choice.label, "run a"), "run b": (choice.label, "run b")}
+    assert dict(single.labels) == {choice.label: (choice.label, "run a")}
+    assert all("display_model" not in cut.attrs for cut in compared.values())
+
+
 def test_cuts_carry_their_effective_membership_to_the_comparison_admission_and_keep_the_source_provenance() -> None:
     run_a = _frame([("l1", "lentil", 1.0), ("l2", "lentil", 3.0), ("c1", "chickpea", 5.0)])
     run_b = _frame([("l2", "lentil", 3.0), ("l3", "lentil", 9.0), ("c1", "chickpea", 5.0)])
@@ -313,6 +327,24 @@ def test_a_cut_shares_no_nested_attribute_object_with_the_source_frame() -> None
     cut.attrs["source_artifact_provenance"]["evaluator"]["output_groups"].clear()
     assert frame.attrs == snapshot
     assert "_exact_comparison_grid_cache" not in cut.attrs  # it describes the rows of the whole frame, not the cut
+
+
+def test_display_labels_live_per_call_and_leave_the_bound_frame_untouched(tmp_path: Path) -> None:
+    frame = _two_material_frame(tmp_path)
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+    with evaluation_session.EvaluationSession({"id": frame}):
+        first = datasets.steady_frames({"id": frame}, lentil, model="run a")
+        attrs = copy.deepcopy(first["lentil, ID"].attrs)
+        attrs.pop(evaluation_session.SESSION_ATTR)
+
+        again = datasets.steady_frames({"id": frame}, lentil, model="run b")
+        unnamed = datasets.steady_frames({"id": frame}, lentil)
+
+        assert again["lentil, ID"] is first["lentil, ID"] is unnamed["lentil, ID"]
+        assert [r.labels["lentil, ID"] for r in (first, again, unnamed)] == [("lentil, ID", m) for m in ("run a", "run b", "")]
+        remaining = copy.deepcopy(first["lentil, ID"].attrs)
+        remaining.pop(evaluation_session.SESSION_ATTR)
+        assert remaining == attrs
 
 
 def test_a_live_session_binds_each_cut_once_and_redraws_hit_its_caches(tmp_path: Path) -> None:

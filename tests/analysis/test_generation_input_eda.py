@@ -5,6 +5,7 @@ Responsibilities:
   - Check that the catalog reads the HDF5 input store, merges equivalent encodings of one case as duplicates, and refuses a
     corrupt duplicate
   - Check that campaign outcomes carry their sampled parameters into the failures-by-parameter figure
+  - Check that the A/B comparison maps stand on the common map grid with a lower band, and that summary numbers fit their cells
 
 Design principles:
   - Selected dataset identity and exact support govern shared controls and aggregates
@@ -16,6 +17,7 @@ This module does NOT:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -29,11 +31,14 @@ import pandas as pd
 import pytest
 from matplotlib.colors import BoundaryNorm
 from matplotlib.figure import Figure
+from matplotlib.table import Cell
 from support.generation_fixtures import lentil_generation_config, rewrite_input_store_equivalently
 
 from src import domain, generation
 from src.analysis import generation_inputs
 from src.analysis.generation_inputs import generation_input_controls as input_controls
+from src.analysis.generation_inputs import generation_input_table_schema
+from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.ui import analysis_ui_controls as ui_controls
 from src.analysis.ui import analysis_ui_notebook as ui_notebook
 from src.analysis.ui import analysis_ui_panel as ui_panel
@@ -374,9 +379,9 @@ def test_grouped_tables_expand_components_and_preserve_raw_values(
 
     drying_parameters = dict(generation_inputs.diagnostics.grouped_table_sections(parameter_table))["Drying"]
     component_labels = (
-        "Smooth component weight [1]",
-        "Event component weight [1]",
-        "Trend component weight [1]",
+        "Smooth component weight [-]",
+        "Event component weight [-]",
+        "Trend component weight [-]",
     )
     component_rows = drying_parameters.loc[("Inlet schedule", list(component_labels)), :]
     assert tuple(component_rows.index.get_level_values("Parameter")) == component_labels
@@ -722,8 +727,10 @@ def test_notebook_executes_workspace_without_input_generation(
 def _map_norm_for_values(figure: Figure, expected: np.ndarray) -> object:
     """Return the normalization attached to one semantically matched map."""
     matches = []
-    for binding in generation_inputs.plots.layout.map_colorbar_bindings(figure):
-        collection = binding.anchor_axis.collections[0]
+    for axis in figure.axes:
+        if axis.get_aspect() != 1.0 or not axis.collections:  # only map axes have the physical equal aspect
+            continue
+        collection = axis.collections[0]
         values = np.asarray(collection.get_array())
         if values.size == expected.size and np.allclose(
             values.reshape(expected.shape),
@@ -788,8 +795,8 @@ def test_basic_spatial_preserves_fields_pressure_and_scale_semantics(
         assert default_first_norm is not default_second_norm
         assert locked_first_norm is locked_second_norm
         assert isinstance(difference_norm, BoundaryNorm)
-        assert len(difference_norm.boundaries) == 12
-        assert difference_norm.Ncmap == 11
+        assert difference_norm.Ncmap == len(difference_norm.boundaries) - 1
+        assert difference_norm.Ncmap in {9, 11, 13}  # an odd count of round signed bands
         assert difference_norm.vmin is not None
         assert difference_norm.vmax is not None
         assert difference_norm.vmin == -difference_norm.vmax
@@ -904,6 +911,140 @@ def test_permeability_and_moisture_plots_preserve_scientific_values(
                 plt.close(figure)
 
 
+def test_pair_comparison_maps_stand_on_the_common_grid_with_one_header_and_a_lower_band(
+    profile_records: dict[
+        str,
+        tuple[
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+        ],
+    ],
+) -> None:
+    """Equal maps, bars as tall as their maps with a unit each, headers and row names once (long ones wrapped), distributions under the maps."""
+    first, second = profile_records["steady_flow"]
+    summary = generation_inputs.diagnostics.build_dataset_diagnostics((first, second))
+    figure = generation_inputs.plots.permeability.tensor_comparison(first, summary, second, summary, lock_scale=False)
+    assert isinstance(figure, Figure)
+    try:
+        figure.canvas.draw()
+        width, height = figure.get_size_inches()
+        rows = len(generation_inputs.plots.permeability.TENSOR_FIELDS)
+        count = 3 * rows
+        maps, slots, lower = figure.axes[:count], figure.axes[count : 2 * count], figure.axes[2 * count :]
+        sizes = np.array([(axis.get_position().width * width, axis.get_position().height * height) for axis in maps])
+        np.testing.assert_allclose(sizes, np.broadcast_to(sizes[0], sizes.shape), rtol=1e-3)
+        for map_axis, slot in zip(maps, slots, strict=True):
+            colorbar = map_axis.collections[0].colorbar
+            assert colorbar is not None
+            assert colorbar.ax is slot
+            drawn = colorbar.outline.get_window_extent().height  # the drawn bar with its arrows
+            assert drawn == pytest.approx(map_axis.get_window_extent().height, rel=1e-2)
+            assert slot.get_ylabel().endswith("]")
+        assert [bool(axis.get_title()) for axis in maps] == [True] * 3 + [False] * (count - 3)
+        assert sum(text.get_gid() == "channel-row-label" for axis in maps for text in axis.texts) == rows
+        assert max(axis.get_position().y1 for axis in lower) < min(axis.get_position().y0 for axis in maps)
+        assert all(axis.get_xlabel().endswith("m²]") for axis in lower[:rows])
+    finally:
+        plt.close(figure)
+    field_labels.set_label_style("name_symbol")  # long row labels with mathtext: they wrap between words, never inside "$...$"
+    try:
+        named = generation_inputs.plots.permeability.tensor_comparison(first, summary, second, summary, lock_scale=False)
+        assert isinstance(named, Figure)
+        labels = [text.get_text() for axis in named.axes for text in axis.texts if text.get_gid() == "channel-row-label"]
+        assert len(labels) == rows
+        assert all("\n" in label and all(line.count("$") % 2 == 0 for line in label.splitlines()) for label in labels)
+        plt.close(named)
+    finally:
+        field_labels.set_label_style("symbol")
+
+
+def test_summary_numbers_fit_their_cells_and_the_side_plot_legend_stands_inside_its_axis(
+    profile_records: dict[
+        str,
+        tuple[
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+        ],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No summary-table text, the widest numbers included, leaves its padded cell; the moisture relation plot carries its legend inside."""
+    summary_table = generation_inputs.diagnostics.field_summary_comparison_table
+
+    def widest(*args: Any, **kwargs: Any) -> pd.DataFrame:
+        """Return the real summary with its widest numbers: four digits (1125 Pa, never e-notation) and a signed permeability."""
+        table = summary_table(*args, **kwargs).copy()
+        table.iloc[0, :] = 1125.0
+        table.iloc[-1, :] = -1.234e-10
+        return table
+
+    monkeypatch.setattr(generation_inputs.diagnostics, "field_summary_comparison_table", widest)
+    steady_first, steady_second = profile_records["steady_flow"]
+    steady_mean = generation_inputs.diagnostics.build_dataset_diagnostics((steady_first, steady_second))
+    transient_first, transient_second = profile_records["transient_drying"]
+    transient_mean = generation_inputs.diagnostics.build_dataset_diagnostics((transient_first, transient_second))
+    basic = generation_inputs.plots.spatial.basic_comparison(steady_first, steady_mean, steady_second, steady_mean, lock_scale=False)
+    moisture = generation_inputs.plots.moisture.moisture_comparison(
+        transient_first, transient_mean, transient_second, transient_mean, lock_scale=False
+    )
+    assert isinstance(basic, Figure)
+    assert isinstance(moisture, Figure)
+    try:
+        for figure in (basic, moisture):
+            figure.canvas.draw()
+            axis = next(axis for axis in figure.axes if axis.tables)
+            texts = {cell.get_text().get_text() for cell in axis.tables[0].get_celld().values()}
+            assert {"1125", "-1.234e-10"} <= texts
+            for cell in axis.tables[0].get_celld().values():
+                room = (1.0 - 2.0 * Cell.PAD) * cell.get_width() * axis.get_window_extent().width  # the text's padding on both sides
+                assert cell.get_text().get_window_extent().width <= room
+        phases = set(generation_inputs.plots.moisture.RELATION_PHASE_COLORS)
+        (side,) = (axis for axis in moisture.axes if (found := axis.get_legend()) and {text.get_text() for text in found.get_texts()} == phases)
+        legend = side.get_legend()
+        assert legend is not None
+        inside = side.get_window_extent()
+        assert inside.x0 <= legend.get_window_extent().x0
+        assert legend.get_window_extent().x1 <= inside.x1
+    finally:
+        plt.close(basic)
+        plt.close(moisture)
+
+
+def test_permeability_histograms_write_their_power_of_ten_into_the_unit_and_the_summary_keeps_one_row_height(
+    profile_records: dict[
+        str,
+        tuple[
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+        ],
+    ],
+) -> None:
+    """The value axis carries no offset text and the factor stands in the unit bracket; the table is top-aligned with display names and units."""
+    first, second = profile_records["steady_flow"]
+    summary = generation_inputs.diagnostics.build_dataset_diagnostics((first, second))
+    figure = generation_inputs.plots.permeability.tensor_comparison(first, summary, second, summary, lock_scale=False)
+    assert isinstance(figure, Figure)
+    try:
+        figure.canvas.draw()
+        rows = len(generation_inputs.plots.permeability.TENSOR_FIELDS)
+        histograms = [axis for axis in figure.axes if axis.get_ylabel() == "Cell count"][:rows]
+        assert len(histograms) == rows
+        for axis in histograms:
+            assert re.search(r"\[10[⁻⁰¹²³⁴⁵⁶⁷⁸⁹]+ m²\]$", axis.get_xlabel())
+            assert axis.xaxis.get_offset_text().get_text() == ""
+        table_axis = next(axis for axis in figure.axes if axis.tables)
+        cells = table_axis.tables[0].get_celld()
+        heights = {round(cell.get_height(), 9) for cell in cells.values()}
+        assert len(heights) == 1
+        assert max(cell.get_y() + cell.get_height() for cell in cells.values()) == pytest.approx(1.0)
+        assert min(cell.get_y() for cell in cells.values()) > 0.0
+        labels = [cells[row, 0].get_text().get_text() for row in range(1, len(cells) // 5)]
+        assert any("κₓₓ" in label and "m²" in label for label in labels)
+        assert not any("m^2" in label or "Kxx" in label for label in labels)
+    finally:
+        plt.close(figure)
+
+
 def test_schedule_plot_preserves_semantic_windows_and_common_mean(
     profile_records: dict[
         str,
@@ -936,7 +1077,10 @@ def test_schedule_plot_preserves_semantic_windows_and_common_mean(
         assert any(np.array_equal(support, expected_operating_h) for support in observed_supports)
         assert any(np.array_equal(support, expected_early_minutes) for support in observed_supports)
 
-        phi_axis = next(axis for axis in figure.axes if axis.get_ylabel() == r"$\varphi_{\mathrm{in,bc}}$ [%]" and axis.get_xlabel() == "time [min]")
+        assert figure.axes[0].get_ylabel()
+        assert not figure.axes[1].get_ylabel()  # the y label stands once per row, in its first column
+        _assert_equal_panels_and_legend_column(figure)  # one key for all six panels, outside right
+        phi_axis = next(axis for axis in figure.axes if axis.get_xlabel() == "Time [min]")  # the bottom row is the humidity row
         expected_first = generation_inputs.diagnostics.case_boundary_schedule(first, display_times_h)[:, 3]
         expected_second = generation_inputs.diagnostics.case_boundary_schedule(second, display_times_h)[:, 3]
         expected_mean = np.mean(
@@ -1004,7 +1148,7 @@ def test_disabled_startup_plot_uses_regular_operation_without_hidden_support(
         observed_supports = [np.asarray(line.get_xdata(), dtype=np.float64) for axis in figure.axes for line in axis.lines]
         assert any(np.array_equal(support, source_schedule[:, 0]) for support in observed_supports)
         assert any(np.array_equal(support, 60.0 * display_times_h) for support in observed_supports)
-        phi_axis = next(axis for axis in figure.axes if axis.get_ylabel() == r"$\varphi_{\mathrm{in,bc}}$ [%]" and axis.get_xlabel() == "time [min]")
+        phi_axis = next(axis for axis in figure.axes if axis.get_xlabel() == "Time [min]")  # the bottom row is the humidity row
         expected_first = generation_inputs.diagnostics.case_boundary_schedule(first, display_times_h)[:, 3]
         expected_second = generation_inputs.diagnostics.case_boundary_schedule(second, display_times_h)[:, 3]
         observed_phi = [np.asarray(line.get_ydata(), dtype=np.float64) for line in phi_axis.lines]
@@ -1135,32 +1279,170 @@ def test_candidate_outcome_rates_keep_attempts_pending_and_selection_separate() 
     assert sources.outcome_parameter_values(rows, "kappa", "1")["failed"].size == 0
 
 
-def test_failures_by_parameter_places_terminal_candidates_by_material_and_typed_reason() -> None:
-    """The outcome table carries every sampled parameter; the figure draws terminal candidates only, per material and reason."""
-    from src.analysis.generation_inputs import generation_input_sources as sources  # noqa: PLC0415
+def _parameter_rows() -> tuple[dict[str, Any], ...]:
+    """Return four candidates of two materials that sampled two parameters of two table sections and one unlisted name."""
 
     def row(material: str, case_id: str, outcome: str, reason: str | None, kappa: float) -> dict[str, Any]:
         failure = None if reason is None else {"stage": "solver", "class": "solver", "reason_code": reason}
-        return {"material_family": material, "case_id": case_id, "outcome": outcome, "failure": failure, "parameters": {"kappa": kappa, "eps": 0.4}}
+        return {
+            "task": "transient_drying",
+            "source_name": "example",
+            "origin": "primary",
+            "material_family": material,
+            "case_id": case_id,
+            "outcome": outcome,
+            "failure": failure,
+            "parameters": {"zeta": 0.4, "initial_moisture.mean_db": 0.2, "kappa_mean": kappa},
+            "parameter_units": {"zeta": "1", "initial_moisture.mean_db": "kg/kg", "kappa_mean": "m^2"},
+        }
 
-    rows = (
+    return (
         row("lentil", "case_0001", "failed", "stalled", 1.0),
         row("lentil", "case_0002", "successful", None, 2.0),
         row("chickpea", "case_0001", "failed", "timed_out", 3.0),
         row("chickpea", "case_0002", "pending", None, 4.0),
     )
-    table = sources.campaign_outcome_table(rows)
-    assert sources.campaign_outcome_parameters(table) == ("kappa", "eps")
-    assert table["kappa"].tolist() == [1.0, 2.0, 3.0, 4.0]
-    figure = generation_inputs.plots.overview.failures_by_parameter(table, sources.campaign_outcome_parameters(table))
+
+
+_SCRAMBLED_PARAMETERS = (("zeta", "1"), ("initial_moisture.mean_db", "kg/kg"), ("kappa_mean", "m^2"))
+_PARAMETER_ORDER = ["kappa_mean", "initial_moisture.mean_db", "zeta"]  # Airflow, Drying, then the unlisted name
+
+
+def _assert_equal_panels_and_legend_column(figure: Figure) -> None:
+    """Check that all panels are of one size and that the one legend stands right of them, top at the top plot frame."""
+    figure.canvas.draw()
+    panels = [axis for axis in figure.axes if axis.get_visible()]
+    assert len({(round(axis.get_position().width, 6), round(axis.get_position().height, 6)) for axis in panels}) == 1
+    (legend,) = figure.legends
+    extent = legend.get_window_extent()
+    assert extent.x0 >= max(axis.get_window_extent().x1 for axis in panels)
+    assert extent.y1 == pytest.approx(max(axis.get_window_extent().y1 for axis in panels), abs=2.0)
+
+
+def test_parameter_groups_follow_the_table_sections() -> None:
+    """Parameters group by table section in table order; a name the tables do not list follows as ``Other``."""
+    groups = generation_input_table_schema.grouped_parameters(_SCRAMBLED_PARAMETERS)
+    assert {section: [name for name, _unit in group] for section, group in groups.items()} == {
+        "Airflow": ["kappa_mean"],
+        "Drying": ["initial_moisture.mean_db"],
+        "Other": ["zeta"],
+    }
+    assert list(groups) == ["Airflow", "Drying", "Other"]
+
+
+def test_failures_by_parameter_places_terminal_candidates_by_material_and_typed_reason() -> None:
+    """The figure draws the terminal candidates in one equal panel per chosen parameter in table order, with one legend of one set of counts."""
+    figure = generation_inputs.plots.overview.failures_by_parameter(_parameter_rows(), _SCRAMBLED_PARAMETERS)
     try:
         panels = [axis for axis in figure.axes if axis.get_title()]
-        assert [axis.get_title() for axis in panels] == ["kappa", "eps"]
+        assert [axis.get_title() for axis in panels] == _PARAMETER_ORDER
         assert [label.get_text() for label in panels[0].get_yticklabels()] == ["chickpea", "lentil"]
+        _assert_equal_panels_and_legend_column(figure)
         assert sorted(text.get_text() for text in figure.legends[0].get_texts()) == ["stalled (n=1)", "successful (n=1)", "timed_out (n=1)"]
-        assert sorted(float(x) for collection in panels[0].collections for x, _y in np.asarray(collection.get_offsets())) == [1.0, 2.0, 3.0]
+        for panel in panels:  # the pending candidate is no terminal candidate; every panel draws the same three
+            assert sum(len(np.asarray(collection.get_offsets())) for collection in panel.collections) == 3
     finally:
         plt.close(figure)
+
+
+def test_failures_by_parameter_selects_values_by_name_and_unit() -> None:
+    """A candidate that recorded the parameter in another unit is not drawn under the chosen unit; the panel names how many it draws."""
+    rows = list(_parameter_rows())
+    rows[0] = {**rows[0], "parameter_units": {**rows[0]["parameter_units"], "kappa_mean": "kPa"}}
+    figure = generation_inputs.plots.overview.failures_by_parameter(rows, (("kappa_mean", "m^2"),))
+    try:
+        (panel,) = (axis for axis in figure.axes if axis.get_title())
+        assert sum(int(np.isfinite(np.asarray(collection.get_offsets())[:, 0]).sum()) for collection in panel.collections) == 2
+        assert panel.get_title() == "kappa_mean (n = 2 of 3)"
+    finally:
+        plt.close(figure)
+
+
+def test_parameter_panels_draw_values_in_the_unit_their_axis_and_choice_label_name() -> None:
+    """A temperature recorded in K reads °C on the axis and in the choice, so the plotted values are converted with it."""
+    from src.analysis.generation_inputs import generation_input_sources as sources  # noqa: PLC0415
+
+    rows = [
+        {**row, "parameters": {"T_in_base": 300.0}, "parameter_units": {"T_in_base": "K"}}
+        for row in _parameter_rows()
+        if row["outcome"] in {"successful", "failed"}
+    ]
+    parameter = ("T_in_base", "K")
+    drawn = [
+        generation_inputs.plots.overview.failures_by_parameter(rows, (parameter,)),
+        generation_inputs.plots.overview.outcome_parameter_distributions(
+            {parameter: sources.outcome_parameter_values(rows, *parameter)}, {"successful": 1, "failed": 2}
+        ),
+    ]
+    try:
+        for figure in drawn:
+            (panel,) = (axis for axis in figure.axes if axis.get_title())
+            assert "°C" in panel.get_xlabel()
+            plotted = [float(x) for collection in panel.collections for x, _y in np.asarray(collection.get_offsets())]
+            plotted += [float(x) for line in panel.lines for x in np.asarray(line.get_xdata(), dtype=float)]
+            assert plotted
+            assert np.allclose(plotted, 300.0 - 273.15)
+    finally:
+        for figure in drawn:
+            plt.close(figure)
+    local = input_controls.CampaignOutcomeControls(sources.CampaignOutcomeCatalog(tuple(rows)))
+    assert "°C" in next(box.description for key, box in local.parameters.boxes.items() if key == parameter)
+
+
+def test_outcome_parameter_distribution_panel_names_its_own_n_when_it_draws_fewer_candidates_than_the_scope() -> None:
+    """Only a panel that draws fewer candidates than the legend counts names its own n, in its title where no legend covers it."""
+    from collections import Counter  # noqa: PLC0415
+
+    from src.analysis.generation_inputs import generation_input_sources as sources  # noqa: PLC0415
+
+    rows = list(_parameter_rows())
+    rows[3] = {**rows[3], "parameters": {key: value for key, value in rows[3]["parameters"].items() if key != "zeta"}}
+    values = {parameter: sources.outcome_parameter_values(rows, *parameter) for parameter in _SCRAMBLED_PARAMETERS}
+    figure = generation_inputs.plots.overview.outcome_parameter_distributions(values, Counter(row["outcome"] for row in rows))
+    try:
+        titles = [axis.get_title() for axis in figure.axes if axis.get_visible()]
+        assert {title.split(" (n = ")[0]: " (n = " in title for title in titles} == {
+            "kappa_mean": False,
+            "initial_moisture.mean_db": False,
+            "zeta": True,
+        }
+        assert not any(axis.texts for axis in figure.axes)
+    finally:
+        plt.close(figure)
+
+
+def test_outcome_parameter_distributions_draw_one_panel_per_parameter_with_one_set_of_counts() -> None:
+    """A parameter without values draws no panel; the legend carries the scope's outcome counts for all panels; the y label stands once per row."""
+    from src.analysis.generation_inputs import generation_input_sources as sources  # noqa: PLC0415
+
+    rows = _parameter_rows()
+    chosen = (*_SCRAMBLED_PARAMETERS, ("missing", "1"))
+    values = {parameter: sources.outcome_parameter_values(rows, *parameter) for parameter in chosen}
+    counts = {"successful": 1, "failed": 2, "pending": 1}
+    figure = generation_inputs.plots.overview.outcome_parameter_distributions(values, counts)
+    try:
+        panels = [axis for axis in figure.axes if axis.get_visible()]
+        assert [axis.get_title() for axis in panels] == _PARAMETER_ORDER
+        _assert_equal_panels_and_legend_column(figure)
+        assert sorted(text.get_text() for text in figure.legends[0].get_texts()) == ["failed (n=2)", "pending (n=1)", "successful (n=1)"]
+        assert panels[0].get_ylabel()
+        assert not panels[1].get_ylabel()
+    finally:
+        plt.close(figure)
+
+
+def test_campaign_outcome_parameter_choice_is_grouped_by_section_and_starts_empty() -> None:
+    """The parameter disclosure offers the sampled parameters by table section, draws none until chosen and reports a change once."""
+    from src.analysis.generation_inputs import generation_input_sources as sources  # noqa: PLC0415
+
+    local = input_controls.CampaignOutcomeControls(sources.CampaignOutcomeCatalog(_parameter_rows()))
+    calls: list[int] = []
+    local.set_callback(lambda: calls.append(1))
+    assert local.chosen_parameters() == ()
+    assert [cast("tuple[str, str]", key)[0] for key in local.parameters.boxes] == _PARAMETER_ORDER  # keys are (name, unit) pairs
+    local.parameters.select([("zeta", "1"), ("kappa_mean", "m^2")])
+    assert local.chosen_parameters() == (("kappa_mean", "m^2"), ("zeta", "1"))
+    assert len(calls) == 1
 
 
 def _record_shows(monkeypatch: pytest.MonkeyPatch) -> list[object]:

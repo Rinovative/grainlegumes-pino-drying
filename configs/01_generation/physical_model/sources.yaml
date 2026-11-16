@@ -7,20 +7,21 @@ sources:
   citation: Albertin, R. M. (2025). Trocknung von Koernerleguminosen. Bachelorarbeit,
     OST.
   identifier: SHA-256 0d59f098 (full digest recorded in input coverage)
-  canonical_locator: local:upload/Albertin_2025_Trocknung_von_Koernerleguminosen_Bachelorarbeit(3).pdf
+  canonical_locator: docs/Albertin_2025_Trocknung_von_Koernerleguminosen_Bachelorarbeit.pdf
   alternate_locators: []
   source_type: project_report
 - source_key: matouk_thermal
-  citation: Matouk, A. M. et al. (2018). Thermal Properties of Some Legume Seeds.
-    Journal of Soil Sciences and Agricultural Engineering, 9, 261-267.
+  citation: Matouk, A. M., El-Kholy, Tharwat & Shamala (2018). Thermal Properties
+    of Some Legume Seeds. Journal of Soil Sciences and Agricultural Engineering,
+    9(7), 261-267. Covers only faba bean and lentil.
   identifier: doi:10.21608/jssae.2018.35758
   canonical_locator: https://doi.org/10.21608/jssae.2018.35758
   alternate_locators: []
   source_type: journal_article
 - source_key: lentil_oswin_source
-  citation: Cenkowski, S., Jayas, D. S., Pabis, S. & Muir, W. E. (2015). Sorption
-    characteristics of red lentils during storage. Canadian Biosystems Engineering,
-    57, 3.1-3.8.
+  citation: Cenkowski, S., Paliwal, Arntfield & Gervais (2015). Sorption characteristics
+    of red lentils as affected by postharvest conditions. Canadian Biosystems Engineering,
+    57, 3.1-3.7.
   identifier: doi:10.7451/CBE.2015.57.3.1
   canonical_locator: https://library.csbe-scgab.ca/docs/journal/57/C15220.pdf
   alternate_locators: []
@@ -34,7 +35,7 @@ sources:
   source_type: journal_article
 - source_key: lentil_drying
   citation: Mangueira, E. R. et al. (2021). Analysis of the thin layer drying kinetic
-    of brown lentil grains. Research, Society and Development, 10.
+    of brown lentil grains. Research, Society and Development, 10(10).
   identifier: doi:10.33448/rsd-v10i10.19258
   canonical_locator: https://doi.org/10.33448/rsd-v10i10.19258
   alternate_locators:
@@ -44,7 +45,7 @@ sources:
   citation: swiss granum (2026). Empfehlungen fuer Uebernahmebedingungen und gesetzliche
     Bestimmungen von Ackerkulturen zur menschlichen Ernaehrung, Ernte 2026.
   identifier: 2026-03-12 edition
-  canonical_locator: local:upload/2026-03-12_Empfehlung_Uebernahmebedingungen_Ackerkulturen_zur_menschl_Ernaehrung_2026_D(3).pdf
+  canonical_locator: docs/2026-03-12_Empfehlung_Uebernahmebedingungen_Ackerkulturen_zur_menschl_Ernaehrung_2026_D.pdf
   alternate_locators: []
   source_type: official_guidance
 - source_key: chickpea_physical
@@ -66,8 +67,8 @@ sources:
   source_type: journal_article
 - source_key: chickpea_drying
   citation: Cavalcanti-Mata, M. E. R. M. et al. (2020). A new approach to traditional
-    drying models for thin-layer drying kinetics of chickpeas. Journal of Food Process
-    Engineering, 43.
+    drying models for the thin-layer drying kinetics of chickpeas. Journal of Food
+    Process Engineering, 43(12), e13569.
   identifier: doi:10.1111/jfpe.13569
   canonical_locator: https://doi.org/10.1111/jfpe.13569
   alternate_locators: []
@@ -118,8 +119,8 @@ sources:
   source_type: journal_article
 - source_key: pea_drying
   citation: Ganesh, C. V. & Sokhansanj, S. (1997). High temperature mechanical drying
-    of field peas (Pisum sativum L.). University of Saskatchewan proceedings/thesis
-    record.
+    of field peas (Pisum sativum L.). Workshop presentation, Saskatoon; measures
+    80 degC only.
   identifier: University of Saskatchewan repository
   canonical_locator: https://harvest.usask.ca/bitstreams/b28e4b4a-4bbf-4e6b-8f49-d3890bd8a3a8/download
   alternate_locators: []
@@ -164,7 +165,7 @@ sources:
 - source_key: swiss_oil
   citation: swiss granum (2026). Uebernahmebedingungen Oelsaaten, Ernte 2026.
   identifier: 2026-03-19 edition
-  canonical_locator: local:upload/2026-03-19_Uebernahmebedingungen_Oelsaaten_2026_D(3).pdf
+  canonical_locator: docs/2026-03-19_Uebernahmebedingungen_Oelsaaten_2026_D.pdf
   alternate_locators: []
   source_type: official_guidance
 - source_key: sunflower_sorption_drying_munder_2019
@@ -178,7 +179,7 @@ sources:
   source_type: journal_article
 - source_key: sunflower_density_isik_izli_2007
   citation: Isik, E. & Izli, N. (2007). Physical Properties of Sunflower Seeds (Helianthus
-    annuus L.). International Journal of Agricultural Research, 2, 677-686.
+    annuus L.). International Journal of Agricultural Research, 2(8), 677-686.
   identifier: doi:10.3923/ijar.2007.677.686
   canonical_locator: https://scialert.net/fulltext/?doi=ijar.2007.677.686
   alternate_locators: []
@@ -252,7 +253,62 @@ sources:
   citation: Khatchatourian, O. A., Toniazzo, N. A. & Gortyshov, Y. F. (2009). Simulation
     of airflow in grain bulks under anisotropic conditions. Biosystems Engineering,
     104(2), 205-215.
-  identifier: Biosystems Engineering 104(2):205-215
-  canonical_locator: https://www.sciencedirect.com/journal/biosystems-engineering/vol/104/issue/2
+  identifier: doi:10.1016/j.biosystemseng.2009.06.023
+  canonical_locator: https://doi.org/10.1016/j.biosystemseng.2009.06.023
+  alternate_locators: []
+  source_type: journal_article
+- source_key: lentil_drying_tahmasebi_2025
+  citation: Tahmasebi et al. (2025). Heat Transfer, 54(6), 3576-3585. Lentil thin-layer
+    drying; Table 2 gives 20.67 to about 12 % wb in 380 min at 50 degC and 1 m/s.
+  identifier: doi:10.1002/htj.23371
+  canonical_locator: https://doi.org/10.1002/htj.23371
+  alternate_locators: []
+  source_type: journal_article
+- source_key: cgc_airflow_resistance_charts
+  citation: Canadian Grain Commission. Airflow resistance charts (manage stored grain).
+    Web page; the page does not state the pressure unit, inches of water column assumed.
+  identifier: Canadian Grain Commission web page
+  canonical_locator: https://www.canada.ca/en/grain-commission/services/grain-quality/manage-stored-grain/airflow-resistance-charts.html
+  alternate_locators: []
+  source_type: government_guidance
+- source_key: chickpea_airflow_masoumi_tabil_2008
+  citation: Masoumi & Tabil (2008). International Journal of Food Properties, 11,
+    481-494. Chickpea airflow resistance, Table 2.
+  identifier: doi:10.1080/10942910701856171
+  canonical_locator: https://doi.org/10.1080/10942910701856171
+  alternate_locators: []
+  source_type: journal_article
+- source_key: airflow_friesen_huminicki_1986
+  citation: Friesen & Huminicki (1986). Canadian Agricultural Engineering, 28, 107.
+    Airflow resistance of oilseed beds (rapeseed, sunflower), Table II.
+  identifier: Canadian Agricultural Engineering 28:107
+  canonical_locator: https://library.csbe-scgab.ca/docs/journal/28/28_2_107_ocr.pdf
+  alternate_locators: []
+  source_type: journal_article
+- source_key: usapulses_storage_manual
+  citation: USA Pulses. Manual, Chapter 3 Legumes, Storing Legumes. Web page.
+  identifier: USA Pulses manual chapter 3
+  canonical_locator: https://usapulses.org/manual/chapter-3-legumes/
+  alternate_locators: []
+  source_type: book_or_manual
+- source_key: saskpulse_storage
+  citation: Saskatchewan Pulse Growers (2025). Post-harvest and long-term storage
+    of pulses (Barker, August 2025, Table 1). Web page.
+  identifier: Saskatchewan Pulse Growers web page
+  canonical_locator: https://saskpulse.com/resources/post-harvest-and-long-term-storage-of-pulses
+  alternate_locators: []
+  source_type: institutional_record
+- source_key: lentil_thermal_gharibzahedi_2014
+  citation: Gharibzahedi et al. (2014). Journal of Food Processing and Preservation,
+    38(4), 1807-1811. Lentil thermal conductivity of the packed bed.
+  identifier: doi:10.1111/jfpp.12151
+  canonical_locator: https://doi.org/10.1111/jfpp.12151
+  alternate_locators: []
+  source_type: journal_article
+- source_key: pulse_thermal_oke_baik_2022
+  citation: Oke & Baik (2022). International Journal of Food Properties, 25(1), 764-779.
+    Thermal properties of pulses (lentil, chickpea); open access.
+  identifier: doi:10.1080/10942912.2022.2058013
+  canonical_locator: https://doi.org/10.1080/10942912.2022.2058013
   alternate_locators: []
   source_type: journal_article

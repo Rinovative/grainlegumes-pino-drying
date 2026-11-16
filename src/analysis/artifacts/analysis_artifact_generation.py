@@ -377,7 +377,8 @@ def _iter_inferred_artifact_cases(
         with torch.inference_mode():
             inputs = raw_inputs.to(device)
             targets = raw_targets.to(device)
-            normalized_inputs = scaling.encode_inputs(inputs)
+            reference = scaling.state_reference(inputs)
+            normalized_inputs = scaling.encode_inputs(inputs, reference=reference)
             normalized_prediction, batch_forward_s = timing.measure_forward(
                 model=model,
                 normalized_inputs=normalized_inputs,
@@ -386,7 +387,7 @@ def _iter_inferred_artifact_cases(
             if not isinstance(normalized_prediction, torch.Tensor):
                 msg = "Artifact model output must be a tensor."
                 raise TypeError(msg)
-            prediction = scaling.decode_state(normalized_prediction)
+            prediction = scaling.decode_state(normalized_prediction, reference=reference)
 
         # Predictions stay unchecked here: case admission classifies them without changing values.
         _require_finite_artifact_tensor(normalized_inputs, label=f"Artifact batch {batch_index} normalized inputs")

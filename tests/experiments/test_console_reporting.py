@@ -71,7 +71,15 @@ def test_run_lines_carry_progress_information_with_storage_relative_paths(
     plain_event = {"epoch": 3.0, "budget/progress": 0.55, "train/loss_total": 0.03, "train/loss_data": 0.03, "optimization/learning_rate": 3.88e-4}
     reporter.event(8, plain_event)
     reporter.startup_phase("training_start", {"updates_per_epoch": 1})
-    budget = {"unit": "units", "total": 40, "units": 40, "train_seconds": 9.5, "validated_point": 20, "skipped_points": []}
+    budget = {
+        "unit": "units",
+        "total": 40,
+        "units": 40,
+        "supervised_transitions": 40,
+        "train_seconds": 9.5,
+        "validated_point": 20,
+        "skipped_points": [],
+    }
     reporter.final({"best_epoch": 2, "completed_epoch": 3, "best_metric": 0.01234, "budget": budget}, total_wall_seconds=125.0)
     evaluated, plain, _startup, end = capsys.readouterr().out.splitlines()
     for expected in ("epoch 2", "step 7", "50.0%", "point 10/20", "loss 3.215e-02", "val 1.234e-02 *best", "lr 3.88e-04", "13 s", "45.0 units/s"):
@@ -80,7 +88,7 @@ def test_run_lines_carry_progress_information_with_storage_relative_paths(
     assert "point" not in plain
     assert "[" not in evaluated  # a single loss term is not repeated as a component
     for expected in (
-        "completed after 3 epochs (40 of 40 units)",
+        "completed after 3 epochs (40 of 40 units, ",
         "best epoch 2",
         reporter.objective_id,
         "total 2 min 05 s (startup 0 s, training 10 s, validation 2 s, other 1 min 53 s)",
@@ -102,18 +110,26 @@ def test_start_block_names_the_loader_workers_that_actually_run(
     assert data_line.endswith("| workers 4")
 
 
-def test_end_line_names_a_measured_train_seconds_budget_as_the_stop_reason(
+def test_end_line_names_a_supervised_transition_budget_and_reports_the_optimisation_seconds(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A matched stage that stops on its measured budget says so, with the optimisation seconds it spent of its budget."""
+    """A matched stage ends on its supervised transitions; the line shows them against the budget and the measured seconds beside."""
     reporter = _reporter(tmp_path, monkeypatch)
-    budget = {"unit": "train_seconds", "total": 10.0, "units": 12, "train_seconds": 10.2, "validated_point": 20, "skipped_points": []}
+    budget = {
+        "unit": "supervised_transitions",
+        "total": 40,
+        "units": 2,
+        "supervised_transitions": 42,
+        "train_seconds": 10.2,
+        "validated_point": 20,
+        "skipped_points": [],
+    }
 
     reporter.final({"best_epoch": 3, "completed_epoch": 3, "best_metric": 0.5, "budget": budget}, total_wall_seconds=30.0)
 
-    assert "completed after 3 epochs (10 s of 10 s train_seconds)" in capsys.readouterr().out
+    assert "completed after 3 epochs (42 of 40 supervised_transitions, 10 s optimisation)" in capsys.readouterr().out
 
 
 def test_loss_components_share_the_epoch_line_only_when_several_remain(

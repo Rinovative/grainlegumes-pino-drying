@@ -2,8 +2,9 @@
 # Physics-informed FNO weight search: 20 trials of half the 600-epoch budget on validation; model and learning rate are the supervised FNO twin's (fno_search); copy the selected weights into the pi-fno experiment under experiments/architecture_comparison/ and rename it: its name lists the weights (`w`) and warm-up (`wu`) the file sets (configs/README.md), and every other value comes from base.yaml.
 
 study:
-  n_trials: 20  # Maximum number of trials requested for the study.
+  n_trials: 20  # Total trial allocation of the study, its configured base first; a rerun runs only the trials left.
   seed: 9  # Seed controlling Optuna sampling/pruning randomness.
+  twin_of: ../experiments/architecture_comparison/fno_m128x160_h64_l3_p0p1__lr-0p000388.yaml  # Supervised twin: every value outside loss.physics, k (training.units_per_update, base.yaml's 16 there) included, must equal it.
   budget_fraction: 0.5  # Trial budget as a fraction of the budget K (training.budget_epochs): 300 of 600 passes, each trial with its own cosine.
   sampler:
     kind: tpe  # Optuna sampler family used to propose trial values.

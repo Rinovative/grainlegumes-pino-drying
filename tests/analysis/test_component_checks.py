@@ -9,6 +9,7 @@ Responsibilities:
   - Check the Train/validation membership filter, its refusal of test and OOD roles, and that
     only selected cases reach the steady reference, transient cases, balances, and scaling fit
   - Check manufactured-field derivative errors, mode truncation, stride views, increment statistics, timing rows, and criteria
+  - Check the residual maps: one unit bar per backend on the locked log scale, the arrow note only where a map has values beyond
 
 Design principles:
   - Small synthetic grids with analytic answers; no published Datasets or solvers
@@ -25,7 +26,7 @@ import dataclasses
 import math
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import matplotlib as mpl
 
@@ -36,8 +37,10 @@ import pandas as pd
 import pytest
 import torch
 import yaml
+from matplotlib.colors import BoundaryNorm
 
 from src import common, datasets, domain, experiments, generation, learning
+from src.analysis import presentation
 from src.analysis.component_checks import component_checks_increments as increments
 from src.analysis.component_checks import component_checks_plots as plots
 from src.analysis.component_checks import component_checks_sources as sources
@@ -50,7 +53,7 @@ from src.analysis.component_checks import component_checks_transient as transien
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-_VISCOSITY = domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY
+_VISCOSITY = domain.physics.contracts.AIR_DYNAMIC_VISCOSITY
 _INLET_PRESSURE = 3.0
 _PERMEABILITY = 1e-8
 _FD = steady.backend_by_label("fd")
@@ -471,6 +474,109 @@ def test_transient_plots_accept_more_cases_than_categorical_colours() -> None:
     plt.close(figure)
 
 
+def _balance_frame() -> pd.DataFrame:
+    """Return a two-interval balance table with every column the transient line figures read."""
+    frame = pd.DataFrame({"end_h": [1.0, 2.0], "grain_change_kg": [-1.0, -1.0]})
+    for name in ("grain", "gas", "total"):
+        frame[f"{name}_closure_kg_trapezoid"] = 1e-3
+    return frame
+
+
+def test_one_panel_line_figures_keep_the_key_inside_and_panel_rows_write_it_once_outside_right() -> None:
+    """A single panel carries its legend itself; a row of panels shares one figure legend and the y label stands only on the first panel."""
+    backends = [backend.label for backend in steady.DERIVATIVE_BACKENDS]
+    residuals = pd.DataFrame({"dtype": "float32", "backend": backends * 2, "crop": [0] * len(backends) + [1] * len(backends), "momentum": 1e-3})
+    single = plots.plot_crop_sweep(residuals)
+    assert single.axes[0].get_legend() is not None
+    assert not single.legends
+    plt.close(single)
+    row = plots.plot_transient_balances({"a": _balance_frame(), "b": _balance_frame()})
+    assert len(row.legends) == 1
+    assert all(axis.get_legend() is None for axis in row.axes)
+    assert [axis.get_ylabel() != "" for axis in row.axes] == [True, False, False]
+    plt.close(row)
+
+
+def test_balance_and_sorption_titles_name_the_quantity_of_their_equation_in_the_active_label_style() -> None:
+    """Sorption panels are titled by the water quantity they balance, not by the equation's position; both rules sit in one key."""
+    sorption = pd.DataFrame({"rule": ["trapezoid", "left"] * 2, "end_h": [1.0, 1.0, 2.0, 2.0]})
+    for name in ("internal", "surface", "grain"):
+        sorption[f"{name}_relative"] = 1e-3
+    previous = presentation.field_labels.label_style()
+    try:
+        presentation.field_labels.set_label_style("symbol")
+        figure = plots.plot_sorption_residuals({"a": sorption})
+        expected = [f"{presentation.field_labels.field_label(field, mathtext=True)} equation" for field in ("w_int", "w_surf", "w_gr")]
+        assert [axis.get_title() for axis in figure.axes[:3]] == expected
+        assert [legend.get_title().get_text() for legend in figure.legends] == ["Case", "Quadrature rule"]
+        plt.close(figure)
+    finally:
+        presentation.field_labels.set_label_style(previous)
+    figure = plots.plot_transient_balances({"a": _balance_frame()}, rule="trapezoid")
+    titles = [axis.get_title() for axis in figure.axes[:3]]
+    assert all(title[0].isupper() and title.endswith("balance (trapezoid)") for title in titles)
+    plt.close(figure)
+
+
+def test_mode_curves_colour_by_field_and_dash_by_padding_with_one_key_entry_each() -> None:
+    """Every field keeps one colour in both paddings, the padding is the line style, and the key lists each once in two groups."""
+    rows = [
+        {"field": field, "axis": axis, "padding": padding, "modes_y": modes, "modes_x": modes, "relative_l2": 10.0**-modes}
+        for field in ("T", "p")
+        for axis in ("y", "x")
+        for padding in (0.0, 0.1)
+        for modes in (2, 4)
+    ]
+    figure = plots.plot_mode_curves(pd.DataFrame(rows), pd.DataFrame({"modes_y": [4], "modes_x": [4]}), title="States")
+    lines = [line for line in figure.axes[0].get_lines() if line.get_marker() == "o"]
+    colours = {line.get_color() for line in lines}
+    assert len(lines) == 4
+    assert len(colours) == 2
+    assert {(line.get_color(), line.get_linestyle()) for line in lines} == {(colour, style) for colour in colours for style in ("-", "--")}
+    assert [legend.get_title().get_text() for legend in figure.legends] == ["Field", "Domain padding"]
+    assert [len(legend.get_texts()) for legend in figure.legends] == [2, 2]
+    plt.close(figure)
+
+
+def test_residual_maps_carry_one_unit_bar_per_backend_on_the_locked_boundaries() -> None:
+    """Each backend map gets its own bar with the unit; every bar spans the same locked log scale, and the header and title stand once."""
+    backends = [backend.label for backend in steady.DERIVATIVE_BACKENDS[:2]]
+    rng = np.random.default_rng(0)
+    base = _fields(_reference(4, 6))
+    fields = [
+        dataclasses.replace(base, backend=label, residual=torch.from_numpy(10.0 ** rng.uniform(-6.0, 0.5, size=(2, 2, 4, 6)))) for label in backends
+    ]
+    figure = plots.plot_residual_maps(fields, case_index=1, case_label="case 1", extent=(0.0, 0.6, 0.0, 0.4))
+    maps = [axis for axis in figure.axes if axis.images]
+    bars = [axis for axis in figure.axes if not axis.images and axis.get_ylabel()]
+    assert len(maps) == len(bars) == len(fields)
+    assert all(bar.get_ylabel().startswith("|R|/G [") and bar.get_ylabel().endswith("]") for bar in bars)
+    norms = [axis.images[0].norm for axis in maps]
+    assert all(isinstance(norm, BoundaryNorm) and np.allclose(norm.boundaries, plots.MAP_BOUNDARIES) for norm in norms)
+    assert [axis.get_title() for axis in maps] == [steady.backend_by_label(label).description for label in backends]
+    assert figure.get_suptitle().endswith("case 1")
+    plt.close(figure)
+
+
+def test_residual_maps_note_the_arrows_only_when_a_map_has_values_beyond_its_locked_scale() -> None:
+    """Values beyond 10⁻⁵ to 1, exact zeros included, draw their arrows and one scale note under the title; values inside draw neither."""
+    backends = [backend.label for backend in steady.DERIVATIVE_BACKENDS[:2]]
+    base = _fields(_reference(4, 6))
+    inside = 10.0 ** np.random.default_rng(0).uniform(-4.5, -0.5, size=(2, 2, 4, 6))
+    with_zero = inside.copy()
+    with_zero[1, :, 0, 0] = 0.0  # one exact zero residual of the drawn case, below the 10⁻⁵ floor
+    with_top = inside.copy()
+    with_top[1, 0, 0, 0] = 3.0
+    for residual, extend in ((inside, "neither"), (with_zero, "min"), (with_top, "max")):
+        fields = [dataclasses.replace(base, backend=label, residual=torch.from_numpy(residual)) for label in backends]
+        figure = plots.plot_residual_maps(fields, case_index=1, case_label="case 1", extent=(0.0, 0.6, 0.0, 0.4))
+        bars = [colorbar for axis in figure.axes for image in axis.images if (colorbar := image.colorbar) is not None]
+        assert [bar.extend for bar in bars] == [extend] * len(backends)
+        notes = [text.get_text() for text in figure.texts if text.get_text().startswith("Colour scales:")]
+        assert notes == ([] if extend == "neither" else ["Colour scales: fixed 10⁻⁵ to 10⁰; arrows mark values outside"])
+        plt.close(figure)
+
+
 def test_changed_source_is_refused_with_the_dataset_admission_message(tmp_path: Path) -> None:
     """A source whose bytes changed after Dataset admission fails with the one message the Dataset owner defines."""
     path = tmp_path / "source.h5"
@@ -712,8 +818,8 @@ def test_timing_without_cuda_reports_unavailable_gpu_rows_and_measured_cpu_rows(
     assert (cpu["median_ms"].astype(float) > 0).all()
 
 
-def test_summary_applies_each_proposed_criterion() -> None:
-    """Each criterion turns constructed tables at or across its threshold into its status; missing tables stay not measured."""
+def _summary_inputs() -> dict[str, Any]:
+    """Return component tables at which every criterion has an admissible option, except that FC's crop never reaches the ratio."""
     index = pd.MultiIndex.from_product([("fd", "fc"), (0, 1, 2)], names=["backend", "crop"])
     crop = pd.DataFrame(
         {"momentum_floor_median": [3.0, 2.0, 1.0, 3.0, 2.0, 1.0], "smooth_1pct_ratio_median": [10.0, 100.0, 300.0, 5.0, 50.0, 99.9]}, index=index
@@ -734,7 +840,12 @@ def test_summary_applies_each_proposed_criterion() -> None:
         {"stride": [1, 2, 4], "status": ["admissible", "admissible", "refused: endpoint"], "max_normalized_rmse": [0.0, 1e-3, math.nan]}
     )
     tables = increments.TransientComponentTables(spectral=modes, stride=stride, increments=pd.DataFrame(), time_steps=pd.DataFrame())
-    status = summary.summary_table(crop=crop, timing=timed, steady_modes=modes, transient=tables)["status"]
+    return {"crop": crop, "timing": timed, "steady_modes": modes, "transient": tables}
+
+
+def test_summary_applies_each_proposed_criterion() -> None:
+    """Each criterion turns constructed tables at or across its threshold into its status; missing tables stay not measured."""
+    status = summary.summary_table(**_summary_inputs())["status"]
     assert status["Derivative backend: FC arm"] == "keep FC arm"
     assert status["Interior crop"] == "fd: crop 1; fc: none"
     assert status["n_modes steady, axis y"] == "padding 0: lower bound 16, sufficient 32"
@@ -743,6 +854,47 @@ def test_summary_applies_each_proposed_criterion() -> None:
     assert (summary.summary_table()["status"] == summary.NOT_MEASURED).all()
     assert summary.summary_table()["criterion"].str.endswith(f"({summary.CRITERIA_STATE})").all()
     assert sources.membership_caption("train", ["a", "b"]) == "train membership · 2 cases"
+
+
+@pytest.mark.parametrize(
+    ("branch", "leading"),
+    [
+        ("none", []),  # a refused stride, a backend without a crop and a padding effect each leave an option: nothing fails
+        ("padding", []),
+        ("crop", ["Interior crop"]),
+        ("modes", ["n_modes steady, axis y", "n_modes steady, axis x"]),
+        ("stride", ["Spatial stride"]),
+        ("fc", ["Derivative backend: FC arm", "Spatial stride"]),  # FC leads its natural place only through its own flag
+    ],
+)
+def test_summary_lists_a_row_first_only_when_its_check_leaves_no_admissible_option(branch: str, leading: list[str]) -> None:
+    """Crop, modes, stride and FC fail when no option remains; they move to the top in table order, the rest keep their order."""
+    inputs = _summary_inputs()
+    natural = list(summary.summary_table(**inputs).index)
+    crop, timing, modes, tables = (inputs[key] for key in ("crop", "timing", "steady_modes", "transient"))
+    refused = dataclasses.replace(tables, stride=tables.stride.assign(status="refused: endpoint"))
+    changes = {
+        "crop": {"crop": crop.assign(smooth_1pct_ratio_median=5.0)},
+        "modes": {"steady_modes": modes.assign(relative_l2=1.0)},
+        "stride": {"transient": refused},
+        "fc": {"timing": timing.assign(median_ms=[10.0, 100.0]), "transient": refused},
+        "padding": {"steady_modes": modes.assign(edge_relative=modes["edge_relative"].where(modes["padding"] == 0.0, 0.5))},
+    }.get(branch, {})
+    ordered = list(summary.summary_table(**{**inputs, **changes}).index)
+    assert ordered == [*leading, *(name for name in natural if name not in leading)]
+
+
+def test_summary_reports_empty_tables_as_not_measured_instead_of_failing() -> None:
+    """A table without rows has no group to judge: every row reads not measured and none moves to the top."""
+    inputs = _summary_inputs()
+    tables = inputs["transient"]
+    empty = {
+        "crop": inputs["crop"].iloc[:0],
+        "timing": inputs["timing"],
+        "steady_modes": inputs["steady_modes"].iloc[:0],
+        "transient": dataclasses.replace(tables, spectral=tables.spectral.iloc[:0], stride=tables.stride.iloc[:0]),
+    }
+    assert (summary.summary_table(**empty)["status"] == summary.NOT_MEASURED).all()
 
 
 def test_padding_with_all_zero_edge_errors_has_no_effect() -> None:

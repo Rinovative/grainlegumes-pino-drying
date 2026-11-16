@@ -3292,8 +3292,10 @@ def _reconcile_success_decisions(
 
     A step that fails after its valid publication (for example on scratch cleanup) never reaches its own decision. The
     case view is ``successful`` by the same admission as the status; a decided case is never touched, and a case whose
-    latest step has not ended stays with that step, which still decides it. A decision hashes the case HDF5, so a
-    metadata-only feed writes none: it returns ``None`` at the first case that needs one.
+    latest step has not ended stays with that step, which still decides it. The feeder records the evidence that step
+    would record, its accounted step id included, so a step decision this feed's records missed holds identical bytes
+    and passes the immutable-evidence check. A decision hashes the case HDF5, so a metadata-only feed writes none: it
+    returns ``None`` at the first case that needs one.
     """
     from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- canonical execution-batch owner
 
@@ -3307,8 +3309,8 @@ def _reconcile_success_decisions(
         view = views.get((lifecycle_service.execution_batch(campaign, reservation).batch_id, str(reservation["case_id"])))
         if view is None or view["state"] != "successful":
             continue
-        if view["latest_job_id"] is not None and view["latest_job_id"] not in scheduler["accounted"]:
-            continue
+        if view["latest_job_id"] is not None and _scheduler_field(scheduler["accounted"].get(view["latest_job_id"]), 5) is None:
+            continue  # The step owns its decision until its accounting proves it ended: a synthetic row has no end time.
         if metadata_only:
             return None
         task = cluster_service.require_campaign_task(campaign, batch_name=str(view["batch_name"]), case_index=int(view["case_index"]))
@@ -3317,10 +3319,11 @@ def _reconcile_success_decisions(
         resources = None
         if latest is not None:
             binding = _execution_binding(manifest, submission_index=int(latest["submission_index"]))
+            step = scheduler["steps"][(str(latest["job_id"]), str(latest["step_name"]))]  # the ended row checked above
             resources = {
                 "dispatch_key": _record_dispatch_key(latest),
                 "slurm_job_id": str(latest["job_id"]),
-                "slurm_step_id": None,
+                "slurm_step_id": str(step["step_id"]),
                 "submission_index": int(latest["submission_index"]),
                 "allocated_cores": int(binding["submission_config"]["cores_per_case"]),
             }

@@ -36,7 +36,7 @@ Every YAML file starts with a `# Role:` line that says what it controls and when
 
 ## Command-line options
 
-Options override a file for one run without changing it; each is documented with its default in the guide of its workflow. An option that is omitted leaves the config value in force: `--train-dataset` falls back to `data.train_dataset` and `--train-seconds` to `training.b.train_seconds`, and a config that leaves either `null` needs the option (`--train-seconds` only for a transient matched plan). The other overrides of `train` and `optuna` fall back to their config keys in the same way ([Training](../docs/05_training.md)). The resolved run configuration records the values used.
+Options override a file for one run without changing it; each is documented with its default in the guide of its workflow. An option that is omitted leaves the config value in force: `--train-dataset` falls back to `data.train_dataset`, and a config that leaves it `null` needs the option. The other overrides of `train` and `optuna` fall back to their config keys in the same way ([Training](../docs/05_training.md)). The resolved run configuration records the values used.
 
 - Training, Optuna, artifacts and probe (`scripts/slurm_ml.sh <resources> train|optuna|artifacts|probe`, with `--mode`, `--partition`, `--cpus-per-task`, `--mem`, `--time`, `--gres`, all optional): [Training](../docs/05_training.md) and [Setup and execution](../docs/01_setup_and_execution.md#ml-jobs).
 - Generation (`scripts/generation run`): [Generation](../docs/03_generation.md).
@@ -100,7 +100,6 @@ A stage token is the stage prefix plus a suffix, for example `a0smp` or `bws`. A
 | `<stage>rl` | rollout length | `training.<stage>.sampling.rollout_length` | `a0`, `a1` (B: `rollout` below) |
 | `<stage>ws` | window stride | `training.<stage>.sampling.window_stride` | `a0`, `b`, `a1` |
 | `<stage>wo` | window offset | `training.<stage>.sampling.window_offset` | `a0`, `b`, `a1` |
-| `<stage>ts` | training seconds | `training.<stage>.train_seconds` | `a0`, `a1` (B: `budget` below) |
 | `<stage>lrs` | learning-rate scale | `training.<stage>.lr_scale` | `a0` (B and A1: `lr` below) |
 
 </details>
@@ -108,7 +107,7 @@ A stage token is the stage prefix plus a suffix, for example `a0smp` or `bws`. A
 <details>
 <summary><strong>Pair folder</strong></summary>
 
-The B/A1 pair folder below A0 reads `b-a1__budget-<S>s__rollout-<L>__lr-<X>`, for example `b-a1__budget-3655s__rollout-32__lr-1__bsmp-rollout-window__bws-32__bwo-0` (72 bytes). `budget` is B's measured training time `training.b.train_seconds` (or `--train-seconds`), `rollout` B's rollout length `training.b.sampling.rollout_length` (or `--rollout-length`), and `lr` the shared `lr_scale` of B and A1, written `lr-b-<X>__lr-a1-<Y>` when they differ. Then follow the B/A1 tokens the plan file sets:
+The B/A1 pair folder below A0 reads `b-a1__rollout-<L>__lr-<X>`, for example `b-a1__rollout-32__lr-1__bsmp-rollout-window__bws-32__bwo-0` (58 bytes). It names no budget: B's K x N supervised transitions follow from A0's `budget_epochs` K, which the seed group names, and A1's from B's receipt. `rollout` is B's rollout length `training.b.sampling.rollout_length` (or `--rollout-length`), and `lr` the shared `lr_scale` of B and A1, written `lr-b-<X>__lr-a1-<Y>` when they differ. Then follow the B/A1 tokens the plan file sets:
 
 | Token | Meaning | Config key |
 | --- | --- | --- |
@@ -135,7 +134,7 @@ The code holds no default for what a task's `base.yaml` owns: a chain (the exper
 | Objective | `evaluation.objective.id` | the same |
 | Optimizer | `optimizer.kind`, `optimizer.lr`, `optimizer.weight_decay`, `optimizer.betas`, `optimizer.second_moment_floor` | `optimizer.kind`, `optimizer.lr`, `optimizer.weight_decay` |
 | Scheduler | `scheduler.kind` (`cosine`; `reduce_on_plateau` adds `factor` and `patience` and serves only the scheduler comparison; `scheduler: null` is a constant rate) | the same |
-| Training | `training.budget_epochs`, `training.units_per_update`, `training.memory_batch` | matched plan: `training.mode`, `training.units_per_update`, `training.memory_batch`, `training.a0` with `budget_epochs`, `training.b` with `sampling`, `curriculum`, `train_seconds` and `lr_scale` (`null` needs `--train-seconds`), `training.a1` with `match_to` and `lr_scale`; each experiment adds `training.a0.sampling`, which A1 takes, and only B has a curriculum |
+| Training | `training.budget_epochs`, `training.units_per_update`, `training.memory_batch` | matched plan: `training.mode`, `training.units_per_update`, `training.a0` with `budget_epochs` (K, one for every architecture), `training.b` with `sampling`, `curriculum` and `lr_scale`, `training.a1` with `lr_scale`; each experiment adds `training.a0.sampling`, which A1 takes, and `memory_batch` under `a0`, `b` and `a1` (an A0 study only under `a0`, the experiment's value), and only B has a curriculum |
 | Tracking | `tracking.wandb.mode`, `tracking.wandb.workflow` | `tracking.wandb.mode`, `tracking.wandb.workflow`, `tracking.wandb.monitor.enabled`, `tracking.wandb.monitor.max_cases` |
 
 An Optuna study also states `study.seed`, `study.budget_fraction`, a median pruner's start point `study.pruner.n_warmup_steps`, `tracking.wandb.workflow: optuna_trial` in its experiment and, for transient drying, `study.mode: stage_a_only`; each `search_space` entry states `name` and `kind`.
@@ -146,6 +145,6 @@ An Optuna study also states `study.seed`, `study.budget_fraction`, a median prun
 
 | Seed | Where | Value |
 | --- | --- | --- |
-| Generation `seed_base` | `02_datasets/<task>/*.yaml` | 9200 (transient), 9300 (steady); every design seed derives from it, the material and the design kind, so there is no split seed |
+| Generation `seed_base` | `02_datasets/<task>/*.yaml` | 9200 (transient), 9300 (steady); every design seed derives from it, the material and the design kind, so there is no split seed; the transient pilot plan `pilot.yaml` uses 9250, so no pilot case enters a production Dataset |
 | Learning `run.seed` | `03_learning/<task>/base.yaml` | 9; the replicate runs use 9, 19 and 29 through `train --seed N`, which keeps the config name (the W&B group) and the layout parent and lands in `seed-N__ep-E__k-K__sch-S` |
 | Optuna `study.seed` | `03_learning/<task>/optuna/*.yaml` | 9 |

@@ -98,9 +98,17 @@ def training_dataset_payload_factory(
         material_role: str | None = None,
     ) -> dict[str, Any]:
         tokens = tuple(source_tokens or sample_ids)
+        # Coordinates form a uniform grid, so the steady scaling finds the inlet row; every other channel is constant.
+        y_grid, x_grid = torch.meshgrid(torch.linspace(0.0, 1.0, 2, dtype=dtype), torch.linspace(0.0, 1.0, 3, dtype=dtype), indexing="ij")
+        coordinates = {"x": x_grid, "y": y_grid}
         inputs = torch.stack(
             [
-                torch.stack([torch.full((2, 3), float(sample_index + channel), dtype=dtype) for channel in range(steady_task.in_channels)])
+                torch.stack(
+                    [
+                        coordinates.get(name, torch.full((2, 3), float(sample_index + channel), dtype=dtype))
+                        for channel, name in enumerate(steady_task.input_names)
+                    ]
+                )
                 for sample_index, _sample_id in enumerate(sample_ids)
             ]
         )

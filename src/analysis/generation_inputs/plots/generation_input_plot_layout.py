@@ -1,32 +1,28 @@
-"""Define notebook-width map, normalization, and colorbar contracts.
+"""Define the schedule and table figure grids and the field scales and drawing of generation-input maps.
 
 Responsibilities:
-  - Create bounded generation-input map and composite figure grids
-  - Attach every map colorbar directly to its associated map axis
-  - Centralize independent, locked, and signed physical normalization
-  - Record map-to-colorbar bindings for focused geometry verification
+  - Create the bounded generation-input composite figure grid of the schedule figure
+  - Draw one structured-grid field on its shared discrete scale
+  - Centralize independent, locked, and signed physical scales: log-positive principal permeabilities, signed Kxy, and
+    round state bands for every other field
 
 Design principles:
-  - Colorbar geometry follows settled map-axis geometry after canvas drawing
-  - Every map retains its own axes-coupled colorbar
+  - Map geometry, headers and colour bars belong to the shared fixed-inch map grid; this module only fills it
   - Presentation helpers never clip displayed scientific values; fields reach maps only through the shared display
     conversion (relative humidity in %), and labelled in the active label style with one unit rule for axes and colour bars
 
 This module does NOT:
   - Load generation inputs, derive fields, or select cases
-  - Import evaluation internals or use manually positioned colorbar axes
+  - Plan map grids, label colour bars, or import evaluation internals
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
-from weakref import WeakKeyDictionary
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.layout_engine import ConstrainedLayoutEngine
-from mpl_toolkits.axes_grid1 import make_axes_locatable  # type: ignore[import-untyped]
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
 from src.analysis.presentation import analysis_display_grid as display_grid
@@ -38,45 +34,35 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from matplotlib.axes import Axes
-    from matplotlib.cm import ScalarMappable
-    from matplotlib.colorbar import Colorbar
+    from matplotlib.collections import QuadMesh
     from matplotlib.figure import Figure
     from matplotlib.gridspec import GridSpec
 
 
 @dataclass(frozen=True, slots=True)
-class GenerationInputMapLayout:
+class GenerationInputFigureLayout:
     """Define one centrally configured generation-input notebook layout."""
 
-    notebook_width: float = shared_layout.MAP_LAYOUT.maximum_width
-    minimum_width: float = shared_layout.MAP_LAYOUT.column_width
-    map_column_width: float = shared_layout.MAP_LAYOUT.column_width
-    map_row_height: float = shared_layout.MAP_LAYOUT.row_height
-    composite_map_row_height: float = shared_layout.MAP_LAYOUT.row_height
+    notebook_width: float = shared_layout.MAP_MAX_WIDTH_IN
+    column_width: float = 5.8  # one column of a schedule figure; maps size themselves on the shared map grid
     distribution_row_height: float = 2.75
     schedule_row_height: float = 2.75
-    table_row_height: float = 2.2
     horizontal_spacing: float = 0.135
     vertical_spacing: float = 0.11
-    relation_vertical_spacing: float = 0.04
-    relation_height_ratios: tuple[float, float] = (0.78, 0.22)
-    colorbar_width_fraction: float = 0.046
-    colorbar_pad_fraction: float = 0.025
-    outer_right_reserve_inches: float = 0.72
     title_size: float = 15.0
     axis_title_size: float = 12.5
     label_size: float = 11.25
     tick_size: float = 10.0
     legend_size: float = 9.0
-    table_size: float = 9.0
+    table_size: float = 8.0
     line_width: float = 1.4
 
     def figure_width(self, columns: int) -> float:
-        """Return a positive notebook-bounded figure width."""
+        """Return a positive notebook-bounded figure width of ``columns`` schedule or table columns."""
         if columns <= 0:
             message = "Generation-input figures require at least one column."
             raise ValueError(message)
-        return min(self.notebook_width, max(self.minimum_width, self.map_column_width * columns))
+        return min(self.notebook_width, self.column_width * columns)
 
     def figure_height(self, row_heights: Sequence[float]) -> float:
         """Return the central height for one explicit row composition."""
@@ -87,38 +73,10 @@ class GenerationInputMapLayout:
         return float(sum(heights) + self.vertical_spacing * (len(heights) - 1))
 
 
-MAP_LAYOUT: Final = GenerationInputMapLayout()
+FIGURE_LAYOUT: Final = GenerationInputFigureLayout()
 DATASET_A_COLOR: Final = "tab:blue"
 DATASET_B_COLOR: Final = "tab:orange"
 DATASET_MEAN_COLOR: Final = "0.30"
-_COLORBAR_BINDINGS: WeakKeyDictionary[Figure, list[MapColorbarBinding]]
-
-
-@dataclass(frozen=True, slots=True)
-class MapColorbarBinding:
-    """Bind one colorbar axis to its anchor and comparable map axes."""
-
-    colorbar: Colorbar
-    anchor_axis: Axes
-    map_axes: tuple[Axes, ...]
-    label: str
-
-
-_COLORBAR_BINDINGS = WeakKeyDictionary()
-_MAP_SCALES: WeakKeyDictionary[ScalarMappable, field_maps.FieldMapDefinition] = WeakKeyDictionary()
-
-
-def _reserve_outer_colorbar_labels(figure: Figure) -> None:
-    """Reserve a fixed physical right margin for appended colorbar artists."""
-    engine = figure.get_layout_engine()
-    if not isinstance(engine, ConstrainedLayoutEngine):
-        message = "Generation-input figures require constrained layout."
-        raise TypeError(message)
-    right = 1.0 - MAP_LAYOUT.outer_right_reserve_inches / figure.get_figwidth()
-    if not 0.0 < right < 1.0:
-        message = "Generation-input figure width cannot hold the colorbar label reserve."
-        raise ValueError(message)
-    engine.set(rect=(0.0, 0.0, right, 1.0))
 
 
 def figure_grid(
@@ -129,43 +87,21 @@ def figure_grid(
     """Create one constrained notebook-width figure and explicit GridSpec."""
     heights = tuple(float(value) for value in row_heights)
     figure = plt.figure(
-        figsize=(MAP_LAYOUT.figure_width(columns), MAP_LAYOUT.figure_height(heights)),
+        figsize=(FIGURE_LAYOUT.figure_width(columns), FIGURE_LAYOUT.figure_height(heights)),
         layout="constrained",
     )
     grid = figure.add_gridspec(
         len(heights),
         columns,
         height_ratios=heights,
-        wspace=MAP_LAYOUT.horizontal_spacing,
-        hspace=MAP_LAYOUT.vertical_spacing,
+        wspace=FIGURE_LAYOUT.horizontal_spacing,
+        hspace=FIGURE_LAYOUT.vertical_spacing,
     )
     return figure, grid
 
 
-def map_subplots(*, rows: int, columns: int) -> tuple[Figure, np.ndarray]:
-    """Create one all-map grid at the shared notebook-native scale."""
-    if rows <= 0 or columns <= 0:
-        message = "Generation-input map grids require positive dimensions."
-        raise ValueError(message)
-    figure, axes = plt.subplots(
-        rows,
-        columns,
-        figsize=(
-            MAP_LAYOUT.figure_width(columns),
-            MAP_LAYOUT.figure_height((MAP_LAYOUT.map_row_height,) * rows),
-        ),
-        squeeze=False,
-        layout="constrained",
-        gridspec_kw={
-            "wspace": MAP_LAYOUT.horizontal_spacing,
-            "hspace": MAP_LAYOUT.vertical_spacing,
-        },
-    )
-    return figure, axes
-
-
 def signed_norm(*values: np.ndarray) -> field_maps.FieldMapDefinition:
-    """Use the shared zero-centred eleven-interval signed-difference scale."""
+    """Use the shared zero-centred round signed-difference scale."""
     return field_maps.build_field_map(
         np.concatenate(tuple(np.ravel(value) for value in values)),
         semantic=field_maps.FieldMapSemantic.SIGNED_ERROR,
@@ -173,18 +109,22 @@ def signed_norm(*values: np.ndarray) -> field_maps.FieldMapDefinition:
 
 
 def physical_norm(quantity: str, *values: np.ndarray) -> field_maps.FieldMapDefinition:
-    """Build one shared discrete physical scale from complete source arrays."""
-    semantic = field_maps.FieldMapSemantic.LINEAR_POSITIVE
+    """
+    Build one shared discrete physical scale from complete source arrays.
+
+    The principal permeabilities are log-positive and Kxy is signed. Every other field is a state on the round state bands
+    (``field_maps.state_boundaries``), so a near-uniform one is widened. A state's bar, Kxy's included, carries the power of
+    ten of its values' size (``field_maps.state_exponent``), none for values between 10^-3 and 10^4.
+    """
+    combined = np.concatenate(tuple(np.ravel(value) for value in values))
+    semantic, locked = field_maps.FieldMapSemantic.LINEAR_POSITIVE, None
     if quantity == "Kxy":
         semantic = field_maps.FieldMapSemantic.LINEAR_SIGNED
     elif quantity in {"Kxx", "Kyy", "K_min", "K_max"}:
         semantic = field_maps.FieldMapSemantic.LOG_POSITIVE
-    return field_maps.build_field_map(
-        np.concatenate(tuple(np.ravel(value) for value in values)),
-        semantic=semantic,
-        field=quantity,
-        unit=diagnostics.FIELD_UNITS[quantity],
-    )
+    elif np.ptp(combined) > 0.0:  # a constant keeps its truthful one-value scale
+        locked = field_maps.state_boundaries(float(np.min(combined)), float(np.max(combined)))
+    return field_maps.build_field_map(combined, semantic=semantic, field=quantity, unit=diagnostics.FIELD_UNITS[quantity], locked_boundaries=locked)
 
 
 def comparison_norms(
@@ -206,32 +146,23 @@ def comparison_norms(
     return physical_norm(quantity, first), physical_norm(quantity, second)
 
 
-def draw_array_map(
+def draw_field(
     axis: Axes,
-    x_coordinates: np.ndarray,
-    y_coordinates: np.ndarray,
+    record: diagnostics.GenerationInputDiagnostics,
     values: np.ndarray,
+    scale: field_maps.FieldMapDefinition,
     *,
-    title: str,
-    norm: field_maps.FieldMapDefinition,
     display_spatial_stride: display_grid.DisplayStride = "auto",
-) -> ScalarMappable:
-    """Draw one exact structured-grid array without creating a colorbar."""
+) -> QuadMesh:
+    """Draw one exact structured-grid array of ``record`` on ``scale``, sampled for display only."""
     indices = display_grid.display_indices(values.shape, display_spatial_stride)
-    image = axis.pcolormesh(
-        display_grid.display_sample(x_coordinates, indices),
-        display_grid.display_sample(y_coordinates, indices),
+    return axis.pcolormesh(
+        display_grid.display_sample(record.fields["x"], indices),
+        display_grid.display_sample(record.fields["y"], indices),
         display_grid.display_sample(values, indices),
         shading="auto",
-        **norm.pcolormesh_kwargs(),
+        **scale.pcolormesh_kwargs(),
     )
-    _MAP_SCALES[image] = norm
-    axis.set_aspect("equal")
-    axis.set_xlabel("x [m]", fontsize=MAP_LAYOUT.label_size)
-    axis.set_ylabel("y [m]", fontsize=MAP_LAYOUT.label_size)
-    axis.set_title(title, fontsize=MAP_LAYOUT.axis_title_size)
-    axis.tick_params(labelsize=MAP_LAYOUT.tick_size)
-    return image
 
 
 def display_field(record: diagnostics.GenerationInputDiagnostics, quantity: str) -> np.ndarray:
@@ -243,92 +174,6 @@ def display_field(record: diagnostics.GenerationInputDiagnostics, quantity: str)
     return values
 
 
-def draw_map(
-    axis: Axes,
-    record: diagnostics.GenerationInputDiagnostics,
-    quantity: str,
-    *,
-    title: str,
-    norm: field_maps.FieldMapDefinition | None = None,
-    display_spatial_stride: display_grid.DisplayStride = "auto",
-) -> ScalarMappable:
-    """Draw one exact structured-grid field without creating a colorbar."""
-    if quantity not in diagnostics.display_field_names(record):
-        message = f"Unknown generation-input map quantity {quantity!r}."
-        raise ValueError(message)
-    values = display_field(record, quantity)
-    resolved_norm = physical_norm(quantity, values) if norm is None else norm
-    return draw_array_map(
-        axis,
-        record.fields["x"],
-        record.fields["y"],
-        values,
-        title=title,
-        norm=resolved_norm,
-        display_spatial_stride=display_spatial_stride,
-    )
-
-
-def _bindings(figure: Figure) -> list[MapColorbarBinding]:
-    """Return the weakly held colorbar-binding list owned by one figure."""
-    try:
-        return _COLORBAR_BINDINGS[figure]
-    except KeyError:
-        bindings: list[MapColorbarBinding] = []
-        _COLORBAR_BINDINGS[figure] = bindings
-        return bindings
-
-
-def add_map_colorbar(
-    figure: Figure,
-    image: ScalarMappable,
-    anchor_axis: Axes,
-    *,
-    label: str,
-    map_axes: Sequence[Axes] | None = None,
-) -> Colorbar:
-    """Attach one axes-coupled colorbar under the central width/padding contract."""
-    _reserve_outer_colorbar_labels(figure)
-    associated = tuple(map_axes) if map_axes is not None else (anchor_axis,)
-    if not associated or anchor_axis not in associated:
-        message = "A map colorbar binding must include its anchor axis."
-        raise ValueError(message)
-    for comparable_axis in associated:
-        if comparable_axis is anchor_axis:
-            continue
-        spacer_divider = make_axes_locatable(comparable_axis)
-        spacer_axis = spacer_divider.append_axes(
-            "right",
-            size=f"{100.0 * MAP_LAYOUT.colorbar_width_fraction:g}%",
-            pad=f"{100.0 * MAP_LAYOUT.colorbar_pad_fraction:g}%",
-        )
-        spacer_axis.set_axis_off()
-    divider = make_axes_locatable(anchor_axis)
-    colorbar_axis = divider.append_axes(
-        "right",
-        size=f"{100.0 * MAP_LAYOUT.colorbar_width_fraction:g}%",
-        pad=f"{100.0 * MAP_LAYOUT.colorbar_pad_fraction:g}%",
-    )
-    scale = _MAP_SCALES[image]
-    colorbar = figure.colorbar(image, cax=colorbar_axis, **scale.colorbar_kwargs())
-    colorbar.set_label(label, fontsize=MAP_LAYOUT.label_size)
-    colorbar.ax.tick_params(labelsize=MAP_LAYOUT.tick_size)
-    _bindings(figure).append(
-        MapColorbarBinding(
-            colorbar=colorbar,
-            anchor_axis=anchor_axis,
-            map_axes=associated,
-            label=label,
-        )
-    )
-    return colorbar
-
-
-def map_colorbar_bindings(figure: Figure) -> tuple[MapColorbarBinding, ...]:
-    """Return immutable map/colorbar bindings for geometry verification."""
-    return tuple(_bindings(figure))
-
-
 def quantity_label(quantity: str) -> str:
     """Return one quantity's label in the active style; a quantity without a shared symbol keeps its concise name."""
     if field_labels.has_declared_field_metadata(quantity):
@@ -337,41 +182,20 @@ def quantity_label(quantity: str) -> str:
 
 
 def quantity_colorbar_label(quantity: str, *, difference: bool = False) -> str:
-    """Return only the display unit of a map's values or differences, as each map title owns the quantity; one unit rule for axes and bars."""
+    """Return only the display unit of a map's values or differences, as each map header owns the quantity; one unit rule for axes and bars."""
     unit = diagnostics.FIELD_UNITS[quantity]
     return f"[{field_labels.display_unit(unit, field=quantity, quantity_kind='difference' if difference else 'absolute')}]" if unit else ""
 
 
-def quantity_axis_label(quantity: str) -> str:
-    """Return one concise physical quantity and display unit label."""
-    return f"{quantity_label(quantity)} {quantity_colorbar_label(quantity)}".rstrip()
+def quantity_axis_label(quantity: str, exponent: int = 0) -> str:
+    """Return one concise physical quantity and display unit label; a nonzero ``exponent`` is written into the unit bracket as on the colour bars."""
+    unit = quantity_colorbar_label(quantity)
+    if exponent and unit:
+        unit = shared_layout.label_with_exponent(unit, exponent)
+    return f"{quantity_label(quantity)} {unit}".rstrip()
 
 
-def align_axis_to_references(
-    figure: Figure,
-    axis: Axes,
-    vertical_reference: Axes,
-    *,
-    right_reference: Axes | None = None,
-) -> None:
-    """Align one axis vertically and optionally extend it to a settled right edge."""
-
-    def align(_event: object = None) -> None:
-        """Copy settled reference bounds after constrained layout resolves."""
-        position = axis.get_position()
-        vertical = vertical_reference.get_position()
-        right = position.x1 if right_reference is None else right_reference.get_position().x1
-        if right <= position.x0:
-            message = "Aligned generation-input axis requires a positive width."
-            raise ValueError(message)
-        axis.set_position(
-            (
-                position.x0,
-                vertical.y0,
-                right - position.x0,
-                vertical.height,
-            )
-        )
-
-    align()
-    figure.canvas.mpl_connect("draw_event", align)
+def histogram_exponent(*values: np.ndarray) -> int:
+    """Return the power of ten the value axis of a histogram of ``values`` is written in (0 for values between 10^-3 and 10^4)."""
+    combined = np.concatenate(tuple(np.ravel(value) for value in values))
+    return field_maps.state_exponent(float(np.min(combined)), float(np.max(combined)))

@@ -54,8 +54,6 @@ DEFAULT_MAX_CACHED_CASES: Final = 24
 DEFAULT_MAX_CACHED_DATASETS: Final = 2
 CASE_KEY_PARTS: Final = 3
 _CANDIDATE_COLUMNS: Final = ("material_family", "domain_profile", "case_id", "origin", "outcome", "selected", "design_key", "duration_seconds")
-# Leading columns of the campaign outcome table; every sampled parameter of a candidate follows as its own column.
-CAMPAIGN_OUTCOME_COLUMNS: Final = (*_CANDIDATE_COLUMNS, "attempts", "failure_stage", "failure_class", "reason_code", "input_admission")
 
 
 @dataclass(frozen=True, slots=True)
@@ -547,11 +545,6 @@ def campaign_outcome_table(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def campaign_outcome_parameters(table: pd.DataFrame) -> tuple[str, ...]:
-    """Return the sampled-parameter columns of a campaign outcome table in table order."""
-    return tuple(str(column) for column in table.columns if column not in CAMPAIGN_OUTCOME_COLUMNS)
-
-
 def campaign_outcome_rates(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
     """Use all terminal candidates as the rate denominator; keep pending visible."""
     grouped: dict[tuple[str, str, str, str], dict[str, int]] = {}
@@ -595,15 +588,21 @@ def campaign_failure_rates(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def parameter_value(row: Mapping[str, Any], name: str, unit: str) -> float | None:
+    """Return the finite scalar value a candidate recorded for ``name`` in exactly ``unit``, else ``None``."""
+    parameters = row.get("parameters")
+    units = row.get("parameter_units")
+    if not isinstance(parameters, Mapping) or not isinstance(units, Mapping) or units.get(name) != unit:
+        return None
+    value = parameters.get(name)
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value) else None
+
+
 def outcome_parameter_values(rows: Iterable[Mapping[str, Any]], name: str, unit: str) -> dict[str, np.ndarray]:
     """Return actual finite scalar parameters grouped by observed candidate outcome."""
     groups: dict[str, list[float]] = {"successful": [], "failed": [], "pending": []}
     for row in rows:
-        parameters = row.get("parameters")
-        units = row.get("parameter_units")
-        if not isinstance(parameters, Mapping) or not isinstance(units, Mapping) or units.get(name) != unit:
-            continue
-        value = parameters.get(name)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value):
-            groups[str(row["outcome"])].append(float(value))
+        value = parameter_value(row, name, unit)
+        if value is not None:
+            groups[str(row["outcome"])].append(value)
     return {outcome: np.asarray(values, dtype=np.float64) for outcome, values in groups.items()}

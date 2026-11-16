@@ -4,7 +4,8 @@ Responsibilities:
   - Bind Dataset A, Case A, Dataset B, and Case B selectors and navigators to the shared selection
   - Default both datasets together and select the first two unique cases
   - Restrict Dataset B to the simulation profile of Dataset A
-  - Provide a local optional A/B map-scale lock, a dataset-overview selector, atlas field checkboxes, and campaign-outcome filters
+  - Provide a local optional A/B map-scale lock, a dataset-overview selector, atlas field checkboxes, campaign-outcome filters, and the
+    Campaign A/B choice of the paired template comparison
 
 Design principles:
   - Visible labels are concise while values retain canonical immutable keys
@@ -24,16 +25,17 @@ from typing import TYPE_CHECKING, Any, cast
 
 from src.analysis import presentation, ui
 
+from . import generation_input_diagnostics as diagnostics
 from . import generation_input_selection as shared_selection
 from . import generation_input_sources as sources
+from . import generation_input_table_schema as table_schema
+from . import generation_input_template_comparison as template
 from .plots import generation_input_plot_atlas as atlas_plots
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
 
     import ipywidgets as widgets
-
-    from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
 
 type ViewPopover = tuple[widgets.ToggleButton, widgets.DOMWidget]
 
@@ -381,16 +383,22 @@ class CampaignOutcomeControls:
         self.origin = dropdown(
             [("All origins", None), *((name, name) for name in sorted({row["origin"] for row in catalog.rows}))], description="Origin"
         )
-        parameters = sorted(
-            {
-                (name, str(unit))
-                for row in catalog.rows
-                for name, unit in (row.get("parameter_units") or {}).items()
-                if isinstance((row.get("parameters") or {}).get(name), (int, float))
-            }
-        )
-        self.parameter = dropdown(
-            [("No parameter plot", None), *((f"{name} [{unit}]", (name, unit)) for name, unit in parameters)], description="Parameter"
+        parameters = {
+            (name, str(unit))
+            for row in catalog.rows
+            for name, unit in (row.get("parameter_units") or {}).items()
+            if isinstance((row.get("parameters") or {}).get(name), (int, float))
+        }
+        # No parameter is drawn until chosen; the grids follow the table sections of the parameters.
+        self.parameters = ui.selectors.ChoiceBlock(
+            "Parameter",
+            [
+                (section, [(f"{name} [{diagnostics.display_unit(name, unit)}]", (name, unit)) for name, unit in group])
+                for section, group in table_schema.grouped_parameters(parameters).items()
+            ],
+            multiple=True,
+            selected=[],
+            per_line=True,  # the names are long
         )
         # Candidate evidence follows the filters, so its width covers every candidate the catalog can offer.
         self.case = dropdown(self._case_options(), description="Evidence", width_texts=[_candidate_label(row) for row in catalog.rows])
@@ -398,15 +406,19 @@ class CampaignOutcomeControls:
         self.rows = (
             ui.panel.row(self.campaign, self.material),
             ui.panel.row(self.outcome, self.origin),
-            ui.panel.row(self.case, self.parameter),
+            ui.panel.row(self.case, self.parameters.header),
         )
-        self.popovers: tuple[ViewPopover, ...] = ()
+        self.popovers: tuple[ViewPopover, ...] = ((self.parameters.header, self.parameters.body),)
         self._callback: Callable[[], None] | None = None
         self._updating = False
         for widget in (self.campaign, self.material, self.outcome, self.origin):
             widget.observe(self._filter_changed, names="value")
-        for widget in (self.case, self.parameter):
-            widget.observe(self._value_changed, names="value")
+        self.case.observe(self._value_changed, names="value")
+        self.parameters.observe(lambda: self._value_changed({}))
+
+    def chosen_parameters(self) -> tuple[table_schema.Parameter, ...]:
+        """Return the chosen ``(name, unit)`` parameters in table order."""
+        return cast("tuple[table_schema.Parameter, ...]", self.parameters.selected())
 
     def set_callback(self, callback: Callable[[], None]) -> None:
         """Bind one active-view update."""
@@ -432,13 +444,10 @@ class CampaignOutcomeControls:
 
     def _rebind_case(self) -> None:
         """Preserve an exact selected candidate when filtering retains it."""
-        previous = self.case.value
         options = self._case_options()
         self._updating = True
         try:
-            self.case.options = options
-            if previous in {value for _label, value in options}:
-                self.case.value = previous
+            _rebind(self.case, options)
         finally:
             self._updating = False
 
@@ -451,6 +460,62 @@ class CampaignOutcomeControls:
         """Refresh a selected evidence record or optional parameter plot."""
         if not self._updating and self._callback is not None:
             self._callback()
+
+
+class TemplateComparisonControls:
+    """Choose Campaign A and a Campaign B of its task that shares designs with it."""
+
+    def __init__(self, catalog: sources.CampaignOutcomeCatalog, partners: Mapping[template.Campaign, tuple[template.Campaign, ...]]) -> None:
+        """Offer the campaigns of ``partners``, the result of ``comparable_campaigns``; Campaign B starts on the first partner of A."""
+        self.catalog = catalog
+        self._partners = partners
+        self._labels = {campaign: f"{campaign[0]}/{campaign[1]}" for campaign in self._partners}
+        texts = list(self._labels.values())
+        self.campaign_a = ui.controls.dropdown([(label, campaign) for campaign, label in self._labels.items()], description="Campaign A")
+        self.campaign_b = ui.controls.dropdown(self._b_options(), description="Campaign B", width_texts=texts)
+        self.status = ui.controls.StatusLine()
+        self.rows = (ui.panel.row(self.campaign_a, self.campaign_b),)
+        self.popovers: tuple[ViewPopover, ...] = ()
+        self._callback: Callable[[], None] | None = None
+        self._updating = False
+        self.campaign_a.observe(self._a_changed, names="value")
+        self.campaign_b.observe(self._notify, names="value")
+
+    def set_callback(self, callback: Callable[[], None]) -> None:
+        """Bind one active-view update."""
+        self._callback = callback
+
+    def comparison(self) -> template.TemplateComparison:
+        """Pair the selected campaigns over their quantities."""
+        campaign_a, campaign_b = (cast("template.Campaign", widget.value) for widget in (self.campaign_a, self.campaign_b))
+        return template.compare_templates(self.catalog.rows, campaign_a, campaign_b, quantities=template.QUANTITIES)
+
+    def _b_options(self) -> list[tuple[str, template.Campaign]]:
+        """Return the partners of the selected Campaign A."""
+        return [(self._labels[campaign], campaign) for campaign in self._partners[cast("template.Campaign", self.campaign_a.value)]]
+
+    def _a_changed(self, _change: dict[str, Any]) -> None:
+        """Offer the partners of the new Campaign A, keep Campaign B when it is one of them, then update once."""
+        options = self._b_options()
+        self._updating = True
+        try:
+            _rebind(self.campaign_b, options)
+        finally:
+            self._updating = False
+        self._notify({})
+
+    def _notify(self, _change: dict[str, Any]) -> None:
+        """Update the active view after a selection."""
+        if not self._updating and self._callback is not None:
+            self._callback()
+
+
+def _rebind(dropdown: widgets.Dropdown, options: list[tuple[str, Any]]) -> None:
+    """Replace the options of ``dropdown``; its value stays when it is still offered, else it moves to the first option."""
+    previous = dropdown.value
+    dropdown.options = options
+    if previous in {value for _label, value in options}:
+        dropdown.value = previous
 
 
 def _candidate_label(row: dict[str, Any]) -> str:

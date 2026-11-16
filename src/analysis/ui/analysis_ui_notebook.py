@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import IO, Any
 
 import ipywidgets as widgets
-import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
@@ -179,22 +178,6 @@ def export_pdf(status: ui_controls.StatusLine, export_state: dict[str, Any] | No
     write_export(status, stem=_export_stem(export_state), suffix=".pdf", write=partial(_write_pdf, figures=figures))
 
 
-def _result_items(result: Any) -> tuple[Any, ...]:
-    """Return what a view result shows: a list stacks its items in order, ``None`` shows nothing (also inside a list), anything else is one item."""
-    return tuple(item for item in (result if isinstance(result, list) else (result,)) if item is not None)
-
-
-def _show_result(slot: panel.PlotSlot, result: Any) -> None:
-    """Show ``result`` in ``slot`` (a list stacks its items, ``None`` empties it); every figure is closed once it is encoded."""
-    items = _result_items(result)
-    try:
-        slot.show(items)
-    finally:
-        for item in items:
-            if isinstance(item, Figure):
-                plt.close(item)
-
-
 def _invoke_dropdown_entry(
     plot_func: Callable[..., Any],
     *,
@@ -216,16 +199,15 @@ def _invoke_dropdown_entry(
 
 
 def make_toggle_shortcut(
-    dfs: dict[str, pd.DataFrame] | list[pd.DataFrame],
+    dfs: dict[str, pd.DataFrame],
 ) -> Callable:
     """
     Create a dropdown-entry factory that injects labelled datasets into viewers.
 
     Parameters
     ----------
-    dfs : dict[str, pandas.DataFrame] | list[pandas.DataFrame]
-        Dataset mapping, or an ordered list assigned stable ``df0``, ``df1``, ...
-        labels within this factory.
+    dfs : dict[str, pandas.DataFrame]
+        Labelled datasets injected as ``datasets`` into targets that declare it.
 
     Returns
     -------
@@ -243,9 +225,6 @@ def make_toggle_shortcut(
     """
     counter = {"i": 0}
 
-    # normalize dfs to dict[str, DataFrame]
-    dataset_map = dfs if isinstance(dfs, dict) else {f"df{i}": df for i, df in enumerate(dfs)}
-
     def toggle(title: str, func: Callable[..., Any], plot_name: str | None = None, **kwargs: Any) -> tuple[str, Callable[..., Any], str]:
         """Bind one target callable and panel-local export identity lazily."""
         if plot_name is None:
@@ -257,7 +236,7 @@ def make_toggle_shortcut(
         parameters = signature(func).parameters
         bound_kwargs = dict(kwargs)
         if "datasets" in parameters:
-            bound_kwargs.setdefault("datasets", dataset_map)
+            bound_kwargs.setdefault("datasets", dfs)
 
         def invoke(
             *,
@@ -354,7 +333,6 @@ class ViewSection(widgets.VBox):
         self.entries = resolved
         self.export_state = export_state
         self.selector = selector
-        self._slot = slot
         self._plain = plain
         self._body = body
         self._current = plain
@@ -452,18 +430,11 @@ class ViewSection(widgets.VBox):
             self._show(self._plain)
             viewers.fail_view(self._plain, error, export_state=state, export_plot_name=plot_name, export_title=title)
             return
-        primary = result[0] if isinstance(result, tuple) and result else result
-        if isinstance(primary, panel.ViewPanel):
-            self._show(primary)
+        if isinstance(result, panel.ViewPanel):
+            self._show(result)
             return
         self._show(self._plain)
-        figures = tuple(item for item in _result_items(primary) if isinstance(item, Figure))
-        if figures and state is not None:
-            state.update(fig=figures[0], figures=figures)
-        try:
-            _show_result(self._slot, primary)
-        except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
-            viewers.fail_view(self._plain, error, export_state=state, export_plot_name=plot_name, export_title=title)
+        viewers.show_result(self._plain, result, export_state=state, export_plot_name=plot_name, export_title=title)
 
 
 def view_section(entries: Sequence[tuple[str, Callable[..., Any], str]], *, export_state: dict[str, Any] | None) -> ViewSection:
@@ -505,7 +476,7 @@ class LazyPanel:
         self.export_button = ui_controls.action_button("Export PDF", kind="export")
         self.tabs = panel.tabs(titles, current, width_ch=panel.tab_width_ch(titles))
         rows = [panel.row(self.close_button, self.export_button), *controls]
-        content = widgets.VBox((panel.control_rows(rows), *panel.popover_bodies(rows, popovers), self.tabs))
+        content = panel.popover_overlay(widgets.VBox((panel.control_rows(rows), self.tabs)), rows, popovers)
         content.add_class(style.ROOT_CLASS)
         content.add_class("glp-panel")
         carrier = style.stylesheet_widget()

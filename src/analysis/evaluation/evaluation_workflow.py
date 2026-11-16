@@ -2,11 +2,12 @@
 
 Responsibilities:
   - Normalize explicit current run paths and optional presentation labels
-  - Invoke shared artifact load-or-build orchestration for selected roles
+  - Load the selected roles read-only; a missing or incompatible role is refused with its exact artifact command
   - Admit each requested role on its own and report every refused role with its reason
   - Compose session-owned role contexts for single-run or comparison panels
   - Admit a matched B or A1 without an eligible checkpoint into the A0/A1/B comparison from its finished run
   - Return concise lifecycle, checkpoint, artifact, and device reporting
+  - Give the transient panel a lazy loader of each loaded stage's training history, read only when its view opens
 
 Design principles:
   - Notebook cells expose choices while reusable orchestration remains in source
@@ -16,8 +17,9 @@ Design principles:
   - Failed preparation closes any session created before the failure
 
 This module does NOT:
-  - Admit runs, reconstruct models, generate payloads, or publish artifacts itself
-  - Choose datasets, roles, labels, sections, devices, or rebuild policy for users
+  - Admit runs, reconstruct models, generate or rebuild payloads, or publish artifacts; held-out roles are evaluated
+    only by the explicit artifact call
+  - Choose datasets, roles, labels, sections, or devices for users
   - Contact tracking services or mutate run lifecycle evidence
 """
 
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
     from src.analysis.artifacts.analysis_artifact_service import PreparedRunArtifacts
     from src.analysis.evaluation.evaluation_artifact_loader import LoadedEvaluationArtifact, LoadedRunArtifacts
     from src.analysis.evaluation.evaluation_panel import EvaluationContext
+    from src.analysis.evaluation.evaluation_run_discovery import StageHistory, UnavailableHistory
     from src.analysis.evaluation.evaluation_selection import EvaluationProtocol, EvaluationSelectionState
     from src.analysis.evaluation.evaluation_session import EvaluationSession
     from src.analysis.evaluation.evaluation_transient_comparison import LineageComparison
@@ -288,8 +291,8 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
         raise ValueError(msg)
     expected_controller = {
         "A0": ("A0", "stage_a_teacher_forcing", "units"),
-        "A1": ("A1", "stage_a_teacher_forcing", "train_seconds"),
-        "B": ("B", "stage_b_self_fed", "train_seconds"),
+        "A1": ("A1", "stage_a_teacher_forcing", "supervised_transitions"),
+        "B": ("B", "stage_b_self_fed", "supervised_transitions"),
     }[arm]
     observed_controller = (
         controller.get("arm"),
@@ -336,8 +339,10 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
             msg = "Matched B/A1 receipt contradicts the common A0 parent experiment."
             raise ValueError(msg)
         planned, actual = total, spent
-        if (arm == "B" and (actual != receipt["budget_value"] or loaded.selected_checkpoint_sha256 != receipt["best_checkpoint_sha256"])) or (
-            arm == "A1" and (planned != receipt["budget_value"] or controller.get("matched_receipt_sha256") != receipt["receipt_sha256"])
+        if (
+            arm == "B" and (actual != receipt["supervised_transitions"] or loaded.selected_checkpoint_sha256 != receipt["best_checkpoint_sha256"])
+        ) or (
+            arm == "A1" and (planned != receipt["supervised_transitions"] or controller.get("matched_receipt_sha256") != receipt["receipt_sha256"])
         ):
             msg = f"{arm} committed budget contradicts the immutable B receipt."
             raise ValueError(msg)
@@ -569,6 +574,26 @@ def _lazy_transient_performance(
     return load
 
 
+def _lazy_transient_histories(
+    *, loaded_runs: Sequence[LoadedRunArtifacts], display_labels: Sequence[str]
+) -> Callable[[], Mapping[str, StageHistory | UnavailableHistory]]:
+    """
+    Return a loader of every loaded stage's training history by display label, which opens no run before it is called.
+
+    Nothing is kept: every call reads each stage again under its run lease, bound to the selected checkpoint digest the loaded
+    artifact records, so a replaced run raises ``RuntimeError`` instead of showing an old or foreign history. A transient stage
+    whose history is missing or refused fails the run's admission with ``RunLifecycleError``; the loader lets that through.
+    """
+
+    def load() -> Mapping[str, StageHistory | UnavailableHistory]:
+        return {
+            label: analysis.evaluation.run_discovery.stage_history(loaded.run_dir, expected_checkpoint_sha256=loaded.selected_checkpoint_sha256)
+            for label, loaded in zip(display_labels, loaded_runs, strict=True)
+        }
+
+    return load
+
+
 def _report_row(
     prepared: PreparedRunArtifacts,
     *,
@@ -589,7 +614,6 @@ def _report_row(
         "artifact_roles": list(artifact_roles),
         "artifact_roots": {role: str(artifact.root) for role, artifact in artifacts.items()},
         "artifact_actions": dict(prepared.role_actions),
-        "artifact_device": prepared.artifact_device,
     }
 
 
@@ -684,10 +708,6 @@ def prepare_evaluation_workflow(
     context_specs: Sequence[EvaluationContextSpec],
     *,
     artifact_roles: tuple[ArtifactSelectionRole, ...] | None = None,
-    dataset_root: Path | str | None = None,
-    auto_build_missing: bool = True,
-    rebuild_incompatible: bool = False,
-    device_policy: str = "cpu",
     evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
@@ -697,10 +717,10 @@ def prepare_evaluation_workflow(
     """
     Prepare one steady or transient Evaluation workflow through task-owned sessions.
 
-    Each requested role is admitted on its own: a refused role does not fail the others, it is reported in
-    ``refused_roles`` with its reason, and the session holds only admitted roles. ``refused_roles`` given by the caller
-    names roles it refused before loading; they are carried into the result and the panel unchanged. ``widths`` is the
-    notebook's width scope.
+    The workflow only reads published artifacts and never builds one. Each requested role is admitted on its own:
+    a refused role does not fail the others, it is reported in ``refused_roles`` with its reason, and the session
+    holds only admitted roles. ``refused_roles`` given by the caller names roles it refused before loading; they are
+    carried into the result and the panel unchanged. ``widths`` is the notebook's width scope.
     """
     requested_device = (
         evaluation_compute_device.requested if isinstance(evaluation_compute_device, compute.AnalysisComputePreference) else evaluation_compute_device
@@ -715,14 +735,10 @@ def prepare_evaluation_workflow(
         raise ValueError(msg)
     requested_roles = None if artifact_roles is None else tuple(artifact_roles)
     prepared_runs = tuple(
-        analysis.artifacts.service.load_or_build_run_artifacts(
+        analysis.artifacts.service.load_prepared_run_artifacts(
             path,
             artifact_roles=requested_roles,
             artifact_root_overrides=selection.artifact_roots,
-            dataset_root=dataset_root,
-            auto_build_missing=auto_build_missing,
-            rebuild_incompatible=rebuild_incompatible,
-            device_policy=device_policy,
         )
         for selection, path in normalized_selections
     )
@@ -842,6 +858,7 @@ def prepare_evaluation_workflow(
                 comparison=len(loaded_runs) > 1,
                 training_performance=transient_performance_loader,
                 training_lineage=lineage,
+                training_histories=_lazy_transient_histories(loaded_runs=loaded_runs, display_labels=display_labels),
                 matched_stage_unavailable_reason=matched_stage_unavailable_reason,
                 selection_state=selection_state,
                 evaluation_compute_device=evaluation_compute_device,
@@ -941,10 +958,6 @@ def prepare_single_model_evaluation_workspace(
     expected_task: str = "transient_drying",
     artifact_roles: tuple[ArtifactSelectionRole, ...] | None = None,
     artifact_roots: Mapping[ArtifactSelectionRole, Path | str] | None = None,
-    dataset_root: Path | str | None = None,
-    auto_build_missing: bool = True,
-    rebuild_incompatible: bool = False,
-    device_policy: str = "cpu",
     evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
@@ -962,10 +975,6 @@ def prepare_single_model_evaluation_workspace(
         ),
         _default_context_specs(),
         artifact_roles=artifact_roles,
-        dataset_root=dataset_root,
-        auto_build_missing=auto_build_missing,
-        rebuild_incompatible=rebuild_incompatible,
-        device_policy=device_policy,
         evaluation_compute_device=evaluation_compute_device,
         sections=sections,
         selection_state=selection_state,
@@ -980,10 +989,6 @@ def prepare_model_comparison_evaluation_workspace(
     labels: Sequence[str | None] | None = None,
     expected_task: str = "transient_drying",
     artifact_roles: tuple[ArtifactSelectionRole, ...] | None = None,
-    dataset_root: Path | str | None = None,
-    auto_build_missing: bool = True,
-    rebuild_incompatible: bool = False,
-    device_policy: str = "cpu",
     evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
@@ -1007,10 +1012,6 @@ def prepare_model_comparison_evaluation_workspace(
         selections,
         _default_context_specs(),
         artifact_roles=artifact_roles,
-        dataset_root=dataset_root,
-        auto_build_missing=auto_build_missing,
-        rebuild_incompatible=rebuild_incompatible,
-        device_policy=device_policy,
         evaluation_compute_device=evaluation_compute_device,
         sections=sections,
         selection_state=selection_state,

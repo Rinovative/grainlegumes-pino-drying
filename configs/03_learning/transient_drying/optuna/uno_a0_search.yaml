@@ -2,7 +2,7 @@
 # Tunes the teacher-forced A0 of the matched plan alone, without B's budget; copy the selected values into the matched experiment config under experiments/architecture_comparison/.
 
 study:
-  n_trials: 24  # Maximum number of trials requested for the study.
+  n_trials: 24  # Total trial allocation of the study, its configured base first; a rerun runs only the trials left.
   mode: stage_a_only  # Transient protocol searched by this study: the plan's A0 alone.
   role: production  # Study role used by the experiment workflow.
   seed: 9  # Seed controlling Optuna sampling/pruning randomness.
@@ -18,11 +18,16 @@ study:
     interval_steps: 1  # Validation-point interval between pruning checks.
 
 # One entry per searched config path: name (Optuna parameter name), kind (categorical or float) and its values or low, high and log (default false).
-# Modes and widths are the union of both tasks' U-NO studies, not yet filtered by the GPU probe.
+# Admission rule (decided 13.11., before the HPO): every corner of this space must train within 2x the cost per supervised transition
+# of the configured experiment (experiments/architecture_comparison/uno_*) and fit B with one unit at horizon 32 on the longest
+# Train trajectory, with warm Adam state and validation, in at most 85 % of the usable GPU memory, checked per depth (n_layers
+# changes the resolution path); the axes are cut until the corners pass.
+# Cut by the GPU probes (169 D3; jobs 882530 on the A6000 and 882592 on the Ada): 64 channels need 91-92 % in B at both depths
+# with any other axis at its top; with 32 channels every corner passes (55-60 %, at most 1.05x).
 search_space:
   model.params.modes_x: {name: modes_x, kind: categorical, values: [32, 48, 64]}
   model.params.modes_y: {name: modes_y, kind: categorical, values: [32, 48, 64]}  # A 5-layer U-NO admits at most 126 Y modes on the full 251 x 401 grid.
-  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [16, 32, 64]}
+  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [16, 32]}
   model.params.n_layers: {name: n_layers, kind: categorical, values: [5, 7]}  # U-NO supports exactly 5 or 7 layers.
   model.params.mode_ratio: {name: mode_ratio, kind: float, low: 0.4, high: 0.6}
   optimizer.lr: {name: lr, kind: float, low: 1.0e-4, high: 1.0e-2, log: true}
@@ -33,7 +38,7 @@ experiment:
     kind: uno  # Architecture family; its params below are interpreted by that family.
     params:
       modes_x: 64  # Search base value: Fourier modes along the x axis.
-      modes_y: 48  # Search base value: Fourier modes along the y axis.
+      modes_y: 64  # Search base value: Fourier modes along the y axis.
       hidden_channels: 32  # Search base value: width of the hidden feature representation.
       n_layers: 7  # Search base value: number of U-NO layers; uno_scalings stays unset so each depth uses its default [y, x] scaling schedule.
       mode_ratio: 0.4951318201313778  # Search base value: fraction controlling the intermediate Fourier-mode allocation.
@@ -41,6 +46,7 @@ experiment:
     lr: 5.319714363424885e-4  # Search base value: initial learning rate.
   training:
     a0:
+      memory_batch: 16  # The matched experiment's A0 memory batch; it changes only floating-point rounding.
       sampling:
         mode: one_step_transition  # Teacher-forced single-transition training examples.
   run:

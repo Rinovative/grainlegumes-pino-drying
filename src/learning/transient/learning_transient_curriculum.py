@@ -8,7 +8,7 @@ Responsibilities:
   - Admit a completed stage's terminal controller and curriculum values against its final history record
 
 Design principles:
-  - Curriculum progress is the stage budget fraction committed before an update group
+  - Curriculum progress is the stage budget fraction committed before an update group, in B its supervised transitions
   - Shorter horizons retain positive probability after later milestones
   - Completed groups retain transition accounting; their time is only on the stage budget's optimisation clock
 
@@ -114,7 +114,7 @@ def _validate_controller_state(state: Mapping[str, Any]) -> None:
     if state["arm"] == "A1":
         _sha256(state["matched_receipt_sha256"], label="matched_receipt_sha256")
     elif state["matched_receipt_sha256"] is not None:
-        msg = "Only A1 trains for a B receipt's seconds."
+        msg = "Only A1 trains for a B receipt's supervised transitions."
         raise ValueError(msg)
 
 

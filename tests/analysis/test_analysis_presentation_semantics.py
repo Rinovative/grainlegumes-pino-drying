@@ -1,7 +1,7 @@
 """Protect shared field labels, unit conversions, and visual normalization contracts.
 
 Responsibilities:
-  - Check label uniqueness, field ordering, dataset colors, statistic visibility, and display units
+  - Check label uniqueness, field ordering, statistic visibility, and display units
 
 Design principles:
   - Display conversion preserves authoritative arrays and explicit experiment roles
@@ -111,27 +111,10 @@ def test_channel_order_and_mixed_dataset_intersection_are_semantic() -> None:
     ) == ("Kxx", "p", "U", "X_0_db_field", "T", "w_int", "quality")
 
 
-def test_visual_semantics_and_dataset_colors_are_deterministic() -> None:
+def test_field_visual_semantics_follow_the_field_role() -> None:
     assert visual_semantics.field_visual_semantics("u").centered is True
     assert visual_semantics.field_visual_semantics("error", role="absolute_error").colormap == "Reds"
     assert visual_semantics.field_visual_semantics("error", role="signed_error").centered is True
-
-    first = visual_semantics.DatasetVisualIdentity("identity-a", "Lentil · Natural")
-    second = visual_semantics.DatasetVisualIdentity("identity-b", "Lentil · Natural")
-    forward = visual_semantics.dataset_colors((first, second))
-    reverse = visual_semantics.dataset_colors((second, first))
-
-    assert forward == reverse
-    assert set(forward) == {"identity-a", "identity-b"}
-    assert forward["identity-a"] != forward["identity-b"]
-
-
-def test_duplicate_canonical_dataset_identity_is_rejected() -> None:
-    first = visual_semantics.DatasetVisualIdentity("identity-a", "One")
-    second = visual_semantics.DatasetVisualIdentity("identity-a", "Two")
-
-    with pytest.raises(ValueError, match="unique canonical identities"):
-        visual_semantics.dataset_colors((first, second))
 
 
 def _cielab(color: str) -> np.ndarray:
@@ -158,14 +141,37 @@ def test_fixed_palettes_are_distinct_and_pooled_role_colors_stand_apart_from_eve
         assert min(float(np.linalg.norm(lab - _cielab(material))) for material in visual_semantics.MATERIAL_COLORS.values()) >= 39.0
 
 
+def test_architecture_shades_step_plain_networks_darker_pi_lighter_and_stay_apart_from_every_other_color() -> None:
+    limit = visual_semantics.SHADE_LIMIT
+    for spec in visual_semantics.ARCHITECTURES:
+        assert visual_semantics.architecture_shade(spec.family, 0, limit) == spec.color  # the first run keeps the hue
+        lightness = [_cielab(visual_semantics.architecture_shade(spec.family, index, limit))[0] for index in range(limit)]
+        assert lightness == sorted(lightness, reverse=not spec.family.startswith("pi-"))
+    colors = [visual_semantics.architecture_shade(spec.family, index, limit) for spec in visual_semantics.ARCHITECTURES for index in range(limit)]
+    for position, first in enumerate(colors):
+        for second in colors[position + 1 :]:
+            assert float(np.linalg.norm(_cielab(first) - _cielab(second))) >= 15.0
+    for color in colors:
+        assert float(np.linalg.norm(_cielab(color) - _cielab("#FFFFFF"))) >= 25.0  # visible on the white background
+    for index, count in ((limit, limit), (0, limit + 1)):
+        with pytest.raises(ValueError, match=r"outside|at most"):
+            visual_semantics.architecture_shade("fno", index, count)
+
+
 def test_series_style_takes_the_color_from_the_architecture_else_the_material_else_the_pooled_role() -> None:
     style = visual_semantics.series_style
 
-    assert style(architecture="uno", material="chickpea", role="parameter_ood") == visual_semantics.SeriesStyle("#D55E00", "--", "s")
-    assert style(material="kidney_bean", role="material_ood") == visual_semantics.SeriesStyle("#009E73", ":", None)
+    assert style(architecture="uno", material="chickpea", role="parameter_ood") == visual_semantics.SeriesStyle("#D55E00", "--", "s", "//")
+    assert style(material="kidney_bean", role="material_ood") == visual_semantics.SeriesStyle("#009E73", ":", None, "..")
     assert style(role="id", pooled=True) == visual_semantics.SeriesStyle(visual_semantics.ROLE_COLORS["id"], "-", None)
     assert style(architecture="fno", role="id", pooled=True).color == visual_semantics.architecture_color("fno")
     assert style(material="lentil").linestyle == "-"
+    assert style(material="lentil").hatch == ""
+
+
+def test_the_role_is_the_hatch_of_bars_and_the_hatches_differ() -> None:
+    assert set(visual_semantics.ROLE_HATCHES) == set(visual_semantics.ROLE_LINESTYLES)
+    assert len(set(visual_semantics.ROLE_HATCHES.values())) == len(visual_semantics.ROLE_HATCHES)
 
 
 @pytest.mark.parametrize(

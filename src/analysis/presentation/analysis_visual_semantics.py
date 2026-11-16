@@ -1,16 +1,17 @@
-"""Define shared semantic colormaps, dataset colors, and one fixed series style per entity for analysis views.
+"""Define shared semantic colormaps and one fixed series style per entity for analysis views.
 
 Responsibilities:
   - Resolve a field's semantic colormap and centered-scale requirement
   - Keep plot normalization separate from semantic color selection
-  - Describe dataset identities used for deterministic presentation colors
-  - Assign colorblind-friendly colors independently of selected dataset order
-  - Fix one color per material and per architecture, one line style per evaluation role, and one marker per material
-  - Resolve the color, line style, and marker of one plotted series from its architecture, material, and role
+  - Fix one color per material and per architecture, one line style (``LineStyle``) and one bar hatch per evaluation role, and one
+    marker per material
+  - Step the color of several runs of one architecture into shades (``architecture_shade``): plain networks darker, physics-informed
+    ones lighter, at most ``SHADE_LIMIT`` apart
+  - Resolve the color, line style, hatch, and marker of one plotted series from its architecture, material, and role
 
 Design principles:
   - Explicit semantic roles take precedence over field-name inference
-  - Canonical identities provide stable color assignment across EDA and evaluation
+  - Fixed identities provide stable color assignment across EDA and evaluation, independent of selection order
   - Colormap selection communicates field semantics rather than plot ownership
   - Color encodes the architecture where architectures are compared, else the material, else the pooled role, never several at once
   - A pooled role color is chosen far from every material color and is not grey, so it reads as a different entity
@@ -24,13 +25,14 @@ This module does NOT:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Mapping
 
+# The Matplotlib line styles a series may take; a subset of Matplotlib's own style type, so plot calls accept it unchanged.
+LineStyle = Literal["-", "--", ":", "-."]
 FieldSemanticRole = Literal[
     "temperature",
     "humidity",
@@ -43,17 +45,6 @@ FieldSemanticRole = Literal[
     "absolute_error",
 ]
 
-_DATASET_COLOR_PALETTE = (
-    "#0072B2",
-    "#E69F00",
-    "#009E73",
-    "#CC79A7",
-    "#56B4E9",
-    "#D55E00",
-    "#F0E442",
-    "#000000",
-)
-
 
 @dataclass(frozen=True, slots=True)
 class FieldVisualSemantics:
@@ -61,19 +52,6 @@ class FieldVisualSemantics:
 
     colormap: str
     centered: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class DatasetVisualIdentity:
-    """Hold the identity and current concise label for one dataset color."""
-
-    canonical_identity: str
-    label: str
-
-    def __post_init__(self) -> None:
-        """Require separately preserved identity and non-empty presentation text."""
-        _require_text(self.canonical_identity, label="canonical_identity")
-        _require_text(self.label, label="label")
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,11 +65,12 @@ class ArchitectureSpec:
 
 @dataclass(frozen=True, slots=True)
 class SeriesStyle:
-    """Hold the Matplotlib color, line style, and optional marker of one plotted series."""
+    """Hold the Matplotlib color, line style, optional marker, and bar hatch of one plotted series."""
 
     color: str
-    linestyle: str
+    linestyle: LineStyle
     marker: str | None
+    hatch: str = ""
 
 
 # Architectures in run-selector order; a physics-informed variant takes a lighter sibling of its network's hue.
@@ -115,13 +94,33 @@ MATERIAL_COLORS: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 # Line style is the evaluation role in both color modes, so the material marker carries the material next to an architecture color.
-ROLE_LINESTYLES: Final[Mapping[str, str]] = MappingProxyType({"id": "-", "parameter_ood": "--", "material_ood": ":"})
+ROLE_LINESTYLES: Final[Mapping[str, LineStyle]] = MappingProxyType({"id": "-", "parameter_ood": "--", "material_ood": ":"})
 # Pooled role colors keep a CIELAB distance of at least 39 to every material color and a chroma well above grey.
 ROLE_COLORS: Final[Mapping[str, str]] = MappingProxyType({"id": "#5E3C99", "parameter_ood": "#7A7A00", "material_ood": "#9E0142"})
+# The bar analogue of the line style: bars of one role share its hatch.
+ROLE_HATCHES: Final[Mapping[str, str]] = MappingProxyType({"id": "", "parameter_ood": "//", "material_ood": ".."})
 MATERIAL_MARKERS: Final[Mapping[str, str]] = MappingProxyType(
     {"lentil": "o", "chickpea": "s", "kidney_bean": "^", "field_pea": "D", "rapeseed": "v", "sunflower_seed": "P"}
 )
-_DEFAULT_LINESTYLE: Final = "-"
+_DEFAULT_LINESTYLE: Final[LineStyle] = "-"
+# Runs of one architecture that stay at least CIELAB 15 apart from every other shade and 25 from white; a third PI shade would
+# either sit under 15 from its neighbour or fade into the background, so more runs switch the figure to run colors.
+SHADE_LIMIT: Final = 2
+# One qualitative color per run once an architecture has more runs than ``SHADE_LIMIT`` (Matplotlib's tab10, spelled out).
+RUN_COLORS: Final = (
+    "#1F77B4",
+    "#FF7F0E",
+    "#2CA02C",
+    "#D62728",
+    "#9467BD",
+    "#8C564B",
+    "#E377C2",
+    "#7F7F7F",
+    "#BCBD22",
+    "#17BECF",
+)
+_DARKEN_STEP: Final = 0.3  # share of the way to black per run of a plain network
+_LIGHTEN_STEP: Final = 0.4  # share of the way to white per run of a physics-informed network
 
 
 def field_visual_semantics(
@@ -162,50 +161,6 @@ def field_visual_semantics(
     return _ROLE_SEMANTICS[resolved_role]
 
 
-def dataset_colors(datasets: Iterable[DatasetVisualIdentity]) -> dict[str, str]:
-    """
-    Assign deterministic colorblind-friendly colors keyed by canonical identity.
-
-    Parameters
-    ----------
-    datasets : Iterable[DatasetVisualIdentity]
-        Dataset identities and current labels. Input order does not affect output.
-
-    Returns
-    -------
-    dict[str, str]
-        Canonical-identity to hexadecimal color mapping.
-
-    Raises
-    ------
-    TypeError
-        If an input is not DatasetVisualIdentity.
-    ValueError
-        If canonical identities repeat.
-
-    """
-    resolved = tuple(datasets)
-    if any(not isinstance(dataset, DatasetVisualIdentity) for dataset in resolved):
-        message = "datasets must contain only DatasetVisualIdentity instances."
-        raise TypeError(message)
-    identities = tuple(dataset.canonical_identity for dataset in resolved)
-    if len(identities) != len(set(identities)):
-        message = "Dataset visual identities must have unique canonical identities."
-        raise ValueError(message)
-    ranked = tuple(sorted(resolved, key=_dataset_rank))
-    assigned: dict[str, str] = {}
-    occupied: set[int] = set()
-    palette_size = len(_DATASET_COLOR_PALETTE)
-    for dataset in ranked:
-        preferred = _stable_palette_index(dataset, palette_size)
-        index = preferred
-        while index in occupied and len(occupied) < palette_size:
-            index = (index + 1) % palette_size
-        occupied.add(index)
-        assigned[dataset.canonical_identity] = _DATASET_COLOR_PALETTE[index]
-    return assigned
-
-
 def material_color(material: str) -> str:
     """Return the fixed color of one registered material; unknown materials raise ``ValueError``."""
     return _lookup(MATERIAL_COLORS, material, kind="material")
@@ -214,6 +169,28 @@ def material_color(material: str) -> str:
 def architecture_color(family: str) -> str:
     """Return the fixed color of one model family (``fno``, ``uno``, ``rno``, ``pi-fno``, ``pi-uno``)."""
     return _architecture(family).color
+
+
+def architecture_shade(family: str, index: int, count: int) -> str:
+    """
+    Return the color of run ``index`` of ``count`` runs of one architecture: run 0 keeps its hue, later runs step away from it.
+
+    A plain network steps darker and its physics-informed sibling (``pi-`` family) lighter, so the two shade sets never meet; every
+    shade of every architecture keeps a CIELAB distance of at least 15 from the others and 25 from white. The shade of a run does not depend on
+    ``count``. ``count`` above ``SHADE_LIMIT`` or an ``index`` outside ``count`` raises ``ValueError``.
+    """
+    if not 0 <= index < count:
+        message = f"Run index {index} is outside {count} runs."
+        raise ValueError(message)
+    if count > SHADE_LIMIT:
+        message = f"Plots tell at most {SHADE_LIMIT} runs of one architecture apart by shade; {count} were given."
+        raise ValueError(message)
+    base = architecture_color(family)
+    lighter = family.startswith("pi-")
+    fraction = index * (_LIGHTEN_STEP if lighter else _DARKEN_STEP)
+    target = 255.0 if lighter else 0.0
+    channels = (int(base[position : position + 2], 16) for position in (1, 3, 5))
+    return "#" + "".join(f"{round(channel + (target - channel) * fraction):02X}" for channel in channels)
 
 
 def architecture_label(family: str) -> str:
@@ -229,7 +206,7 @@ def series_style(
     pooled: bool = False,
 ) -> SeriesStyle:
     """
-    Resolve the color, line style, and marker of one plotted series.
+    Resolve the color, line style, hatch, and marker of one plotted series.
 
     Parameters
     ----------
@@ -246,7 +223,7 @@ def series_style(
     -------
     SeriesStyle
         Color (architecture, else material, else pooled role), line style (role, solid without one),
-        and marker (material, only next to an architecture color).
+        marker (material, only next to an architecture color), and bar hatch (role, empty without one).
 
     Raises
     ------
@@ -258,18 +235,19 @@ def series_style(
         message = "A pooled series merges materials and cannot name one."
         raise ValueError(message)
     linestyle = _DEFAULT_LINESTYLE if role is None else _lookup(ROLE_LINESTYLES, role, kind="role")
+    hatch = "" if role is None else _lookup(ROLE_HATCHES, role, kind="role")
     if architecture is not None:
         marker = None if material is None else _lookup(MATERIAL_MARKERS, material, kind="material")
-        return SeriesStyle(architecture_color(architecture), linestyle, marker)
+        return SeriesStyle(architecture_color(architecture), linestyle, marker, hatch)
     if material is not None:
-        return SeriesStyle(material_color(material), linestyle, None)
+        return SeriesStyle(material_color(material), linestyle, None, hatch)
     if pooled and role is not None:
-        return SeriesStyle(_lookup(ROLE_COLORS, role, kind="role"), linestyle, None)
+        return SeriesStyle(_lookup(ROLE_COLORS, role, kind="role"), linestyle, None, hatch)
     message = "A series needs an architecture, a material, or a pooled role to pick its color."
     raise ValueError(message)
 
 
-def _lookup(table: Mapping[str, str], key: str, *, kind: str) -> str:
+def _lookup[V](table: Mapping[str, V], key: str, *, kind: str) -> V:
     """Return one fixed presentation value or name the known keys."""
     try:
         return table[key]
@@ -314,18 +292,6 @@ def _resolve_role(field_name: str, role: FieldSemanticRole | None) -> FieldSeman
     if normalized in {"p", "pressure"} or "pressure" in normalized:
         return "pressure"
     return "scalar"
-
-
-def _dataset_rank(dataset: DatasetVisualIdentity) -> tuple[bytes, str, str]:
-    """Return an order-independent deterministic collision-resolution rank."""
-    token = f"{dataset.canonical_identity}\x00{dataset.label}".encode()
-    return sha256(token).digest(), dataset.canonical_identity, dataset.label
-
-
-def _stable_palette_index(dataset: DatasetVisualIdentity, palette_size: int) -> int:
-    """Map one stable identity and label token to an initial palette position."""
-    digest = _dataset_rank(dataset)[0]
-    return int.from_bytes(digest[:8], byteorder="big") % palette_size
 
 
 def _require_text(value: str, *, label: str) -> None:

@@ -1,4 +1,4 @@
-"""Coordinate exclusive filesystem writers with process-scoped advisory locks.
+"""Coordinate exclusive filesystem writers with advisory locks that also exclude across the nodes of a shared filesystem.
 
 Responsibilities:
   - Acquire shared reader locks and re-entrant exclusive writer locks on persistent lock files
@@ -10,11 +10,24 @@ Design principles:
   - Lock files live outside any target directory a caller may delete
   - Kernel-owned locks, rather than file existence, define lease ownership
   - Re-entrancy is limited to the owning process thread and exact lock path
+  - Locks are whole-file open-file-description (OFD) locks, so they exclude across NFS clients and the file server
 
 This module does NOT:
   - Delete persistent lock files or infer ownership from their existence
   - Coordinate threads through an in-memory mutex in place of a kernel lock
   - Make a multi-file operation transactional beyond the caller-held context
+  - Guess the ``struct flock`` layout of a platform other than Linux x86_64; there it fails closed
+
+Notes:
+  Why OFD locks:
+    - On ICE the storage is local ZFS on the login node and NFS 4.2 on the compute nodes. An NFS client forwards
+      ``flock`` to the server as a POSIX lock, which does not conflict with a ``flock`` held on the server itself
+      (measured: a compute node acquired an exclusive ``flock`` while the login node held one).
+    - OFD locks are POSIX-family locks, so they conflict with the POSIX locks the server holds for its clients
+      (measured: a login-node OFD lock blocked OFD and ``lockf`` on a compute node).
+    - Like ``flock`` they belong to the open file description: another descriptor, thread, or process conflicts, and
+      closing an unrelated descriptor keeps the lock.
+
 """
 
 from __future__ import annotations
@@ -22,15 +35,22 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import platform
 import stat
+import struct
+import sys
 import threading
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from contextlib import AbstractContextManager
+
+# struct flock on Linux x86_64: l_type, l_whence, padding, l_start, l_len, l_pid, padding (32 bytes).
+_FLOCK_LAYOUT: Final = "hh4xqqi4x"
+_OFD_LOCKS_SUPPORTED: Final = sys.platform == "linux" and platform.machine() == "x86_64" and hasattr(fcntl, "F_OFD_SETLK")
 
 
 class FileLockUnavailableError(RuntimeError):
@@ -89,6 +109,18 @@ os.register_at_fork(
 )
 
 
+def _require_ofd_locks() -> None:
+    """Fail closed on a platform whose OFD lock commands or ``struct flock`` layout this module does not know."""
+    if not _OFD_LOCKS_SUPPORTED:
+        msg = f"File locks require Linux x86_64 open-file-description locks, not {sys.platform} {platform.machine()}."
+        raise RuntimeError(msg)
+
+
+def _whole_file_lock(kind: int) -> bytes:
+    """Return the ``struct flock`` of one whole-file request of ``kind``; an OFD request must carry ``l_pid`` 0."""
+    return struct.pack(_FLOCK_LAYOUT, kind, os.SEEK_SET, 0, 0, 0)
+
+
 def _open_lock_file(path: Path) -> int:
     """
     Open a non-inheritable regular lock file without following a final symlink.
@@ -107,7 +139,8 @@ def _open_lock_file(path: Path) -> int:
 
 
 def file_lock_is_active(path: Path | str) -> bool:
-    """Return whether an existing regular lock file is currently held, without creating it."""
+    """Return whether an existing regular lock file is currently held by a writer, without creating it."""
+    _require_ofd_locks()
     lock_path = Path(path).expanduser().absolute()
     try:
         marker_mode = lock_path.lstat().st_mode
@@ -125,16 +158,9 @@ def file_lock_is_active(path: Path | str) -> bool:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             msg = f"Lock path is not a regular file: {lock_path}"
             raise OSError(msg)
-        try:
-            # Every writer lease is exclusive; a shared probe also works on a
-            # readable marker that cannot be opened for writing.
-            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except OSError as error:
-            if error.errno in {errno.EACCES, errno.EAGAIN}:
-                return True
-            raise
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        return False
+        # Every writer lease is exclusive; a shared probe reports only a writer and also works on a read-only marker.
+        probe = fcntl.fcntl(descriptor, fcntl.F_OFD_GETLK, _whole_file_lock(fcntl.F_RDLCK))
+        return struct.unpack(_FLOCK_LAYOUT, probe)[0] != fcntl.F_UNLCK
     finally:
         os.close(descriptor)
 
@@ -143,11 +169,12 @@ def file_lock_is_active(path: Path | str) -> bool:
 def _hold_file_lock(
     path: Path | str,
     *,
-    operation: int,
+    kind: int,
     blocking: bool,
     contention_message: str,
 ) -> Iterator[Path]:
-    """Hold one advisory lock of the given ``flock`` kind; re-entry in the owning thread yields at once."""
+    """Hold one whole-file OFD lock of ``kind`` (``F_RDLCK`` or ``F_WRLCK``); re-entry in the owning thread yields at once."""
+    _require_ofd_locks()
     lock_path = Path(path).expanduser().resolve(strict=False)
     if lock_path in _THREAD_LOCK_STATE.locks:
         yield lock_path
@@ -158,7 +185,7 @@ def _hold_file_lock(
         descriptor = _open_lock_file(lock_path)
         _OPEN_LOCK_DESCRIPTORS.add(descriptor)
     try:
-        fcntl.flock(descriptor, operation if blocking else operation | fcntl.LOCK_NB)
+        fcntl.fcntl(descriptor, fcntl.F_OFD_SETLKW if blocking else fcntl.F_OFD_SETLK, _whole_file_lock(kind))
     except OSError as error:
         with _OPEN_LOCK_DESCRIPTORS_GUARD:
             _OPEN_LOCK_DESCRIPTORS.discard(descriptor)
@@ -176,7 +203,7 @@ def _hold_file_lock(
         with _OPEN_LOCK_DESCRIPTORS_GUARD:
             _OPEN_LOCK_DESCRIPTORS.discard(descriptor)
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                fcntl.fcntl(descriptor, fcntl.F_OFD_SETLK, _whole_file_lock(fcntl.F_UNLCK))
             finally:
                 os.close(descriptor)
 
@@ -189,7 +216,7 @@ def shared_file_lock(
     """Hold a shared advisory reader lock, optionally failing on an active writer."""
     return _hold_file_lock(
         path,
-        operation=fcntl.LOCK_SH,
+        kind=fcntl.F_RDLCK,
         blocking=blocking,
         contention_message="Shared file lock is blocked by an active writer",
     )
@@ -233,7 +260,7 @@ def exclusive_file_lock(
     """
     return _hold_file_lock(
         path,
-        operation=fcntl.LOCK_EX,
+        kind=fcntl.F_WRLCK,
         blocking=blocking,
         contention_message="Exclusive file lock is already held",
     )

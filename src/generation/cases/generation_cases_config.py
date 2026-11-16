@@ -117,7 +117,7 @@ _OPERATION_CONSTRAINTS: Final = {
     "porosity_natural_support_policy": "realized_mean_must_retain_natural_or_kappa_mean_ood_state",
 }
 # Registry coordinates fixed_bed.yaml owns; bed_fields.yaml owns every other operator-owned coordinate (bed, permeability, porosity,
-# inlet-pressure shape and initial-moisture structure), and the material files own these.
+# airflow target, inlet-pressure shape and initial-moisture structure), and the material files own these.
 _OPERATION_BLOCK: Final = "operation"
 _MATERIAL_OWNED_PARAMETERS: Final = frozenset(
     {

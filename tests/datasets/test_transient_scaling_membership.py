@@ -77,10 +77,8 @@ def _create(package: dict[str, Any], sampling: Any, *, train_subset: int | None 
 
 def _close(loaders: Any) -> None:
     """Close every loader Dataset the training loaders own."""
-    owned: tuple[Any, ...] = (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test)
-    for loader in owned:
-        if loader is not None:
-            loader.dataset.close()
+    for loader in (loaders.train, loaders.evaluation):
+        loader.dataset.close()
 
 
 def _fit(package: dict[str, Any], sampling: Any, *, train_subset: int | None = None) -> tuple[TrainScaling, dict[str, Any], list[str]]:

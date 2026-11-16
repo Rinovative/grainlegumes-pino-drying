@@ -162,8 +162,8 @@ def _open_training(
         memory_batch=1,
         **kwargs,
     )
-    for loader in (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test):
-        if loader is not None and isinstance(loader.dataset, transient_runtime.TransientPhysicalDataset):
+    for loader in (loaders.train, loaders.evaluation):
+        if isinstance(loader.dataset, transient_runtime.TransientPhysicalDataset):
             loader.dataset.close()
     return loaders.split, loaders.scaling_artifact
 

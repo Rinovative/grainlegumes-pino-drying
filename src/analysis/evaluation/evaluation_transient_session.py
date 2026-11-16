@@ -7,6 +7,7 @@ Responsibilities:
   - Rank frames by the selection objective of their complete autonomous rollouts
   - Reduce the relative norms of complete rollouts per physical time with their supported case counts
   - Expose bounded case and dataset views
+  - Resolve the series styles of the comparison once over all loaded frames, for every transient view
 
 Design principles:
   - Persisted scaling is reconstructed exactly and never refitted
@@ -44,6 +45,7 @@ from . import evaluation_transient_artifact as sequence_artifact
 from . import evaluation_transient_comparison as comparison
 from . import evaluation_transient_metrics as metrics
 from . import evaluation_transient_timing as timing
+from .evaluation_plot import evaluation_plot_series as series
 
 _DEFAULT_MODES = ("teacher_forced_one_step", "autonomous_full", "rolling_origin")
 _FIELD_METRIC_IDS = tuple(spec.id for spec in domain.tasks.spec.field_metric_specs(sequence_artifact.STATE_ORDER))
@@ -656,6 +658,7 @@ class TransientEvaluationSession:
                 "checkpoint_sha256": run.get("best_checkpoint_sha256"),
                 "checkpoint_epoch": run.get("best_checkpoint_epoch"),
                 "run_name": run.get("name"),
+                "model_kind": identity.get("model_kind"),
                 "stage_identity": MappingProxyType(dict(lineage)) if isinstance(lineage, Mapping) else None,
                 "evaluation_config_identity": identity.get("evaluation_config_identity"),
             }
@@ -677,6 +680,7 @@ class TransientEvaluationSession:
             "checkpoint_sha256": run.get("best_checkpoint_sha256"),
             "checkpoint_epoch": run.get("best_checkpoint_epoch"),
             "run_name": run.get("name"),
+            "model_kind": identity.get("model_kind"),
             "stage_identity": MappingProxyType(dict(lineage)) if isinstance(lineage, Mapping) else None,
             "evaluation_config_identity": identity.get("evaluation_config_identity"),
         }
@@ -999,6 +1003,23 @@ class TransientEvaluationSession:
             return dict.fromkeys(_NORMALIZED_COLUMNS, math.nan)
         values, _unavailable = _population_metrics([case for summary in materials for case in summary.case_statistics], artifact)
         return {name: math.nan if value is None else value for name, value in values.items()}
+
+    def series_styles(self) -> series.SeriesStyles:
+        """
+        Return the fixed style of every series this comparison can draw, resolved once over all its loaded frames.
+
+        Each frame contributes its run (model kind and selected checkpoint), Dataset role and materials from its provenance
+        (``series.comparison_styles``); every transient view takes these styles, so a run keeps its colour in a view that holds
+        evidence for only some runs. Each frame's whole series is also held under the frame name, for views drawn per frame.
+        """
+        members: dict[str, list[tuple[Any, ...]]] = {}
+        for frame_name in self.frame_names:
+            provenance = self._frame_provenance(frame_name)
+            facts = (provenance.get("model_kind"), provenance.get("dataset_role"), provenance.get("checkpoint_sha256"))
+            members[frame_name] = [(facts[0], facts[1], material, facts[2]) for material in self.material_families(frame_name)]
+        styles = series.comparison_styles(member for frame_members in members.values() for member in frame_members)
+        styles.update(series.select_styles(members, styles))
+        return styles
 
     def relative_norm_curve(self, frame_name: str) -> pd.DataFrame:
         """

@@ -4,6 +4,7 @@ Responsibilities:
   - Resolve the saved task contract and reconstruct the semantic model kind
   - Load saved model weights only when the run's recorded model digest equals the running model code
   - Rebuild the saved Train scaling on the inference device
+  - Return a steady run's model and Train scaling without a split, for inference on cases outside its Datasets
   - Reopen each saved split part through the shared runtime factory and refuse drift from its saved identity
   - Build deterministic split-aware evaluation datasets and dataloaders
   - Validate saved field contracts against model and dataset channels
@@ -33,7 +34,7 @@ Notes:
     Inference sequence:
       1. Load the saved resolved configuration
       2. Reconstruct the model and load best-checkpoint weights
-      3. Rebuild the admitted Train scaling without refitting
+      3. Rebuild the admitted Train scaling without refitting; ``load_steady_model`` stops here
       4. Admit the requested saved train, evaluation, or OOD membership, reopen its parts by Dataset ID and apply it
       5. Build the deterministic loader and return it with the model, scaling, and device
 
@@ -97,6 +98,46 @@ class SplitSelection:
             positions.extend(offset + position for position in part.index_values)
             offset += part.full_count
         return torch.tensor(positions, dtype=torch.long)
+
+
+@dataclass(frozen=True, slots=True)
+class SteadyModelContext:
+    """
+    Carry one completed steady run's model and Train scaling, independent of any saved split.
+
+    Attributes
+    ----------
+    run_name : str
+        The run's scientific run name.
+    model : nn.Module
+        Best-checkpoint model on ``device``.
+    scaling : datasets.preprocessing.normalization.TrainScaling
+        Admitted Train scaling on ``device``. Its ``dataset_identity`` is the run's Train Dataset (ID and manifest
+        digest), whose manifest records the coordinate grid the run was trained on.
+    device : torch.device
+        Inference device.
+    input_names, output_names : tuple[str, ...]
+        Ordered model input and output channels of the run's task contract.
+
+    """
+
+    run_name: str
+    model: nn.Module
+    scaling: datasets.preprocessing.normalization.TrainScaling
+    device: torch.device
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SteadyRunAdmission:
+    """One admitted steady run with its device, field contract and model seed, before its model is built."""
+
+    evidence: dict[str, Any]
+    device: torch.device
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    model_seed: int
 
 
 class IndexedSubset(Dataset[dict[str, Any]]):
@@ -318,8 +359,100 @@ def _build_eval_loader(dataset: Dataset[Any], batch_size: int) -> DataLoader:
 
 
 # ======================================================================
-# PUBLIC INFERENCE ENTRY POINT
+# STEADY MODEL ADMISSION
 # ======================================================================
+def _admit_steady_run(run_dir: Path, device_resolution: learning_device.DeviceResolution) -> _SteadyRunAdmission:
+    """Admit one completed steady run up to its model build: evidence, model-code and task guards, fields and seeds."""
+    if not isinstance(device_resolution, learning_device.DeviceResolution):
+        msg = f"Inference requires one DeviceResolution, got {device_resolution!r}."
+        raise TypeError(msg)
+    device = device_resolution.device
+    evaluable_run = experiments.run.validate_evaluable_run(run_dir)
+
+    cfg = evaluable_run["config"]
+    # Loading the weights continues the trained computation, so the recorded model code must be the running one.
+    common.code_identity.require_current_implementation(
+        learning.training.checkpoint.MODEL_PROJECTIONS[cfg["task"]],
+        cfg["producer"]["model_sha256"],
+        unit=f"Run {evaluable_run['scientific_run_name']}",
+        remedy=_MODEL_CHANGED_REMEDY,
+    )
+    if cfg["task"] != datasets.preprocessing.normalization.STEADY_TASK:
+        msg = f"Run {evaluable_run['scientific_run_name']} belongs to task {cfg['task']!r}; steady inference loads steady_flow runs only."
+        raise ValueError(msg)
+    input_channels, output_channels = _field_contract(cfg)
+    seed_plan = experiments.run.configure_reproducibility(cfg, device=device)
+    return _SteadyRunAdmission(evaluable_run, device, tuple(input_channels), tuple(output_channels), seed_plan["model_init"])
+
+
+def _build_steady_model(admission: _SteadyRunAdmission) -> SteadyModelContext:
+    """Build the admitted run's model under its model seed, guard its channels and load its weights and Train scaling."""
+    evaluable_run, device = admission.evidence, admission.device
+    input_channels, output_channels = list(admission.input_names), list(admission.output_names)
+    experiments.run.seed_process(admission.model_seed, device=device)
+    model = _build_model_from_config(evaluable_run["config"], device=device)
+    # ------------------------------
+    # HARD GUARDS: field contract <-> model
+    # ------------------------------
+    if getattr(model, "in_channels", None) is not None and model.in_channels != len(input_channels):
+        msg = f"in_channels mismatch: model.in_channels={model.in_channels} vs field contract={len(input_channels)} ({input_channels})"
+        raise RuntimeError(msg)
+
+    if getattr(model, "out_channels", None) is not None and model.out_channels != len(output_channels):
+        msg = f"out_channels mismatch: model.out_channels={model.out_channels} vs field contract={len(output_channels)} ({output_channels})"
+        raise RuntimeError(msg)
+
+    best_checkpoint = evaluable_run["best_checkpoint"]
+    model.load_state_dict(best_checkpoint["model_state_dict"], strict=True)
+    model = model.to(device)
+
+    scaling = datasets.preprocessing.normalization.TrainScaling.from_state_dict(evaluable_run["normalizer_state"]).to(device)
+    return SteadyModelContext(
+        run_name=str(evaluable_run["scientific_run_name"]),
+        model=model,
+        scaling=scaling,
+        device=device,
+        input_names=admission.input_names,
+        output_names=admission.output_names,
+    )
+
+
+# ======================================================================
+# PUBLIC INFERENCE ENTRY POINTS
+# ======================================================================
+def load_steady_model(*, run_dir: str | Path, device_resolution: learning_device.DeviceResolution) -> SteadyModelContext:
+    """
+    Rebuild a completed steady run's model and Train scaling without any saved split or Dataset.
+
+    The run is admitted like :func:`load_inference_context_with_resolution` admits it: evaluable-run validation, the
+    model-code guard, seeding, the model build, the channel guards, the best-checkpoint weights and the saved Train
+    scaling, never refitted.
+
+    Parameters
+    ----------
+    run_dir : str | Path
+        Completed steady run directory.
+    device_resolution : learning_device.DeviceResolution
+        Immutable runtime decision resolved by the inference boundary.
+
+    Returns
+    -------
+    SteadyModelContext
+        The run's model, Train scaling, device, field contract and run name.
+
+    Raises
+    ------
+    TypeError
+        If ``device_resolution`` is not a DeviceResolution.
+    ValueError
+        If the run is not a steady_flow run or its recorded model code differs from the running one.
+    RuntimeError
+        If the model channels contradict the run's field contract.
+
+    """
+    return _build_steady_model(_admit_steady_run(Path(run_dir), device_resolution))
+
+
 def load_inference_context_with_resolution(
     *,
     run_dir: str | Path,
@@ -379,45 +512,12 @@ def load_inference_context_with_resolution(
         If required evaluable-run evidence or a dataset artifact is absent.
 
     """
-    if not isinstance(device_resolution, learning_device.DeviceResolution):
-        msg = f"Inference requires one DeviceResolution, got {device_resolution!r}."
-        raise TypeError(msg)
-    device = device_resolution.device
-    run_dir = Path(run_dir)
     current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_datasets_root()
-    evaluable_run = experiments.run.validate_evaluable_run(run_dir)
-
-    cfg = evaluable_run["config"]
-    # Loading the weights continues the trained computation, so the recorded model code must be the running one.
-    common.code_identity.require_current_implementation(
-        learning.training.checkpoint.MODEL_PROJECTIONS[cfg["task"]],
-        cfg["producer"]["model_sha256"],
-        unit=f"Run {evaluable_run['scientific_run_name']}",
-        remedy=_MODEL_CHANGED_REMEDY,
-    )
-    split_indices = evaluable_run["split_indices"]
-    input_channels, output_channels = _field_contract(cfg)
-    seed_plan = experiments.run.configure_reproducibility(cfg, device=device)
-    split_selection = _select_split(split_indices=split_indices, split=str(split))
-
-    experiments.run.seed_process(seed_plan["model_init"], device=device)
-    model = _build_model_from_config(cfg, device=device)
-    # ------------------------------
-    # HARD GUARDS: field contract <-> model
-    # ------------------------------
-    if getattr(model, "in_channels", None) is not None and model.in_channels != len(input_channels):
-        msg = f"in_channels mismatch: model.in_channels={model.in_channels} vs field contract={len(input_channels)} ({input_channels})"
-        raise RuntimeError(msg)
-
-    if getattr(model, "out_channels", None) is not None and model.out_channels != len(output_channels):
-        msg = f"out_channels mismatch: model.out_channels={model.out_channels} vs field contract={len(output_channels)} ({output_channels})"
-        raise RuntimeError(msg)
-
-    best_checkpoint = evaluable_run["best_checkpoint"]
-    model.load_state_dict(best_checkpoint["model_state_dict"], strict=True)
-    model = model.to(device)
-
-    scaling = datasets.preprocessing.normalization.TrainScaling.from_state_dict(evaluable_run["normalizer_state"]).to(device)
+    # One admission serves split and model, and the split is refused before any model is built.
+    admission = _admit_steady_run(Path(run_dir), device_resolution)
+    split_selection = _select_split(split_indices=admission.evidence["split_indices"], split=str(split))
+    steady = _build_steady_model(admission)
+    input_channels, output_channels = list(steady.input_names), list(steady.output_names)
 
     source_dataset = datasets.preprocessing.splits.combine_identity_datasets(_open_split_sources(split_selection, dataset_root=current_dataset_root))
     # ------------------------------
@@ -437,7 +537,7 @@ def load_inference_context_with_resolution(
     selected_dataset = IndexedSubset(source_dataset, split_selection.indices)
     loader = _build_eval_loader(selected_dataset, batch_size=batch_size)
 
-    return model, loader, scaling, device
+    return steady.model, loader, steady.scaling, steady.device
 
 
 def load_inference_context(

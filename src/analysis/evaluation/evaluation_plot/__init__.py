@@ -3,12 +3,14 @@ Scientific plots for model-evaluation sections.
 
 Provides:
 - error_behavior: predictive-error distributions, maps, and decompositions
-- layout: shared physical-map sizing and colorbar contracts
+- layout: title, case-count and unavailable-panel helpers of evaluation figures and the text of their map grids
 - physical_consistency: residual and boundary-consistency plots
 - run_summary: completed-run overview plots
 - samples_outliers: sample, outlier, and extreme-case plots
 - sensitivity_capacity: capacity and metadata-sensitivity plots
+- series: fixed series styles of entities and the grouping of steady frames into panels
 - spectral_fidelity: prediction-spectrum fidelity plots
+- training: training curves, study progress, learning curves, and the break-even case count
 - transient: sequence, process, matched-compute, and timing plots
 """
 
@@ -24,7 +26,9 @@ if TYPE_CHECKING:
     from . import evaluation_plot_run_summary as run_summary
     from . import evaluation_plot_samples_outliers as samples_outliers
     from . import evaluation_plot_sensitivity_capacity as sensitivity_capacity
+    from . import evaluation_plot_series as series
     from . import evaluation_plot_spectral_fidelity as spectral_fidelity
+    from . import evaluation_plot_training as training
     from . import evaluation_plot_transient as transient
 
 _MODULES = {
@@ -34,7 +38,9 @@ _MODULES = {
     "run_summary": "evaluation_plot_run_summary",
     "samples_outliers": "evaluation_plot_samples_outliers",
     "sensitivity_capacity": "evaluation_plot_sensitivity_capacity",
+    "series": "evaluation_plot_series",
     "spectral_fidelity": "evaluation_plot_spectral_fidelity",
+    "training": "evaluation_plot_training",
     "transient": "evaluation_plot_transient",
 }
 __all__ = [
@@ -44,7 +50,9 @@ __all__ = [
     "run_summary",
     "samples_outliers",
     "sensitivity_capacity",
+    "series",
     "spectral_fidelity",
+    "training",
     "transient",
 ]
 

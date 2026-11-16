@@ -3,7 +3,8 @@
 Responsibilities:
   - Admit domain fields separately from boundary, scalar, and time support
   - Prepare full-resolution discrete scales once for a selected case
-  - Render independently selected fields without reloading case evidence
+  - Render independently selected fields without reloading case evidence, each as a header-labelled map with its
+    unit-bearing colour bar on the shared fixed-inch map grid, at most three per row, in the order of a 2 x 3 grid
 
 Design principles:
   - Persisted arrays and exact tensor diagnostics determine availability
@@ -28,6 +29,8 @@ from src.analysis.generation_inputs import generation_input_diagnostics as diagn
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
+from src.analysis.ui import analysis_ui_figure_layout as figure_layout
+from src.analysis.ui import analysis_ui_plot_layout as shared_layout
 
 from . import generation_input_plot_layout as layout
 
@@ -38,7 +41,9 @@ if TYPE_CHECKING:
 
 _MAXIMUM_COLUMNS = 3
 _SPATIAL_DIMENSIONS = 2
-_LOG_FIELDS = frozenset({"Kxx", "Kyy", "K_min", "K_max"})
+_ATLAS_ORDER = ("Kxx", "Kxy", "eps_bed", "Kyy", "K_orientation", "X_0_db_field")  # fills a 2 x 3 grid; other fields follow in their natural order
+# Half of arctan2 lies in [-90, 90] degrees, both ends included and naming the same axial direction: nine 20-degree bands.
+_ORIENTATION_BOUNDARIES = np.linspace(-90.0, 90.0, 10)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,34 +95,21 @@ def prepare_field_atlas(record: diagnostics.GenerationInputDiagnostics) -> Gener
     else:
         notes.append("Principal-direction map unavailable: isotropic cells have no unique direction.")
 
-    scales = {}
-    for name, values in fields.items():
-        semantic = field_maps.FieldMapSemantic.LINEAR_POSITIVE
-        if name in _LOG_FIELDS:
-            semantic = field_maps.FieldMapSemantic.LOG_POSITIVE
-        elif name in {"Kxy", "K_orientation"}:
-            semantic = field_maps.FieldMapSemantic.LINEAR_SIGNED
-        if name == "K_orientation":
-            # Axial angles wrap after 180 degrees; the two endpoint colors must
-            # meet. Constant orientations retain the truthful one-value scale.
-            boundaries = None if np.all(values == values.flat[0]) else np.linspace(-90.0, 90.0, field_maps.N_COLOR_BINS + 1)
-            scales[name] = field_maps.build_field_map(
-                values,
-                semantic=semantic,
-                field=name,
-                unit=units[name],
-                display_transform="principal_axis_modulo_180_degrees",
-                comparison_scope="axial_direction",
-                locked_boundaries=boundaries,
-                colormap_name="twilight",
-            )
-            continue
-        scales[name] = field_maps.build_field_map(
-            values,
-            semantic=semantic,
-            field=name,
-            unit=units[name],
-            comparison_scope=f"case:{record.case.payload['case_input_id']}",
+    fields = dict(sorted(fields.items(), key=lambda item: _ATLAS_ORDER.index(item[0]) if item[0] in _ATLAS_ORDER else len(_ATLAS_ORDER)))
+    scales = {name: layout.physical_norm(name, values) for name, values in fields.items() if name != "K_orientation"}
+    if "K_orientation" in fields:
+        # Axial angles wrap at +-90 degrees, so the cyclic colormap's two ends meet there. A constant orientation keeps the
+        # truthful one-value scale.
+        orientation = fields["K_orientation"]
+        scales["K_orientation"] = field_maps.build_field_map(
+            orientation,
+            semantic=field_maps.FieldMapSemantic.LINEAR_SIGNED,
+            field="K_orientation",
+            unit=units["K_orientation"],
+            display_transform="principal_axis_modulo_180_degrees",
+            comparison_scope="axial_direction",
+            locked_boundaries=None if np.all(orientation == orientation.flat[0]) else _ORIENTATION_BOUNDARIES,
+            colormap_name="twilight",
         )
     return GeneratedFieldAtlas(
         record,
@@ -139,23 +131,22 @@ def field_atlas(atlas: GeneratedFieldAtlas, selected: Sequence[str], *, display_
     ordered = tuple(name for name in atlas.fields if name in selected)
     columns = min(_MAXIMUM_COLUMNS, len(ordered))
     rows = (len(ordered) + columns - 1) // columns
-    figure, grid = layout.figure_grid(columns=columns, row_heights=(layout.MAP_LAYOUT.map_row_height,) * rows)
+    extent = display_grid.physical_extent(atlas.record.fields["x"], atlas.record.fields["y"])
+    geometry = shared_layout.plan_geometry(rows, columns, (extent[1] - extent[0], extent[3] - extent[2]), row_labels=False)
+    figure, axes, slots = shared_layout.map_grid(geometry, extent=extent)
     for index, name in enumerate(ordered):
-        axis = figure.add_subplot(grid[index // columns, index % columns])
-        scale = atlas.scales[name]
-        indices = display_grid.display_indices(atlas.fields[name].shape, display_spatial_stride)
-        image = axis.pcolormesh(
-            display_grid.display_sample(atlas.record.fields["x"], indices),
-            display_grid.display_sample(atlas.record.fields["y"], indices),
-            display_grid.display_sample(atlas.fields[name], indices),
-            shading="auto",
-            **scale.pcolormesh_kwargs(),
+        row, column = divmod(index, columns)
+        image = layout.draw_field(
+            axes[row, column], atlas.record, atlas.fields[name], atlas.scales[name], display_spatial_stride=display_spatial_stride
         )
-        axis.set_aspect("equal")
-        axis.set_xlabel("x [m]")
-        axis.set_ylabel("y [m]")
-        axis.set_title(atlas.labels[name])
-        colorbar = figure.colorbar(image, ax=axis, **scale.colorbar_kwargs())
-        colorbar.set_label(f"[{field_labels.display_unit(atlas.units[name], field=name)}]")
-    figure.suptitle(f"Generated fields — case {atlas.record.case.case_index}")
+        shared_layout.add_field_map_colorbar(
+            figure, image, slots[row, column], atlas.scales[name], label=f"[{field_labels.display_unit(atlas.units[name], field=name)}]"
+        )
+        shared_layout.set_column_headers(axes[row : row + 1, column : column + 1], [atlas.labels[name]], [])
+    for index in range(len(ordered), rows * columns):  # cells the last row leaves empty: the maps above them close the grid
+        row, column = divmod(index, columns)
+        axes[row, column].set_visible(False)
+        axes[row - 1, column].tick_params(labelbottom=True)
+        axes[row - 1, column].set_xlabel("x [m]", fontsize=figure_layout.LABEL_PT)
+    shared_layout.set_map_title(figure, f"Generated fields — case {atlas.record.case.case_index}")
     return figure

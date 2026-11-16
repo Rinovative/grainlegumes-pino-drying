@@ -6,8 +6,12 @@ Responsibilities:
   - Check that a complete target or stage of other analysis code is refused before any change, and rebuilt on request
   - Check that one role validator refuses a corrupted steady payload on write, cache hit and read
   - Check that a missing target is generated beside another published role only when both come from the running analysis code
+  - Check that a rebuild names every role of other analysis code and publishes its roles all or nothing, so a run keeps one producer
+  - Check that a read refuses one run of two producers, that a rollback attempts every target, and that a build refuses
+    the backup of an interrupted publication
   - Check that the sibling check and the publication of a target hold the run-wide artifact lock
-  - Check that the prepared artifacts of one run share one analysis producer, read as evidence when they do
+  - Check that preparation only reads: published roles are evidence, and a missing held-out role is refused with the
+    artifact command that releases exactly that role
 
 Design principles:
   - Task writers are explicit fakes; the shared flow, stage handling and role validator run unchanged
@@ -104,7 +108,7 @@ def _recording_admission(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     return admitted
 
 
-def _run(run_dir: Path, *, rebuild: bool = False) -> pd.DataFrame:
+def _run(run_dir: Path) -> pd.DataFrame:
     """Run the shared locked flow for the ID role."""
     return service._run_or_load_artifacts_locked(
         run_dir=run_dir,
@@ -112,7 +116,6 @@ def _run(run_dir: Path, *, rebuild: bool = False) -> pd.DataFrame:
         split="eval",
         device_resolution=cast("Any", SimpleNamespace(device=torch.device("cpu"))),
         dataset_root=run_dir / "datasets",
-        rebuild=rebuild,
     )
 
 
@@ -220,10 +223,16 @@ def test_rebuild_replaces_a_target_of_other_analysis_code(monkeypatch: pytest.Mo
     _fake_task(monkeypatch, task, generate)
     _recording_admission(monkeypatch)
 
-    frame = _run(run_dir, rebuild=True)
+    plan = SimpleNamespace(run_dir=run_dir, task=task, roles=(_ID_ROLE,))
+    frames = service._rebuild_run_roles(
+        plan=cast("Any", plan),
+        roles=("id",),
+        device_resolution=cast("Any", SimpleNamespace(device=torch.device("cpu"))),
+        dataset_root=run_dir / "datasets",
+    )
 
     assert generated == [target.parent / ".id.stage"]
-    assert frame.attrs["artifact_provenance"]["producer"] == {"analysis_sha256": _RUNNING_ANALYSIS}
+    assert frames["eval"].attrs["artifact_provenance"]["producer"] == {"analysis_sha256": _RUNNING_ANALYSIS}
     stored = json.loads(contracts.artifact_provenance_path(target).read_text(encoding="utf-8"))
     assert stored["producer"] == {"analysis_sha256": _RUNNING_ANALYSIS}
 
@@ -265,38 +274,133 @@ def test_one_validator_refuses_a_corrupted_steady_payload(monkeypatch: pytest.Mo
         assert (target.parent / ".id.stage").is_dir()
 
 
+_OTHER_ROLE = SimpleNamespace(dataset_name="other", split="material_ood", dataset_role="material_ood")
+
+
+def _two_role_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task: str, generate: Callable[[Path, Any], None]) -> Path:
+    """Fake one run with an ID and a material-OOD role and return its directory."""
+    _fake_task(monkeypatch, task, generate)
+    plan = SimpleNamespace(
+        ood_roles={"material_ood": _OTHER_ROLE},
+        roles=(_ID_ROLE, _OTHER_ROLE),
+        role=lambda split: _ID_ROLE if split == "eval" else _OTHER_ROLE,
+    )
+    monkeypatch.setattr(service.artifact_plan, "artifact_plan_from_completed", lambda *_args, **_kwargs: plan)
+    _recording_admission(monkeypatch)
+    return tmp_path.resolve() / "run"
+
+
+def _targets(run_dir: Path) -> tuple[Path, Path]:
+    """Return the ID and material-OOD targets of the two-role run."""
+    return (
+        common.paths.resolve_id_analysis_dir(run_dir),
+        service._artifact_save_root(run_dir=run_dir, dataset_name="other", split="material_ood"),
+    )
+
+
+def _producers(run_dir: Path) -> list[str]:
+    """Return the recorded analysis producer of each published target of the two-role run."""
+    markers = (contracts.artifact_provenance_path(target) for target in _targets(run_dir))
+    return [json.loads(marker.read_text(encoding="utf-8"))["producer"]["analysis_sha256"] for marker in markers]
+
+
+def _rebuild(run_dir: Path, task: str, roles: tuple[str, ...]) -> dict[str, pd.DataFrame]:
+    """Rebuild the named roles of the two-role run through the run-level rebuild."""
+    plan = SimpleNamespace(run_dir=run_dir, task=task, roles=(_ID_ROLE, _OTHER_ROLE))
+    return service._rebuild_run_roles(
+        plan=cast("Any", plan),
+        roles=cast("Any", roles),
+        device_resolution=cast("Any", SimpleNamespace(device=torch.device("cpu"))),
+        dataset_root=run_dir / "datasets",
+    )
+
+
 @pytest.mark.parametrize("task", _TASKS)
-@pytest.mark.parametrize("rebuild", [False, True])
-def test_a_missing_target_beside_a_role_of_other_analysis_code_is_generated_only_on_rebuild(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task: str, *, rebuild: bool
+def test_a_missing_target_beside_a_role_of_other_analysis_code_is_refused_before_inference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task: str
 ) -> None:
-    """Generating beside a published role of other analysis code would give the run two producers: refused before inference unless rebuilt."""
-    run_dir = tmp_path.resolve() / "run"
+    """Generating beside a published role of other analysis code would give the run two producers: refused before inference."""
+    run_dir = _two_role_run(monkeypatch, tmp_path, task, lambda _stage, _reporter: pytest.fail("generated beside a stale role"))
+    _write_artifact(_targets(run_dir)[1], analysis_sha256=_OTHER_ANALYSIS)
+    before = _tree_bytes(run_dir)
+
+    with pytest.raises(service.ArtifactCacheError, match=r"two analysis producers.*--split material_ood --rebuild"):
+        _run(run_dir)
+
+    assert _tree_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize("task", _TASKS)
+def test_a_partial_rebuild_beside_a_stale_role_is_refused_with_the_command_naming_every_affected_role(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task: str
+) -> None:
+    """Rebuilding only ID while material OOD records other analysis code would leave two producers: refused before inference."""
+    run_dir = _two_role_run(monkeypatch, tmp_path, task, lambda _stage, _reporter: pytest.fail("a partial rebuild reached inference"))
+    for target in _targets(run_dir):
+        _write_artifact(target, analysis_sha256=_OTHER_ANALYSIS)
+    before = _tree_bytes(run_dir)
+
+    command = rf"--run-dir {run_dir} --split id --split material_ood --rebuild"
+    with pytest.raises(service.ArtifactCacheError, match=rf"two analysis producers[\s\S]*{command}"):
+        _rebuild(run_dir, task, ("id",))
+
+    assert _tree_bytes(run_dir) == before
+
+
+@pytest.mark.parametrize("task", _TASKS)
+def test_a_rebuild_naming_every_stale_role_leaves_one_producer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task: str) -> None:
+    """Every stale role named: both are regenerated and the run records only the running analysis code."""
     generated: list[Path] = []
 
     def generate(stage: Path, reporter: Any) -> None:
         generated.append(stage)
         _write_artifact(stage, reporter)
 
-    _fake_task(monkeypatch, task, generate)
-    other_role = SimpleNamespace(dataset_name="other", split="material_ood")
-    plan = SimpleNamespace(
-        ood_roles={"material_ood": other_role}, roles=(_ID_ROLE, other_role), role=lambda split: _ID_ROLE if split == "eval" else other_role
-    )
-    monkeypatch.setattr(service.artifact_plan, "artifact_plan_from_completed", lambda *_args, **_kwargs: plan)
-    sibling_root = service._artifact_save_root(run_dir=run_dir, dataset_name="other", split="material_ood")
-    _write_artifact(sibling_root, analysis_sha256=_OTHER_ANALYSIS)
-    _recording_admission(monkeypatch)
-    before = _tree_bytes(run_dir)
+    run_dir = _two_role_run(monkeypatch, tmp_path, task, generate)
+    for target in _targets(run_dir):
+        _write_artifact(target, analysis_sha256=_OTHER_ANALYSIS)
 
-    if not rebuild:
-        with pytest.raises(service.ArtifactCacheError, match=r"two analysis producers.*--rebuild"):
-            _run(run_dir)
-        assert generated == []
-        assert _tree_bytes(run_dir) == before
-        return
-    frame = _run(run_dir, rebuild=True)
-    assert frame.attrs["artifact_provenance"]["producer"] == {"analysis_sha256": _RUNNING_ANALYSIS}
+    frames = _rebuild(run_dir, task, ("id", "material_ood"))
+
+    assert set(frames) == {"eval", "material_ood"}
+    assert len(generated) == len(_targets(run_dir))
+    assert _producers(run_dir) == [_RUNNING_ANALYSIS, _RUNNING_ANALYSIS]
+
+
+@pytest.mark.parametrize("task", _TASKS)
+@pytest.mark.parametrize("failure", ["generation", "publication"])
+def test_a_failed_rebuild_publishes_no_role_beside_its_stale_siblings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, task: str, failure: str
+) -> None:
+    """All or nothing per run: when one named role fails to stage or publish, no new artifact replaces any target."""
+
+    def generate(stage: Path, reporter: Any) -> None:
+        if failure == "generation" and stage.name.startswith(".other"):
+            msg = "material-OOD inference failed"
+            raise RuntimeError(msg)
+        _write_artifact(stage, reporter)
+
+    run_dir = _two_role_run(monkeypatch, tmp_path, task, generate)
+    id_target, ood_target = _targets(run_dir)
+    for target in (id_target, ood_target):
+        _write_artifact(target, analysis_sha256=_OTHER_ANALYSIS)
+    before = {target: _tree_bytes(target) for target in (id_target, ood_target)}
+    if failure == "publication":
+        replace = type(ood_target).replace
+
+        def refuse_second_publication(self: Path, target: Path) -> Path:
+            if self.name.startswith(".other") and self.name.endswith(".stage"):
+                msg = "rename refused"
+                raise OSError(msg)
+            return replace(self, target)
+
+        monkeypatch.setattr(type(ood_target), "replace", refuse_second_publication)
+
+    with pytest.raises((RuntimeError, OSError)):
+        _rebuild(run_dir, task, ("id", "material_ood"))
+
+    assert {target: _tree_bytes(target) for target in (id_target, ood_target)} == before
+    assert _producers(run_dir) == [_OTHER_ANALYSIS, _OTHER_ANALYSIS]
 
 
 @pytest.mark.parametrize("task", _TASKS)
@@ -309,7 +413,7 @@ def test_the_sibling_check_and_publication_hold_the_run_wide_artifact_lock(monke
     run_lock = common.paths.resolve_artifact_lock_path(common.paths.resolve_analysis_root(run_dir))
     held: dict[str, bool] = {}
     sibling_check = service._sibling_from_other_analysis
-    publish = service._publish_staged_artifact
+    publish = service._publish_staged_artifacts
 
     def check(**kwargs: Any) -> Any:
         held["sibling_check"] = common.locking.file_lock_is_active(run_lock)
@@ -320,7 +424,7 @@ def test_the_sibling_check_and_publication_hold_the_run_wide_artifact_lock(monke
         publish(**kwargs)
 
     monkeypatch.setattr(service, "_sibling_from_other_analysis", check)
-    monkeypatch.setattr(service, "_publish_staged_artifact", publish_held)
+    monkeypatch.setattr(service, "_publish_staged_artifacts", publish_held)
     service.run_or_load_artifacts(
         run_dir=run_dir,
         dataset_name="dataset",
@@ -336,110 +440,115 @@ def test_the_sibling_check_and_publication_hold_the_run_wide_artifact_lock(monke
 _ROLE_SPLITS = {"id": "eval", "material_ood": "material_ood"}
 
 
-@pytest.mark.parametrize(
-    ("recorded", "rebuild_incompatible", "expected_builds", "expected_actions"),
-    [
-        pytest.param(
-            {"id": _OTHER_ANALYSIS, "material_ood": _OTHER_ANALYSIS},
-            False,
-            [],
-            {"id": "reused", "material_ood": "reused"},
-            id="one-older-producer-is-read",
-        ),
-        pytest.param({"id": _RUNNING_ANALYSIS, "material_ood": _OTHER_ANALYSIS}, False, [], None, id="mixed-refused"),
-        pytest.param(
-            {"id": _RUNNING_ANALYSIS, "material_ood": _OTHER_ANALYSIS},
-            True,
-            [("material_ood", True)],
-            {"id": "reused", "material_ood": "rebuilt"},
-            id="mixed-rebuilt",
-        ),
-        pytest.param({"id": _OTHER_ANALYSIS, "material_ood": None}, False, [], None, id="missing-beside-older-refused"),
-        pytest.param(
-            {"id": _OTHER_ANALYSIS, "material_ood": None},
-            True,
-            [("id", True), ("material_ood", False)],
-            {"id": "rebuilt", "material_ood": "generated"},
-            id="missing-beside-older-rebuilds-it-first",
-        ),
-        pytest.param(
-            {"id": None, "material_ood": _RUNNING_ANALYSIS},
-            False,
-            [("id", False)],
-            {"id": "generated", "material_ood": "reused"},
-            id="missing-beside-running-is-generated",
-        ),
-    ],
-)
-def test_prepared_run_artifacts_share_one_analysis_producer(
+@pytest.mark.parametrize("role", ["id", "material_ood"])
+def test_preparation_never_builds_and_names_the_artifact_command_of_exactly_the_missing_role(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    recorded: dict[str, str | None],
-    *,
-    rebuild_incompatible: bool,
-    expected_builds: list[tuple[str, bool]],
-    expected_actions: dict[str, str] | None,
+    role: str,
 ) -> None:
-    """Roles of one producer are read as evidence; a preparation that would leave two producers rebuilds on request, else refuses before a build."""
+    """Preparation only reads: a missing held-out role is refused with the explicit artifact command that releases that role alone."""
+    run_dir = tmp_path.resolve()
+    split = cast("Any", _ROLE_SPLITS[role])
+
+    def missing(_path: Path, **_kwargs: Any) -> loader.LoadedRunArtifacts:
+        raise loader._missing(task="steady_flow", run_name="run", run_dir=run_dir, role=split, root=run_dir / "analysis")
+
+    monkeypatch.setattr(loader, "load_run_artifacts", missing)
+    monkeypatch.setattr(service, "run_or_load_artifacts", lambda **_kwargs: pytest.fail("a preparation built an artifact"))
+
+    with pytest.raises(loader.MissingEvaluationArtifactsError) as refused:
+        service.load_prepared_run_artifacts(run_dir)
+
+    assert str(refused.value).endswith(f"artifacts --run-dir {run_dir} --split {role}")
+
+
+def test_preparation_reads_roles_of_other_analysis_code_as_evidence_and_never_rebuilds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Published roles are historical evidence: preparation reads them whatever code produced them and replaces nothing."""
     run_dir = tmp_path.resolve()
     monkeypatch.setitem(contracts.ANALYSIS_PROJECTIONS, "steady_flow", SimpleNamespace(name="analysis_steady_flow", sha256=lambda: _RUNNING_ANALYSIS))
-    plan = SimpleNamespace(
-        task="steady_flow",
-        dataset_roles=("id", "material_ood"),
-        roles=tuple(SimpleNamespace(split=split, dataset_name=f"{split}-dataset") for split in ("eval", "material_ood")),
-        role=lambda split: SimpleNamespace(dataset_name=f"{split}-dataset"),
-    )
-    monkeypatch.setattr(service, "load_run_artifact_plan", lambda _path: plan)
 
-    def publish(role: str, digest: str) -> None:
-        recorded[role] = digest
-        split = cast("Any", _ROLE_SPLITS[role])
-        marker = contracts.artifact_provenance_path(service._artifact_save_root(run_dir=run_dir, dataset_name=f"{split}-dataset", split=split))
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps({"producer": {"analysis_sha256": digest}}), encoding="utf-8")
-
-    for role, digest in tuple(recorded.items()):
-        if digest is not None:
-            publish(role, digest)
-
-    def artifact(role: str) -> SimpleNamespace:
+    def artifact() -> Any:
         frame = pd.DataFrame()
-        frame.attrs["artifact_provenance"] = {"producer": {"analysis_sha256": recorded[role]}}
+        frame.attrs["artifact_provenance"] = {"producer": {"analysis_sha256": _OTHER_ANALYSIS}}
         return SimpleNamespace(frame=frame)
 
-    def load(_path: Path, **_kwargs: Any) -> loader.LoadedRunArtifacts:
-        for role, digest in recorded.items():
-            if digest is None:
-                msg = f"{role} is missing"
-                raise loader.MissingEvaluationArtifactsError(msg, role=cast("Any", _ROLE_SPLITS[role]))
-        return loader.LoadedRunArtifacts(
-            task="steady_flow",
-            run_name="run",
+    loaded = loader.LoadedRunArtifacts(task="steady_flow", run_name="run", run_dir=run_dir, id_artifact=artifact(), material_ood_artifact=artifact())
+    monkeypatch.setattr(loader, "load_run_artifacts", lambda _path, **_kwargs: loaded)
+    monkeypatch.setattr(service, "run_or_load_artifacts", lambda **_kwargs: pytest.fail("a preparation rebuilt an artifact"))
+
+    prepared = service.load_prepared_run_artifacts(run_dir)
+
+    assert prepared.loaded_run is loaded
+    assert prepared.role_actions == {"id": "reused", "material_ood": "reused"}
+
+
+def test_a_read_of_one_run_whose_roles_carry_two_producers_is_refused_with_the_rebuild_of_every_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after one publication, or a read across a publication, mixes producers within one run: refused on read."""
+    run_dir = tmp_path.resolve() / "run"
+    producers = {"id": _RUNNING_ANALYSIS, "material_ood": _OTHER_ANALYSIS}
+
+    def load_role(*, role: str, **_kwargs: Any) -> Any:
+        frame = pd.DataFrame()
+        frame.attrs["artifact_provenance"] = {"producer": {"analysis_sha256": producers[role]}}
+        return SimpleNamespace(frame=frame)
+
+    monkeypatch.setattr(loader.experiments.config.loader, "validate_resolved_task_contract", lambda _config: SimpleNamespace(id="steady_flow"))
+    monkeypatch.setattr(loader, "_steady_role_context", lambda *_args: ({}, {role: role for role in producers}))
+    monkeypatch.setattr(loader, "_load_role", load_role)
+    command = rf"--run-dir {run_dir} --split id --split material_ood --rebuild"
+
+    with pytest.raises(loader.IncompatibleEvaluationArtifactsError, match=rf"two analysis producers[\s\S]*{command}"):
+        loader._load_admitted_run_artifacts(run_dir, {"summary": {}, "config": {}})
+
+
+def test_a_failed_rollback_still_restores_every_other_target_and_names_the_unrestored_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rollback attempts every target: one failed restore does not stop the others, and the error names what stayed unrestored."""
+    run_dir = tmp_path.resolve() / "run"
+    targets = (
+        common.paths.resolve_id_analysis_dir(run_dir),
+        service._artifact_save_root(run_dir=run_dir, dataset_name="first", split="material_ood"),
+        service._artifact_save_root(run_dir=run_dir, dataset_name="second", split="parameter_ood"),
+    )
+    stages = tuple(contracts.artifact_stage_path(target) for target in targets)
+    for target, stage in zip(targets, stages, strict=True):
+        _write_artifact(target, analysis_sha256=_OTHER_ANALYSIS)
+        _write_artifact(stage)
+    before = {target: _tree_bytes(target) for target in targets}
+    replace = type(run_dir).replace
+
+    def failing_replace(self: Path, destination: Path) -> Path:
+        if self == stages[2] or (self == targets[1] and destination == stages[1]):
+            msg = f"rename refused: {self}"
+            raise OSError(msg)
+        return replace(self, destination)
+
+    monkeypatch.setattr(type(run_dir), "replace", failing_replace)
+
+    with pytest.raises(service.ArtifactCacheError, match=rf"left unrestored[\s\S]*{targets[1]}") as refused:
+        service._publish_staged_artifacts(run_dir=run_dir, stages=tuple(zip(targets, stages, strict=True)))
+
+    assert str(targets[0]) not in str(refused.value)
+    assert _tree_bytes(targets[0]) == before[targets[0]]
+    assert _tree_bytes(targets[2]) == before[targets[2]]
+
+
+def test_a_build_beside_the_backup_of_an_interrupted_publication_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A backup left by a crash between two renames may hold the only old copy: the next build refuses and names it."""
+    run_dir = tmp_path.resolve() / "run"
+    leftover = common.paths.resolve_analysis_root(run_dir) / ".id.backup.0123abcd"
+    _write_artifact(leftover, analysis_sha256=_OTHER_ANALYSIS)
+    _fake_task(monkeypatch, "steady_flow", lambda _stage, _reporter: pytest.fail("a build ran beside an interrupted publication"))
+    before = _tree_bytes(run_dir)
+
+    with pytest.raises(service.ArtifactCacheError, match=rf"interrupted publication[\s\S]*{leftover}"):
+        service.run_or_load_artifacts(
             run_dir=run_dir,
-            id_artifact=cast("Any", artifact("id")),
-            material_ood_artifact=cast("Any", artifact("material_ood")),
+            dataset_name="dataset",
+            split="eval",
+            device_resolution=cast("Any", SimpleNamespace(device=torch.device("cpu"))),
+            dataset_root=run_dir / "datasets",
         )
 
-    monkeypatch.setattr(loader, "load_run_artifacts", load)
-    builds: list[tuple[str, bool]] = []
-
-    def build(**kwargs: Any) -> None:
-        role = "id" if kwargs["split"] == "eval" else "material_ood"
-        builds.append((role, kwargs["rebuild"]))
-        publish(role, _RUNNING_ANALYSIS)
-
-    monkeypatch.setattr(service, "run_or_load_artifacts", build)
-
-    def prepare() -> service.PreparedRunArtifacts:
-        return service.load_or_build_run_artifacts(
-            run_dir, rebuild_incompatible=rebuild_incompatible, device_resolution=experiments.run.learning.device.resolve_device("cpu")
-        )
-
-    if expected_actions is None:
-        with pytest.raises(service.ArtifactCacheError, match=r"two analysis producers.*--rebuild"):
-            prepare()
-        assert builds == []
-        return
-    prepared = prepare()
-    assert prepared.role_actions == expected_actions
-    assert builds == expected_builds
+    assert _tree_bytes(run_dir) == before

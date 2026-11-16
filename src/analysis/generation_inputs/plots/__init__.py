@@ -4,11 +4,12 @@ Scientific tables and figures for generation-input exploratory analysis.
 Provides:
 - atlas: one admitted case with independently selected domain fields
 - boundaries: boundary tables and exact transient schedule comparisons
-- layout: canonical map, normalization, and colorbar geometry
+- layout: schedule and table figure grids, field scales, and map drawing
 - moisture: transient moisture, sorption, and inlet-bed diagnostics
 - overview: A/B comparison and raw dataset overview tables
 - permeability: tensor, principal-value, and anisotropy diagnostics
 - spatial: A/B/B-minus-A map blocks and retained distributions
+- template: paired template comparison parity panels and tables
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from . import generation_input_plot_overview as overview
     from . import generation_input_plot_permeability as permeability
     from . import generation_input_plot_spatial as spatial
+    from . import generation_input_plot_template as template
 
 _MODULES = {
     "atlas": "generation_input_plot_atlas",
@@ -33,6 +35,7 @@ _MODULES = {
     "overview": "generation_input_plot_overview",
     "permeability": "generation_input_plot_permeability",
     "spatial": "generation_input_plot_spatial",
+    "template": "generation_input_plot_template",
 }
 __all__ = [
     "atlas",
@@ -42,6 +45,7 @@ __all__ = [
     "overview",
     "permeability",
     "spatial",
+    "template",
 ]
 
 

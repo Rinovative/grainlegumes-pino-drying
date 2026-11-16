@@ -7,40 +7,53 @@ Responsibilities:
   - Admit available artifacts through exact run, Dataset, and payload evidence
   - Return deterministic catalog evidence and bounded per-candidate issues
   - Resolve each run's model family from its saved config, or record an issue and keep the run listed without one
+  - Carry the run name of the A0 that a B or A1 run starts from, as its saved config records it
   - Read one completed stage's work quantities (time, runtime, work, units, budget) from its summary
+  - Name the distinct completed runs of labelled frames by their first frame, a run being its name and end time
+  - Read one completed stage's training history through its run admission and the history's own validator, with the
+    stage's start epoch and its selected validation point; a missing or unusable history is unavailable with its reason
+  - Read the keys of an Optuna study summary that the study curve draws
 
 Design principles:
   - Persisted config, summary, saved split, and parent records remain authoritative; current Dataset manifests are never consulted
   - Discovery never contacts tracking services or infers scientific identity
   - One malformed candidate cannot prevent inspection of unrelated runs
   - A work quantity the summary does not record is ``None``, never zero
+  - A history is read only from an admitted completed run, bound to the epochs and points its last checkpoint counts
 
 This module does NOT:
-  - Load models, source datasets, numerical arrays, widgets, plots, or notebooks
+  - Load models, source datasets, numerical arrays, widgets, plots, or notebooks; a history read leaves checkpoint loading to the
+    run admission (``experiments.run``)
   - Generate, repair, publish, or mutate any persisted evidence
+  - Validate history records or study summaries beyond the keys its readers return; their producers own the schemas
   - Create storage layouts or use directory names as scientific identity
 """
 
 from __future__ import annotations
 
 import json
-import shlex
+import math
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import yaml
 
-from src import common, datasets
+from src import common, datasets, experiments, learning
 from src.analysis.artifacts import analysis_artifact_contracts as artifact_contracts
 from src.experiments import experiments_run_identity as run_identity
 from src.experiments.config import experiments_config_naming as config_naming
 from src.learning.models import naming
 from src.learning.training import learning_training_budget as stage_budget
 
+from . import evaluation_artifact_loader as artifact_loader
+from . import evaluation_dataframe as dataframe
 from . import evaluation_transient_artifact as transient_artifact
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 ArtifactState = Literal["ready", "generating", "scoped_partial", "missing", "invalid"]
 RunAvailability = Literal["available", "unavailable"]
@@ -48,6 +61,62 @@ RunAvailability = Literal["available", "unavailable"]
 _SHA256_HEX_LENGTH = 64
 # The text of a work quantity a run did not record, also inside a value joined over its attempts.
 UNAVAILABLE: Final = "unavailable"
+_HANDOFF_STAGES: Final = frozenset({"B", "A1"})  # stages that start from the A0 teacher handoff
+_OBJECTIVE_DIRECTIONS: Final = frozenset({"minimize", "maximize"})
+# The finished trial statuses: the only ones whose values the study summary counts towards the best so far
+# (``experiments_tuning_optuna._BEST_STATUSES`` and its use in ``_study_lifecycle_summary``).
+STUDY_FINISHED_STATUSES: Final = ("completed", "duplicate")
+
+
+@dataclass(frozen=True, slots=True)
+class StageHistory:
+    """
+    Hold one completed stage's admitted training history and what places it on a shared epoch axis.
+
+    ``stage`` is ``steady``, ``A0``, ``B`` or ``A1``; ``pipeline`` is the run name of the A0 a B or A1 starts from (else the run's
+    own) and ``start_epoch`` that A0's handoff epoch (else 0). ``selected_point`` is the validation point of the selected (best)
+    checkpoint. ``epochs`` and ``validations`` are the history's records in order.
+    """
+
+    run_name: str
+    stage: str
+    model_family: str
+    pipeline: str
+    start_epoch: int
+    objective_id: str
+    objective_direction: str
+    selected_point: int
+    epochs: tuple[Mapping[str, float], ...]
+    validations: tuple[Mapping[str, float], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class UnavailableHistory:
+    """Name a completed run whose training history cannot be shown and why."""
+
+    run_dir: Path
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class StudyTrial:
+    """One Optuna trial of a study summary: its number, terminal status, objective value and the best value so far."""
+
+    number: int
+    status: str
+    value: float | None
+    best_so_far: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class StudySummary:
+    """The keys of one study summary the study curve reads."""
+
+    study_name: str
+    objective_id: str
+    direction: str
+    trial_counts: Mapping[str, int]
+    trials: tuple[StudyTrial, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +190,7 @@ class EvaluationRunDiscovery:
     metadata_issues: tuple[str, ...] = ()
     config_label: str | None = None
     pair_label: str | None = None
+    a0_run_name: str | None = None  # The run name of the A0 a B or A1 run starts from, as its saved teacher handoff names it.
 
     def artifacts(self) -> tuple[EvaluationArtifactInspection, ...]:
         """Return the ID artifact target and every OOD artifact target in canonical role order."""
@@ -596,10 +666,9 @@ def _run_from_leaf(
         metadata_issues=metadata_issues,
         config_label=f"{layout['family']}/{layout['config_name']}",
         pair_label=layout["pair"],
-        artifact_command=(
-            "./scripts/slurm_ml.sh --mode cpu --partition standard --cpus-per-task 4 "
-            "--mem 16G --time 02:00:00 artifacts --run-dir " + shlex.quote(str(run_dir))
-        ),
+        a0_run_name=_text(_optional_mapping(training_mapping.get("teacher_handoff")).get("source_run_name")),
+        # Full coverage names every planned held-out role; running it is their explicit release.
+        artifact_command=artifact_loader.artifact_command(run_dir=run_dir, roles=("id", *ood_names)),
     )
 
 
@@ -745,7 +814,9 @@ def _precision_text(precision: object) -> str | None:
     if not isinstance(precision, Mapping):
         return None
     flags = "/".join("on" if precision[f"tf32_{kind}"] else "off" for kind in ("matmul", "cudnn"))
-    return f"{'+'.join(precision['parameter_dtypes'])}, autocast {precision['autocast_dtype'] or 'off'}, TF32 matmul/cuDNN {flags}"
+    autotune = "on" if precision["cudnn_autotune"] else "off"
+    dtypes = "+".join(precision["parameter_dtypes"])
+    return f"{dtypes}, autocast {precision['autocast_dtype'] or 'off'}, TF32 matmul/cuDNN {flags}, cuDNN autotune {autotune}"
 
 
 def stage_work_row(summary: Mapping[str, Any], *, inference_seconds_per_case: float | None = None) -> dict[str, Any]:
@@ -764,7 +835,7 @@ def stage_work_row(summary: Mapping[str, Any], *, inference_seconds_per_case: fl
     dict[str, Any]
         End status (the training outcome's), optimisation, total and attempted seconds with their coverage, device, driver, CUDA
         build, precision, trainable parameters, optimizer steps, supervised and forward transitions,
-        units and cases, k and memory batch, budget, overrun and inference time. A value the summary
+        units, the full Train set's transitions and cases, k and memory batch, budget, overrun and inference time. A value the summary
         does not record is ``None``; device, driver, CUDA build and precision join the attempts that
         computed optimisation seconds, each without its value as ``unavailable``.
 
@@ -803,6 +874,7 @@ def stage_work_row(summary: Mapping[str, Any], *, inference_seconds_per_case: fl
         "seen_units": None if budget is None else budget.units,
         "train_units": units.get("train_units"),
         "full_set_units": units.get("full_set_units"),
+        "full_set_transitions": units.get("full_set_transitions"),
         "seen_cases": units.get("seen_cases"),
         "train_cases": units.get("train_cases"),
         "units_per_update": units.get("units_per_update"),
@@ -812,3 +884,189 @@ def stage_work_row(summary: Mapping[str, Any], *, inference_seconds_per_case: fl
         "overrun": None if budget is None else budget.overrun,
         "inference_seconds_per_case": inference_seconds_per_case,
     }
+
+
+def distinct_runs(frames: Mapping[str, pd.DataFrame]) -> dict[str, Mapping[str, Any]]:
+    """Return the completed-run summary of each distinct run of the labelled frames (a run is its name and end time), keyed by its first frame."""
+    runs: dict[tuple[object, object], tuple[str, Mapping[str, Any]]] = {}
+    for label, frame in frames.items():
+        summary = frame.attrs[dataframe.COMPLETED_RUN_SUMMARY_ATTR]
+        runs.setdefault((summary.get("run_name"), summary.get("ended_at")), (label, summary))
+    return dict(runs.values())
+
+
+def _stage_placement(config: Mapping[str, Any], summary: Mapping[str, Any]) -> tuple[str, str, int]:
+    """Return a completed run's stage, the pipeline it belongs to (its A0's run name) and the epoch it starts at."""
+    # The run admission already validated the summary's terminal controller and teacher handoff.
+    stage = str(stage_work_row(summary)["stage"])
+    if stage not in _HANDOFF_STAGES:
+        return stage, str(config["run"]["name"]), 0
+    handoff = summary["teacher_handoff"]
+    return stage, str(handoff["source_run_name"]), int(handoff["best_epoch"])
+
+
+def _selected_point(best: Mapping[str, Any], last: Mapping[str, Any]) -> int:
+    """Return the selected checkpoint's validation point: the first entry of the last checkpoint's objective history at its epoch and value."""
+    selected = (best["best_epoch"], float(best["best_metric"]))
+    for entry in last["objective_history"]:
+        if entry["value"] is not None and (entry["epoch"], float(entry["value"])) == selected:
+            return int(entry["point"])
+    message = "The last checkpoint's objective history does not hold the selected checkpoint's epoch and value."
+    raise ValueError(message)
+
+
+def stage_history(run_dir: Path | str, *, expected_checkpoint_sha256: str) -> StageHistory | UnavailableHistory:
+    """
+    Read one completed stage's training history, or say why it is unavailable.
+
+    The run is admitted first (``experiments.run.saved_artifact_run_lease``: completed, digests, identities and checkpoints, with
+    the numerical environment its checkpoints recorded). Under that same lease its selected checkpoint's digest must be
+    ``expected_checkpoint_sha256`` (the one the loaded artifact records), so a replaced run is refused, not read. The history is
+    read under the lease by its own validator,
+    bound to the run's task, name and checkpoint identity, to the completed epochs of its last checkpoint and to every entry of
+    that checkpoint's objective history (point, epoch, eligibility, value), with ordered steps. The selected point is the
+    first entry at the best checkpoint's epoch and value; B and A1 start at their A0 handoff epoch.
+
+    The two tasks differ at admission. A transient run's admission already validates its history, so a transient stage
+    without ``history.json`` or with a refused one fails the lease and raises ``RunLifecycleError``. A steady run is
+    admitted without its history, so a steady run without one (trained before the durable history) or with one the
+    validator refuses returns ``UnavailableHistory`` with the reason.
+
+    Parameters
+    ----------
+    run_dir : Path | str
+        Completed run leaf of one steady run or one transient stage (A0, B or A1).
+    expected_checkpoint_sha256 : str
+        Digest of the selected checkpoint the caller's loaded artifact records.
+
+    Returns
+    -------
+    StageHistory | UnavailableHistory
+        The admitted records with the stage, its pipeline and start epoch, the objective and the selected validation point.
+
+    Raises
+    ------
+    experiments.run.RunLifecycleError
+        If the run is not an admitted completed run, also when a transient stage's history is missing or refused.
+    RuntimeError
+        If the admitted run's selected checkpoint digest is not ``expected_checkpoint_sha256``.
+
+    """
+    with experiments.run.saved_artifact_run_lease(run_dir) as admitted:
+        if admitted["selected_checkpoint_sha256"] != expected_checkpoint_sha256:
+            message = (
+                f"Run {Path(admitted['run_dir']).name!r} selects checkpoint {admitted['selected_checkpoint_sha256']}, "
+                f"not the expected {expected_checkpoint_sha256}; load the run again."
+            )
+            raise RuntimeError(message)
+        path, config, last = Path(admitted["run_dir"]), admitted["config"], admitted["last_checkpoint"]
+        identity, best = admitted["checkpoint_identity"], admitted["best_checkpoint"]
+        try:
+            history = learning.training.history.validate_completed_history(
+                path,
+                task=str(config["task"]),
+                run_name=str(config["run"]["name"]),
+                checkpoint_identity=identity,
+                completed_epoch=int(last["completed_epoch"]),
+                validations=last["objective_history"],
+            )
+        except FileNotFoundError as error:
+            return UnavailableHistory(path, f"{error} Runs trained before the durable training history have none.")
+        except (TypeError, ValueError) as error:
+            return UnavailableHistory(path, f"Training history refused: {error}")
+    stage, pipeline, start_epoch = _stage_placement(config, admitted["summary"])
+    return StageHistory(
+        run_name=str(config["run"]["name"]),
+        stage=stage,
+        model_family=config_naming.model_family(config),
+        pipeline=pipeline,
+        start_epoch=start_epoch,
+        objective_id=str(identity["objective"]["id"]),
+        objective_direction=str(identity["objective"]["direction"]),
+        selected_point=_selected_point(best, last),
+        epochs=tuple(dict(record) for record in history["epochs"]),
+        validations=tuple(dict(record) for record in history["validations"]),
+    )
+
+
+def _finite_or_none(value: object, *, label: str) -> float | None:
+    """Return one finite study value, or ``None`` for a trial without one."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        message = f"{label} must be a finite number or null, got {value!r}."
+        raise ValueError(message)
+    return float(value)
+
+
+def _study_trial(record: object, *, previous: int | None) -> StudyTrial:
+    """Admit one trial record after the trial numbered ``previous``."""
+    trial = _mapping(record, label="study_summary.json trial")
+    number, status = trial.get("number"), trial.get("status")
+    if isinstance(number, bool) or not isinstance(number, int) or (previous is not None and number <= previous) or _text(status) is None:
+        message = "Study summary trials need ascending integer numbers and a status text."
+        raise ValueError(message)
+    if not {"value", "best_objective_so_far"} <= trial.keys():
+        message = f"Study summary trial {number} must record its value and best_objective_so_far, null when it has none."
+        raise ValueError(message)
+    return StudyTrial(
+        number=number,
+        status=str(status),
+        value=_finite_or_none(trial["value"], label=f"Trial {number} value"),
+        best_so_far=_finite_or_none(trial["best_objective_so_far"], label=f"Trial {number} best_objective_so_far"),
+    )
+
+
+def _require_running_best(trials: Iterable[StudyTrial], *, direction: str) -> None:
+    """Require every trial's best so far to be the producer's: the strictly better values of completed and duplicate trials so far."""
+    best: float | None = None
+    minimize = direction == "minimize"
+    for trial in trials:
+        value = trial.value
+        # Strictly better only, so the earlier trial keeps a tie.
+        if value is not None and trial.status in STUDY_FINISHED_STATUSES and (best is None or (value < best if minimize else value > best)):
+            best = value
+        if trial.best_so_far != best:
+            message = f"Study summary trial {trial.number} best_objective_so_far {trial.best_so_far!r} is not the running best {best!r}."
+            raise ValueError(message)
+
+
+def read_study_summary(path: Path | str) -> StudySummary:
+    """
+    Read the study name, objective, trial counts and trials of one Optuna ``study_summary.json``.
+
+    Only the keys the study curve draws are checked; the tuning service owns the full schema. Every trial records its value
+    and best so far (null when it has none). The counts must equal the trials' statuses, so the curve's points and its
+    counts describe the same trials, and every best so far must be the running best of the completed and duplicate trials
+    in the objective's direction, as the tuning service derives it.
+
+    Raises
+    ------
+    TypeError
+        If the summary, its objective, counts or a trial is not a mapping, or its trials are not a list.
+    ValueError
+        If a checked key is missing or invalid, or the counts disagree with the trials.
+
+    """
+    payload = _read_json(Path(path))
+    objective = _mapping(payload.get("objective"), label="study_summary.json objective")
+    study_name, objective_id, direction = _text(payload.get("study_name")), _text(objective.get("id")), objective.get("direction")
+    if study_name is None or objective_id is None or direction not in _OBJECTIVE_DIRECTIONS:
+        message = "Study summary needs a study name, an objective id and a direction minimize or maximize."
+        raise ValueError(message)
+    counts = _mapping(payload.get("trial_counts"), label="study_summary.json trial_counts")
+    if any(not isinstance(key, str) or isinstance(count, bool) or not isinstance(count, int) or count < 0 for key, count in counts.items()):
+        message = "Study summary trial_counts must map status texts to non-negative integers."
+        raise ValueError(message)
+    records = payload.get("trials")
+    if not isinstance(records, list):
+        message = "Study summary trials must be a list."
+        raise TypeError(message)
+    trials: list[StudyTrial] = []
+    for record in records:
+        trials.append(_study_trial(record, previous=trials[-1].number if trials else None))
+    if Counter(trial.status for trial in trials) != Counter({status: count for status, count in counts.items() if count}):
+        message = "Study summary trial_counts disagree with the statuses of its trials."
+        raise ValueError(message)
+    _require_running_best(trials, direction=str(direction))
+    return StudySummary(study_name, objective_id, str(direction), dict(counts), tuple(trials))

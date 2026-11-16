@@ -2,18 +2,23 @@
 
 Responsibilities:
   - Summarize dimensionless momentum, flux-balance, and pressure-boundary metrics
-  - Plot scalar residual CDFs with separate axes and legends
-  - Render full-grid momentum magnitude maps and per-row flux-balance profiles
+  - Plot scalar residual CDFs on separate panels with one legend beside them
+  - Compare the median pressure-boundary components and the pressure-drop error as bars on two panels
+  - Render the full-grid momentum magnitude map of every dataset side by side on the shared fixed map grid, with the residual
+    CDFs in a band above them or one flux-balance profile in a band right of them on the maps' y range
   - Calculate pressure-drop mismatch from admitted pressure and boundary fields
   - Pair only scalar distributions and maps that represent the same quantity
   - Present descriptive physical statistics in colored tables
 
 Design principles:
   - Scalar metrics and full-grid arrays retain their declared distinct semantics
-  - Residual metrics are dimensionless; pressure-drop evidence stays in pascals
+  - Residual metrics are dimensionless and pressure-drop evidence stays in pascals, so the two never share an axis
   - Complete or bounded case reductions are owned by EvaluationSession
   - Display clipping never changes immutable residual or pressure evidence
   - Per-case distributions leave out non-finite cases, which the invalid-prediction warning names
+  - Residual maps share one round scale locked over the datasets, each bar with its unit and an arrow only where its map has values
+    beyond; every line or bar takes its model's fixed series style (``evaluation_plot_series``)
+  - Line and bar figures draw a row of panels per dataset and the models as lines or bars inside it
 
 This module does NOT:
   - Recompute residual equations, derivatives, crops, or boundary masks
@@ -26,30 +31,47 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
-import ipywidgets as widgets
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.lines import Line2D
 
 from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_session as sessions
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
+from src.analysis.evaluation.evaluation_plot import evaluation_plot_series as series
 from src.analysis.presentation import analysis_field_labels as field_labels
+from src.analysis.presentation import analysis_field_maps as field_maps
+from src.analysis.ui import analysis_ui_figure_layout as figure_layout
+from src.analysis.ui import analysis_ui_plot_layout as map_layout
+from src.analysis.ui import analysis_ui_tables as tables
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
+    import ipywidgets as widgets
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
+    from src.analysis.evaluation import evaluation_datasets as dataset_cuts
+    from src.analysis.presentation import analysis_visual_semantics as visual_semantics
+
 _DEFAULT_CASE_LIMIT = 100
-_RESIDUAL_COLORBAR_LABEL = rf"mean $\sqrt{{R_x^2+R_y^2}}/G$ [{field_labels.display_unit('1')}]"
-_RESIDUAL_LABELS = {
-    "momentum_residual_mse": (r"MSE of Brinkman momentum residual $(R_x^2+R_y^2)/G^2$", "1"),
-    "flux_balance_mse": (r"MSE of cross-section flux deviation $(q(y)-\bar{q})/Q$", "1"),
+_CDF_BAND_IN = 3.0  # height of the residual-CDF band above the maps
+_PROFILE_BAND_IN = 3.0  # width of the flux-balance profile band right of the maps
+_DIMENSIONLESS = field_labels.display_unit("1")
+_HIDDEN_NOTE_GID = "cdf-values-not-shown"
+_RESIDUAL_COLORBAR_LABEL = rf"mean $\sqrt{{R_x^2+R_y^2}}$ [{_DIMENSIONLESS}]"  # R_x, R_y are already scaled by the pressure gradient
+_RESIDUAL_LABELS = {  # the per-case scalar of each residual, in the symbols of the artifact contract
+    "momentum_residual_mse": r"$\mathrm{mean}(R_x^2+R_y^2)$",
+    "flux_balance_mse": r"$\mathrm{mean}(((q(y)-\bar{q})/Q)^2)$",
+    "pressure_boundary_mse": r"$\mathrm{mean}_{in}((p-p_{bc})^2)/\Delta p^2+(\bar{p}_{out}/\Delta p)^2$",
 }
+_PRESSURE_COMPONENTS = (  # the dimensionless medians of the pressure-boundary summary: column, frame column
+    ("pressure inlet MSE / Δp²", "pressure_inlet_mse"),
+    ("squared outlet mean / Δp²", "pressure_outlet_mean_square"),
+    ("pressure boundary MSE / Δp²", "pressure_boundary_mse"),
+)
+_PRESSURE_DROP_COLUMN = "pressure drop absolute error"
 
 
 def _values(frame: pd.DataFrame, column: str, max_cases: int) -> np.ndarray:
@@ -67,13 +89,47 @@ def _log_axis_values(values: np.ndarray) -> np.ndarray:
     return np.where(values > 0.0, values, np.nan)
 
 
-def _cdf(axis: Axes, values: np.ndarray, *, label: str, color: object | None = None) -> Line2D:
-    """Draw one empirical CDF on a log axis; exact zeros cannot be placed there, so they keep only their CDF share."""
-    ordered = np.sort(np.asarray(values, dtype=float))
-    cumulative = np.linspace(0.0, 1.0, ordered.size)
-    positive = ordered > 0.0
-    (line,) = axis.plot(ordered[positive], cumulative[positive], linewidth=2, label=label, color=color)
-    return line
+def _cdf(axis: Axes, values: np.ndarray, style: visual_semantics.SeriesStyle, *, name: str, case_count: int, label: str | None = None) -> None:
+    """
+    Draw one series' CDF on a log axis; a series without a finite case, and every value ≤ 0 a log axis cannot place, are named on the panel.
+
+    The values ≤ 0 keep their share of the CDF but get no point, so the panel says how many each series has.
+    """
+    if values.size == 0:
+        layout.mark_empty_prefix(axis, case_count=case_count, model=name)
+        return
+    hidden = int(np.count_nonzero(values <= 0.0))
+    if hidden:
+        earlier = sum(item.get_gid() == _HIDDEN_NOTE_GID for item in axis.texts)
+        axis.text(
+            0.98,
+            0.02 + 0.08 * earlier,
+            f"{name}: {hidden} of {values.size} values ≤ 0 not shown",
+            ha="right",
+            va="bottom",
+            transform=axis.transAxes,
+            fontsize=figure_layout.TICK_PT,
+            gid=_HIDDEN_NOTE_GID,
+        )
+    if hidden < values.size:
+        layout.plot_ecdf(axis, values, color=style.color, linestyle=style.linestyle, marker=style.marker, label=label, positive_only=True)
+
+
+def _finish(
+    figure: Figure,
+    axes: np.ndarray,
+    title: str,
+    datasets: dataset_cuts.DisplayFrames,
+    groups: Mapping[str, Mapping[str, str]],
+    styles: series.SeriesStyles,
+    count_headings: Mapping[str, str],
+    *,
+    bars: bool = False,
+) -> None:
+    """Write the dataset header of every row, the legend naming the models (and differing roles) and the figure title."""
+    figure_layout.set_row_headers(figure, axes, [count_headings[dataset] or dataset for dataset in groups])
+    layout.add_series_legend(figure, axes, datasets, groups, styles, bars=bars)
+    figure_layout.set_figure_title(figure, axes, title, note=layout.series_note(styles))
 
 
 def build_physical_consistency_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
@@ -96,28 +152,6 @@ def build_physical_consistency_summary_table(datasets: Mapping[str, pd.DataFrame
     return pd.DataFrame(rows).set_index("Model")
 
 
-def _blue_style(table: pd.DataFrame) -> pd.DataFrame:
-    """Return quantile-bounded blue numeric cell fills."""
-    styles = pd.DataFrame("", index=table.index, columns=table.columns)
-    cmap = plt.get_cmap("Blues")
-    for column in table.columns:
-        values = np.asarray(pd.to_numeric(table[column], errors="coerce"), dtype=float)
-        finite = values[np.isfinite(values)]
-        if finite.size == 0:
-            continue
-        low, high = np.quantile(finite, (0.05, 0.95))
-        if np.isclose(low, high):
-            continue
-        for row, value in enumerate(values):
-            if not np.isfinite(value):
-                continue
-            fraction = float(np.clip((value - low) / (high - low), 0.0, 1.0))
-            red, green, blue, _alpha = cmap(0.05 + 0.90 * fraction)
-            column_index = cast("int", styles.columns.get_loc(column))
-            styles.iloc[row, column_index] = f"background-color: rgba({int(red * 255)}, {int(green * 255)}, {int(blue * 255)}, 0.55)"
-    return styles
-
-
 def plot_physical_consistency_summary_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.VBox:
     """Return the automatically rendered colored summary table."""
     summary = build_physical_consistency_summary_table(datasets)
@@ -127,53 +161,46 @@ def plot_physical_consistency_summary_table(*, datasets: Mapping[str, pd.DataFra
     )
     if any(count_headings.values()):
         summary = summary.rename(index={label: count_headings[label] for label in datasets})
-    styler = summary.style
-    styler.format("{:.4g}")
-    styler.apply(lambda _table: _blue_style(summary), axis=None)
-    return widgets.VBox((widgets.HTML(f"<h2>{title}</h2>"), widgets.HTML(styler.to_html())))
+    return tables.styled_dataframe(summary, title=title)
 
 
 def plot_flux_balance(
     *,
-    datasets: Mapping[str, pd.DataFrame],
+    datasets: dataset_cuts.DisplayFrames,
     max_cases: int = _DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Plot the flux-balance distribution beside its mean per-row profile."""
+    """Plot the flux-balance distribution beside its mean per-row profile: a row per dataset, the models as lines."""
     dataframe.validate_comparison(datasets, require_physics=True)
-    metric_label, unit = _RESIDUAL_LABELS["flux_balance_mse"]
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
     with sessions.scoped_session(datasets) as active_session:
-        summaries = {id(frame): active_session.full_summary(frame, max_cases).require_residuals() for frame in datasets.values()}
-    figure_title, count_headings = layout.aggregate_title_context(
-        "Mass conservation: cross-section flux balance",
-        {label: summaries[id(frame)].sample_count for label, frame in datasets.items()},
+        summaries = {key: active_session.full_summary(frame, max_cases).require_residuals() for key, frame in datasets.items()}
+    figure_title, count_headings = layout.dataset_title_context(
+        "Mass conservation: cross-section flux balance", groups, {key: summary.sample_count for key, summary in summaries.items()}
     )
-    colors = {label: plt.get_cmap("tab10")(index % 10) for index, label in enumerate(datasets)}
-    figure = plt.figure(figsize=(13.0, 4.8))
-    grid = figure.add_gridspec(1, 3, width_ratios=(1.0, 1.0, 0.30), wspace=0.28)
-    cdf_axis = figure.add_subplot(grid[0, 0])
-    profile_axis = figure.add_subplot(grid[0, 1])
-    legend_axis = figure.add_subplot(grid[0, 2])
-    legend_axis.axis("off")
-    for label, frame in datasets.items():
-        summary = summaries[id(frame)]
-        heading = count_headings[label] or label
-        _cdf(cdf_axis, _values(frame, "flux_balance_mse", max_cases), label=heading, color=colors[label])
-        rows = summary.grid.coordinates[1, :, 0]
-        profile_axis.plot(_log_axis_values(cast("np.ndarray", summary.flux_balance_mean)), rows, linewidth=2, color=colors[label])
-    cdf_axis.set_xscale("log")
-    cdf_axis.set_xlabel(f"{metric_label} [{unit}]")
-    cdf_axis.set_ylabel("CDF")
-    cdf_axis.set_title("Per-case distribution")
-    profile_axis.set_xscale("log")
-    profile_axis.set_xlabel(r"mean $|q(y)-\bar{q}|/Q$ [-]")
-    profile_axis.set_ylabel(f"y [{summaries[id(next(iter(datasets.values())))].grid.coordinate_units[1]}]")
-    profile_axis.set_title("Mean profile over the bed height")
-    for axis in (cdf_axis, profile_axis):
+    figure, axes = figure_layout.panel_figure(len(groups), 2)
+    for (cdf_axis, profile_axis), models in zip(axes, groups.values(), strict=True):
+        for model, key in models.items():
+            style, summary = styles[key], summaries[key]
+            _cdf(cdf_axis, _values(datasets[key], "flux_balance_mse", max_cases), style, name=model, case_count=min(max_cases, len(datasets[key])))
+            profile_axis.plot(
+                _log_axis_values(cast("np.ndarray", summary.flux_balance_mean)),
+                summary.grid.coordinates[1, :, 0],
+                linewidth=2,
+                color=style.color,
+                linestyle=style.linestyle,
+                marker=style.marker,
+                markevery=layout.MARK_EVERY,
+            )
+        cdf_axis.set_xlabel(f"{_RESIDUAL_LABELS['flux_balance_mse']} [{_DIMENSIONLESS}]")
+        cdf_axis.set_ylabel("CDF")
+        figure_layout.set_panel_title(cdf_axis, "Per-case distribution")
+        profile_axis.set_xlabel(rf"mean $|q(y)-\bar{{q}}|/Q$ [{_DIMENSIONLESS}]")
+        profile_axis.set_ylabel(f"y [{summaries[next(iter(models.values()))].grid.coordinate_units[1]}]")
+        figure_layout.set_panel_title(profile_axis, "Mean profile over the bed height")
+    for axis in axes.flat:
+        figure_layout.set_log_scale(axis, "x")
         axis.grid(True, which="both", linestyle="--", alpha=0.3)
-    handles = [Line2D([0], [0], color=colors[label], linewidth=2, label=count_headings[label] or label) for label in datasets]
-    legend_axis.legend(handles, [str(handle.get_label()) for handle in handles], loc="upper left", frameon=True)
-    figure.subplots_adjust(top=0.84, bottom=0.16, left=0.07, right=0.98)
-    layout.title_over_axes(figure, figure_title, (cdf_axis, profile_axis), y=0.96)
+    _finish(figure, axes, figure_title, datasets, groups, styles, count_headings)
     return figure
 
 
@@ -215,50 +242,80 @@ def _pressure_drop_values(
 
 def plot_pressure_consistency(
     *,
-    datasets: Mapping[str, pd.DataFrame],
+    datasets: dataset_cuts.DisplayFrames,
     max_cases: int = _DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Place pressure-drop and boundary-condition CDFs in one honest view."""
+    """Place pressure-drop and boundary-condition CDFs in one honest view: a row per dataset, the models as lines."""
     dataframe.validate_comparison(datasets, require_physics=True)
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
     pressure_drop = _pressure_drop_values(datasets, max_cases)
-    pressure_boundary = {label: _values(frame, "pressure_boundary_mse", max_cases) for label, frame in datasets.items()}
-    figure_title, count_headings = layout.aggregate_title_context(
-        "Pressure and boundary-condition consistency",
-        layout.effective_case_counts(datasets, max_cases=max_cases),
+    pressure_boundary = {key: _values(frame, "pressure_boundary_mse", max_cases) for key, frame in datasets.items()}
+    figure_title, count_headings = layout.dataset_title_context(
+        "Pressure and boundary-condition consistency", groups, layout.effective_case_counts(datasets, max_cases=max_cases)
     )
-    colors = {label: plt.get_cmap("tab10")(index % 10) for index, label in enumerate(datasets)}
-    figure = plt.figure(figsize=(13.0, 4.8))
-    grid = figure.add_gridspec(1, 3, width_ratios=(1.0, 1.0, 0.30), wspace=0.28)
-    axes = (figure.add_subplot(grid[0, 0]), figure.add_subplot(grid[0, 1]))
-    legend_axis = figure.add_subplot(grid[0, 2])
-    legend_axis.axis("off")
+    figure, axes = figure_layout.panel_figure(len(groups), 2)
     specifications = (
-        (
-            axes[0],
-            pressure_drop,
-            "Pressure-drop mismatch",
-            r"$|\Delta p_{pred}-\Delta p_{bc}|/\Delta p_{bc}$ [-]",
-        ),
-        (
-            axes[1],
-            pressure_boundary,
-            "Pressure-boundary mismatch",
-            r"$\mathrm{MSE}(p_\Gamma-p_{bc})/\Delta p^2$ [-]",
-        ),
+        (0, pressure_drop, "Pressure-drop mismatch", rf"$|\Delta p_{{pred}}-\Delta p_{{bc}}|/\Delta p_{{bc}}$ [{_DIMENSIONLESS}]"),
+        (1, pressure_boundary, "Pressure-boundary mismatch", f"{_RESIDUAL_LABELS['pressure_boundary_mse']} [{_DIMENSIONLESS}]"),
     )
-    for axis, values, axis_title, xlabel in specifications:
-        for label in datasets:
-            _cdf(axis, values[label], label=count_headings[label] or label, color=colors[label])
-        axis.set_xscale("log")
-        axis.set_xlabel(xlabel)
-        axis.set_ylabel("CDF")
-        axis.set_title(axis_title)
-        axis.grid(True, which="both", linestyle="--", alpha=0.3)
-    handles = [Line2D([0], [0], color=colors[label], linewidth=2, label=count_headings[label] or label) for label in datasets]
-    legend_axis.legend(handles, [str(handle.get_label()) for handle in handles], loc="upper left", frameon=True)
-    figure.subplots_adjust(top=0.84, bottom=0.18, left=0.07, right=0.98)
-    layout.title_over_axes(figure, figure_title, axes, y=0.96)
+    for row, models in enumerate(groups.values()):
+        for column, values, axis_title, xlabel in specifications:
+            axis = axes[row, column]
+            for model, key in models.items():
+                _cdf(axis, values[key], styles[key], name=model, case_count=min(max_cases, len(datasets[key])))
+            figure_layout.set_log_scale(axis, "x")
+            axis.set_xlabel(xlabel)
+            figure_layout.set_panel_title(axis, axis_title)
+            axis.grid(True, which="both", linestyle="--", alpha=0.3)
+    figure_layout.label_rows_once(axes, "CDF")
+    _finish(figure, axes, figure_title, datasets, groups, styles, count_headings)
     return figure
+
+
+def _residual_maps(
+    summaries: Sequence[sessions.FullEvaluationSummary],
+    headings: Sequence[str],
+    *,
+    title: str,
+    attribute: str,
+    colorbar_label: str,
+    above_in: float = 0.0,
+    right_in: float = 0.0,
+) -> tuple[Figure, map_layout.MapGeometry]:
+    """
+    Draw one mean residual map per summary in a row on the shared fixed map grid and return the figure and its geometry.
+
+    The columns follow the selection, so the figure grows with them (no width cap). The maps share one round scale, locked over
+    them, from 0 to the rounded 95th percentile of their pooled finite values; each bar carries ``colorbar_label`` with its unit and an
+    arrow only if its own map has values beyond. ``above_in`` and ``right_in`` reserve the band of a line panel.
+    """
+    values = [np.asarray(getattr(summary, attribute), dtype=np.float64) for summary in summaries]
+    extents = {summary.grid.extent for summary in summaries}
+    if len(extents) != 1:
+        msg = "The maps of one figure share one physical extent, but the selected datasets have different grids."
+        raise ValueError(msg)
+    extent = next(iter(extents))
+    pooled = np.concatenate([field[np.isfinite(field)] for field in values])
+    boundaries = field_maps.error_boundaries(pooled, signed=False)
+    definition = field_maps.build_field_map(
+        np.append(pooled, boundaries[[0, -1]]),  # the scale's own ends keep a uniform residual from being a constant map
+        semantic=field_maps.FieldMapSemantic.ABSOLUTE_ERROR,
+        field=attribute,
+        unit="1",
+        locked_boundaries=boundaries,
+    )
+    geometry = map_layout.plan_geometry(
+        1, len(summaries), (extent[1] - extent[0], extent[3] - extent[2]), row_labels=False, width_cap=None, above_in=above_in, right_in=right_in
+    )
+    figure, axes, slots = map_layout.map_grid(geometry, extent=extent)
+    for column, (summary, field) in enumerate(zip(summaries, values, strict=True)):
+        image = axes[0, column].pcolormesh(*summary.grid.coordinates, np.ma.masked_invalid(field), shading="auto", **definition.pcolormesh_kwargs())
+        extend = field_maps.locked_extend(field[np.isfinite(field)], boundaries)
+        map_layout.add_field_map_colorbar(figure, image, slots[0, column], definition, label=colorbar_label, extend=extend)
+    map_layout.set_column_headers(axes, headings, ())
+    map_layout.set_map_title(figure, title)
+    layout.add_scale_note(figure, shared=False)
+    return figure, geometry
 
 
 def _metric_map_composite(
@@ -270,106 +327,66 @@ def _metric_map_composite(
     title: str,
     colorbar_label: str,
 ) -> Figure:
-    """Compose one scalar-residual line region directly above matching maps."""
+    """Compose the scalar-residual CDFs in a band above one row of matching maps, a column per dataset."""
     dataframe.validate_comparison(datasets, require_physics=True)
-    metric_label, unit = _RESIDUAL_LABELS[metric]
     with sessions.scoped_session(datasets) as active_session:
         summaries = {id(frame): active_session.full_summary(frame, max_cases).require_residuals() for frame in datasets.values()}
     figure_title, count_headings = layout.aggregate_title_context(
         f"{title}: distribution and map",
         {label: summaries[id(frame)].sample_count for label, frame in datasets.items()},
     )
-    figure = plt.figure(figsize=layout.MAP_LAYOUT.composite_size(map_columns=len(datasets)))
-    grid = figure.add_gridspec(
-        2,
-        len(datasets),
-        height_ratios=layout.MAP_LAYOUT.composite_height_ratios,
-        hspace=layout.MAP_LAYOUT.composite_hspace,
-        wspace=layout.MAP_LAYOUT.composite_group_spacing,
+    headings = {label: count_headings[label] or label for label in datasets}
+    figure, geometry = _residual_maps(
+        [summaries[id(frame)] for frame in datasets.values()],
+        list(headings.values()),
+        title=figure_title,
+        attribute=attribute,
+        colorbar_label=colorbar_label,
+        above_in=_CDF_BAND_IN,
     )
-    line_axis = figure.add_subplot(grid[0, :])
-    handles = []
+    styles = series.series_styles(datasets)
+    line_axis = figure.add_axes(map_layout.band_rect(geometry, "above"))
     for label, frame in datasets.items():
-        handles.append(_cdf(line_axis, _values(frame, metric, max_cases), label=count_headings[label] or label))
-    line_axis.set_xscale("log")
-    line_axis.set_xlabel(f"{metric_label} [{unit}]")
+        _cdf(line_axis, _values(frame, metric, max_cases), styles[label], name=label, case_count=min(max_cases, len(frame)), label=headings[label])
+    figure_layout.set_log_scale(line_axis, "x")
+    line_axis.set_xlabel(f"{_RESIDUAL_LABELS[metric]} [{_DIMENSIONLESS}]")
     line_axis.set_ylabel("CDF")
     line_axis.grid(True, which="both", linestyle="--", alpha=0.3)
-    line_axis.legend(handles=handles, labels=[str(handle.get_label()) for handle in handles], loc="best", ncol=min(3, len(handles)))
-
-    map_axes: list[Axes] = []
-    for column, (label, frame) in enumerate(datasets.items()):
-        summary = summaries[id(frame)]
-        values = cast("np.ndarray", getattr(summary, attribute))
-        upper = max(float(np.nanpercentile(values, 99.5)), np.finfo(float).eps)
-        map_group = grid[1, column].subgridspec(1, 1)
-        axis = figure.add_subplot(map_group[0, 0])
-        map_axes.append(axis)
-        image = axis.imshow(
-            np.clip(values, 0.0, upper),
-            origin="lower",
-            extent=summary.grid.extent,
-            aspect="equal",
-            vmin=0.0,
-            vmax=upper,
-            interpolation="nearest",
-        )
-        heading = count_headings[label] or label
-        axis.set_title(f"{heading} — mean spatial residual")
-        layout.add_map_colorbar(figure, image, axis, label=colorbar_label)
-    first_summary = summaries[id(next(iter(datasets.values())))]
-    layout.apply_map_grid_axis_labels(
-        (map_axes,),
-        x_label=f"x [{first_summary.grid.coordinate_units[0]}]",
-        y_label=f"y [{first_summary.grid.coordinate_units[1]}]",
-    )
-    figure.subplots_adjust(top=0.93, bottom=0.07, left=0.07, right=0.98)
-    figure.suptitle(figure_title)
+    if line_axis.lines:
+        line_axis.legend(loc="best")
     return figure
 
 
 def plot_physical_consistency_cdf_grid(
     *,
-    datasets: Mapping[str, pd.DataFrame],
+    datasets: dataset_cuts.DisplayFrames,
     max_cases: int = _DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Render the approved 2 x 2 residual grid and external legend."""
+    """Render the four residual CDFs of every dataset as a row of panels, the models as lines, with one legend beside them."""
     dataframe.validate_comparison(datasets, require_physics=True)
-    colors = {label: plt.get_cmap("tab10")(index % 10) for index, label in enumerate(datasets)}
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
     pressure_drop = _pressure_drop_values(datasets, max_cases)
-    figure_title, count_headings = layout.aggregate_title_context(
-        "Physical consistency distributions",
-        layout.effective_case_counts(datasets, max_cases=max_cases),
+    figure_title, count_headings = layout.dataset_title_context(
+        "Physical consistency distributions", groups, layout.effective_case_counts(datasets, max_cases=max_cases)
     )
     specifications = (
-        ("flux_balance_mse", r"$\mathrm{MSE}((q(y)-\bar{q})/Q)$", "Mass conservation (flux balance)"),
-        ("momentum_residual_mse", r"$\mathrm{MSE}((R_x^2+R_y^2)/G^2)$", "Brinkman residual"),
+        ("flux_balance_mse", _RESIDUAL_LABELS["flux_balance_mse"], "Mass conservation (flux balance)"),
+        ("momentum_residual_mse", _RESIDUAL_LABELS["momentum_residual_mse"], "Brinkman residual"),
         (None, r"$|\Delta p_{pred}-\Delta p_{bc}|/\Delta p_{bc}$", "Pressure drop"),
-        ("pressure_boundary_mse", r"$\mathrm{MSE}(p_\Gamma-p_{bc})/\Delta p^2$", "Pressure BC"),
+        ("pressure_boundary_mse", _RESIDUAL_LABELS["pressure_boundary_mse"], "Pressure BC"),
     )
-    figure = plt.figure(figsize=(15.5, 8.5))
-    grid = figure.add_gridspec(2, 3, width_ratios=(1.0, 1.0, 0.30), wspace=0.25, hspace=0.30)
-    axes = (
-        figure.add_subplot(grid[0, 0]),
-        figure.add_subplot(grid[0, 1]),
-        figure.add_subplot(grid[1, 0]),
-        figure.add_subplot(grid[1, 1]),
-    )
-    legend_axis = figure.add_subplot(grid[:, 2])
-    legend_axis.axis("off")
-    for axis, (metric, xlabel, title) in zip(axes, specifications, strict=True):
-        for label, frame in datasets.items():
-            values = pressure_drop[label] if metric is None else _values(frame, metric, max_cases)
-            _cdf(axis, values, label=label, color=colors[label])
-        axis.set_xscale("log")
-        axis.set_xlabel(xlabel)
-        axis.set_ylabel("CDF")
-        axis.set_title(title)
-        axis.grid(True, which="both", linestyle="--", alpha=0.3)
-    handles = [Line2D([0], [0], color=colors[label], linewidth=2, label=count_headings[label] or label) for label in datasets]
-    legend_axis.legend(handles, [str(handle.get_label()) for handle in handles], loc="upper left", frameon=True)
-    figure.subplots_adjust(top=0.88, bottom=0.10, left=0.06, right=0.98)
-    layout.title_over_axes(figure, figure_title, axes, y=0.96)
+    figure, axes = figure_layout.panel_figure(len(groups), len(specifications))
+    for row, models in enumerate(groups.values()):
+        for axis, (metric, xlabel, title) in zip(axes[row], specifications, strict=True):
+            for model, key in models.items():
+                values = pressure_drop[key] if metric is None else _values(datasets[key], metric, max_cases)
+                _cdf(axis, values, styles[key], name=model, case_count=min(max_cases, len(datasets[key])))
+            figure_layout.set_log_scale(axis, "x")
+            axis.set_xlabel(f"{xlabel} [{_DIMENSIONLESS}]")
+            figure_layout.set_panel_title(axis, title)
+            axis.grid(True, which="both", linestyle="--", alpha=0.3)
+    figure_layout.label_rows_once(axes, "CDF")
+    _finish(figure, axes, figure_title, datasets, groups, styles, count_headings)
     return figure
 
 
@@ -378,7 +395,12 @@ def plot_spatial_residuals(
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int | None = None,
 ) -> Figure:
-    """Retain a direct momentum-map and flux-profile family outside approved panel scope."""
+    """
+    Plot the mean momentum-residual map of every dataset side by side and one flux-balance profile of all of them right of the maps.
+
+    The profile panel stands in a band of the maps' height and y range, so each profile row lies at the height of its map row; its lines
+    take the datasets' fixed colours and line styles and its legend stands inside it.
+    """
     limit = min(len(frame) for frame in datasets.values()) if max_cases is None else max_cases
     dataframe.validate_comparison(datasets, require_physics=True)
     with sessions.scoped_session(datasets) as active_session:
@@ -387,60 +409,92 @@ def plot_spatial_residuals(
         "Spatial residuals",
         {label: summaries[id(frame)].sample_count for label, frame in datasets.items()},
     )
-    figure, axes = plt.subplots(len(datasets), 2, figsize=(12.0, 4.0 * len(datasets)), squeeze=False, width_ratios=(2.0, 1.0))
-    for row, (label, frame) in enumerate(datasets.items()):
+    headings = {label: count_headings[label] or label for label in datasets}
+    figure, geometry = _residual_maps(
+        [summaries[id(frame)] for frame in datasets.values()],
+        list(headings.values()),
+        title=figure_title,
+        attribute="momentum_mean",
+        colorbar_label=_RESIDUAL_COLORBAR_LABEL,
+        right_in=_PROFILE_BAND_IN,
+    )
+    styles = series.series_styles(datasets)
+    profile_axis = figure.add_axes(map_layout.band_rect(geometry, "right"))
+    for label, frame in datasets.items():
         summary = summaries[id(frame)]
-        heading = count_headings[label] or label
-        momentum = cast("np.ndarray", summary.momentum_mean)
-        upper = max(float(np.quantile(momentum, 0.99)), np.finfo(float).eps)
-        image = axes[row, 0].imshow(momentum, origin="lower", extent=summary.grid.extent, aspect="equal", cmap="magma", vmin=0.0, vmax=upper)
-        axes[row, 0].set_title(f"{heading} — momentum")
-        axes[row, 0].set_xlabel(f"x [{summary.grid.coordinate_units[0]}]")
-        axes[row, 0].set_ylabel(f"y [{summary.grid.coordinate_units[1]}]")
-        layout.add_map_colorbar(figure, image, axes[row, 0], label=_RESIDUAL_COLORBAR_LABEL)
-        rows = summary.grid.coordinates[1, :, 0]
-        axes[row, 1].plot(_log_axis_values(cast("np.ndarray", summary.flux_balance_mean)), rows, linewidth=2)
-        axes[row, 1].set_xscale("log")
-        axes[row, 1].set_title(f"{heading} — flux balance")
-        axes[row, 1].set_xlabel(r"mean $|q(y)-\bar{q}|/Q$ [-]")
-        axes[row, 1].set_ylabel(f"y [{summary.grid.coordinate_units[1]}]")
-        axes[row, 1].grid(True, which="both", linestyle="--", alpha=0.3)
-    figure.suptitle(figure_title)
-    figure.tight_layout()
+        profile_axis.plot(
+            _log_axis_values(cast("np.ndarray", summary.flux_balance_mean)),
+            summary.grid.coordinates[1, :, 0],
+            linewidth=2,
+            label=headings[label],
+            color=styles[label].color,
+            linestyle=styles[label].linestyle,
+            marker=styles[label].marker,
+            markevery=layout.MARK_EVERY,
+        )
+    extent = next(iter(summaries.values())).grid.extent
+    profile_axis.set_ylim(extent[2], extent[3])
+    profile_axis.tick_params(labelleft=False)
+    figure_layout.set_log_scale(profile_axis, "x")
+    profile_axis.set_xlabel(r"mean $|q(y)-\bar{q}|/Q$ [-]")
+    profile_axis.grid(True, which="both", linestyle="--", alpha=0.3)
+    profile_axis.legend(loc="best")
+    map_layout.set_column_headers(np.array([[profile_axis]], dtype=object), ["Mean flux-balance profile"], ())
     return figure
 
 
-def build_pressure_boundary_summary(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
-    """Build current pressure-boundary components and pressure-drop error."""
+def _median(values: np.ndarray) -> float:
+    """Return the median of the finite case values, NaN without any."""
+    return float(np.median(values)) if values.size else float("nan")
+
+
+def build_pressure_boundary_summary(datasets: Mapping[str, pd.DataFrame], max_cases: int = _DEFAULT_CASE_LIMIT) -> pd.DataFrame:
+    """Build the medians of the pressure-boundary components and of the pressure-drop error over the finite cases of the saved prefix."""
     dataframe.validate_comparison(datasets, require_physics=True)
     with sessions.scoped_session(datasets) as active_session:
-        summaries = {id(frame): active_session.full_summary(frame).require_pressure() for frame in datasets.values()}
+        summaries = {label: active_session.full_summary(frame, max_cases).require_pressure() for label, frame in datasets.items()}
     rows = []
     for label, frame in datasets.items():
-        summary = summaries[id(frame)]
         rows.append(
             {
                 "Model": label,
-                "pressure inlet MSE / Δp² [1]": float(np.median(frame["pressure_inlet_mse"])),
-                "squared outlet mean / Δp² [1]": float(np.median(frame["pressure_outlet_mean_square"])),
-                "pressure boundary MSE / Δp² [1]": float(np.median(frame["pressure_boundary_mse"])),
-                "pressure drop absolute error [Pa]": float(np.median(cast("np.ndarray", summary.pressure_absolute_error))),
+                **{name: _median(_values(frame, column, max_cases)) for name, column in _PRESSURE_COMPONENTS},
+                _PRESSURE_DROP_COLUMN: _median(validity_contract.finite_case_values(summaries[label].pressure_absolute_error)),
             }
         )
     return pd.DataFrame(rows).set_index("Model")
 
 
-def plot_pressure_boundary_summary(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
-    """Retain the direct pressure summary diagnostic outside panel scope."""
-    table = build_pressure_boundary_summary(datasets)
-    figure_title, count_headings = layout.aggregate_title_context(
-        "Pressure boundary and drop summary",
-        layout.effective_case_counts(datasets),
+def plot_pressure_boundary_summary(*, datasets: dataset_cuts.DisplayFrames, max_cases: int = _DEFAULT_CASE_LIMIT) -> Figure:
+    """Compare the median pressure-boundary components ([-]) and the pressure-drop error (Pa) on two panels per dataset row, a bar per model."""
+    table = build_pressure_boundary_summary(datasets, max_cases)
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
+    figure_title, count_headings = layout.dataset_title_context(
+        "Pressure boundary and drop summary", groups, layout.effective_case_counts(datasets, max_cases=max_cases)
     )
-    if any(count_headings.values()):
-        table = table.rename(index={label: count_headings[label] for label in datasets})
-    figure, axis = plt.subplots(figsize=(12, 5), constrained_layout=True)
-    table.plot.bar(ax=axis)
-    axis.set_yscale("log")
-    figure.suptitle(figure_title)
+    figure, axes = figure_layout.panel_figure(len(groups), 2, width_ratios=(1.6, 1.0))
+    panels = (
+        (0, [name for name, _column in _PRESSURE_COMPONENTS], f"Median [{_DIMENSIONLESS}]"),
+        (1, [_PRESSURE_DROP_COLUMN], f"Median absolute error [{field_labels.display_unit('Pa')}]"),
+    )
+    for row, models in enumerate(groups.values()):
+        width = 0.8 / len(models)
+        for column, columns, ylabel in panels:
+            axis = axes[row, column]
+            positions = np.arange(len(columns), dtype=float)
+            shown: list[float] = []
+            for offset, (model, key) in enumerate(models.items()):
+                medians = table.loc[key, columns].to_numpy(dtype=float)
+                if not np.isfinite(medians).any():
+                    layout.mark_empty_prefix(axis, case_count=min(max_cases, len(datasets[key])), model=model)
+                    continue
+                shown.extend(medians[np.isfinite(medians)])
+                bars = positions + (offset - (len(models) - 1) / 2.0) * width
+                axis.bar(bars, medians, width, color=styles[key].color, edgecolor="white", hatch=styles[key].hatch)
+            axis.set_xticks(positions, columns, rotation=25, ha="right")
+            axis.set_ylabel(ylabel)
+            axis.grid(True, axis="y", which="both", linestyle="--", alpha=0.3)
+            if shown and min(shown) > 0.0:
+                figure_layout.set_log_scale(axis, "y")
+    _finish(figure, axes, figure_title, datasets, groups, styles, count_headings, bars=True)
     return figure

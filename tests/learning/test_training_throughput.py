@@ -62,9 +62,9 @@ class _RecordingLoader:
 class _CaseMSE(nn.Module):
     """Return every case's squared error as its loss."""
 
-    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
+    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor, reference: object = None) -> dict[str, torch.Tensor]:
         """Return ``total`` per case."""
-        del x
+        del x, reference
         return {"total": (pred - y).square().flatten(1).mean(dim=1)}
 
 
@@ -178,7 +178,7 @@ def test_checkpoint_timer_measures_capture_and_publication_outside_observers(
     def train(_model: nn.Module, train_loader: DataLoader[Any], *_args: Any, **kwargs: Any) -> dict[str, Any]:
         clock[0] += 7.0
         loop.train_unit_sampler(train_loader).advance(1)
-        kwargs["budget"].record_group(units=1, train_seconds=7.0)
+        kwargs["budget"].record_group(units=1, supervised_transitions=1, train_seconds=7.0)
         work = {"optimizer_steps": 1.0, "gradient_predictions": 1.0, "units": 1.0, "update_distinct_cases": 1.0}
         return {"train/loss": 0.5, **work, "update_work": [[1, 1, 1]], "divergence": None}
 

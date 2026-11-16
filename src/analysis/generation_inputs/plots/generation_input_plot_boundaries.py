@@ -24,6 +24,7 @@ import numpy as np
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
 from src.analysis.presentation import analysis_field_labels as field_labels
+from src.analysis.ui import analysis_ui_figure_layout as figure_layout
 from src.analysis.ui import tables
 
 from . import generation_input_plot_layout as layout
@@ -61,20 +62,9 @@ def boundary_comparison_table(
     )
 
 
-def _schedule_axes() -> tuple[Figure, tuple[tuple[Axes, Axes], ...]]:
-    """Create three channel rows with operating and first-hour columns."""
-    figure, grid = layout.figure_grid(
-        columns=2,
-        row_heights=(layout.MAP_LAYOUT.schedule_row_height,) * 3,
-    )
-    axes = tuple(
-        (
-            figure.add_subplot(grid[row, 0]),
-            figure.add_subplot(grid[row, 1]),
-        )
-        for row in range(3)
-    )
-    return figure, axes
+def _schedule_axes() -> tuple[Figure, np.ndarray]:
+    """Create three channel rows with operating and first-hour columns of equal panels."""
+    return figure_layout.panel_figure(3, 2, panel_in=(layout.FIGURE_LAYOUT.column_width, layout.FIGURE_LAYOUT.schedule_row_height))
 
 
 def _early_operation_ticks(*supports: Iterable[float]) -> tuple[float, ...]:
@@ -135,7 +125,7 @@ def _plot_schedule(
         diagnostics.display_value(name, values[:, column], unit),
         color=color,
         linestyle=linestyle,
-        linewidth=layout.MAP_LAYOUT.line_width,
+        linewidth=layout.FIGURE_LAYOUT.line_width,
         label=label,
     )
 
@@ -267,56 +257,39 @@ def schedule_comparison(
                     linestyle="--",
                     label=f"Mean B, n = {mean_b.case_count}",
                 )
-            axis.set_ylabel(
-                f"{field_labels.field_label(name, mathtext=True)} [{diagnostics.display_unit(name, unit)}]",
-                fontsize=layout.MAP_LAYOUT.label_size,
-            )
-            axis.tick_params(labelsize=layout.MAP_LAYOUT.tick_size)
+            if axis_pair == 0:  # both columns show the same channel, so its label stands once per row
+                axis.set_ylabel(f"{field_labels.field_label(name, mathtext=True)} [{diagnostics.display_unit(name, unit)}]")
             axis.grid(alpha=0.24)
 
     for row in range(3):
         axes[row][1].set_xlim(0.0, 60.0 * _EARLY_OPERATION_END_H)
         axes[row][1].set_xticks(early_operation_ticks)
 
-    axes[0][0].set_title(
-        (f"Operating schedule: {60.0 * startup_duration_h:g} min onward" if startup_enabled else "Operating schedule"),
-        fontsize=layout.MAP_LAYOUT.axis_title_size,
+    figure_layout.set_panel_title(
+        axes[0][0], f"Operating schedule: {60.0 * startup_duration_h:g} min onward" if startup_enabled else "Operating schedule"
     )
-    axes[0][1].set_title(
+    figure_layout.set_panel_title(
+        axes[0][1],
         (
             f"Startup and early operation: 0-{60.0 * _EARLY_OPERATION_END_H:g} min"
             if startup_enabled
             else f"Early operation: 0-{60.0 * _EARLY_OPERATION_END_H:g} min"
         ),
-        fontsize=layout.MAP_LAYOUT.axis_title_size,
     )
-    axes[-1][0].set_xlabel("time [h]", fontsize=layout.MAP_LAYOUT.label_size)
-    axes[-1][1].set_xlabel("time [min]", fontsize=layout.MAP_LAYOUT.label_size)
+    axes[-1][0].set_xlabel("Time [h]")
+    axes[-1][1].set_xlabel("Time [min]")
 
-    handles, legend_labels = axes[0][0].get_legend_handles_labels()
-    figure.legend(
-        handles,
-        legend_labels,
-        loc="outside lower center",
-        ncols=min(4, len(legend_labels)),
-        fontsize=layout.MAP_LAYOUT.legend_size,
-    )
     unavailable = []
     if mean_a.schedule_mean_unavailable is not None:
         unavailable.append(f"Mean A: {mean_a.schedule_mean_unavailable}")
     if not same_dataset and mean_b.schedule_mean_unavailable is not None:
         unavailable.append(f"Mean B: {mean_b.schedule_mean_unavailable}")
-    if unavailable:
-        figure.text(
-            0.01,
-            0.01,
-            " ".join(unavailable),
-            fontsize=layout.MAP_LAYOUT.tick_size,
-            ha="left",
-            va="bottom",
-        )
-    figure.suptitle(
+    figure_layout.set_figure_title(
+        figure,
+        axes,
         f"Transient schedules — Case {first.case.case_index} (A) vs Case {second.case.case_index} (B)",
-        fontsize=layout.MAP_LAYOUT.title_size,
+        note=" ".join(unavailable) or None,
     )
+    handles, legend_labels = axes[0][0].get_legend_handles_labels()
+    figure_layout.add_legend(figure, axes, handles, legend_labels)
     return figure

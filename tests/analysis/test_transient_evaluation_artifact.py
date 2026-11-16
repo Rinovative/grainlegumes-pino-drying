@@ -1018,6 +1018,12 @@ def test_rollout_modes_origins_horizons_conditioning_and_sequence_roundtrip(  # 
         record.target["reference_evidence_scope"] == "unavailable_partial_interval" and record.target["reference_available"] is False
         for record in (*teacher, *rolling)
     )
+    assert all(record.target["target_moisture_wb"] == pytest.approx(0.05) for record in evaluated.records)
+    without_moisture_target = {name: value for name, value in full[0].target.items() if name != "target_moisture_wb"}
+    with pytest.raises(artifact.TransientSequenceArtifactError, match=r"missing \['target_moisture_wb'\]"):
+        replace(full[0], target=without_moisture_target).validated()
+    with pytest.raises(ValueError, match="Target moisture"):
+        replace(full[0], target={**full[0].target, "target_moisture_wb": 5.0}).validated()
     wrong_criterion = dict(full[0].target)
     wrong_criterion["criterion"] = "noncanonical"
     with pytest.raises(artifact.TransientSequenceArtifactError, match="canonical"):
@@ -1044,7 +1050,7 @@ def test_rollout_modes_origins_horizons_conditioning_and_sequence_roundtrip(  # 
         "producer": {"analysis_sha256": "9" * 64},
         "run": {
             "name": "run",
-            "checkpoint_sha256": "b" * 64,
+            "best_checkpoint_sha256": "b" * 64,
             "parent_experiment": {
                 "kind": "grouped",
                 "parent_available": True,
@@ -1084,6 +1090,7 @@ def test_rollout_modes_origins_horizons_conditioning_and_sequence_roundtrip(  # 
     assert stored.summaries[0].identity["checkpoint_identity"] == {"sha256": "b" * 64}
     stored_full = next(record for record in stored.summaries if record.mode == "autonomous_full")
     assert stored_full.target["reference_time_to_target"] == pytest.approx(3.5)
+    assert all(summary.target["target_moisture_wb"] == pytest.approx(0.05) for summary in stored.summaries)
     identity_before_telemetry = stored.identity_sha256
     recorder = artifact_performance.ArtifactPerformanceRecorder(
         device="cpu",
@@ -1316,6 +1323,7 @@ def _cache_test_record(case_id: str, *, mode: artifact.EvaluationMode, grid: tup
     target = {
         "criterion": artifact.TARGET_CRITERION,
         "limit": 0.5,
+        "target_moisture_wb": 0.05,
         "reference_evidence_scope": "canonical_completed_case" if full_autonomous else "unavailable_partial_interval",
         "predicted_evidence_scope": "regular_sequence_grid",
         "reference_available": full_autonomous,
@@ -1925,6 +1933,20 @@ def test_load_rejects_chain_storage_without_a_valid_owner(
         artifact.load_transient_sequence_artifact_index(root)
 
 
+def test_load_rejects_an_old_payload_whose_target_evidence_lacks_the_target_moisture(tmp_path: Path) -> None:
+    """A stored index written before the wet-basis target was recorded is refused when opened, never read with a default."""
+    _chains, records = _chain_test_case()
+    root = _write_chain_test_artifact(tmp_path, records)
+    rows = pd.read_parquet(root / "artifacts.parquet")
+    rows["target_json"] = [
+        json.dumps({name: value for name, value in json.loads(text).items() if name != "target_moisture_wb"}, sort_keys=True)
+        for text in rows["target_json"]
+    ]
+    _resign_chain_test_artifact(root, rows=rows)
+    with pytest.raises(artifact.TransientSequenceArtifactError, match=r"missing \['target_moisture_wb'\]"):
+        artifact.load_transient_sequence_artifact_index(root)
+
+
 def test_load_rejects_a_stored_chain_longer_than_its_longest_record(tmp_path: Path) -> None:
     """Reject an owner chain carrying an appended state and availability flag."""
     _chains, records = _chain_test_case()
@@ -2019,7 +2041,7 @@ def _cache_test_provenance() -> dict[str, Any]:
         "producer": {"analysis_sha256": "9" * 64},
         "run": {
             "name": "run",
-            "checkpoint_sha256": "b" * 64,
+            "best_checkpoint_sha256": "b" * 64,
             "parent_experiment": {
                 "kind": "grouped",
                 "parent_available": True,
@@ -3484,7 +3506,9 @@ def test_saved_prediction_comparison_viewers_are_read_only(
     )
     evaluation = transient_session.TransientEvaluationSession({"Saved model A ID": index.frame, "Saved model B ID": index.frame})
     before = {path.relative_to(tmp_path): common.serialization.file_sha256(path) for path in tmp_path.rglob("*") if path.is_file()}
-    analysis.evaluation.panel.build_transient_panel(session=evaluation, comparison=True, sections=("runtime", "matched_stages"))
+    analysis.evaluation.panel.build_transient_panel(
+        session=evaluation, comparison=True, sections=("runtime", "matched_stages"), training_histories=dict
+    )
     monkeypatch.setattr(common.paths, "get_storage_root", lambda: tmp_path)
     export_state: dict[str, Any] = {"fig": None}
     viewer = analysis.evaluation.panel._make_transient_runtime_viewer(session=evaluation, kind="tradeoff", export_state=export_state)

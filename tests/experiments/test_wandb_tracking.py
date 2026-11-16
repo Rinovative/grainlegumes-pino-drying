@@ -51,7 +51,7 @@ class _FakeRun:
         self.metric_definitions.append((name, kwargs))
 
     def log(self, data: dict[str, Any], **options: Any) -> None:
-        assert not options  # W&B's own step only counts calls; train_seconds in the payload is the x-axis
+        assert not options  # W&B's own step only counts calls; supervised_transitions in the payload is the x-axis
         if self.fail_log:
             msg = "synthetic transport failure"
             raise OSError(msg)
@@ -165,9 +165,8 @@ def test_disabled_tracking_has_no_sdk_or_filesystem_side_effects(
         config,
         run_dir=tmp_path,
         state_updater=update,
-        ood_roles=(),
     )
-    session.log_event(1, {"train/loss_total": 2.0, "budget/train_seconds": 2.0})
+    session.log_event(1, {"train/loss_total": 2.0, "budget/supervised_transitions": 2.0})
     session.finish(status="completed")
     assert not session.enabled
     assert state == {}
@@ -188,7 +187,6 @@ def test_online_authentication_is_checked_before_sdk_import(
             _resolved_config(),
             run_dir=tmp_path,
             state_updater=update,
-            ood_roles=(),
         )
     assert fake.initializations == []
     assert state["status"] == "failed_before_start"
@@ -209,25 +207,23 @@ def test_fresh_runs_are_isolated_and_resume_reuses_persisted_identity(
         config,
         run_dir=tmp_path / "first",
         state_updater=first_update,
-        ood_roles=(),
     )
-    second = tracking.initialize_wandb(config, run_dir=tmp_path / "second", ood_roles=())
+    second = tracking.initialize_wandb(config, run_dir=tmp_path / "second")
     resumed = tracking.initialize_wandb(
         config,
         run_dir=tmp_path / "first",
         resume=True,
         persisted_run_id=first.run_id,
         previous_last_logged_step=2,
-        ood_roles=(),
     )
     assert first.run_id != second.run_id
     assert resumed.run_id == first.run_id == first_state["wandb_run_id"]
     assert [item["resume"] for item in fake.initializations] == ["never", "never", "must"]
     assert set(config["tracking"]["wandb"]["tags"]) <= set(fake.runs[2].tags)
     assert set(manual_tags) <= set(fake.runs[2].tags)
-    resumed.log_event(3, {"train/loss_total": 1.0, "budget/train_seconds": 2.0})
+    resumed.log_event(3, {"train/loss_total": 1.0, "budget/supervised_transitions": 2.0})
     with pytest.raises(tracking.TrackingError, match="cannot rewrite"):
-        resumed.log_event(3, {"train/loss_total": 0.5, "budget/train_seconds": 2.0})
+        resumed.log_event(3, {"train/loss_total": 0.5, "budget/supervised_transitions": 2.0})
 
 
 def test_resume_from_an_older_last_keeps_the_first_attempt_history_of_retrained_steps(
@@ -238,7 +234,7 @@ def test_resume_from_an_older_last_keeps_the_first_attempt_history_of_retrained_
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
     config = _resolved_config()
-    first = tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=())
+    first = tracking.initialize_wandb(config, run_dir=tmp_path)
     state, update = _state_recorder()
     resumed = tracking.initialize_wandb(
         config,
@@ -247,19 +243,18 @@ def test_resume_from_an_older_last_keeps_the_first_attempt_history_of_retrained_
         persisted_run_id=first.run_id,
         previous_last_logged_step=4,
         state_updater=update,
-        ood_roles=(),
     )
 
-    resumed.log_event(3, {"train/loss_total": 1.0, "budget/train_seconds": 2.0})
-    resumed.log_event(4, {"train/loss_total": 0.9, "budget/train_seconds": 2.0})
+    resumed.log_event(3, {"train/loss_total": 1.0, "budget/supervised_transitions": 2.0})
+    resumed.log_event(4, {"train/loss_total": 0.9, "budget/supervised_transitions": 2.0})
     assert fake.runs[1].logs == []
     assert "last_logged_step" not in state
-    resumed.log_event(5, {"train/loss_total": 0.8, "budget/train_seconds": 2.0})
+    resumed.log_event(5, {"train/loss_total": 0.8, "budget/supervised_transitions": 2.0})
     assert [step for _data, step in fake.runs[1].logs] == [5]
     assert fake.runs[1].logs[0][0]["global_step"] == 5
     assert state["last_logged_step"] == 5
     with pytest.raises(tracking.TrackingError, match="cannot rewrite"):
-        resumed.log_event(5, {"train/loss_total": 0.7, "budget/train_seconds": 2.0})
+        resumed.log_event(5, {"train/loss_total": 0.7, "budget/supervised_transitions": 2.0})
 
 
 def test_resume_dedupes_training_by_step_and_validation_by_point(
@@ -271,8 +266,8 @@ def test_resume_dedupes_training_by_step_and_validation_by_point(
     _patch_wandb(monkeypatch, fake)
     config = _resolved_config()
     objective = f"id/{config['evaluation']['objective']['id']}"
-    event = {"train/loss_total": 1.0, "budget/train_seconds": 2.0, objective: 0.5}
-    first = tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=())
+    event = {"train/loss_total": 1.0, "budget/supervised_transitions": 2.0, objective: 0.5}
+    first = tracking.initialize_wandb(config, run_dir=tmp_path)
     state, update = _state_recorder()
 
     def recording_update(values: Mapping[str, Any]) -> None:
@@ -288,15 +283,14 @@ def test_resume_dedupes_training_by_step_and_validation_by_point(
         previous_last_logged_step=4,
         previous_last_logged_point=2,
         state_updater=recording_update,
-        ood_roles=(),
     )
     run = fake.runs[1]
 
     resumed.log_event(5, {**event, "validation/point": 2.0})  # a replayed point at a new step keeps only its training keys
-    assert run.logs[-1][0] == {"global_step": 5, "train_seconds": 2.0, "Overview/train-loss_total": 1.0}
+    assert run.logs[-1][0] == {"global_step": 5, "supervised_transitions": 2.0, "Overview/train-loss_total": 1.0}
     assert "last_logged_point" not in state
     resumed.log_event(6, {**event, "validation/point": 3.0})  # a new point sends everything, persisted before the log
-    assert set(run.logs[-1][0]) == {"global_step", "train_seconds", "Overview/train-loss_total", "Overview/objective-id_validation"}
+    assert set(run.logs[-1][0]) == {"global_step", "supervised_transitions", "Overview/train-loss_total", "Overview/objective-id_validation"}
     assert run.events == ["log", "persist-point", "log"]
     assert (state["last_logged_step"], state["last_logged_point"]) == (6, 3)
     with pytest.raises(tracking.TrackingError, match="cannot rewrite"):
@@ -307,12 +301,12 @@ def test_resume_sends_a_new_point_below_the_restored_step_without_training_keys(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With a seconds budget the replay can reach a new point at a lower global step: only its validation keys are sent."""
+    """A new point at or below the restored global step sends only its validation keys."""
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
     config = _resolved_config()
     objective = f"id/{config['evaluation']['objective']['id']}"
-    first = tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=())
+    first = tracking.initialize_wandb(config, run_dir=tmp_path)
     state, update = _state_recorder()
     resumed = tracking.initialize_wandb(
         config,
@@ -322,42 +316,41 @@ def test_resume_sends_a_new_point_below_the_restored_step_without_training_keys(
         previous_last_logged_step=8,
         previous_last_logged_point=2,
         state_updater=update,
-        ood_roles=(),
     )
 
-    resumed.log_event(5, {"train/loss_total": 1.0, "budget/train_seconds": 2.0})  # at or below the restored step: nothing
-    resumed.log_event(6, {"train/loss_total": 1.0, "budget/train_seconds": 2.0, objective: 0.5, "validation/point": 3.0})
-    assert fake.runs[1].logs == [({"global_step": 6, "train_seconds": 2.0, "Overview/objective-id_validation": 0.5}, 6)]
+    resumed.log_event(5, {"train/loss_total": 1.0, "budget/supervised_transitions": 2.0})  # at or below the restored step: nothing
+    resumed.log_event(6, {"train/loss_total": 1.0, "budget/supervised_transitions": 2.0, objective: 0.5, "validation/point": 3.0})
+    assert fake.runs[1].logs == [({"global_step": 6, "supervised_transitions": 2.0, "Overview/objective-id_validation": 0.5}, 6)]
     assert state["last_logged_point"] == 3
     assert "last_logged_step" not in state
 
 
-def test_every_curated_history_definition_uses_the_optimisation_clock_as_its_axis(
+def test_every_curated_history_definition_uses_the_supervised_transitions_as_its_axis(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Hidden axes are declared once and every curated series of a steady run plots over train_seconds (one loop serves both tasks)."""
+    """Hidden axes are declared once and every curated series of a steady run plots over supervised transitions (seen units there)."""
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
-    session = tracking.initialize_wandb(_resolved_config(), run_dir=tmp_path, ood_roles=())
+    session = tracking.initialize_wandb(_resolved_config(), run_dir=tmp_path)
     definitions = dict(fake.runs[0].metric_definitions)
-    assert definitions["train_seconds"] == {"hidden": True, "summary": "none"}
+    assert definitions["supervised_transitions"] == {"hidden": True, "summary": "none"}
     curated = {definition.wandb_key for definition in session.history_metric_definitions}
     assert curated <= definitions.keys()
-    assert {definitions[key]["step_metric"] for key in curated} == {"train_seconds"}
+    assert {definitions[key]["step_metric"] for key in curated} == {"supervised_transitions"}
     assert {definitions[key]["step_sync"] for key in curated} == {False}
 
 
-def test_a_training_event_without_the_optimisation_clock_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The x-axis is mandatory: an event without budget/train_seconds fails closed instead of falling back to steps."""
+def test_a_training_event_without_the_supervised_transitions_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The x-axis is mandatory: an event without budget/supervised_transitions fails closed instead of falling back to steps."""
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
-    session = tracking.initialize_wandb(_resolved_config(), run_dir=tmp_path, ood_roles=())
-    with pytest.raises(tracking.TrackingError, match=r"budget/train_seconds"):
-        session.log_event(1, {"train/loss_total": 1.0})
+    session = tracking.initialize_wandb(_resolved_config(), run_dir=tmp_path)
+    with pytest.raises(tracking.TrackingError, match=r"budget/supervised_transitions"):
+        session.log_event(1, {"train/loss_total": 1.0, "budget/train_seconds": 2.0})
     assert fake.runs[0].logs == []
-    session.log_event(1, {"train/loss_total": 1.0, "budget/train_seconds": 2.0})  # the rejected event consumed no step
-    assert fake.runs[0].logs[0][0]["train_seconds"] == 2.0
+    session.log_event(1, {"train/loss_total": 1.0, "budget/supervised_transitions": 2.0})  # the rejected event consumed no step
+    assert fake.runs[0].logs[0][0]["supervised_transitions"] == 2.0
 
 
 def test_offline_mode_needs_no_key_and_preserves_resume_identity(
@@ -369,7 +362,7 @@ def test_offline_mode_needs_no_key_and_preserves_resume_identity(
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
     config = _resolved_config(mode="offline")
-    fresh = tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=())
+    fresh = tracking.initialize_wandb(config, run_dir=tmp_path)
     state, update = _state_recorder()
     resumed = tracking.initialize_wandb(
         config,
@@ -377,7 +370,6 @@ def test_offline_mode_needs_no_key_and_preserves_resume_identity(
         resume=True,
         persisted_run_id=fresh.run_id,
         state_updater=update,
-        ood_roles=(),
     )
     assert resumed.run_id == fresh.run_id
     assert all(item["mode"] == "offline" for item in fake.initializations)
@@ -407,7 +399,7 @@ def test_sdk_is_silent_and_online_state_is_node_local_while_offline_state_stays_
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
     run_dir = tmp_path / "run"
-    session = tracking.initialize_wandb(_resolved_config(mode=mode), run_dir=run_dir, ood_roles=())
+    session = tracking.initialize_wandb(_resolved_config(mode=mode), run_dir=run_dir)
 
     assert fake.setups == [{"silent": True}]
     sdk_dir = Path(fake.initializations[0]["dir"])
@@ -432,7 +424,7 @@ def test_failed_online_finish_preserves_the_node_local_sdk_state_in_the_run_fold
     _patch_wandb(monkeypatch, fake)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    session = tracking.initialize_wandb(_resolved_config(), run_dir=run_dir, ood_roles=())
+    session = tracking.initialize_wandb(_resolved_config(), run_dir=run_dir)
     state_file = _write_sdk_state(Path(fake.initializations[0]["dir"]))
     fake.runs[0].fail_finish = True
 
@@ -457,7 +449,7 @@ def test_failed_sdk_state_copy_is_a_warning_and_never_masks_the_finish_outcome(
     _patch_wandb(monkeypatch, fake)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    session = tracking.initialize_wandb(_resolved_config(), run_dir=run_dir, ood_roles=())
+    session = tracking.initialize_wandb(_resolved_config(), run_dir=run_dir)
     _write_sdk_state(Path(fake.initializations[0]["dir"]))
     session._observer_failed = True  # an earlier observer operation failed
     fake.runs[0].fail_finish = finish_fails
@@ -553,11 +545,10 @@ def test_transient_tracking_definitions_and_semantic_payload_use_existing_keys()
         physics_monitor_enabled=False,
         cuda_enabled=False,
         task_id="transient_drying",
-        ood_roles=("material_ood",),
     )
     destinations = {definition.wandb_key for definition in definitions}
-    expected = {"Loss/data-w_int", "Overview/objective-id_validation", "Fields/material-id_validation-temperature"}
-    assert expected | {"Moisture/material-id_validation-w_gr_physical"} <= destinations
+    expected = {"Loss/data-w_int", "Overview/objective-id_validation", "Fields/id_validation-temperature"}
+    assert expected | {"Moisture/id_validation-w_gr_physical"} <= destinations
     assert len(destinations) == len(definitions)
 
 
@@ -582,7 +573,7 @@ def test_system_monitor_watches_only_the_allocated_gpus(
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
 
-    tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=("material_ood",))
+    tracking.initialize_wandb(config, run_dir=tmp_path)
 
     assert fake.initializations[0]["settings"].get("x_stats_gpu_device_ids") == expected
 
@@ -613,7 +604,7 @@ def test_current_transient_session_projects_curated_history_and_config_group(
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
 
-    session = tracking.initialize_wandb(config, run_dir=tmp_path, semantic_config=semantic, ood_roles=("material_ood", "parameter_ood"))
+    session = tracking.initialize_wandb(config, run_dir=tmp_path, semantic_config=semantic)
 
     initialization = fake.initializations[0]
     configured_identity = initialization["config"]["data"]["configured_identity"]
@@ -639,19 +630,20 @@ def test_current_transient_session_projects_curated_history_and_config_group(
     metrics["system/cuda_peak_memory_allocated_bytes"] = _PROJECTED_GIB * _GIB_BYTES
     metrics["system/session_elapsed_seconds"] = 5.0  # telemetry outside the curated list is not logged
     metrics["validation/point"] = 1.0  # validation series are sent with their point
-    metrics["budget/train_seconds"] = 1.0  # the optimisation clock is the hidden x-axis, not a curated series
+    metrics["budget/supervised_transitions"] = 1.0  # the hidden x-axis, not a curated series
 
     session.log_event(1, metrics)
 
     payload, step = fake.runs[0].logs[-1]
     assert step == 1
-    assert set(payload) == {"global_step", "train_seconds", *destinations}
+    assert set(payload) == {"global_step", "supervised_transitions", *destinations}
     assert payload["Performance/memory-cuda_peak_gib"] == _PROJECTED_GIB
-    # One ID source feeds both pages.
-    assert payload["Fields/material-id_validation-temperature"] == payload["Fields/parameter-id_validation-temperature"] == 1.0
+    # Training evaluates no OOD part, so each comparison section keeps its validation page alone.
+    assert payload["Fields/id_validation-temperature"] == 1.0
+    assert not any("ood" in key or "material" in key or "parameter" in key for key in payload)
     assert list(payload) == [
         "global_step",
-        "train_seconds",
+        "supervised_transitions",
         *(definition.wandb_key for definition in definitions),
     ]  # projection order, not producer order
 
@@ -664,6 +656,7 @@ def _steady_loop_telemetry(config: dict[str, Any]) -> dict[str, float]:
         *(f"train/loss_data_{part}" for part in ("p", "velocity", "u", "v")),
         "optimization/learning_rate",
         "budget/progress",
+        "budget/supervised_transitions",
         "budget/train_seconds",
         "budget/units",
         "validation/point",
@@ -686,14 +679,14 @@ def test_steady_session_is_grouped_by_config_and_logs_the_curated_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Group a steady run by family and config, log every design section, and fill the OOD accuracy series."""
+    """Group a steady run by family and config, log every design section, and never log an OOD series a loop event carries."""
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
     config = _resolved_config(physics_enabled=True)
     layout = config["run"]["layout"]
 
-    # Only the material part is configured here, so no parameter-OOD row is defined or logged.
-    session = tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=("material_ood",))
+    # The split configures a material-OOD part, but training evaluates no held-out role, so W&B defines no OOD row.
+    session = tracking.initialize_wandb(config, run_dir=tmp_path)
 
     initialization = fake.initializations[0]
     assert initialization["project"] == experiments.config.defaults.WANDB_TASK_PROJECTS["steady_flow"]
@@ -704,18 +697,17 @@ def test_steady_session_is_grouped_by_config_and_logs_the_curated_history(
     session.log_event(1, _steady_loop_telemetry(config))
 
     payload, _step = fake.runs[0].logs[-1]
-    keys = set(payload) - {"global_step", "train_seconds"}
+    keys = set(payload) - {"global_step", "supervised_transitions"}
     assert {key.partition("/")[0] for key in keys} == {"Overview", "Training", "Loss", "Residuals", "Fields", "Physical", "Norms", "Performance"}
     assert {key for key in keys if key.startswith(("Fields/", "Physical/", "Norms/"))} == {
-        f"{section}/material-{label}-{name}"
+        f"{section}/id_validation-{name}"
         for section, names in (("Fields", ("p", "u", "v", "velocity")), ("Physical", "puv"), ("Norms", ("relative_l2", "relative_h1")))
-        for label in ("id_validation", "ood")
         for name in names
     }
     terms = ("momentum", "continuity", "boundary")
     assert {key for key in keys if key.startswith(("Overview/", "Training/", "Loss/", "Residuals/", "Performance/"))} == {
-        *(f"Overview/{name}" for name in ("objective-id_validation", "objective-material", "transfer_gap-material", "train-loss_total")),
-        *(f"Training/{name}" for name in ("budget-progress", "learning_rate", "optimizer_steps")),
+        *(f"Overview/{name}" for name in ("objective-id_validation", "train-loss_total")),
+        *(f"Training/{name}" for name in ("budget-progress", "learning_rate", "optimisation_seconds", "optimizer_steps")),
         *(f"Training/weight-{term}" for term in terms),
         *(f"Loss/data-{part}" for part in ("p", "total", "u", "v", "velocity")),
         *(f"Loss/physics-{term}" for term in terms),
@@ -736,7 +728,7 @@ def test_terminal_summary_copies_only_the_selected_metrics_the_history_projects(
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
     config = _resolved_config(physics_enabled=True)
-    session = tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=("material_ood",))
+    session = tracking.initialize_wandb(config, run_dir=tmp_path)
     objective = f"selected/id/{config['evaluation']['objective']['id']}"
     selected = {
         objective: 0.1,
@@ -766,9 +758,9 @@ def test_every_summary_only_key_is_declared_hidden_before_it_is_written(
         "data": {"split": {"artifact_sha256": "c"}, "normalization": {"artifact_sha256": "d"}},
         "tuning": {"study_name": "s", "trial_number": 1, "sampled_parameters": {"lr": 0.1}},
     }
-    session = tracking.initialize_wandb(config, run_dir=tmp_path, semantic_config=semantic, ood_roles=())
+    session = tracking.initialize_wandb(config, run_dir=tmp_path, semantic_config=semantic)
     run = fake.runs[0]
-    hidden = [name for name, options in run.metric_definitions if options.get("hidden") and name not in {"global_step", "train_seconds"}]
+    hidden = [name for name, options in run.metric_definitions if options.get("hidden") and name not in {"global_step", "supervised_transitions"}]
     assert hidden == list(schema.SUMMARY_ONLY_KEYS)
 
     objective = config["evaluation"]["objective"]["id"]
@@ -847,7 +839,6 @@ def test_optuna_trials_group_by_study_directory_and_log_the_report_and_best_valu
             _trial_config(tmp_path, trial_number=3, epochs=epochs, revision=revision),
             run_dir=tmp_path / f"ep{epochs}",
             semantic_config={"tuning": {"trial_number": 3}},
-            ood_roles=(),
         )
         for epochs, revision, _study_dir in studies
     ]
@@ -860,7 +851,7 @@ def test_optuna_trials_group_by_study_directory_and_log_the_report_and_best_valu
     assert len({initialization["name"] for initialization in fake.initializations}) == len(studies)
 
     sessions[0].log_event(
-        1, {"id/normalized_group_macro_rmse": 0.5, "optuna/best_objective": 0.4, "validation/point": 1.0, "budget/train_seconds": 2.0}
+        1, {"id/normalized_group_macro_rmse": 0.5, "optuna/best_objective": 0.4, "validation/point": 1.0, "budget/supervised_transitions": 2.0}
     )
     payload, _step = fake.runs[0].logs[-1]
     assert payload["Overview/objective-id_validation"] == 0.5
@@ -902,11 +893,10 @@ def test_requested_history_failures_are_fail_closed(
         _resolved_config(mode=mode),
         run_dir=tmp_path,
         state_updater=update,
-        ood_roles=(),
     )
     fake.runs[0].fail_log = True
     with pytest.raises(tracking.TrackingIOError, match=rf"{mode} W&B history"):
-        session.log_event(1, {"train/loss_total": 1.0, "budget/train_seconds": 2.0})
+        session.log_event(1, {"train/loss_total": 1.0, "budget/supervised_transitions": 2.0})
     assert state["status"] == "failed"
     assert state["failed_operation"] == "history"
 
@@ -926,7 +916,6 @@ def test_initialization_and_finish_errors_are_redacted_and_fail_closed(
             _resolved_config(),
             run_dir=tmp_path,
             state_updater=update,
-            ood_roles=(),
         )
     assert secret not in str(captured.value)
     assert secret not in str(state)
@@ -938,7 +927,6 @@ def test_initialization_and_finish_errors_are_redacted_and_fail_closed(
         _resolved_config(),
         run_dir=tmp_path,
         state_updater=finish_update,
-        ood_roles=(),
     )
     finish_fake.runs[0].fail_finish = True
     with pytest.raises(tracking.TrackingIOError, match="finish"):

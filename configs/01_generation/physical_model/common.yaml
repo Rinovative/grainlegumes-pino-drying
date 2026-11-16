@@ -20,17 +20,20 @@ grid_provenance:
     source_refs:
     - transient_comsol_model_report
   Lx:
-    evidence: synthetic_design
+    evidence: project_baseline
     source_refs:
-    - transient_comsol_model_report
+    - ba
+    note: Bachelor thesis section 4.2, bed footprint 1.2 m x 0.8 m.
   Ly:
-    evidence: synthetic_design
+    evidence: project_baseline
     source_refs:
-    - transient_comsol_model_report
+    - ba
+    note: Bachelor thesis section 4.2, bed height 750 mm.
   Lz:
-    evidence: synthetic_design
+    evidence: project_baseline
     source_refs:
-    - transient_comsol_model_report
+    - ba
+    note: Bachelor thesis section 4.2, bed footprint 1.2 m x 0.8 m.
   dx:
     evidence: derived
     source_refs:
@@ -90,7 +93,8 @@ scientific_fixed_values:
     provenance:
       evidence: project_baseline
       source_refs:
-      - transient_comsol_model_report
+      - ba
+      note: Bachelor thesis pages 19 and 23.
   # Lower admissible inlet temperature for the regular operating schedule.
   T_in_min:
     value: 290.15
@@ -107,9 +111,11 @@ scientific_fixed_values:
     provenance:
       evidence: synthetic_design
       source_refs:
-      - ba
+      - saskpulse_storage
+      - usapulses_storage_manual
+      method: Design bound of 40 degC below the grain-quality limits of SaskPulse (peas and lentils at most 45 degC) and USA Pulses (below 43 degC); SaskPulse gives beans 27-32 degC.
       applicability:
-        general: quality-preserving hard bound for whole pulses/oilseed pilot
+        general: grain-quality limit for whole pulses, not modelled; no quality criterion is evaluated
   # Lower hard bound on inlet humidity ratio, in kg water/kg dry air.
   omega_min:
     value: 0.0025

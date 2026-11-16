@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check completion denominators, omissions, case details, and censoring classification
+  - Check the spatial map scale semantic a field gets (diverging only for a quantity signed by meaning)
 
 Design principles:
   - Eligible cases define each dataset's denominator without changing raw evidence
@@ -18,6 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from src import domain
 from src.analysis.eda import eda_transient as transient
@@ -116,6 +118,23 @@ def _frame(
         }
     )
     return frame
+
+
+@pytest.mark.parametrize(
+    ("field", "unit", "values", "semantic"),
+    [
+        ("Kxx", "-", (-7.4, -6.9), "LINEAR_SEQUENTIAL"),  # log10 permeability channel: negative, but not signed by meaning
+        ("p", "Pa", (-3.0, 600.0), "LINEAR_SEQUENTIAL"),  # pressure undershoot
+        ("p", "Pa", (0.0, 600.0), "LINEAR_POSITIVE"),
+        ("Kxx", "m^2", (1.0e-11, 2.0e-11), "LOG_POSITIVE"),
+        ("Kxy", "m^2", (1.0e-12, 2.0e-12), "LINEAR_SIGNED"),
+        ("delta_T", "K", (1.0, 2.0), "LINEAR_SIGNED"),
+        ("u", "m/s", (0.1, 0.2), "LINEAR_SIGNED"),  # centred visual semantic
+    ],
+)
+def test_a_map_scale_is_diverging_only_for_a_quantity_signed_by_meaning(field: str, unit: str, values: tuple[float, float], semantic: str) -> None:
+    scale = plots.spatial_field_scale(field, unit, "physical", np.asarray(values))
+    assert scale.semantic.name == semantic
 
 
 def test_outcomes_use_eligible_denominator_and_report_omissions_separately() -> None:
@@ -237,6 +256,30 @@ def test_cases_follow_the_selected_dataset_cases() -> None:
     assert tuple(cases["dataset"].value_counts().sort_index()) == (1, 3)
 
 
+def test_batches_of_one_material_share_a_color_and_differ_in_line_style_with_one_outside_legend() -> None:
+    """Bar outlines carry the batch line style in the material color, and the one legend sits right of the panels."""
+    frames = {label: _frame((True, False)) for label in ("A", "B")}
+    figure = plots.plot_completion_target_analysis(datasets=frames, styles=plots.batch_styles({"A": "chickpea", "B": "chickpea"}))
+    try:
+        outcome, times, moisture, wet = figure.axes[:4]
+        bars = outcome.patches
+        assert len({bar.get_facecolor() for bar in bars}) == 1
+        assert len({bar.get_hatch() for bar in bars}) == len(frames)  # the bar analogue of the line style
+        assert all(bar.get_edgecolor() != bar.get_facecolor() for bar in bars)  # the hatch is drawn in the edge color
+        assert "Right-censoring time" in [text.get_text() for text in figure.legends[0].get_texts()]
+        labels = list(frames)
+        assert [tick.get_text() for tick in times.get_yticklabels()] == labels  # every row names its dataset
+        assert [tick.get_text() for tick in wet.get_xticklabels()] == labels
+        assert moisture.get_shared_x_axes().joined(moisture, wet)
+        assert len(figure.legends) == 1
+        assert all(axis.get_legend() is None for axis in figure.axes)
+        right = max(axis.get_window_extent().x1 for axis in figure.axes)
+        assert isinstance(figure.canvas, FigureCanvasAgg)
+        assert figure.legends[0].get_window_extent(figure.canvas.get_renderer()).x0 >= right
+    finally:
+        plt.close(figure)
+
+
 def test_right_censored_case_is_classified_and_plotted() -> None:
     """Classify a horizon stop without target attainment and still build the figure."""
     frame = _frame((False,))
@@ -248,7 +291,9 @@ def test_right_censored_case_is_classified_and_plotted() -> None:
     completion["physical_duration_hours"] = 85.0
 
     analysis = transient.completion_target_analysis({"Drying · Lentil · ID": frame})
-    figure = plots.plot_completion_target_analysis(datasets={"Drying · Lentil · ID": frame})
+    figure = plots.plot_completion_target_analysis(
+        datasets={"Drying · Lentil · ID": frame}, styles=plots.batch_styles({"Drying · Lentil · ID": None})
+    )
     plt.close(figure)
 
     assert analysis.cases.iloc[0]["terminal_time_kind"] == "right_censoring_time"

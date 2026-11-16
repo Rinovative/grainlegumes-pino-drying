@@ -182,7 +182,8 @@ def curated_metric_projections(
     pairs = [(f"{role}/{objective_id}", f"Overview/objective-{label}") for role, label in roles]
     pairs.append(("train/loss_total", "Overview/train-loss_total"))
     pairs += [(f"{role}/objective_difference", f"Overview/transfer_gap-{label}") for role, label in roles[1:]]
-    # The budget fraction drives the schedule and the validation points; the optimisation clock is the x-axis of every chart.
+    # The budget fraction drives the schedule and the validation points; the committed supervised transitions are the x-axis
+    # of every chart (a steady case is one), and the optimisation seconds, which budget nothing, are their own curve.
     pairs.append(("budget/progress", "Training/budget-progress"))
     if transient:
         if rollout_curriculum:
@@ -193,6 +194,7 @@ def curated_metric_projections(
         pairs += [
             ("transient/forward_transitions", "Training/forward_transitions"),
             ("optimization/learning_rate", "Training/learning_rate"),
+            ("budget/train_seconds", "Training/optimisation_seconds"),
             ("global_step", "Training/optimizer_steps"),
             ("transient/processed_target_transitions", "Training/transitions"),
         ]
@@ -201,6 +203,7 @@ def curated_metric_projections(
         pairs += [(f"train/loss_data_{field}", f"Loss/data-{field}") for field in ("w_int", "w_surf")]
     else:
         pairs.append(("optimization/learning_rate", "Training/learning_rate"))
+        pairs.append(("budget/train_seconds", "Training/optimisation_seconds"))
         pairs.append(("global_step", "Training/optimizer_steps"))
         pairs.append(("train/loss_data_p", "Loss/data-p"))
         pairs.append(("train/loss_data", "Loss/data-total"))

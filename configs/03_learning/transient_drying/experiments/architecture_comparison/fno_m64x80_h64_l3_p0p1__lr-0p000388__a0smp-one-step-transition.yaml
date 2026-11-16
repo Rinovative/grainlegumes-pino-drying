@@ -12,13 +12,17 @@ optimizer:
 
 training:
   a0:
+    memory_batch: 16  # Units computed at once (GPU probe 156); gradients accumulate up to k, so it changes only floating-point rounding, never the science.
     sampling:
       mode: one_step_transition  # Teacher-forced single-transition training examples; A0 draws no rollout horizon.
   b:
+    memory_batch: 1  # One rollout window at a time; this FNO's B exceeds 48 GB with two (GPU probe 156).
     sampling:
       mode: rollout_window  # Self-fed rollout windows of the base rollout_length.
       window_stride: 32  # Step between rollout-window starts in the sampled trajectory.
       window_offset: 0  # Starting offset applied when selecting rollout windows.
+  a1:
+    memory_batch: 16  # A1 trains A0's teacher-forced protocol, so it computes as many units at once as A0.
 
 task: transient_drying  # Selects the task contract and its compatible data, model and loss validation.
 base: ../../base.yaml  # Shared task settings; every value set in this file overrides them.

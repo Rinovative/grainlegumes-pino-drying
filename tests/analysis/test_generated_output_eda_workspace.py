@@ -262,9 +262,12 @@ def test_published_transient_eda_uses_actual_inputs_targets_and_bounded_cases(tr
             datasets={"Published": frame},
             case_ids={"Published": view.case_ids[0]},
             physical_time_hours=1.0,
+            styles=transient_plots.batch_styles({"Published": None}),
             channels=("T",),
         ),
-        transient_plots.plot_state_trajectory_summary(datasets={"Published": frame}, max_cases=1, channels=("T",)),
+        transient_plots.plot_state_trajectory_summary(
+            datasets={"Published": frame}, max_cases=1, styles=transient_plots.batch_styles({"Published": None}), channels=("T",)
+        ),
     )
     for figure in figures:
         assert figure.axes

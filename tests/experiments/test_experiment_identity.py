@@ -181,10 +181,11 @@ def test_another_k_is_another_experiment_with_its_own_identity_and_location(tmp_
 
 
 def test_memory_batch_is_execution_only_so_plans_differing_in_it_share_identity_and_resume_each_other(tmp_path: Path) -> None:
-    """The memory split changes only rounding: every identity, name and resume admission ignores it."""
+    """The per-stage memory splits change only rounding: every identity, name and resume admission ignores them."""
     original_raw = configs.transient_matched_config()
     changed_raw = copy.deepcopy(original_raw)
-    changed_raw["training"]["memory_batch"] += 1
+    for stage in ("a0", "b", "a1"):
+        changed_raw["training"][stage]["memory_batch"] += 1
     source = configs.write_yaml(tmp_path / "plan.yaml", original_raw)
     original_stages, changed_stages = _plan(tmp_path, original_raw), _plan(tmp_path, changed_raw)
 
@@ -229,8 +230,8 @@ def test_authored_config_and_repository_provenance_do_not_change_parent_identity
     assert first["parent_identity_sha256"] == second["parent_identity_sha256"]
 
 
-def test_pairs_with_other_budgets_share_the_seed_group_a0(tmp_path: Path) -> None:
-    """A second B/A1 pair gets its own pair directory beside the one A0 of the seed group."""
+def test_pairs_with_other_branch_settings_share_the_seed_group_a0(tmp_path: Path) -> None:
+    """A second B/A1 pair (another continuation scale) gets its own pair directory beside the one A0 of the seed group."""
     raw = configs.transient_matched_config()
     first = _plan(tmp_path, raw)
     source = configs.write_yaml(tmp_path / "plan.yaml", raw)
@@ -238,7 +239,7 @@ def test_pairs_with_other_budgets_share_the_seed_group_a0(tmp_path: Path) -> Non
     a0 = common.paths.resolve_config_run_dir(first[0])
     assert marker.parent.parent == a0.parent == common.paths.resolve_config_experiment_dir(first[0])
     assert first[0]["run"]["layout"]["pair"] is None
-    raw["training"]["b"]["train_seconds"] = 2.0
+    raw["training"]["b"]["lr_scale"] = 0.5
 
     second = _plan(tmp_path, raw)
 

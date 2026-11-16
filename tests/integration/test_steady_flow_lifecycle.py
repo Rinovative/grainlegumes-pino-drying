@@ -479,6 +479,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     assert [part.dataset_id for part in split.material_ood] == [_OOD_DATASET, _SECOND_OOD_DATASET]
 
     # The curated W&B series have real producers; physics training and CUDA are off in this run, so those series are not projected.
+    # Training evaluates no held-out role, so the run projects no OOD series.
     config = lifecycle.config
     definitions = experiments.tracking.automatic_history_metric_definitions(
         config["evaluation"]["metrics"],
@@ -487,15 +488,16 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         physics_monitor_enabled=bool(config["tracking"]["wandb"]["monitor"]["enabled"]),
         cuda_enabled=False,
         task_id="steady_flow",
-        ood_roles=split.ood_roles,
     )
-    # Only the material part is declared here; the empty parameter part produced no series.
+    # The material part is declared, yet training produced no series of it or of any other held-out role.
     assert split.ood_roles == ("material_ood",)
-    assert not any(key.startswith("parameter_ood/") for epoch in lifecycle.epoch_metrics for key in epoch)
+    held_out = ("id_test", "material_ood", "parameter_ood")
+    assert not any(role in key for epoch in lifecycle.epoch_metrics for key in epoch for role in held_out)
+    assert not any(role in key for key in lifecycle.completed["summary"]["selected_metrics"] for role in held_out)
     # Undefined on this tiny data only: every case's p, u and v reference RMS lies below its TaskSpec floor
     # (domain_task_steady_flow.py: 1 Pa, 1e-4 m/s), so physical_relative_l2 has no finite value and is absent from
     # the event. Its producer is covered by test_metric_spaces.py::test_validation_produces_the_curated_relative_l2_above_the_reference_floors.
-    undefined = {f"{role}/physical_relative_l2" for role in ("id", *split.ood_roles)}
+    undefined = {"id/physical_relative_l2"}
     assert {definition.source_key for definition in definitions} - undefined <= set().union(*lifecycle.epoch_metrics)
     projected_selected = {wandb_schema.selected_summary_key(definition.source_key) for definition in definitions} - {None}
     projected_selected -= {wandb_schema.selected_summary_key(key) for key in undefined}
@@ -526,7 +528,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     expected_input_mean = lifecycle.id_payload["inputs"][train_indices].mean(dim=(0, 2, 3))
     expected_output_mean = lifecycle.id_payload["outputs"][train_indices].mean(dim=(0, 2, 3))
     assert torch.allclose(input_mean[fitted_inputs], expected_input_mean[fitted_inputs])
-    assert torch.allclose(scaling.group("state").mean, expected_output_mean)
+    assert torch.allclose(scaling.physical_state.mean, expected_output_mean)
     full_input_mean = lifecycle.id_payload["inputs"].mean(dim=(0, 2, 3))
     eps_index = task.input_names.index("eps_bed")
     assert not torch.isclose(input_mean[eps_index], full_input_mean[eps_index])
@@ -553,6 +555,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         runs_root=lifecycle.run_dir,
         dataset_root=lifecycle.dataset_root,
         device_policy="cpu",
+        roles=("id", "material_ood"),
     )
     frames = generated[str(lifecycle.run_dir.resolve())]
     assert set(frames) == {"eval", "material_ood"}
@@ -592,14 +595,6 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         )
         assert artifact_provenance["normalizer"]["output_scales"] == train_scales
         assert frame.attrs[objective_id] == artifact_summary
-        if role == "eval":
-            # ID artifacts evaluate ID-test membership; checkpoint selection used validation.
-            continue
-        assert float(artifact_summary["value"]) == pytest.approx(
-            lifecycle.completed["summary"]["selected_metrics"][f"selected/material_ood/{objective_id}"],
-            rel=analysis.artifacts.contracts.NORMALIZED_OBJECTIVE_TOLERANCE["rtol"],
-            abs=analysis.artifacts.contracts.NORMALIZED_OBJECTIVE_TOLERANCE["atol"],
-        )
 
     id_target = common.paths.resolve_id_analysis_dir(lifecycle.run_dir)
     ood_target = common.paths.resolve_ood_analysis_dir(lifecycle.run_dir, "material_ood", _MATERIAL_OOD_DATASET)
@@ -631,7 +626,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
             "grid_axes": ["y", "x"],
         }
         assert physics["interior_crop"] == _ARTIFACT_CROP
-        assert physics["constants"]["dynamic_viscosity_pa_s"] == domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY
+        assert physics["constants"]["dynamic_viscosity_pa_s"] == domain.physics.contracts.AIR_DYNAMIC_VISCOSITY
         assert physics["continuity_kind"] == "cross_section_flux_balance"
         assert physics["scalar_definitions"]["flux_balance_mse"] == {"formula": "mean(flux_balance**2)", "unit": "1"}
         assert physics["residual_evaluation_region"]["residual_arrays"] == "full grid"
@@ -660,6 +655,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         runs_root=lifecycle.run_dir,
         dataset_root=lifecycle.dataset_root,
         device_policy="cpu",
+        roles=("id", "material_ood"),
     )
     pd.testing.assert_frame_equal(cached[str(lifecycle.run_dir.resolve())]["eval"], frames["eval"])
     pd.testing.assert_frame_equal(cached[str(lifecycle.run_dir.resolve())]["material_ood"], frames["material_ood"])
@@ -742,6 +738,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         runs_root=lifecycle.run_dir,
         dataset_root=lifecycle.dataset_root,
         device_policy="cpu",
+        roles=("id", "material_ood"),
         rebuild=True,
     )
     for target in targets:
@@ -810,29 +807,26 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
     original = _copy_without_analysis(completed_lifecycle.run_dir, tmp_path / "original")
     renamed = tmp_path / "paper_model_a"
     original.rename(renamed)
-    evaluation = analysis.evaluation.workflow.prepare_evaluation_workflow(
-        (analysis.evaluation.workflow.EvaluationRunSelection(run_dir=renamed, label="Paper model A"),),
-        (
-            analysis.evaluation.workflow.EvaluationContextSpec(key="id", label="ID", artifact_role="id"),
-            analysis.evaluation.workflow.EvaluationContextSpec(
-                key="material_ood",
-                label="Material OOD",
-                artifact_role="material_ood",
-            ),
-        ),
-        dataset_root=completed_lifecycle.dataset_root,
-        device_policy="cpu",
+    contexts = (
+        analysis.evaluation.workflow.EvaluationContextSpec(key="id", label="ID", artifact_role="id"),
+        analysis.evaluation.workflow.EvaluationContextSpec(key="material_ood", label="Material OOD", artifact_role="material_ood"),
     )
-    generated = evaluation.prepared_runs[0]
-    first = generated.loaded_run
-    assert generated.role_actions == {"id": "generated", "material_ood": "generated"}
-    assert generated.artifact_device == "cpu"
+    selection = (analysis.evaluation.workflow.EvaluationRunSelection(run_dir=renamed, label="Paper model A"),)
+    # The workflow only reads: a held-out role is refused with its explicit artifact command until that call releases it.
+    with pytest.raises(analysis.evaluation.artifact_loader.MissingEvaluationArtifactsError, match="--split id"):
+        analysis.evaluation.workflow.prepare_evaluation_workflow(selection, contexts)
+    analysis.artifacts.service.build_artifacts(
+        runs_root=renamed, dataset_root=completed_lifecycle.dataset_root, device_policy="cpu", roles=("id", "material_ood")
+    )
+    evaluation = analysis.evaluation.workflow.prepare_evaluation_workflow(selection, contexts)
+    prepared = evaluation.prepared_runs[0]
+    first = prepared.loaded_run
+    assert prepared.role_actions == {"id": "reused", "material_ood": "reused"}
     assert first.storage_alias == "paper_model_a"
     assert first.scientific_run_name == completed_lifecycle.config["run"]["name"]
     assert first.id_artifact is not None
     assert first.material_ood_artifact is not None
-    assert evaluation.report[0]["artifact_device"] == "cpu"
-    assert evaluation.report[0]["artifact_actions"] == {"id": "generated", "material_ood": "generated"}
+    assert evaluation.report[0]["artifact_actions"] == {"id": "reused", "material_ood": "reused"}
     checkpoint_digest = first.selected_checkpoint_sha256
     evaluation.close()
 
@@ -851,14 +845,9 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
 
     original_inference = learning.inference.context.load_inference_context_with_resolution
     monkeypatch.setattr(learning.inference.context, "load_inference_context_with_resolution", unexpected_inference)
-    reused = analysis.artifacts.service.load_or_build_run_artifacts(
-        moved,
-        dataset_root=completed_lifecycle.dataset_root,
-        device_policy="cpu",
-    )
+    reused = analysis.artifacts.service.load_prepared_run_artifacts(moved)
     loaded = reused.loaded_run
     assert reused.role_actions == {"id": "reused", "material_ood": "reused"}
-    assert reused.artifact_device is None
     assert loaded.storage_alias == "promoted_model"
     assert loaded.scientific_run_name == first.scientific_run_name
     assert loaded.id_artifact is not None
@@ -904,9 +893,8 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
         pd.testing.assert_frame_equal(reread.material_ood_artifact.frame, loaded.material_ood_artifact.frame)
         assert reread.selected_checkpoint_sha256 == checkpoint_digest
         assert _artifact_inventory((moved,)) == before_read
-        prepared_read = analysis.artifacts.service.load_or_build_run_artifacts(moved, auto_build_missing=False)
+        prepared_read = analysis.artifacts.service.load_prepared_run_artifacts(moved)
         assert prepared_read.role_actions == {"id": "reused", "material_ood": "reused"}
-        assert prepared_read.artifact_device is None
         assert prepared_read.loaded_run.selected_checkpoint_sha256 == checkpoint_digest
 
         # Reader contracts still bind the published evaluator under numerical-environment drift.
@@ -927,7 +915,7 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
         absent_ood = loaded.material_ood_artifact.root.with_name("retained-ood")
         loaded.material_ood_artifact.root.rename(absent_ood)
         with pytest.raises(analysis.evaluation.artifact_loader.MissingEvaluationArtifactsError):
-            analysis.artifacts.service.load_or_build_run_artifacts(moved, artifact_roles=("material_ood",), auto_build_missing=False)
+            analysis.artifacts.service.load_prepared_run_artifacts(moved, artifact_roles=("material_ood",))
         absent_ood.rename(loaded.material_ood_artifact.root)
 
     raw_moved = pd.read_parquet(loaded.id_artifact.root / "artifacts.parquet")
@@ -1004,7 +992,7 @@ def test_completed_optuna_trial_moved_outside_its_study_stays_a_trial_without_ar
     for key in ("study_name", "trial_number", "sampled_parameters", "overrides", "study_role"):
         assert completed["summary"][key] == original_summary[key]
     with pytest.raises(ValueError, match="is an Optuna trial"):
-        analysis.artifacts.service.load_or_build_run_artifacts(moved, dataset_root=completed_lifecycle.dataset_root, device_policy="cpu")
+        analysis.artifacts.service.build_artifacts(runs_root=moved, dataset_root=completed_lifecycle.dataset_root, device_policy="cpu", roles=("id",))
     assert not common.paths.resolve_analysis_root(moved).exists()
 
 
@@ -1102,6 +1090,66 @@ def test_saved_config_resume_continues_a_renamed_interrupted_bundle(
     completed = experiments.run.validate_completed_run(renamed)
     assert completed["config"]["run"]["name"] == saved_name
     assert completed["last_checkpoint"]["completed_epoch"] == 1
+
+
+def test_steady_run_persists_its_completed_epoch_history(completed_lifecycle: CompletedLifecycle) -> None:
+    """A completed steady run binds one record per completed epoch and per validation point to its identity."""
+    completed = completed_lifecycle.completed
+    last = completed["last_checkpoint"]
+    history = learning.training.history.validate_completed_history(
+        completed_lifecycle.run_dir,
+        task="steady_flow",
+        run_name=str(completed["config"]["run"]["name"]),
+        checkpoint_identity=completed["best_checkpoint"]["identity"],
+        completed_epoch=int(last["completed_epoch"]),
+        validations=last["objective_history"],
+    )
+    (epoch_record,), (validation,) = history["epochs"], history["validations"]
+    # The one epoch's terminal event validated point 20: its validation record is that event's evidence before the last publication.
+    assert validation == {key: value for key, value in completed_lifecycle.epoch_metrics[-1].items() if key != "checkpoint/last_published"}
+    assert validation["validation/point"] == 20.0
+    assert "train/loss_total" in epoch_record
+    assert "validation/point" not in epoch_record
+
+
+@pytest.mark.parametrize("change", ["ahead", "behind", "missing"])
+def test_steady_resume_reconciles_its_history_with_the_restored_last_checkpoint(
+    completed_lifecycle: CompletedLifecycle,
+    tmp_path: Path,
+    change: str,
+) -> None:
+    """Resume truncates records ahead of the restored last checkpoint and refuses a history behind it or none at all."""
+    run_dir = _interrupted_copy(completed_lifecycle, tmp_path / "history_resume_bundle")
+    path = learning.training.history.history_path(run_dir)
+    exact = json.loads(path.read_text(encoding="utf-8"))
+    if change == "missing":
+        path.unlink()
+    else:
+        ahead = {**exact["epochs"][-1], "epoch": 2.0, "global_step": exact["epochs"][-1]["global_step"] + 1.0}
+        records = [*exact["epochs"], ahead] if change == "ahead" else []
+        path.write_text(json.dumps({**exact, "epochs": records}), encoding="utf-8")
+    config_path = common.paths.resolve_run_config_path(run_dir)
+
+    if change == "ahead":
+        experiments.run.run_experiment(config_path, resume=run_dir, device="cpu")
+        assert json.loads(path.read_text(encoding="utf-8")) == exact
+        return
+    with pytest.raises(FileNotFoundError if change == "missing" else ValueError, match="history"):
+        experiments.run.run_experiment(config_path, resume=run_dir, device="cpu")
+
+
+def test_completed_steady_run_without_history_stays_evaluable(completed_lifecycle: CompletedLifecycle, tmp_path: Path) -> None:
+    """A completed steady run trained before its history existed is still admitted; its training curves are unavailable, not refused."""
+    run_dir = _copy_without_analysis(completed_lifecycle.run_dir, tmp_path / "run_without_history")
+    selected = experiments.run.validate_evaluable_run(run_dir)["selected_checkpoint_sha256"]
+    history = analysis.evaluation.run_discovery.stage_history(run_dir, expected_checkpoint_sha256=selected)
+    assert isinstance(history, analysis.evaluation.run_discovery.StageHistory)
+    assert (history.stage, history.start_epoch, history.selected_point) == ("steady", 0, 20)
+    learning.training.history.history_path(run_dir).unlink()
+
+    assert experiments.run.validate_completed_run(run_dir)["summary"]["status"] == "completed"
+    unavailable = analysis.evaluation.run_discovery.stage_history(run_dir, expected_checkpoint_sha256=selected)
+    assert isinstance(unavailable, analysis.evaluation.run_discovery.UnavailableHistory)
 
 
 def _mutate_task_identity(run_dir: Path, dataset_root: Path) -> None:

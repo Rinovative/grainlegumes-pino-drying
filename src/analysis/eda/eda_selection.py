@@ -219,8 +219,9 @@ class PublishedDatasetEDAView:
 
     @property
     def label(self) -> str:
-        """Keep the package's authored name and unambiguous identity visible."""
-        return f"{self.manifest['dataset_name']} [{self.key}]"
+        """Show the package identity once when the authored name equals it, else the name and the identity."""
+        name = str(self.manifest["dataset_name"])
+        return self.key if name == self.key else f"{name} [{self.key}]"
 
     @property
     def task_id(self) -> str:
@@ -231,6 +232,12 @@ class PublishedDatasetEDAView:
     def simulation_profile(self) -> str:
         """Expose the profile-native EDA frame dispatch identity."""
         return self.task_id
+
+    @property
+    def material_family(self) -> str | None:
+        """Return the package's one material from its validated manifest, or ``None`` for a mixed-material package."""
+        materials = self.manifest["materials"]
+        return str(materials[0]) if len(materials) == 1 else None
 
     @property
     def capabilities(self) -> frozenset[GeneratedOutputCapability]:

@@ -18,6 +18,7 @@ This module does NOT:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -367,15 +368,15 @@ def test_a_crash_before_the_amendment_record_is_published_keeps_the_old_rate_eve
     """An amendment whose atomic publication fails leaves no record, so every design of the material keeps the old rate."""
     campaign, storage, root = _three_design_campaign(generation_config_factory, tmp_path)
     before = {path: path.read_bytes() for path in root.rglob("amendment_*.json")}
-    publish = common.serialization.atomic_write_bytes
+    publish = os.link
 
-    def crash_on_amendment(path: Path, payload: bytes) -> Path:
-        if path.name.startswith("amendment_"):
+    def crash_on_amendment(source: str, destination: str | Path) -> None:
+        if Path(destination).name.startswith("amendment_"):
             msg = "Synthetic crash before publication"
             raise OSError(msg)
-        return publish(path, payload)
+        publish(source, destination)
 
-    monkeypatch.setattr(common.serialization, "atomic_write_bytes", crash_on_amendment)
+    monkeypatch.setattr(os, "link", crash_on_amendment)
     with pytest.raises(OSError, match="Synthetic crash"):
         lifecycle.amend_minimum_success_rate(
             "steady_flow", campaign.source_name, "lentil", minimum_success_rate=0.5, reason="Lost", storage_root=storage

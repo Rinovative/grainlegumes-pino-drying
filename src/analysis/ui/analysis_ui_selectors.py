@@ -1,15 +1,17 @@
-"""Select runs and datasets through one collapsed line «<noun>: k von n gewählt» whose body lists the choices by group.
+"""Select runs and datasets through one collapsed line, «<noun>: k von n gewählt», whose body lists the choices by group.
 
 Responsibilities:
   - Show grouped choices as checkboxes (several) or one-of buttons (one), with a summary line that counts the selection
   - List unavailable choices in disabled groups with each item's reason
-  - Group runs by architecture in the fixed run-selector order, full names one per line
+  - Group runs by architecture in the fixed run-selector order, full names one per line, left-aligned, a continuing run indented below its parent run
   - Keep runs without valid architecture metadata visible and disabled under «Metadaten fehlen»
   - Group datasets by role or sampling regime and offer the switch «Materialien je Rolle zusammenfassen» where pooling is valid
 
 Design principles:
-  - The summary counts selectable items only and reads «k von n gewählt» for single and multiple choice alike (F3)
-  - No «alle» or «keine» buttons, and every body starts closed (Q20, Q22)
+  - The summary counts selectable items only and reads «k von n gewählt» for single and multiple choice alike (F3); the single run
+    selector is the exception and reads «Lauf: <short label of the selected run>» (Rino 16.11.)
+  - No «alle» or «keine» buttons
+  - Every body starts closed (Q20, Q22), except the Evaluation workspace run selector, which opens at the start (Rino 16.11.)
   - The pooling switch is enabled only where the view's reduction is material-balanced; elsewhere it is disabled with its reason
   - Selection changes notify observers once, programmatic state changes can stay silent
 
@@ -33,7 +35,7 @@ from . import analysis_ui_panel as panel
 from . import analysis_ui_style as style
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Hashable, Iterable, Sequence
+    from collections.abc import Callable, Collection, Hashable, Iterable, Sequence
 
     from src.analysis.presentation.analysis_dataset_selection import DatasetChoice, DatasetInventory
 
@@ -44,6 +46,7 @@ MISSING_METADATA_GROUP: Final = "Metadaten fehlen"
 UNAVAILABLE_GROUP: Final = "Nicht verfügbar"
 POOL_LABEL: Final = "Materialien je Rolle zusammenfassen"
 _ONE_OF_ALLOWANCE_CH: Final = 4
+_INDENT_PX: Final = 3 * style.CH_PX  # indent of a run below its parent run
 
 
 def _heading(text: str) -> panel.Row:
@@ -52,13 +55,18 @@ def _heading(text: str) -> panel.Row:
     return panel.row(label)
 
 
-def _one_of(label: str, value: bool) -> widgets.ToggleButton:
-    """Return one button of a one-of choice, as wide as its full text."""
+def _one_of_px(label: str) -> int:
+    """Return the estimated pixel width of one one-of button with ``label``."""
+    return style.text_px(label, allowance_ch=_ONE_OF_ALLOWANCE_CH)
+
+
+def _one_of(label: str, value: bool, *, width_px: int | None = None) -> widgets.ToggleButton:
+    """Return one button of a one-of choice, as wide as its full text or ``width_px``."""
     return widgets.ToggleButton(
         value=value,
         description=label,
         tooltip=label,
-        layout=widgets.Layout(width=f"{style.GRID.snap(style.text_px(label, allowance_ch=_ONE_OF_ALLOWANCE_CH))}px", flex="0 0 auto"),
+        layout=widgets.Layout(width=f"{style.GRID.snap(_one_of_px(label)) if width_px is None else width_px}px", flex="0 0 auto"),
     )
 
 
@@ -76,7 +84,8 @@ class ChoiceBlock:
 
     ``header`` is one element of a panel row and ``body`` its popover; pass ``(header, body)`` to the panel's
     ``popovers``. Several choices use checkboxes, one choice uses one-of buttons. ``boxes`` maps each selectable key
-    to its widget. ``per_line`` puts every item on its own line (long names); ``footer`` rows follow the groups.
+    to its widget. ``per_line`` puts every item on its own line (long names; the buttons of a group share the width of its
+    longest); ``indented`` keys (per-line only) stand shifted right by ``_INDENT_PX``; ``footer`` rows follow the groups.
     """
 
     def __init__(
@@ -88,21 +97,34 @@ class ChoiceBlock:
         selected: Iterable[Hashable],
         disabled_groups: Sequence[DisabledGroup] = (),
         per_line: bool = False,
+        indented: Collection[Hashable] = (),
         footer: Sequence[widgets.Widget] = (),
+        opened: bool = False,
+        close_on_pick: bool = False,
     ) -> None:
         """
-        Create the block with ``selected`` checked and the body closed.
+        Create the block with ``selected`` checked and the body closed, or open with ``opened``.
 
-        A single choice without a selected key selects its first item.
+        A single choice without a selected key selects its first item; with ``close_on_pick`` a click on one of its
+        buttons closes the body before observers run (``select()`` leaves it open).
 
         Raises
         ------
         ValueError
-            If a key repeats, a selected key is not selectable, or a single choice gets more than one key.
+            If a key repeats, a selected key is not selectable, a single choice gets more than one key, or
+            ``close_on_pick`` is set for a multiple choice, or ``indented`` is given without ``per_line``.
 
         """
+        if close_on_pick and multiple:
+            message = f"{noun}: close_on_pick applies to a single choice only."
+            raise ValueError(message)
+        if indented and not per_line:
+            message = f"{noun}: indented applies to per-line choices only."
+            raise ValueError(message)
+        shifted = frozenset(indented)
         self.noun = noun
         self.multiple = multiple
+        self._close_on_pick = close_on_pick
         keys = [key for _heading_text, items in groups for _label, key in items]
         if len(set(keys)) != len(keys):
             message = f"{noun}: every choice needs its own key."
@@ -123,18 +145,33 @@ class ChoiceBlock:
         rows: list[widgets.Widget] = []
         for heading, items in groups:
             rows.append(_heading(heading))
+            # One width for the buttons of a per-line single-choice group: the longest label, an indented one counted with its indent.
+            widest = (
+                style.GRID.snap(max((_one_of_px(label) + (_INDENT_PX if key in shifted else 0) for label, key in items), default=0))
+                if per_line and not multiple
+                else 0
+            )
             group_boxes: list[widgets.Widget] = []
             for label, key in items:
-                box = controls.checkbox(label, value=key in chosen) if multiple else _one_of(label, key in chosen)
+                shift = _INDENT_PX if key in shifted else 0
+                if multiple:
+                    box = controls.checkbox(label, value=key in chosen)
+                else:
+                    box = _one_of(label, key in chosen, width_px=widest - shift if per_line else None)
                 box.observe(lambda change, key=key: self._changed(key, change), names="value")
                 self.boxes[key] = box
                 group_boxes.append(box)
-            rows.extend([panel.row(box) for box in group_boxes] if per_line else [panel.row(*group_boxes)])
+                if per_line:
+                    rows.append(panel.row(box))
+                    if shift:
+                        rows[-1].layout.margin = f"0 0 0 {_INDENT_PX}px"
+            if not per_line:
+                rows.append(panel.row(*group_boxes))
         for heading, disabled_items in disabled_groups:
             rows.append(_heading(heading))
             rows.extend(panel.row(_disabled_item(label, reason, multiple=multiple)) for label, reason in disabled_items)
         rows.extend(footer)
-        self.header, self.body = panel.disclosure(self._summary(), widgets.VBox(tuple(rows)))
+        self.header, self.body = panel.disclosure(self._summary(), widgets.VBox(tuple(rows)), opened=opened)
 
     def selected(self) -> tuple[Hashable, ...]:
         """Return the selected keys in display order."""
@@ -181,6 +218,7 @@ class ChoiceBlock:
                     self.boxes[key].value = True
                 finally:
                     self._silent = False
+                self._close_after_pick()
                 return
             self._silent = True
             try:
@@ -189,7 +227,12 @@ class ChoiceBlock:
                         box.value = False
             finally:
                 self._silent = False
+            self._close_after_pick()
         self._notify()
+
+    def _close_after_pick(self) -> None:
+        if self._close_on_pick:
+            self.header.value = False
 
     def _notify(self) -> None:
         self.header.summary = self._summary()
@@ -199,30 +242,49 @@ class ChoiceBlock:
 
 @dataclass(frozen=True, slots=True)
 class RunOption:
-    """One selectable run: its full name, its architecture family from the saved config, its key, and a metadata issue."""
+    """
+    One selectable run: its full name, its architecture family from the saved config, its key, and a metadata issue.
+
+    ``label`` is the short label a single-choice header shows (the name when None); ``parent`` is the key of the run this
+    one continues (a B or A1 run its A0), which it stands indented below when that run is listed in the same group.
+    """
 
     name: str
     family: str | None
     key: Hashable
     issue: str | None = None
+    label: str | None = None
+    parent: Hashable | None = None
 
 
 class RunSelector(ChoiceBlock):
     """
-    «Läufe: k von n gewählt» with one heading per architecture in the order FNO, U-NO, RNO, PI-FNO, PI-U-NO.
+    «Läufe: k von n gewählt» (single choice: «Lauf: <label>») with one heading per architecture in the order FNO, U-NO, RNO, PI-FNO, PI-U-NO.
 
-    Run names stand in full, one per line, because they carry the key parameters. A run whose family is missing or
-    unknown stays visible and disabled under «Metadaten fehlen» with its issue; it never makes the selector fail.
+    Run names stand in full, one per line, left-aligned, in name order, because they carry the key parameters. A run with
+    a listed ``parent`` stands indented directly below it; one whose parent is not listed stands in the name order
+    unindented. A run whose family is missing or unknown stays visible and disabled under «Metadaten fehlen» with its
+    issue; it never makes the selector fail.
     """
 
-    def __init__(self, runs: Sequence[RunOption], *, multiple: bool, selected: Iterable[Hashable] = ()) -> None:
-        """Create the selector over ``runs`` with ``selected`` chosen (a single choice defaults to its first run)."""
+    def __init__(
+        self, runs: Sequence[RunOption], *, multiple: bool, selected: Iterable[Hashable] = (), opened: bool = False, close_on_pick: bool = False
+    ) -> None:
+        """Create the selector over ``runs`` with ``selected`` chosen (a single choice defaults to its first run); see ``ChoiceBlock``."""
+        self._labels = {run.key: run.label or run.name for run in runs}  # read by ``_summary``, which the base constructor calls
         known = {spec.family: spec.label for spec in presentation.visual_semantics.ARCHITECTURES}
         groups: list[Group] = []
+        indented: list[Hashable] = []
         for spec in presentation.visual_semantics.ARCHITECTURES:
             members = sorted((run for run in runs if run.family == spec.family), key=lambda run: run.name)
-            if members:
-                groups.append((spec.label, [(run.name, run.key) for run in members]))
+            anchors = {run.key for run in members if run.parent is None}
+            placed: list[RunOption] = []
+            for root in (run for run in members if run.parent not in anchors):
+                children = [run for run in members if root.key in anchors and run.parent == root.key]
+                placed.extend([root, *children])
+                indented.extend(child.key for child in children)
+            if placed:
+                groups.append((spec.label, [(run.name, run.key) for run in placed]))
         missing = [
             (run.name, run.issue or ("Architektur fehlt" if run.family is None else f"unbekannte Architektur {run.family!r}"))
             for run in runs
@@ -235,7 +297,14 @@ class RunSelector(ChoiceBlock):
             selected=selected,
             disabled_groups=[(MISSING_METADATA_GROUP, missing)] if missing else (),
             per_line=True,
+            indented=indented,
+            opened=opened,
+            close_on_pick=close_on_pick,
         )
+
+    def _summary(self) -> str:
+        chosen = self.selected()
+        return super()._summary() if self.multiple or not chosen else f"Lauf: {self._labels[chosen[0]]}"
 
 
 class DatasetSelector(ChoiceBlock):

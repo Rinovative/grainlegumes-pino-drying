@@ -608,6 +608,95 @@ def test_replacement_batch_passes_terminal_validation_under_its_canonical_identi
             generation.runtime.admit_terminal_batch(replacement.batch_storage_name, storage_root=storage)
 
 
+def _reserved_replacement_after_one_failure(base_path: Path, storage: Path, work: Path) -> tuple[Any, Any, dict[str, Any]]:
+    """Fail the first of two originals, then plan the replacement and generate its input: campaign, batch and case payload."""
+    campaign = generation.cases.config.load_campaign_config(base_path)
+    lifecycle.create_campaign(campaign, storage_root=storage)
+    primary = campaign.batches[0]
+    inputs = generation.cases.input_generation.generate_input_cases(primary, 2, storage_root=storage)
+    first = generation.cases.input_generation.admit_configured_input_references(primary, storage_root=storage)[1].case_payload()
+    lifecycle.decide_candidate(
+        "steady_flow",
+        campaign.source_name,
+        "lentil",
+        "case_0001",
+        outcome="failed",
+        stage="validation",
+        failure_class="validation",
+        reason_code="synthetic_rejection",
+        detail="Synthetic scientific rejection",
+        case_input_id=first["case_input_id"],
+        simulation_case_id=first["simulation_case_id"],
+        case_hdf5_relative=None,
+        case_hdf5_sha256=None,
+        evidence={"input_manifest_relative": (inputs.metadata_directory / "input_generation_manifest.json").relative_to(storage).as_posix()},
+        storage_root=storage,
+    )
+    successful_source_case(campaign.source_name, primary, 2, storage, work)
+    lifecycle.amend_minimum_success_rate(
+        "steady_flow",
+        campaign.source_name,
+        primary.material_family,
+        minimum_success_rate=0.9,
+        reason="Synthetic tolerated failure",
+        storage_root=storage,
+    )
+    replacement = lifecycle.materialize_replacement_batch(campaign, primary.batch_id, storage_root=storage)
+    generation.cases.input_generation.generate_input_cases(replacement, 1, storage_root=storage)
+    payload = generation.cases.input_generation.admit_configured_input_references(replacement, storage_root=storage)[3].case_payload()
+    return campaign, replacement, payload
+
+
+def test_replacement_identity_binds_science_and_position_but_not_the_producer_code(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement keeps its candidate ID and case identifiers under a changed Generation code fingerprint, as a primary does."""
+    base_path, _template = generation_config_factory(simulation_profile="steady_flow", executable=fake_comsol, natural_count=2)
+    code_identity = source_service.source_producer_identity
+    campaign, replacement, payload = _reserved_replacement_after_one_failure(base_path, tmp_path / "before", tmp_path / "before-work")
+    monkeypatch.setattr(source_service, "source_producer_identity", lambda: {**code_identity(), "source_implementation_sha256": "f" * 64})
+    changed_campaign, changed_replacement, changed_payload = _reserved_replacement_after_one_failure(
+        base_path, tmp_path / "after", tmp_path / "after-work"
+    )
+
+    assert changed_campaign.campaign_digest != campaign.campaign_digest
+    assert changed_campaign.batches[0].batch_id == campaign.batches[0].batch_id
+    design = replacement.scientific_values["replacement_design"]
+    assert changed_replacement.scientific_values["replacement_design"] == design
+    assert changed_replacement.case_input_config_digest == replacement.case_input_config_digest
+    assert changed_payload["case_input_id"] == payload["case_input_id"]
+    assert changed_payload["simulation_case_id"] == payload["simulation_case_id"]
+
+    # A different parent science, design point or failed slot is a different case.
+    for field, value in (("parent_scientific_config_digest", "0" * 64), ("design_index", 7), ("target_slot", 2)):
+        other = {**design, field: value}
+        other["candidate_id"] = lifecycle._replacement_candidate_id(other)
+        assert other["candidate_id"] != design["candidate_id"]
+        scientific = {**replacement.scientific_values, "replacement_design": other}
+        assert generation.cases.config.compute_case_input_config_digest(scientific) != replacement.case_input_config_digest
+
+
+def test_a_replacement_reservation_is_reconstructed_only_under_its_own_campaign(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+) -> None:
+    """The design carries no campaign binding, so the reservation's own task, source name and campaign digest must match."""
+    base_path, _template = generation_config_factory(simulation_profile="steady_flow", executable=fake_comsol, natural_count=2)
+    storage = tmp_path / "scientific-storage"
+    campaign, replacement, _payload = _reserved_replacement_after_one_failure(base_path, storage, tmp_path / "work")
+    records = lifecycle.candidate_records("steady_flow", campaign.source_name, storage_root=storage)
+    reservation = next(row["reservation"] for row in records if row["reservation"]["origin"] == "replacement")
+    rebuilt = lifecycle.replacement_batch_from_reservation(campaign, reservation, storage_root=storage)
+    assert rebuilt.batch_id == replacement.batch_id
+    for field in ("task", "campaign_name", "campaign_digest"):
+        with pytest.raises(ValueError, match="conflicts with its frozen campaign"):
+            lifecycle.replacement_batch_from_reservation(campaign, {**reservation, field: "other"}, storage_root=storage)
+
+
 @dataclass
 class _FeederCampaign:
     """One two-original steady Source with an authored minimum success rate of 0.8, fed through a fake scheduler."""

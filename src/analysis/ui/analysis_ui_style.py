@@ -1,6 +1,7 @@
 """Define the geometry constants, the column grid, and the scoped stylesheet of every notebook control panel.
 
 Responsibilities:
+  - Left-align the text of the buttons and checkboxes in popovers
   - Fix the pixel geometry of rows, gaps, buttons, status line, plot gap, popovers, and tab headers
   - Estimate text widths generously in ch so that labels and options are never cut
   - Provide the column grid on which every element of a panel starts and ends
@@ -32,7 +33,6 @@ BUTTON_PX: Final = 34  # width of every step button
 STATUS_PX: Final = 20  # one reserved status line
 PLOT_GAP_PX: Final = 20  # status line to the plot below
 TRACK_PX: Final = 40  # one column track of the grid; the column pitch is TRACK_PX + GAP_PX
-POPOVER_MAX_PX: Final = 420  # an opened body taller than this scrolls as one block
 CH_PX: Final = 8  # one ch of the widget font in px, slightly generous
 TAB_HEIGHT_PX: Final = LINE_PX  # tab header height, tall enough that the bar never shows scroll arrows
 TAB_PADDING_CH: Final = 3  # tab header padding plus a margin, in ch
@@ -85,14 +85,17 @@ _STYLESHEET: Final = """
 .glp-ui .glp-status progress { vertical-align: middle; width: 120px; height: 10px; margin-left: 8px; }
 .glp-ui .glp-failure p { margin: 0 0 4px 0; color: var(--jp-error-color1, #c0392b); }
 .glp-ui .glp-failure pre { max-height: 180px; overflow: auto; font-size: 11px; margin: 4px 0 0 0; }
-.glp-ui.glp-panel { position: relative; }
 .glp-ui.glp-panel, .glp-ui.glp-host, .glp-ui.glp-shell { overflow: visible; }
 .glp-ui .glp-popover {
-  position: absolute; left: 0; z-index: 20; box-sizing: border-box; max-width: 100%; max-height: @POPMAX@px; overflow: auto;
+  position: relative; z-index: 20; align-self: start; justify-self: start; box-sizing: border-box; max-width: 100%;
+  overflow-x: auto; overflow-y: hidden;
   padding: 6px 8px 6px 0; background: var(--jp-layout-color1, #fff);
   border: 1px solid var(--jp-border-color1, #888); border-left: none; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
 }
 .glp-ui .glp-popover .glp-row { overflow: visible; height: auto; }
+.glp-ui .glp-popover .widget-toggle-button, .glp-ui .glp-popover .jupyter-button, .glp-ui .glp-popover .widget-checkbox {
+  justify-content: flex-start; text-align: left;
+}
 .glp-ui .glp-plot { overflow-x: auto; overflow-y: hidden; }
 .glp-ui .glp-plot img, .glp-ui .widget-image, .glp-ui .jupyter-widget-image { max-width: none; }
 .glp-ui .glp-text pre { margin: 0; }
@@ -185,7 +188,6 @@ def stylesheet() -> str:
         "@PLOTGAP@": PLOT_GAP_PX,
         "@PITCH@": ROW_PITCH_PX,
         "@TABH@": TAB_HEIGHT_PX,
-        "@POPMAX@": POPOVER_MAX_PX,
     }
     text = _STYLESHEET
     for token, value in replacements.items():

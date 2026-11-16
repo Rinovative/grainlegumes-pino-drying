@@ -1,25 +1,29 @@
-"""Define shared notebook-scale physical-map and colorbar presentation.
+"""Define the shared fixed-inch map grid and the figure helpers kept beside it.
 
 Responsibilities:
-  - Create equal-sized, width-capped physical-map subplot grids under constrained layout
-  - Plan fixed-inch map grids: equal maps with the domain's aspect, colour bars as tall as their maps, fixed gaps
-  - Assemble a fixed map grid's map axes and hidden colour-bar slots in one place
-  - Write map-grid column headers with notes, row labels and one figure title once each
-  - Attach proportionate axes-coupled colorbars or fill reserved fixed-inch colour-bar slots
-  - Reserve a dedicated legend column inside the same constrained layout
+  - Plan fixed-inch map grids: equal maps with the domain's aspect, colour bars as tall as their maps, fixed gaps, the
+    margins of row labels and a figure title, a width cap or none, and non-map bands above, below or right of the maps
+  - Assemble a fixed map grid's map axes and hidden colour-bar slots in one place and give each band's figure rectangle
+  - Write map-grid column headers with notes, row labels, one figure title and the text of an empty cell
+  - Fill reserved fixed-inch colour-bar slots
+  - Label the colour bar of a field-map scale from its kind: a constant's value, a cyclic scale's boundaries, a signed
+    one's band centres, a wide log scale's decades, the power of ten in the unit bracket from the size of a state's
+    values and from the step of an error, every label thinned to the bar's real tick spacing
+  - Lay out a line figure's time windows as columns of one grid inside a given grid cell, rows sharing their y axis
+    (``window_axes``), and head a row of such a figure with a formula and unit (``add_channel_row_label``)
   - Normalize finite constant and varying physical fields predictably
-  - Choose round discrete colour-scale boundaries: steps of 1, 2 or 5 times a power of ten
-  - Write a power of ten into the unit bracket of a colour-bar label
 
 Design principles:
   - Layout never changes scientific arrays or their physical coordinates
-  - One immutable sizing contract serves EDA, Evaluation and generation-input maps
-  - Every colorbar remains explicitly bound to its map axis
-  - A fixed-inch grid's figure size is a pure function of rows, columns and domain and uses no layout engine,
-    so a reused figure keeps its pixel size and axes positions
+  - One fixed-inch map grid serves EDA, Evaluation and generation-input maps
+  - Every colorbar remains explicitly bound to its map's slot
+  - A fixed-inch grid's figure size is a pure function of its plan (rows, columns, domain, margins and bands) and uses
+    no layout engine, so a reused figure keeps its pixel size and axes positions
+  - Every text of a fixed-inch map figure sets its size, taken from ``analysis_ui_figure_layout``, so no rc setting changes a map
+  - Colour-bar labels are thinned when drawn, from the drawn tick positions, so every layout gets the real spacing
 
 This module does NOT:
-  - Choose scientific fields, units, colormaps, or comparison semantics
+  - Choose scientific fields, units, colormaps, colour-scale boundaries or comparison semantics
   - Load data, construct notebook controls, or manage figure export
 """
 
@@ -27,91 +31,74 @@ from __future__ import annotations
 
 import math
 import re
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.axis import Axis, YAxis
 from matplotlib.colors import Normalize
+from matplotlib.ticker import Formatter, LogFormatterSciNotation, NullFormatter
 from mpl_toolkits.axes_grid1 import Size, make_axes_locatable  # type: ignore[import-untyped]
 
 from src.analysis.presentation import analysis_field_maps as field_maps
 
+from . import analysis_ui_figure_layout as figure_layout
+
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Iterable, Sequence
 
     from matplotlib.axes import Axes
     from matplotlib.cm import ScalarMappable
     from matplotlib.colorbar import Colorbar
     from matplotlib.figure import Figure
-    from matplotlib.gridspec import GridSpec
+    from matplotlib.gridspec import GridSpec, SubplotSpec
 
     from src.analysis.presentation.analysis_field_maps import FieldMapExtend
+    from src.analysis.ui.analysis_ui_time import TimeWindow
 
 MAP_WIDTH_IN = 4.2  # target width of one drawn map
-MAP_MAX_WIDTH_IN = 17.4  # figure width cap: all maps shrink uniformly to stay under it
+MAP_MAX_WIDTH_IN = 17.4  # default figure width cap: all maps shrink uniformly to stay under it
 COLORBAR_WIDTH_IN = 0.14
 COLORBAR_PAD_IN = 0.08  # map to its colour bar
-GAP_H_IN = 1.10  # colour bar to the next map: the bar's tick labels and unit label sit here
+GAP_H_IN = 1.10  # colour bar to the next map or to the right band: the bar's tick labels and unit label sit here
 GAP_V_IN = 0.40  # between rows: x tick labels stand on the bottom row only
-MARGIN_LEFT_IN = 1.50  # row labels, y tick labels and "y [m]"
+BAND_GAP_V_IN = 0.85  # maps to a band above or below: x tick labels, x label and the next panel title or column header
+MARGIN_LEFT_IN = 0.95  # y tick labels and "y [m]"
+MARGIN_LEFT_ROW_LABEL_IN = 1.50  # plus the row labels
 MARGIN_RIGHT_IN = 1.10  # tick labels and unit label of the last colour bar
-MARGIN_TOP_IN = 0.95  # figure title and column headers with one note line
+MARGIN_TOP_IN = 0.50  # column headers with one note line
+MARGIN_TOP_TITLE_IN = 0.95  # plus the figure title
 MARGIN_BOTTOM_IN = 0.75  # x tick labels and "x [m]"
+TICK_LABEL_SPACING_MIN_IN = 0.16  # colour-bar labels closer than this are thinned; every tick keeps its mark
+_LOG_DECADE_RATIO = 30.0  # a geometric scale wider than this factor ...
+_LOG_DECADES_MIN = 4  # ... that holds at least this many decades is labelled at its decades
+_MINIMUM_TICKS = 2
+_GEOMETRIC_SIGNIFICANT_DIGITS = 3  # a narrow geometric scale (no decade labels) writes its smallest boundary with this many digits
+_CYCLIC_COLORMAPS = frozenset({"twilight", "twilight_shifted", "hsv"})  # Matplotlib's cyclic colormaps: their two ends meet
 _TITLE_FROM_TOP_IN = 0.12
 _ROW_LABEL_OFFSET_PT = 62.0  # left of the first column's y tick labels and "y [m]"
-_HEADER_PAD_PT = 6.0  # Matplotlib's default title pad
+_HEADER_PAD_PT = 4.0  # header to its map: slightly below Matplotlib's 6 pt
 _HEADER_NOTE_LINE_PT = 14.0  # one 10 pt note line under a header
-_TICK_SIZE_PT = 9.0
-_LABEL_SIZE_PT = 10.0
-_HEADER_SIZE_PT = 11.0
-_TITLE_SIZE_PT = 12.0
-_NOTE_SIZE_PT = 10.0  # note lines carry per-map metrics, readable in a 60-dpi GIF
 _NOTE_COLOUR = "0.20"
-_BAND_MANTISSAS = (1.0, 2.0, 2.5, 5.0)  # round band widths: these times a power of ten
-_PREFERRED_BANDS = 11  # the band count that wins a tie in the covered span
-_MAX_STEP_DECIMALS = 15
-# Relative: far below the gap between round steps, above the roundoff of a step taken as a difference of large boundaries.
-_STEP_TOLERANCE = 1e-6
 _SUPERSCRIPT = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
 _UNIT_BRACKET = re.compile(r"\[([^\]]*)\]\s*$")
 _MATH_SPAN = re.compile(r"\$([^$]+)\$")
 
 
 @dataclass(frozen=True, slots=True)
-class MapLayoutContract:
-    """Define one consistent notebook-scale physical-map layout."""
-
-    column_width: float = 5.8
-    row_height: float = 3.6
-    maximum_width: float = 17.4
-    column_spacing: float = 0.18
-    row_spacing: float = 0.10
-    colorbar_fraction: float = 0.046
-    colorbar_pad: float = 0.025
-    label_size: float = 11.25
-    tick_size: float = 10.0
-
-    def figure_size(self, *, rows: int, columns: int) -> tuple[float, float]:
-        """Return the shared positive map-grid dimensions, shrinking columns to the width cap."""
-        if rows <= 0 or columns <= 0:
-            message = "Physical map grids require positive row and column counts."
-            raise ValueError(message)
-        return min(self.column_width * columns, self.maximum_width), self.row_height * rows
-
-
-MAP_LAYOUT = MapLayoutContract()
-
-
-@dataclass(frozen=True, slots=True)
 class MapGeometry:
-    """Hold the resolved inch geometry of one fixed map grid with row labels and a figure title."""
+    """Hold the resolved inch geometry of one fixed map grid: its maps, left and top margins and the non-map bands beside it."""
 
     rows: int
     columns: int
     map_width: float
     map_height: float
+    left: float
+    top: float
+    above_in: float
+    below_in: float
+    right_in: float
 
     @property
     def cell_width(self) -> float:
@@ -119,30 +106,52 @@ class MapGeometry:
         return self.map_width + COLORBAR_PAD_IN + COLORBAR_WIDTH_IN
 
     @property
+    def grid_width(self) -> float:
+        """Return the width of the map columns: cells and the gaps between them."""
+        return self.columns * self.cell_width + (self.columns - 1) * GAP_H_IN
+
+    @property
+    def grid_height(self) -> float:
+        """Return the height of the map rows: maps and the gaps between them."""
+        return self.rows * self.map_height + (self.rows - 1) * GAP_V_IN
+
+    @property
     def figure_width(self) -> float:
-        """Return the figure width: margins, cells and the gaps between them."""
-        return MARGIN_LEFT_IN + MARGIN_RIGHT_IN + self.columns * self.cell_width + (self.columns - 1) * GAP_H_IN
+        """Return the figure width: margins, map columns and a right band behind its gap."""
+        return self.left + self.grid_width + _band_extent(self.right_in, GAP_H_IN) + MARGIN_RIGHT_IN
 
     @property
     def figure_height(self) -> float:
-        """Return the figure height: margins, maps and the gaps between rows."""
-        return MARGIN_TOP_IN + MARGIN_BOTTOM_IN + self.rows * self.map_height + (self.rows - 1) * GAP_V_IN
+        """Return the figure height: margins, map rows and the bands above and below, each behind its gap."""
+        return (
+            self.top + _band_extent(self.above_in, BAND_GAP_V_IN) + self.grid_height + _band_extent(self.below_in, BAND_GAP_V_IN) + MARGIN_BOTTOM_IN
+        )
 
 
-@contextmanager
-def eda_typography() -> Iterator[None]:
-    """Moderately enlarge EDA figure text for an opt-in plotting scope."""
-    with plt.rc_context(
-        {
-            "font.size": 11.5,
-            "axes.titlesize": 12.5,
-            "axes.labelsize": 11.5,
-            "xtick.labelsize": 10.5,
-            "ytick.labelsize": 10.5,
-            "legend.fontsize": 10.5,
-        }
-    ):
-        yield
+@dataclass(frozen=True, slots=True)
+class TickFormat:
+    """The labels of a colour bar: ``decimals`` after the point, the ticks written divided by 10**``exponent`` (the factor stands in the unit)."""
+
+    decimals: int = 1
+    exponent: int = 0
+
+
+class _BarLabels(Formatter):
+    """Write colour-bar tick labels in one fixed format, thinned when drawn to the real spacing of the ticks on the bar."""
+
+    def __init__(self, shown: TickFormat) -> None:
+        self._shown = shown
+
+    def __call__(self, x: float, pos: int | None = None) -> str:  # noqa: ARG002 -- Matplotlib's formatter signature
+        """Return one label; rounding first turns a small negative value into +0.0, so no label reads "-0.0"."""
+        value = round(x / 10.0**self._shown.exponent, self._shown.decimals) + 0.0
+        return f"{value:.{self._shown.decimals}f}".replace("-", "\N{MINUS SIGN}")
+
+    def format_ticks(self, values: list[float]) -> list[str]:
+        """Return the labels of all tick ``values``, empty for the ticks thinned out (``_labelled_ticks``)."""
+        ticks = np.asarray(values, dtype=np.float64)
+        kept = _labelled_ticks(ticks, _tick_gaps_in(self.axis, ticks))
+        return [self(value) if index in kept else "" for index, value in enumerate(ticks)]
 
 
 def linear_norm(*values: np.ndarray) -> Normalize:
@@ -163,171 +172,169 @@ def linear_norm(*values: np.ndarray) -> Normalize:
     return Normalize(vmin=lower, vmax=upper)
 
 
-def step_decimals(step: float) -> int:
-    """Return the decimals the round ``step`` needs exactly (0.25 gives 2, 2.5 gives 1, 25 gives 0)."""
-    for decimals in range(_MAX_STEP_DECIMALS):
-        if abs(round(step, decimals) - step) <= _STEP_TOLERANCE * step:
-            return decimals
-    return _MAX_STEP_DECIMALS
+def _band_extent(size: float, gap: float) -> float:
+    """Return the room a band of ``size`` inches takes beside the maps: the band and its gap, nothing for an absent band."""
+    return size + gap if size > 0.0 else 0.0
 
 
-def _best_band(width: float, bands_from: Callable[[float], int | None], max_decimals: int | None) -> tuple[float, int] | None:
-    """Return the (step, band count) of the round candidate covering the least span, ties to the count nearest 11, then the larger step."""
-    base = math.floor(math.log10(width / field_maps.MAX_BANDS))
-    best: tuple[tuple[float, int, float], float, int] | None = None
-    for power in range(base, base + 3):
-        for mantissa in _BAND_MANTISSAS:
-            step = mantissa * 10.0**power
-            count = None if max_decimals is not None and step_decimals(step) > max_decimals else bands_from(step)
-            if count is None:
-                continue
-            key = (round(count * step / width, 9), abs(count - _PREFERRED_BANDS), -step)
-            if best is None or key < best[0]:
-                best = (key, step, count)
-    return None if best is None else best[1:]
+def _grid_bottom(geometry: MapGeometry) -> float:
+    """Return the height in inches of the lowest map row's bottom edge above the figure's bottom edge."""
+    return MARGIN_BOTTOM_IN + _band_extent(geometry.below_in, BAND_GAP_V_IN)
 
 
-def rounded_boundaries(lower: float, upper: float, *, max_decimals: int | None = None) -> np.ndarray | None:
+def _tick_gaps_in(axis: object, ticks: np.ndarray) -> np.ndarray:
+    """Return the drawn distances in inches between neighbouring ``ticks`` on ``axis``; unknown distances are infinite."""
+    if not isinstance(axis, Axis) or ticks.size < _MINIMUM_TICKS or (figure := axis.axes.get_figure(root=True)) is None:
+        return np.full(max(ticks.size - 1, 0), np.inf)
+    along = 1 if isinstance(axis, YAxis) else 0
+    points = np.zeros((ticks.size, 2))
+    points[:, along] = ticks
+    return np.abs(np.diff(axis.axes.transData.transform(points)[:, along])) / figure.dpi
+
+
+def _labelled_ticks(ticks: np.ndarray, gaps_in: np.ndarray) -> set[int]:
     """
-    Return the round boundaries of 9 to 13 equal bands from a multiple of the step at or below ``lower`` that reach ``upper``.
+    Return the indices of the ``ticks`` that keep a label when neighbouring ticks stand ``gaps_in`` inches apart.
 
-    The step is m times a power of ten with m in 1, 2, 2.5 or 5. Among the candidates that reach ``upper`` the one with the
-    smallest covered span wins; a tie goes to the band count nearest 11, then to the larger step. With ``max_decimals``
-    candidates whose step needs more decimals are skipped, and a range whose best step is finer than the last decimal is too
-    narrow for it: ``None``, as for ``upper`` not above ``lower`` (or a width that underflows or overflows). The boundaries
-    are the doubles nearest their decimal values (``_multiples``).
+    Every tick is labelled while each gap holds one label (``TICK_LABEL_SPACING_MIN_IN``). Otherwise every k-th tick keeps
+    its label, k the smallest count of gaps that holds one: both ends always, no interior label closer than k gaps to an
+    end, and a scale symmetric about 0 thinned symmetrically (an odd count from its centre tick, an even one from both
+    ends). An odd symmetric scale always keeps its centre 0: with both ends when each half holds one label, else alone.
+    Any other bar too short for both end labels keeps only its top label.
     """
-    width = upper - lower
-    if not (math.isfinite(width) and width / field_maps.MAX_BANDS > 0.0):
+    last = ticks.size - 1
+    smallest = float(np.min(gaps_in)) if last >= 1 else math.inf
+    if smallest >= TICK_LABEL_SPACING_MIN_IN:
+        return set(range(ticks.size))
+    step = math.ceil(TICK_LABEL_SPACING_MIN_IN / smallest) if smallest > 0.0 else last
+    symmetric = bool(np.allclose(ticks, -ticks[::-1], rtol=0.0, atol=1e-9 * float(np.max(np.abs(ticks)))))
+    if symmetric and last % 2 == 0:
+        centre = last // 2
+        if float(np.sum(gaps_in[:centre])) < TICK_LABEL_SPACING_MIN_IN:
+            return {centre}
+        core = {index for index in range(last + 1) if (index - centre) % step == 0}
+        return {0, centre, last} | {index for index in core if min(index, last - index) >= step}
+    if float(np.sum(gaps_in)) < TICK_LABEL_SPACING_MIN_IN:
+        return {last}
+    if symmetric:
+        core = {index for index in range(last + 1) if min(index, last - index) % step == 0}
+    else:
+        core = {index for index in range(last + 1) if (last - index) % step == 0}
+    return {0, last} | {index for index in core if min(index, last - index) >= step}
+
+
+def _decades(boundaries: np.ndarray) -> list[float] | None:
+    """Return the decades that label a wide geometric scale (a ratio above 30 holding at least four decades), else ``None``."""
+    if boundaries.size < _MINIMUM_TICKS or boundaries[0] <= 0.0 or boundaries[-1] / boundaries[0] <= _LOG_DECADE_RATIO:
         return None
-
-    def bands_from(step: float) -> int | None:
-        first = _first_multiple(lower, step)
-        count = max(field_maps.MIN_BANDS, math.ceil(upper / step - first - 1e-9))
-        count += 1 if _multiples(first + count, step) < upper else 0  # the top itself is checked: a rounding step below ``upper`` would cut it short
-        return count if count <= field_maps.MAX_BANDS else None
-
-    found = _best_band(width, bands_from, None)
-    if found is not None and max_decimals is not None and step_decimals(found[0]) > max_decimals:
-        found = None if found[0] < 10.0**-max_decimals * (1.0 - 1e-9) else _best_band(width, bands_from, max_decimals)
-    if found is None:
+    steps = np.diff(np.log(boundaries))
+    low, high = math.ceil(math.log10(boundaries[0]) - 1e-9), math.floor(math.log10(boundaries[-1]) + 1e-9)
+    if not np.allclose(steps, steps[0]) or high - low + 1 < _LOG_DECADES_MIN:
         return None
-    step, count = found
-    return _multiples(_first_multiple(lower, step) + np.arange(count + 1), step)
+    return [10.0**power for power in range(low, high + 1)]
 
 
-def _multiples(indices: np.ndarray | int, step: float) -> np.ndarray:
-    """Return ``indices`` times the round ``step`` as the doubles nearest their decimal values (3 times 0.1 gives 0.3)."""
-    exponent = math.floor(math.log10(step)) - 1  # m times 10^k with m in 1, 2, 2.5 or 5 is a whole number times 10^(k-1)
-    whole = np.asarray(indices, dtype=np.float64) * round(step / 10.0**exponent)
-    return whole / 10.0**-exponent if exponent < 0 else whole * 10.0**exponent
-
-
-def _first_multiple(lower: float, step: float) -> int:
-    """Return the index of the largest multiple of ``step`` at or below ``lower`` (a quotient rounded up to a whole number steps back)."""
-    first = math.floor(lower / step + 1e-9)
-    return first - 1 if _multiples(first, step) > lower else first
-
-
-def symmetric_boundaries(reach: float) -> np.ndarray | None:
+def _geometric_format(boundaries: np.ndarray) -> TickFormat:
     """
-    Return round boundaries of an odd number (9, 11 or 13) of equal bands of width w with ``count / 2 * w`` at least ``reach``.
+    Return the format that writes every boundary of a narrow geometric scale with the significant digits of its smallest one.
 
-    The middle band is centred on 0. The candidates and the choice among them are those of ``rounded_boundaries``.
-    ``None`` for a reach that is not positive (or underflows), or whose span overflows.
+    At least three; more when the smallest relative step r between adjacent boundaries needs them (1 - floor(log10 r)), so
+    every absolute step is at least one unit of the last decimal and adjacent boundaries never read alike.
     """
-    if not (math.isfinite(2.0 * reach) and reach / field_maps.MAX_BANDS > 0.0):
-        return None
-
-    def bands_from(step: float) -> int | None:
-        count = max(field_maps.MIN_BANDS, math.ceil(2.0 * reach / step - 1e-9))
-        count += 1 - count % 2
-        count += 2 if count / 2.0 * step < reach else 0
-        return count if count <= field_maps.MAX_BANDS else None
-
-    found = _best_band(2.0 * reach, bands_from, None)
-    if found is None:
-        return None
-    step, count = found
-    return (np.arange(count + 1) - count / 2.0) * step
+    exponent = math.floor(math.log10(float(boundaries[-1])))
+    smallest = float(boundaries[0]) / 10.0**exponent
+    digits = max(_GEOMETRIC_SIGNIFICANT_DIGITS, 1 - math.floor(math.log10(float(np.min(np.diff(boundaries) / boundaries[:-1])))))
+    return TickFormat(decimals=max(0, digits - 1 - math.floor(math.log10(smallest))), exponent=exponent)
 
 
-def map_subplots(
-    *,
-    rows: int,
-    columns: int,
-    figure: Figure | None = None,
-    **kwargs: Any,
-) -> tuple[Figure, np.ndarray]:
+def error_ticks(boundaries: np.ndarray, *, signed: bool) -> np.ndarray:
+    """Return the labelled ticks of an error bar: the band boundaries, or for a signed scale the band centres 0, ±w, ±2w ... (w the band width)."""
+    return (boundaries[:-1] + boundaries[1:]) / 2.0 if signed else boundaries
+
+
+def tick_step(ticks: np.ndarray) -> float | None:
+    """Return the smallest step between the ticks (``None`` for fewer than two or equal ones)."""
+    step = float(np.min(np.diff(ticks))) if ticks.size >= _MINIMUM_TICKS else 0.0
+    return step if step > 0.0 else None
+
+
+def tick_format(step: float | None) -> TickFormat:
     """
-    Create one equal-column map grid under the shared layout contract.
+    Return the labels of an error bar whose smallest round tick step is ``step``: exactly the decimals the step needs.
 
-    A given ``figure`` (created here) is cleared and reused with its current size and
-    layout engine, so animation frames keep identical pixel dimensions.
+    A step that would need more than three decimals is written as a multiple of its power of ten instead, which the unit
+    names. The error bars are centred on 0; a state bar uses ``state_format``, whose factor follows the size of its values.
     """
-    owned = {"figsize", "squeeze", "layout", "gridspec_kw"}
-    overlap = owned.intersection(kwargs)
-    if overlap:
-        message = f"Shared map grids own figure size, squeezing, layout, and spacing; received {sorted(overlap)}."
-        raise ValueError(message)
-    spacing = {"wspace": MAP_LAYOUT.column_spacing, "hspace": MAP_LAYOUT.row_spacing}
-    if figure is not None:
-        figure.clear()
-        return figure, figure.subplots(rows, columns, squeeze=False, gridspec_kw=spacing, **kwargs)
-    figure, axes = plt.subplots(
-        rows,
-        columns,
-        figsize=MAP_LAYOUT.figure_size(rows=rows, columns=columns),
-        squeeze=False,
-        layout="compressed",
-        gridspec_kw=spacing,
-        **kwargs,
+    if step is None:
+        return TickFormat()
+    decimals = field_maps.step_decimals(step)
+    if decimals <= field_maps.MAX_TICK_DECIMALS:
+        return TickFormat(decimals)
+    exponent = math.floor(math.log10(step) + 1e-9)
+    return TickFormat(field_maps.step_decimals(step / 10.0**exponent), exponent)
+
+
+def state_format(steps: Iterable[float | None], exponent: int = 0) -> TickFormat:
+    """
+    Return the labels of a state bar written in 10**``exponent``: the decimals its frames' round tick steps need there, at most three.
+
+    ``exponent`` is the bar's ``field_maps.state_exponent``, which follows the size of its values, never its step; 0 (no
+    factor) for the states whose values lie between 10^-3 and 10^4. A frame whose step would need more decimals is
+    near-uniform and does not set them (``field_maps.widened_range`` serves it); ``None`` steps (constant frames) are
+    ignored. Without any frame that fits, the bar gets the three decimals.
+    """
+    needed = [field_maps.step_decimals(step / 10.0**exponent) for step in steps if step is not None]
+    fitting = [decimals for decimals in needed if decimals <= field_maps.MAX_TICK_DECIMALS]
+    return TickFormat(max(fitting) if fitting else field_maps.MAX_TICK_DECIMALS if needed else 1, exponent)
+
+
+def error_format(boundaries: np.ndarray | None, *, signed: bool) -> TickFormat:
+    """Return the label format of an error bar over ``boundaries``, the one ``set_fixed_decimal_ticks`` derives from its ticks."""
+    return TickFormat() if boundaries is None else tick_format(tick_step(error_ticks(boundaries, signed=signed)))
+
+
+def is_finer_than_decimals(step: float | None, decimals: int) -> bool:
+    """Return whether a round tick ``step`` is below the unit of the last decimal ``decimals``."""
+    return step is not None and step < 10.0**-decimals * (1.0 - 1e-9)
+
+
+def set_fixed_decimal_ticks(colorbar: Colorbar, ticks: np.ndarray, fixed: TickFormat | None = None) -> None:
+    """
+    Label ``colorbar`` at ``ticks`` in the format ``fixed`` (default: the one its own ticks need), with the true minus sign and no "-0".
+
+    A power of ten is written into the unit bracket of the bar's label. A caller that draws several frames passes the format
+    that fits all of them, so the labels and the unit never change between frames. When the bar is drawn, labels closer
+    than ``TICK_LABEL_SPACING_MIN_IN`` are thinned (``_labelled_ticks``); every tick keeps its mark.
+    """
+    shown = tick_format(tick_step(ticks)) if fixed is None else fixed
+    colorbar.set_ticks(ticks.tolist())
+    if shown.exponent:
+        colorbar.set_label(label_with_exponent(colorbar.ax.get_ylabel(), shown.exponent))
+    colorbar.ax.yaxis.set_major_formatter(_BarLabels(shown))
+
+
+def window_axes(
+    figure: Figure,
+    spec: SubplotSpec,
+    windows: Sequence[TimeWindow],
+    row_heights: Sequence[float],
+    **grid_kwargs: Any,
+) -> np.ndarray:
+    """
+    Return the axes ``[row, window]`` of a grid in ``spec``: one column per time window, as wide as the window asks.
+
+    A row shares its y axis over the windows, whose y tick labels stay on the first column. ``grid_kwargs`` are the
+    spacings of the grid (``wspace``, ``hspace``).
+    """
+    grid = spec.subgridspec(
+        len(row_heights), len(windows), width_ratios=[window.width_ratio for window in windows], height_ratios=list(row_heights), **grid_kwargs
     )
-    return figure, axes
-
-
-def subplots_with_legend_column(
-    *,
-    rows: int,
-    columns: int,
-    column_width: float = 4.8,
-    row_height: float = 3.6,
-    legend_width: float = 2.4,
-    sharex: bool = False,
-    hspace: float = 0.34,
-) -> tuple[Figure, np.ndarray, Axes]:
-    """Create a constrained subplot grid with one reserved legend rail."""
-    if rows <= 0 or columns <= 0:
-        message = "Legend-column grids require positive row and column counts."
-        raise ValueError(message)
-    if min(column_width, row_height, legend_width) <= 0.0:
-        message = "Legend-column grid dimensions must be positive."
-        raise ValueError(message)
-    if hspace < 0.0:
-        message = "Legend-column grid row spacing is invalid."
-        raise ValueError(message)
-    figure = plt.figure(
-        figsize=(column_width * columns + legend_width, row_height * rows),
-        layout="constrained",
-    )
-    grid = figure.add_gridspec(
-        rows,
-        columns + 1,
-        width_ratios=(*([1.0] * columns), legend_width / column_width),
-        wspace=0.34,
-        hspace=hspace,
-    )
-    axes = np.empty((rows, columns), dtype=object)
-    for row in range(rows):
-        for column in range(columns):
-            shared_axis = axes[0, column] if sharex and row > 0 else None
-            axes[row, column] = figure.add_subplot(
-                grid[row, column],
-                sharex=shared_axis,
-            )
-    legend_axis = figure.add_subplot(grid[:, -1])
-    legend_axis.set_axis_off()
-    return figure, axes, legend_axis
+    axes = np.empty((len(row_heights), len(windows)), dtype=object)
+    for row, column in np.ndindex(axes.shape):
+        axis = axes[row, column] = figure.add_subplot(grid[row, column], sharey=axes[row, 0] if column else None)
+        if column:
+            axis.tick_params(axis="y", labelleft=False)
+    return axes
 
 
 def add_channel_row_label(
@@ -361,118 +368,11 @@ def add_channel_row_label(
         rotation=90,
         va="center",
         ha="center",
-        fontsize=11,
+        fontsize=figure_layout.PANEL_TITLE_PT,
         fontweight="bold",
         annotation_clip=False,
     )
     annotation.set_gid("channel-row-label")
-
-
-def set_suptitle_over_axes(
-    figure: Figure,
-    title: str,
-    axes: Iterable[Axes],
-    **kwargs: Any,
-) -> Any:
-    """
-    Title one figure over its scientific axes.
-
-    A manually laid-out figure centres the title over the given axes, excluding
-    side rails. A constrained figure positions the title itself, so ``y`` is
-    dropped and the title is centred on the figure.
-    """
-    scientific_axes = tuple(axis for axis in axes if axis.get_visible())
-    if not scientific_axes:
-        message = "A scientific-block title requires at least one visible axis."
-        raise ValueError(message)
-    if not isinstance(title, str) or not title.strip():
-        message = "Scientific-block titles must be non-empty text."
-        raise ValueError(message)
-    if figure.get_layout_engine() is not None:
-        kwargs.pop("y", None)
-        return figure.suptitle(title, **kwargs)
-    left = min(axis.get_position().x0 for axis in scientific_axes)
-    right = max(axis.get_position().x1 for axis in scientific_axes)
-    return figure.suptitle(title, x=(left + right) / 2.0, **kwargs)
-
-
-def configure_bottom_occupied_row_xlabels(
-    axes: Iterable[Axes],
-    *,
-    columns: int,
-    label: str | None = None,
-    hide_upper_tick_labels: bool,
-) -> None:
-    """Keep x-axis text on the bottom occupied row of one row-major grid."""
-    occupied = tuple(axes)
-    if not occupied:
-        message = "Bottom-row x-axis formatting requires at least one occupied axis."
-        raise ValueError(message)
-    if isinstance(columns, bool) or not isinstance(columns, int) or columns < 1:
-        message = "Bottom-row x-axis formatting requires a positive column count."
-        raise ValueError(message)
-    if label is not None and (not isinstance(label, str) or not label.strip()):
-        message = "Bottom-row x-axis labels must be non-empty text when supplied."
-        raise ValueError(message)
-    if not isinstance(hide_upper_tick_labels, bool):
-        message = "Bottom-row x-axis tick visibility must be boolean."
-        raise TypeError(message)
-    bottom_row = (len(occupied) - 1) // columns
-    for index, axis in enumerate(occupied):
-        is_bottom = index // columns == bottom_row
-        if is_bottom:
-            if label is not None:
-                axis.set_xlabel(label)
-        else:
-            axis.set_xlabel("")
-        if hide_upper_tick_labels:
-            axis.tick_params(axis="x", labelbottom=is_bottom)
-
-
-def add_map_colorbar(
-    figure: Figure,
-    image: ScalarMappable,
-    map_axis: Axes,
-    *,
-    label: str = "",
-) -> Colorbar:
-    """Attach one proportionate colorbar and record its map-axis ownership."""
-    colorbar = figure.colorbar(image, ax=map_axis, fraction=MAP_LAYOUT.colorbar_fraction, pad=MAP_LAYOUT.colorbar_pad)
-    colorbar.set_label(label, fontsize=MAP_LAYOUT.label_size)
-    colorbar.ax.tick_params(labelsize=MAP_LAYOUT.tick_size)
-    return colorbar
-
-
-def apply_map_grid_axis_labels(
-    axes: Iterable[Iterable[Axes]],
-    *,
-    x_label: str,
-    y_label: str,
-) -> None:
-    """Place coordinate labels and tick labels only on visible grid edges."""
-    rows = tuple(tuple(row) for row in axes)
-    if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
-        message = "Map-axis grids must be non-empty and rectangular."
-        raise ValueError(message)
-    bottom = len(rows) - 1
-    for row_index, row in enumerate(rows):
-        for column_index, axis in enumerate(row):
-            if not axis.get_visible() or not axis.axison:
-                continue
-            is_bottom = row_index == bottom
-            is_left = column_index == 0
-            axis.set_xlabel(x_label if is_bottom else "")
-            axis.set_ylabel(y_label if is_left else "")
-            axis.tick_params(
-                axis="x",
-                labelbottom=is_bottom,
-                labelsize=MAP_LAYOUT.tick_size,
-            )
-            axis.tick_params(
-                axis="y",
-                labelleft=is_left,
-                labelsize=MAP_LAYOUT.tick_size,
-            )
 
 
 def label_with_exponent(label: str, exponent: int) -> str:
@@ -501,13 +401,27 @@ def _bold_label(text: str) -> str:
     return _MATH_SPAN.sub(lambda match: "$\\mathbf{" + match.group(1).replace("\\mathrm{", "\\mathbf{") + "}$", text)
 
 
-def plan_geometry(rows: int, columns: int, domain: tuple[float, float]) -> MapGeometry:
+def plan_geometry(
+    rows: int,
+    columns: int,
+    domain: tuple[float, float],
+    *,
+    row_labels: bool = True,
+    title: bool = True,
+    width_cap: float | None = MAP_MAX_WIDTH_IN,
+    above_in: float = 0.0,
+    below_in: float = 0.0,
+    right_in: float = 0.0,
+) -> MapGeometry:
     """
-    Return the fixed-inch geometry of one map grid with row labels and a figure title.
+    Return the fixed-inch geometry of one map grid.
 
-    Every map has the same width (the target width, shrunk uniformly when the columns would exceed the width
-    cap) and the physical aspect of ``domain`` (width, height); the figure size follows from rows, columns and
-    domain alone. Non-positive counts or a non-finite or non-positive domain raise ``ValueError``.
+    Every map has the same width and the physical aspect of ``domain`` (width, height). The left margin holds the row
+    labels (``row_labels``), the top margin the figure title (``title``) above the column headers. ``above_in``,
+    ``below_in`` and ``right_in`` reserve non-map bands of that height or width beside the maps, each behind one fixed
+    gap (``band_rect``). The maps shrink uniformly when the figure would be wider than ``width_cap``; ``None`` never
+    shrinks them, so the figure grows with its columns. Non-positive counts, a non-finite or non-positive domain, a
+    negative or non-finite band, or a cap that leaves no room for the maps raise ``ValueError``.
     """
     if rows <= 0 or columns <= 0:
         message = "Map grids need positive row and column counts."
@@ -516,18 +430,50 @@ def plan_geometry(rows: int, columns: int, domain: tuple[float, float]) -> MapGe
     if not (np.isfinite(width) and np.isfinite(height) and width > 0.0 and height > 0.0):
         message = f"Map grids need a finite positive physical domain, got {domain!r}."
         raise ValueError(message)
-    fixed = MARGIN_LEFT_IN + MARGIN_RIGHT_IN + columns * (COLORBAR_PAD_IN + COLORBAR_WIDTH_IN) + (columns - 1) * GAP_H_IN
-    map_width = min(MAP_WIDTH_IN, (MAP_MAX_WIDTH_IN - fixed) / columns)
-    return MapGeometry(rows, columns, map_width, map_width * height / width)
+    bands = (float(above_in), float(below_in), float(right_in))
+    if not all(math.isfinite(band) and band >= 0.0 for band in bands):
+        message = f"Map-figure bands need finite non-negative sizes, got {bands!r}."
+        raise ValueError(message)
+    left = MARGIN_LEFT_ROW_LABEL_IN if row_labels else MARGIN_LEFT_IN
+    map_width = MAP_WIDTH_IN
+    if width_cap is not None:
+        fixed = left + MARGIN_RIGHT_IN + _band_extent(bands[2], GAP_H_IN) + columns * (COLORBAR_PAD_IN + COLORBAR_WIDTH_IN) + (columns - 1) * GAP_H_IN
+        available = (width_cap - fixed) / columns
+        if not (math.isfinite(available) and available > 0.0):
+            message = f"A width cap of {width_cap!r} in leaves no room for {columns} maps."
+            raise ValueError(message)
+        map_width = min(MAP_WIDTH_IN, available)
+    return MapGeometry(rows, columns, map_width, map_width * height / width, left, MARGIN_TOP_TITLE_IN if title else MARGIN_TOP_IN, *bands)
+
+
+def band_rect(geometry: MapGeometry, where: Literal["above", "below", "right"]) -> tuple[float, float, float, float]:
+    """
+    Return the (left, bottom, width, height) figure fractions of one non-map band the geometry reserves.
+
+    The bands above and below span the map columns; the right band spans the map rows only, so an axes there shares the
+    maps' vertical extent. A band the geometry does not reserve, or an unknown ``where``, raises ``ValueError``.
+    """
+    sizes = {"above": geometry.above_in, "below": geometry.below_in, "right": geometry.right_in}
+    if sizes.get(where, 0.0) <= 0.0:
+        message = f"The map geometry reserves no {where!r} band."
+        raise ValueError(message)
+    bottom = _grid_bottom(geometry)
+    x0, y0, width, height = {
+        "above": (geometry.left, bottom + geometry.grid_height + BAND_GAP_V_IN, geometry.grid_width, geometry.above_in),
+        "below": (geometry.left, MARGIN_BOTTOM_IN, geometry.grid_width, geometry.below_in),
+        "right": (geometry.left + geometry.grid_width + GAP_H_IN, bottom, geometry.right_in, geometry.grid_height),
+    }[where]
+    return x0 / geometry.figure_width, y0 / geometry.figure_height, width / geometry.figure_width, height / geometry.figure_height
 
 
 def map_figure(geometry: MapGeometry, *, figure: Figure | None = None) -> tuple[Figure, GridSpec]:
     """
     Return a figure of exactly the geometry's size without a layout engine and its grid of map cells.
 
-    Each cell is one map plus its colour-bar slot wide and one map tall. A given ``figure`` (made here for the
-    same geometry) is cleared and reused, so animation frames keep one pixel size and identical axes positions;
-    a figure of another size or with a layout engine that would re-solve the positions raises ``ValueError``.
+    Each cell is one map plus its colour-bar slot wide and one map tall; the bands stay free (``band_rect``). A given
+    ``figure`` (made here for the same geometry) is cleared and reused, so animation frames keep one pixel size and
+    identical axes positions; a figure of another size or with a layout engine that would re-solve the positions raises
+    ``ValueError``.
     """
     size = (geometry.figure_width, geometry.figure_height)
     if figure is None:
@@ -537,13 +483,14 @@ def map_figure(geometry: MapGeometry, *, figure: Figure | None = None) -> tuple[
         raise ValueError(message)
     else:
         figure.clear()
+    bottom = _grid_bottom(geometry)
     grid = figure.add_gridspec(
         geometry.rows,
         geometry.columns,
-        left=MARGIN_LEFT_IN / geometry.figure_width,
-        right=1.0 - MARGIN_RIGHT_IN / geometry.figure_width,
-        bottom=MARGIN_BOTTOM_IN / geometry.figure_height,
-        top=1.0 - MARGIN_TOP_IN / geometry.figure_height,
+        left=geometry.left / geometry.figure_width,
+        right=(geometry.left + geometry.grid_width) / geometry.figure_width,
+        bottom=bottom / geometry.figure_height,
+        top=(bottom + geometry.grid_height) / geometry.figure_height,
         wspace=GAP_H_IN / geometry.cell_width,
         hspace=GAP_V_IN / geometry.map_height,
     )
@@ -563,9 +510,9 @@ def prepare_map_axes(axis: Axes, *, extent: tuple[float, float, float, float], b
     axis.set_ylim(extent[2], extent[3])
     slot = make_axes_locatable(axis).append_axes("right", size=Size.Fixed(COLORBAR_WIDTH_IN), pad=Size.Fixed(COLORBAR_PAD_IN))
     slot.set_visible(False)
-    axis.tick_params(labelbottom=bottom, labelleft=left, labelsize=_TICK_SIZE_PT)
-    axis.set_xlabel("x [m]" if bottom else "")
-    axis.set_ylabel("y [m]" if left else "")
+    axis.tick_params(labelbottom=bottom, labelleft=left, labelsize=figure_layout.TICK_PT)
+    axis.set_xlabel("x [m]" if bottom else "", fontsize=figure_layout.LABEL_PT)
+    axis.set_ylabel("y [m]" if left else "", fontsize=figure_layout.LABEL_PT)
     return slot
 
 
@@ -600,14 +547,83 @@ def add_slot_colorbar(
     Fill one reserved colour-bar slot: as tall as its map, width and pad fixed in inches, labelled with ``label``.
 
     ``label`` must end in a unit bracket such as ``[K]`` or ``[-]``, else ``ValueError``; ``extend`` draws an arrow
-    only at the ends the caller found values beyond.
+    only at the ends the caller found values beyond. The caller labels the ticks: ``add_field_map_colorbar`` for the bar
+    of a field-map scale, ``set_fixed_decimal_ticks`` for ticks of its own.
     """
     label_with_exponent(label, 0)
     slot.set_visible(True)
     colorbar = figure.colorbar(image, cax=slot, extend=extend)
-    colorbar.ax.tick_params(labelsize=_TICK_SIZE_PT)
-    colorbar.set_label(label, size=_LABEL_SIZE_PT)
+    colorbar.ax.tick_params(labelsize=figure_layout.TICK_PT)
+    colorbar.set_label(label, size=figure_layout.LABEL_PT)
     return colorbar
+
+
+def add_field_map_colorbar(
+    figure: Figure,
+    image: ScalarMappable,
+    slot: Axes,
+    scale: field_maps.FieldMapDefinition,
+    *,
+    label: str,
+    extend: FieldMapExtend | None = None,
+) -> Colorbar:
+    """
+    Fill one map's slot with the bar of ``scale`` (``add_slot_colorbar``) and label it from the scale's kind, the one place that does.
+
+    - A constant scale has one tick at its value.
+    - A cyclic scale (a colormap whose ends meet, ``_CYCLIC_COLORMAPS``) is labelled at its boundaries, so both wrap ends are named.
+    - Any other signed scale (``field_maps.SIGNED_SEMANTICS``) is labelled at its band centres 0, ±w, ±2w ...
+    - A log-positive scale is labelled at its decades when it is wide (``_decades``), every boundary a minor tick, else at its
+      boundaries with the significant digits of the smallest one that keep adjacent ones distinct, at least three (``_geometric_format``).
+    - Where the ticks stand and how they are written are separate: a linear state, positive or signed, has at most three decimals
+      in the power of ten of its boundaries' size (``field_maps.state_exponent``, the one its state bands were built in; none
+      between 10^-3 and 10^4) in the unit bracket (``state_format``); an error (``field_maps.ERROR_SEMANTICS``), signed or not,
+      gets exactly the decimals its step needs, a finer step as a power of ten in the unit bracket.
+
+    Labels are thinned to the bar's real height. ``extend`` replaces the scale's arrows for one of several maps that share a locked
+    scale but not its values beyond. A categorical scale raises ``ValueError``, and so does a linear or narrow geometric scale whose ticks, written
+    as the bar writes them, would repeat a label (locked boundaries off the grid of their format).
+    """
+    if scale.semantic is field_maps.FieldMapSemantic.CATEGORICAL:
+        message = "A categorical field map has no slot colour bar."
+        raise ValueError(message)
+    colorbar = add_slot_colorbar(figure, image, slot, label=label, extend=scale.extend if extend is None else extend)
+    boundaries = np.asarray(scale.boundaries, dtype=np.float64)
+    if scale.semantic is field_maps.FieldMapSemantic.CONSTANT:
+        colorbar.set_ticks(boundaries.tolist())
+        return colorbar
+    if scale.semantic is field_maps.FieldMapSemantic.LOG_POSITIVE:
+        decades = _decades(boundaries)
+        if decades is None:
+            set_fixed_decimal_ticks(colorbar, boundaries, _geometric_format(boundaries))
+            _require_distinct_labels(colorbar, boundaries, label)
+            return colorbar
+        colorbar.set_ticks(decades)
+        colorbar.ax.yaxis.set_major_formatter(LogFormatterSciNotation())
+        colorbar.set_ticks(boundaries.tolist(), minor=True)
+        colorbar.ax.yaxis.set_minor_formatter(NullFormatter())
+        return colorbar
+    centred = scale.semantic in field_maps.SIGNED_SEMANTICS and scale.colormap.name not in _CYCLIC_COLORMAPS
+    ticks = error_ticks(boundaries, signed=centred)
+    error = scale.semantic in field_maps.ERROR_SEMANTICS
+    exponent = field_maps.state_exponent(float(boundaries[0]), float(boundaries[-1]))
+    set_fixed_decimal_ticks(colorbar, ticks, None if error else state_format([tick_step(ticks)], exponent))
+    _require_distinct_labels(colorbar, ticks, label)
+    return colorbar
+
+
+def _require_distinct_labels(colorbar: Colorbar, ticks: np.ndarray, label: str) -> None:
+    """Raise ``ValueError`` naming ``label`` when two ``ticks``, written by the bar's own formatter before thinning, read alike."""
+    texts = [colorbar.ax.yaxis.get_major_formatter()(tick) for tick in ticks]
+    if repeated := sorted({text for text in texts if texts.count(text) > 1}):
+        message = f"The colour bar {label!r} would repeat the tick labels {repeated}."
+        raise ValueError(message)
+
+
+def empty_cell(axis: Axes, text: str) -> None:
+    """Show one grid cell as empty: no frame and no ticks, ``text`` centred in it."""
+    axis.set_axis_off()
+    axis.text(0.5, 0.5, text, ha="center", va="center", wrap=True, transform=axis.transAxes, fontsize=figure_layout.LABEL_PT)
 
 
 def add_map_note(axis: Axes, text: str) -> None:
@@ -620,7 +636,7 @@ def add_map_note(axis: Axes, text: str) -> None:
         textcoords="offset points",
         ha="center",
         va="bottom",
-        fontsize=_NOTE_SIZE_PT,
+        fontsize=figure_layout.NOTE_PT,
         color=_NOTE_COLOUR,
     )
 
@@ -636,7 +652,7 @@ def set_column_headers(axes: np.ndarray, titles: Sequence[str], notes: Sequence[
         axis = axes[0, column]
         axis.set_title(
             _bold_label(text),
-            fontsize=_HEADER_SIZE_PT,
+            fontsize=figure_layout.PANEL_TITLE_PT,
             fontweight="bold",
             pad=_HEADER_PAD_PT + (_HEADER_NOTE_LINE_PT if raised else 0.0),
         )
@@ -656,12 +672,12 @@ def set_row_labels(axes: np.ndarray, labels: Sequence[str]) -> None:
             rotation=90,
             ha="center",
             va="center",
-            fontsize=_HEADER_SIZE_PT,
+            fontsize=figure_layout.PANEL_TITLE_PT,
             fontweight="bold",
         )
         annotation.set_gid("channel-row-label")
 
 
-def set_figure_title(figure: Figure, text: str) -> None:
+def set_map_title(figure: Figure, text: str) -> None:
     """Write the one bold figure title of a fixed-inch map grid into its top margin."""
-    figure.suptitle(text, x=0.5, y=1.0 - _TITLE_FROM_TOP_IN / figure.get_figheight(), fontsize=_TITLE_SIZE_PT, fontweight="bold")
+    figure.suptitle(text, x=0.5, y=1.0 - _TITLE_FROM_TOP_IN / figure.get_figheight(), fontsize=figure_layout.TITLE_PT, fontweight="bold")

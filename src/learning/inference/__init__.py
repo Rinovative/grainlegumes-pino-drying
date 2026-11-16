@@ -2,6 +2,7 @@
 Saved-run steady and transient inference reconstruction.
 
 Provides:
+- airflow: steady-run airflow of one Generation case of either task against its COMSOL reference
 - context: steady model, Train scaling, split, and dataloader reconstruction
 - transient: explicit transient-drying model and physical rollout service
 """
@@ -13,10 +14,11 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import learning_inference as context
+    from . import learning_inference_airflow as airflow
     from . import learning_inference_transient as transient
 
-_MODULES = {"context": "learning_inference", "transient": "learning_inference_transient"}
-__all__ = ["context", "transient"]
+_MODULES = {"airflow": "learning_inference_airflow", "context": "learning_inference", "transient": "learning_inference_transient"}
+__all__ = ["airflow", "context", "transient"]
 
 
 def __getattr__(name: str) -> object:

@@ -4,6 +4,7 @@ Responsibilities:
   - Compute Darcy-Brinkman momentum residuals with the stationary COMSOL stress
   - Compute the cross-section volume-flux balance implied by div(u) = 0
   - Derive per-sample characteristic scales from task inputs only
+  - Provide the one mean prescribed inlet pressure dp, which also nondimensionalizes the steady representation
   - Bind the steady-flow task fields outside generic numerical kernels
   - Return full-grid fields and dimensionless scalar loss terms
 
@@ -45,12 +46,10 @@ import torch
 from torch import Tensor
 
 from . import domain_physics_contracts as physics_contracts
-from .domain_physics_boundary import PressureBoundaryResiduals, pressure_boundary_residuals
+from .domain_physics_boundary import PressureBoundaryResiduals, pressure_boundary_masks, pressure_boundary_residuals
+from .domain_physics_contracts import AIR_DYNAMIC_VISCOSITY
 from .domain_physics_derivatives import DerivativeOperator, crop_interior, infer_uniform_spacing
 
-# COMSOL "Air" eta(T) evaluated at the stationary template's T_flow_ref = 300.65 K
-# (27.5 degC); the template takes viscosity from the material at that temperature.
-AIR_DYNAMIC_VISCOSITY = 1.85075e-5
 # The stationary COMSOL template's stress K = (mu/eps)(grad u + grad u^T - (2/3) div(u) I).
 STRESS_TRACE_COEFFICIENT = 2.0 / 3.0
 POROSITY_FLOOR = 1e-6
@@ -175,6 +174,36 @@ class BrinkmanDiagnostics:
         }
 
 
+def _inlet_mean(prescribed_pressure: Tensor, inlet_mask: Tensor) -> Tensor:
+    """Return the per-sample mean of a ``[batch, y, x]`` prescribed pressure over its inlet mask."""
+    inlet = inlet_mask.to(prescribed_pressure.dtype)
+    return (prescribed_pressure * inlet).sum(dim=_SPATIAL_AXES) / inlet.sum(dim=_SPATIAL_AXES)
+
+
+def mean_inlet_pressure(inputs: Tensor, *, input_fields: Sequence[str]) -> Tensor:
+    """
+    Return the per-sample mean prescribed inlet pressure ``dp`` of task-ordered physical inputs.
+
+    Parameters
+    ----------
+    inputs : torch.Tensor
+        Task-ordered physical BCHW inputs with ``x``, ``y`` and ``p_in_bc``.
+    input_fields : Sequence[str]
+        Exact task-owned input field declaration.
+
+    Returns
+    -------
+    torch.Tensor
+        ``[batch]`` mean of ``p_in_bc`` over the y-min inlet mask, in Pa: the pressure scale of
+        :func:`brinkman_scales`. The value is not checked for sign.
+
+    """
+    values = _field_mapping(inputs, input_fields, ("x", "y", "p_in_bc"), label="input")
+    _, spacing_y = infer_uniform_spacing(values["x"], values["y"], axes=_SPATIAL_AXES)
+    masks = pressure_boundary_masks(values["y"], spacing_y, spatial_axes=_SPATIAL_AXES)
+    return _inlet_mean(values["p_in_bc"], masks.inlet)
+
+
 def brinkman_scales(
     prescribed_pressure: Tensor,
     inlet_mask: Tensor,
@@ -221,8 +250,7 @@ def brinkman_scales(
         msg = f"viscosity must be positive, got {viscosity}."
         raise ValueError(msg)
     with torch.no_grad():
-        inlet = inlet_mask.to(prescribed_pressure.dtype)
-        pressure = (prescribed_pressure * inlet).sum(dim=_SPATIAL_AXES) / inlet.sum(dim=_SPATIAL_AXES)
+        pressure = _inlet_mean(prescribed_pressure, inlet_mask)
         length_x = x_coordinate.amax(dim=_SPATIAL_AXES) - x_coordinate.amin(dim=_SPATIAL_AXES)
         length_y = y_coordinate.amax(dim=_SPATIAL_AXES) - y_coordinate.amin(dim=_SPATIAL_AXES)
         log_permeability = 0.5 * (torch.log(permeability_xx) + torch.log(permeability_yy))

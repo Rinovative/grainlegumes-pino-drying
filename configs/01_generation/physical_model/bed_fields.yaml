@@ -1,5 +1,5 @@
 # Role: reference data of the physical model. Edit: only with new physical evidence or a deliberate model change.
-# Bed, permeability, porosity, inlet-pressure and initial-moisture field statistics: every operator-owned registry coordinate outside the operation block.
+# Bed, permeability, porosity, airflow-target, inlet-pressure-shape and initial-moisture field statistics: every operator-owned registry coordinate outside the operation block.
 schema_kind: generation_bed_fields
 # Named field coordinates with natural and optional parameter-OOD supports. Nominals and supports use each registry transform (registry.yaml).
 parameter_values:
@@ -258,21 +258,26 @@ parameter_values:
       source_refs:
       - pino_airflow_project
       note: Low amplitude may be invisible; require RMS and clipping diagnostics. Only the clearly visible high tail is retained.
-  # Base inlet-pressure level (inlet profile = this value * (1 + shape)); its unit and transform are declared by the parameter registry.
-  pressure_bc.mean:
-    lower: 250.0
-    upper: 750.0
+  # Target mean superficial velocity; Generation derives the base inlet pressure v*mu*L_y/kappa_mean from it (inlet profile =
+  # that pressure * (1 + shape)). Its unit and transform are declared by the parameter registry.
+  airflow.superficial_velocity:
+    lower: 0.05
+    upper: 0.3
     ood:
-    - lower: 900.0
-      upper: 1200.0
-    nominal: 500.0
-    distribution: uniform_in_registry_transform_space
+    - lower: 0.4
+      upper: 0.65
+    nominal: 0.14
+    distribution: uniform_in_log_transform_space
     provenance:
-      evidence: project_baseline
+      evidence: engineering_estimate
       source_refs:
-      - pino_airflow_project
-      note: Not redundant; strongest VP1 scalar association. The low-pressure tail is rejected because its stable support
-        would be narrow relative to ID.
+      - ba
+      method: Darcy estimate on the nominal bed at the operating points of the BA single fan (EC radial fan ebm-papst
+        8300100725, speed factor 0.5-1.0) over lentil (0.05-0.16 m/s) and chickpea (0.14-0.30 m/s); the BA design point
+        is about 0.14 m/s.
+      note: Owner decision of 2026-11-15 (item 199) replaces the sampled base inlet pressure, which gave physically
+        impossible velocities for permeable materials. One synthetic OOD tail above the fan's reach; no low tail. The base
+        pressure is neither capped nor used to reject cases.
   # Amplitude of the sinusoidal inlet-pressure component; sin_freq and sin_phase define its shape.
   pressure_bc.sin_amp:
     lower: -0.02

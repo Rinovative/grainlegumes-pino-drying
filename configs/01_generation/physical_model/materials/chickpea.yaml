@@ -11,21 +11,22 @@ material_scope:
   description: Whole mature dry Kabuli chickpea
 # The permeability scale kappa_mean is in m^2. Natural support and transform define sampling; ood_supports are separate synthetic stress intervals.
 permeability:
-  nominal: 1.43e-08
+  nominal: 3.0e-08
   support:
-    lower: 8.0e-09
-    upper: 3.0e-08
+    lower: 1.4e-08
+    upper: 6.0e-08
   transform: log
   distribution: uniform_in_log_space
   ood_supports:
-  - lower: 2.5e-09
-    upper: 5.0e-09
-  - lower: 4.8e-08
-    upper: 8.0e-08
+  - lower: 5.24e-09
+    upper: 1.05e-08
+  - lower: 1.01e-07
+    upper: 1.68e-07
   provenance:
-    evidence: project_baseline
+    evidence: literature_transfer
     source_refs:
-    - ba
+    - chickpea_airflow_masoumi_tabil_2008
+    method: Clean chickpea like the density and porosity record. Masoumi and Tabil (2008, Table 2) give 2.4-6.2e-08 m^2 at 0.14 m/s, and the Kozeny-Carman estimate at the reference porosity 0.403 is 3.1e-08 m^2; the farm-bed value 1.43e-08 m^2 of the thesis, measured with fines, is not used.
     applicability:
       packing: Only for packing bands in each complete density record; generated mean
         eps must pass the material band.
@@ -53,6 +54,9 @@ thermal_properties:
       evidence: literature_transfer
       source_refs:
       - matouk_thermal
+      - lentil_thermal_gharibzahedi_2014
+      - pulse_thermal_oke_baik_2022
+      method: Transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover. Oke and Baik (2022) chickpea packed-bed values converted with the Maxwell-Eucken relation give 0.29-0.42 W/(m*K) against 0.30, and Gharibzahedi et al. (2014) check the lentil value used for the transfer; the value is unchanged.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -75,6 +79,7 @@ thermal_properties:
       evidence: literature_transfer
       source_refs:
       - matouk_thermal
+      method: Transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover; the value is unchanged.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -84,15 +89,15 @@ thermal_properties:
 # Initial moisture is dry basis (kg water/kg dry solids); amplitude controls field variation and field_support bounds generated values.
 initial_moisture:
   mean_db:
-    nominal: 0.25
+    nominal: 0.2345679012345679
     support:
       lower: 0.1904761904761905
-      upper: 0.3157894736842105
+      upper: 0.28205128205128205
     transform: linear
     distribution: uniform
     ood_supports:
-    - lower: 0.36
-      upper: 0.45
+    - lower: 0.3
+      upper: 0.35
     provenance:
       evidence: engineering_estimate
       source_refs:
@@ -127,14 +132,14 @@ initial_moisture:
         gap and width policy.
       verification: mathematically_reproduced
   field_support:
-    lower: 0.1904761904761905
-    upper: 0.3157894736842105
+    lower: 0.16606936416184973
+    upper: 0.32205128205128203
     unit: kg/kg
     provenance:
       evidence: derived
       source_refs:
       - ba
-      method: X_db=X_wb/(1-X_wb)
+      method: X_db=X_wb/(1-X_wb); lower bound is the target 0.135/0.865 plus margin_above_target_db 0.01, upper bound is the upper mean_db 0.22/0.78 plus the upper amplitude_db 0.04.
       verification: mathematically_reproduced
   margin_above_target_db: 0.01
 # Dimensionless support for generated bed-mean porosity; density calibration stores a compatible paired reference state.
@@ -218,14 +223,12 @@ oswin:
         RH 0.30-0.80
 # Single operational drying target on a wet basis; it is a material target, not an initial-moisture support.
 target_moisture:
-  target_moisture_wb: 0.12
+  target_moisture_wb: 0.135
   provenance:
-    evidence: derived
+    evidence: official_industry_target
     source_refs:
     - swiss_crops
-    method: Exact safe-storage reference 0.11923 wb, rounded to the nearest whole
-      wet-basis percentage point.
-    verification: mathematically_reproduced
+    method: swiss granum (2026-03-12) chapter 1.1 lists 13.5 % wb for chickpeas.
     note: Single practical safe-storage drying target; market acceptance is not
       an operational target.
 # Surface/internal moisture-transfer prior: r_surf_0 is a rate, r_int_surf a rate ratio, f_surf a fraction; the loader derives the two OOD records from the nominals.
@@ -233,10 +236,10 @@ two_compartment_kinetics:
   record_id: chickpea_two_compartment_kinetics_v1
   components:
     r_surf_0:
-      nominal: 1.0e-05
+      nominal: 5.5e-05
       support:
-        lower: 5.0e-06
-        upper: 1.8e-05
+        lower: 2.75e-05
+        upper: 9.9e-05
       transform: log
     r_int_surf:
       nominal: 0.15
@@ -255,13 +258,12 @@ two_compartment_kinetics:
     evidence: calibration_prior
     source_refs:
     - chickpea_drying
+    - lentil_drying_tahmasebi_2025
+    method: r_surf_0 and its support are the earlier design values multiplied by 5.5, the factor of lentil (Tahmasebi et al. 2025, calibrated at 35 degC and 20 % relative humidity), as a fallback until a comparable literature end point exists. Cavalcanti-Mata et al. (2020) report about 20 h at 40 degC but only the abstract was read and the end moisture is unknown, so chickpea_drying serves only as a plausibility check; r_int_surf and f_surf are unchanged.
     applicability:
       evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
         at known T, RH/omega, airflow and product state; T(t) if available
-      limitation: Kinetics were conservatively aligned using a limited numerical pilot
-        to reduce seven-day right-censoring and produce informative neural-operator
-        transients; they were not fitted to experiments or validated as real drying-time
-        predictions.
+      limitation: The rate prior is the lentil factor used as a fallback pending a comparable chickpea drying end point; it is not fitted to experiments of this bed, and the drying times were not validated as real predictions.
   ood_provenance:
     evidence: synthetic_design
     source_refs: []

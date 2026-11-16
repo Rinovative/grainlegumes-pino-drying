@@ -75,7 +75,6 @@ def moisture_comparison(
         title="Initial moisture and sorption",
         lock_scale=lock_scale,
         display_spatial_stride=display_spatial_stride,
-        include_distributions=True,
         side_plot=partial(
             _draw_inlet_bed_comparison,
             first=first,
@@ -128,7 +127,6 @@ def _mean_relationship(
 
 def _draw_inlet_bed_comparison(
     axis: Axes,
-    legend_axis: Axes,
     *,
     first: diagnostics.GenerationInputDiagnostics,
     mean_a: diagnostics.DatasetDiagnostics,
@@ -222,17 +220,9 @@ def _draw_inlet_bed_comparison(
     axis.set_xticks(positions, labels)
     axis.set_ylabel(
         layout.quantity_axis_label("phi_eq"),
-        fontsize=layout.MAP_LAYOUT.label_size,
+        fontsize=layout.FIGURE_LAYOUT.label_size,
     )
-    axis.set_title("Inlet vs bed-equilibrium RH", fontsize=layout.MAP_LAYOUT.axis_title_size)
-    axis.tick_params(labelsize=layout.MAP_LAYOUT.tick_size)
+    axis.set_title("Inlet vs bed-equilibrium RH", fontsize=layout.FIGURE_LAYOUT.axis_title_size)
+    axis.tick_params(labelsize=layout.FIGURE_LAYOUT.tick_size)
     axis.grid(axis="y", alpha=0.22)
-    legend_axis.legend(
-        handles=phase_handles,
-        loc="center",
-        bbox_to_anchor=(0.0, 0.0, 1.0, 1.0),
-        borderaxespad=0.0,
-        mode="expand",
-        fontsize=layout.MAP_LAYOUT.legend_size,
-        ncols=len(phase_handles),
-    )
+    axis.legend(handles=phase_handles, loc="best", fontsize=layout.FIGURE_LAYOUT.legend_size)

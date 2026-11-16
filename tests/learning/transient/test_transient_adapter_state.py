@@ -475,7 +475,9 @@ def _rno_stage_b_update(memory_batch: int) -> float:
     items: Any = [  # A list serves as the map-style dataset of the two trajectories.
         {"batch": TransientBatch(**{field.name: getattr(batch, field.name)[row : row + 1] for field in fields(TransientBatch)})} for row in range(2)
     ]
-    sampler = UnitSampler(unit_kind="trajectory", cases=(0, 1), keys=(6, 6), units_per_update=2, memory_batch=memory_batch, seed=0)
+    sampler = UnitSampler(
+        unit_kind="trajectory", cases=(0, 1), keys=(6, 6), units_per_update=2, memory_batch=memory_batch, seed=0, full_set_transitions=12
+    )
     sampler.begin_epoch(0)
     adapter: Any = _rno_adapter("b")
     model = _StateRNO()
@@ -487,7 +489,7 @@ def _rno_stage_b_update(memory_batch: int) -> float:
         _UnitMSE(),
         torch.device("cpu"),
         adapter,
-        budget=learning.training.budget.StageBudget(unit="units", total=2),
+        budget=learning.training.budget.StageBudget(unit="supervised_transitions", total=12),
         adapter=adapter,
     )
     assert values["train/updates"] == 1.0

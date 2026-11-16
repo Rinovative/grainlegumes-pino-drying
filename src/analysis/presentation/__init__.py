@@ -10,7 +10,7 @@ Provides:
 - histograms: shared exact constant and non-constant histogram rendering
 - moisture_display: wet-basis percent display of water densities with masked unphysical cells
 - registry: numbered EDA and evaluation presentation definitions
-- visual_semantics: semantic colormaps, dataset colors, and fixed material, architecture, and role series styles
+- visual_semantics: semantic colormaps and fixed material, architecture, and role series styles
 """
 
 from __future__ import annotations

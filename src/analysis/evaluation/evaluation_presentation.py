@@ -130,7 +130,7 @@ _PARAMETER_PRESENTATION = (
     ParameterPresentation("parameters_permeability.orientation.jitter", "Orientation jitter", "Material and properties", 270),
     ParameterPresentation("parameters_porosity.smooth_len_rel", "Porosity smoothing length", "Material and properties", 280),
     ParameterPresentation("parameters_porosity.texture_amp", "Porosity texture amplitude", "Material and properties", 290),
-    # gen_pressure_bc builds shape terms in this order, then applies pressure_bc.mean.
+    # The inlet profile builds its shape terms in this order, then scales them by the base pressure derived from the target velocity.
     ParameterPresentation("parameters_pressure_bc.sin_amp", "Inlet sinusoid amplitude", "Boundary conditions", 410),
     ParameterPresentation("parameters_pressure_bc.sin_freq", "Inlet sinusoid frequency", "Boundary conditions", 420),
     ParameterPresentation("parameters_pressure_bc.sin_phase", "Inlet sinusoid phase", "Boundary conditions", 430, "rad"),
@@ -139,7 +139,7 @@ _PARAMETER_PRESENTATION = (
     ParameterPresentation("parameters_pressure_bc.gauss_width", "Inlet Gaussian width", "Boundary conditions", 460),
     ParameterPresentation("parameters_pressure_bc.gauss_jitter", "Inlet Gaussian jitter", "Boundary conditions", 470),
     ParameterPresentation("parameters_pressure_bc.linear_amp", "Inlet linear-gradient amplitude", "Boundary conditions", 480),
-    ParameterPresentation("parameters_pressure_bc.mean", "Base inlet pressure", "Boundary conditions", 490, "Pa"),
+    ParameterPresentation("parameters_airflow.superficial_velocity", "Target superficial velocity", "Boundary conditions", 490, "m/s"),
 )
 _PARAMETER_BY_COLUMN = {spec.column: spec for spec in _PARAMETER_PRESENTATION}
 _STRUCTURAL_METADATA_LEAVES = frozenset({"dx", "dy", "lx", "ly", "nx", "ny", "res"})

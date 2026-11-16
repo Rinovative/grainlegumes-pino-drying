@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from textwrap import fill
 from typing import TYPE_CHECKING, cast
 
 from src.analysis import generation_inputs
@@ -32,6 +31,7 @@ if TYPE_CHECKING:
 _COLLISION_MINIMUM_SIZE = 2
 _FACET_MINIMUM_WIDTH = 24
 _FACET_TOKEN_SEPARATOR = re.compile(r"/|__")
+_LABEL_BREAKS = re.compile(r"(?<=\+)|(?<=__)|(?<= )")  # a wrapped dataset label may break after a space, a ``+`` or a ``__``
 _TASK_LABELS = {
     "steady_flow": "Airflow",
     "transient_drying": "Drying",
@@ -183,8 +183,15 @@ def wrapped_dataset_display_label(
     label: str,
     *,
     width: int = 32,
+    max_lines: int | None = None,
 ) -> str:
-    """Wrap one complete visible dataset label without removing identity text."""
+    """
+    Wrap one complete visible dataset label without removing identity text.
+
+    Lines hold at most ``width`` characters and break after a space (the line break replaces the spaces before it), a ``+`` or a ``__`` (a
+    dataset name has no spaces), never inside a word; ``max_lines`` widens the lines until the label fits that many. A single
+    unbreakable word stays whole.
+    """
     if not isinstance(label, str):
         message = "Dataset display labels must be text."
         raise TypeError(message)
@@ -194,12 +201,19 @@ def wrapped_dataset_display_label(
     if isinstance(width, bool) or not isinstance(width, int) or width < 1:
         message = "Dataset display-label wrap width must be a positive integer."
         raise ValueError(message)
-    return fill(
-        label,
-        width=width,
-        break_long_words=False,
-        break_on_hyphens=False,
-    )
+    if max_lines is not None and (isinstance(max_lines, bool) or not isinstance(max_lines, int) or max_lines < 1):
+        message = "Dataset display-label line limit must be a positive integer."
+        raise ValueError(message)
+    pieces = _LABEL_BREAKS.split(label)
+    while True:
+        lines = [""]
+        for piece in pieces:
+            if lines[-1] and len(lines[-1]) + len(piece.rstrip()) > width:
+                lines.append("")
+            lines[-1] += piece
+        if max_lines is None or len(lines) <= max_lines:
+            return "\n".join(line.rstrip() for line in lines)
+        width += 1
 
 
 def dataset_display_labels(datasets: Iterable[DatasetDisplayMetadata]) -> tuple[str, ...]:

@@ -3,6 +3,7 @@
 Responsibilities:
   - Exercise compact transient packages, scaling, A0/B/A1 lifecycle, A0 budget identity, and model optimizer paths
   - Exercise best-checkpoint payload kinds and the refusal of non-completed B runs for evaluation
+  - Compare an interrupted B, resumed with another memory batch, group by group with an uninterrupted B
   - Exercise one real A0 Optuna trial whose study signature equals the dry run's and whose trial and history validate
 
 Design principles:
@@ -15,6 +16,7 @@ This module does NOT:
 from __future__ import annotations
 
 import json
+import math
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -40,8 +42,9 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.integration
 _LR_SCALE = 0.5
-# Long enough that B's first group never spends it, short enough that the resumed B finishes in seconds.
-_INTERRUPTED_B_SECONDS = 2.0
+# K of the interrupted B: its K x N transitions outlast its first group (at most two windows of two transitions),
+# and the resumed B still finishes in seconds.
+_INTERRUPTED_K = 3
 _CUDA_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA integration lifecycle requires an available CUDA device.",
@@ -231,12 +234,10 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
         assert loaders.scaling.spatial_shape == (16, 16)
         assert loaders.split["roles"]["train"]["case_ids"] == transient_package["case_partition"]["train"]
         assert loaders.split["roles"]["id_test"]["case_ids"] == transient_package["case_partition"]["id_test"]
-        assert loaders.material_ood is None
         assert loaders.split["dataset_identity"]["train"]["dataset_id"] == id_dataset_id
     finally:
-        for value in (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test):
-            if value is not None:
-                _close_loader_dataset(value)
+        for value in (loaders.train, loaders.evaluation):
+            _close_loader_dataset(value)
     curriculum = RolloutCurriculum(lengths=(2, 4), milestone_fractions=(0.0, 0.2))
     curriculum_state = RolloutCurriculumState.create(curriculum, seed=9)
     draws = curriculum_state.draw(progress=0.2, available_lengths=(4, 4))
@@ -288,7 +289,7 @@ def _authored_fno_plan(
     train_dataset: str,
     destination: Path,
     device: str = "cuda",
-    train_seconds: float = 1.0e-6,
+    budget_epochs: int = 1,
     lr_scale: float = 1.0,
     scheduler: bool = False,
 ) -> Path:
@@ -306,10 +307,9 @@ def _authored_fno_plan(
     if not scheduler:
         raw["scheduler"] = None
     raw["tracking"]["wandb"]["mode"] = "disabled"
-    raw["training"]["a0"]["budget_epochs"] = 1
+    raw["training"]["a0"]["budget_epochs"] = budget_epochs  # the one K: A0's passes and B's K x N transitions
     raw["training"]["b"].update(
         {
-            "train_seconds": train_seconds,
             "lr_scale": lr_scale,
             "sampling": {"mode": "rollout_window", "rollout_length": 2, "window_stride": 1, "window_offset": 0},
             "curriculum": {"lengths": [2], "milestone_fractions": [0.0]},
@@ -330,11 +330,10 @@ def _assert_curated_series_are_produced(run_dir: Path, *, cuda: bool) -> None:
         physics_monitor_enabled=False,
         cuda_enabled=cuda,
         task_id="transient_drying",
-        ood_roles=datasets.preprocessing.splits.read_saved_split(run_dir).ood_roles,
         rollout_curriculum="curriculum" in config["training"],  # only the self-fed Stage B fills the curriculum series
     )
-    records = json.loads((run_dir / "history.json").read_text(encoding="utf-8"))["epochs"]
-    produced = set().union(*records)
+    persisted = json.loads((run_dir / "history.json").read_text(encoding="utf-8"))
+    produced = set().union(*persisted["epochs"], *persisted["validations"])
     selected = experiments.run.read_run_summary(run_dir)["selected_metrics"]
     assert {definition.source_key for definition in definitions} <= produced
     selected_keys = {wandb_schema.selected_summary_key(definition.source_key) for definition in definitions} - {None}
@@ -375,7 +374,6 @@ def test_transient_a0_b_a1_lifecycle(transient_package: dict[str, Any], monkeypa
     manifest = handoff.validate_stage_a_handoff(
         a0_dir / handoff.HANDOFF_DIRECTORY,
         target_config=b["config"],
-        device=resolution.as_dict(),
         expected_source_run_name=a0["config"]["run"]["name"],
     )
     assert manifest["model_kind"] == "fno"
@@ -385,20 +383,22 @@ def test_transient_a0_b_a1_lifecycle(transient_package: dict[str, Any], monkeypa
     assert "curriculum_b" in b_summary["seed_plan"]
     assert "terminal_curriculum" not in a_summary
     assert "terminal_curriculum" not in a1_summary
-    # A0 trains its unit budget; B its seconds on the optimisation clock, and A1 exactly B's receipt; each ends at point 20.
+    # A0 trains K passes in units, B K x N supervised transitions (K = 1 here), A1 exactly B's receipt; each ends at point 20.
     a0_budget, b_budget, a1_budget = (summary["terminal_budget"] for summary in (a_summary, b_summary, a1_summary))
     assert a0_budget["unit"] == "units"
     assert a0_budget["units"] >= a0_budget["total"]
-    assert b_budget["unit"] == a1_budget["unit"] == "train_seconds"
-    assert b_budget["train_seconds"] >= b_budget["total"] > 0
-    assert a1_budget["total"] == b_budget["train_seconds"]
-    assert a1_budget["train_seconds"] >= a1_budget["total"]
+    assert b_budget["unit"] == a1_budget["unit"] == "supervised_transitions"
+    assert b_budget["total"] == b_summary["training_units"]["full_set_transitions"] > 0
+    assert b_budget["supervised_transitions"] >= b_budget["total"]
+    assert a1_budget["total"] == b_budget["supervised_transitions"]
+    assert a1_budget["supervised_transitions"] >= a1_budget["total"]
     assert a0_budget["validated_point"] == b_budget["validated_point"] == a1_budget["validated_point"] == 20
-    assert b_summary["terminal_controller"]["post_handoff_optimizer_steps"] == 1
+    # The pair's one GPU model is B's, recorded in its receipt, and A1 trained on it.
+    receipt = json.loads((b_dir / "b_train_budget_receipt.json").read_text(encoding="utf-8"))
+    assert receipt["device"] == handoff.device_evidence(resolution.as_dict())
     assert b_summary["terminal_controller"]["best_within_budget_metric"] == b_summary["best_metric"]
     assert b_summary["terminal_controller"]["best_within_budget_epoch"] + 1 == b_summary["best_epoch"]
-    assert b_summary["global_step"] == b_summary["terminal_controller"]["post_handoff_optimizer_steps"]
-    assert b_summary["global_step"] == 1
+    assert b_summary["global_step"] == b_summary["terminal_controller"]["post_handoff_optimizer_steps"] >= 1
     assert a_summary["global_step"] >= 1
     assert b_summary["terminal_curriculum"]["draw_index"] > 0
     assert b_summary["terminal_curriculum"]["max_horizon"] == 2
@@ -481,7 +481,7 @@ def test_matched_b_restarts_its_schedule_at_the_scaled_a0_start_rate(transient_p
         train_dataset=transient_package["train_dataset"],
         destination=root / "scaled_fno.yaml",
         device="cpu",
-        train_seconds=_INTERRUPTED_B_SECONDS,
+        budget_epochs=_INTERRUPTED_K,
         lr_scale=_LR_SCALE,
         scheduler=True,
     )
@@ -511,9 +511,13 @@ def test_matched_b_restarts_its_schedule_at_the_scaled_a0_start_rate(transient_p
     b_dir = interrupted.value.run_dir
     assert interrupted.value.resumable
     _assert_evaluation_refused(b_dir, "interrupted")
-    # The first group runs at the stage start rate p = 0, whatever rate A0's cosine had reached at its best.
-    assert _saved_learning_rates(b_dir) == pytest.approx((start_rate * _LR_SCALE,) * 2, rel=1e-3)
+    # The first group ran at the scaled stage start rate (p = 0), whatever rate A0's cosine had reached at its best; the
+    # checkpoint holds that start rate and the cosine rate at the fraction of K x N transitions the group committed.
     b_last = torch.load(b_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    progress = b_last["budget_state_dict"]["supervised_transitions"] / b_last["budget_state_dict"]["total"]
+    assert 0.0 < progress < 1.0
+    scaled = start_rate * _LR_SCALE
+    assert _saved_learning_rates(b_dir) == pytest.approx((scaled * (1.0 + math.cos(math.pi * progress)) / 2.0, scaled), rel=1e-3)
     assert b_last["global_step"] == 1
     assert _adam_steps(b_last["optimizer_state_dict"]) == {step + 1 for step in _adam_steps(teacher["optimizer_state_dict"])}
     # B counts its own work from zero; A0's committed groups are not carried across the handoff.
@@ -537,7 +541,8 @@ def test_matched_b_restarts_its_schedule_at_the_scaled_a0_start_rate(transient_p
     assert resumed["result"]["status"] == "completed"
     summary = experiments.run.read_run_summary(b_dir)
     assert summary["training_outcome"]["status"] == "completed"
-    assert summary["terminal_budget"]["train_seconds"] >= summary["terminal_budget"]["total"] == _INTERRUPTED_B_SECONDS
+    budget = summary["terminal_budget"]
+    assert budget["supervised_transitions"] >= budget["total"] == _INTERRUPTED_K * summary["training_units"]["full_set_transitions"]
     assert summary["training_work"]["optimizer_steps"] > first_work["optimizer_steps"]
     # The resume continues B's own cosine from its saved start rate and never rescales it.
     assert _saved_learning_rates(b_dir)[1] == pytest.approx(start_rate * _LR_SCALE)
@@ -545,6 +550,87 @@ def test_matched_b_restarts_its_schedule_at_the_scaled_a0_start_rate(transient_p
     # The finished B has spent its budget: it is never extended.
     with pytest.raises(ValueError, match="never extended"):
         experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir)
+    # Its training curve continues from the A0 handoff; without its history the admission itself refuses the stage.
+    selected = experiments.run.validate_evaluable_run(b_dir)["selected_checkpoint_sha256"]
+    history = analysis.evaluation.run_discovery.stage_history(b_dir, expected_checkpoint_sha256=selected)
+    assert isinstance(history, analysis.evaluation.run_discovery.StageHistory)
+    a0_name = experiments.config.loader.load_yaml(common.paths.resolve_run_config_path(a0_dir))["run"]["name"]
+    assert (history.stage, history.pipeline, history.start_epoch) == ("B", a0_name, teacher["best_epoch"])
+    learning.training.history.history_path(b_dir).unlink()
+    with pytest.raises(experiments.run.RunLifecycleError, match="history"):
+        analysis.evaluation.run_discovery.stage_history(b_dir, expected_checkpoint_sha256=selected)
+
+
+def test_an_interrupted_b_resumed_with_another_memory_batch_trains_like_an_uninterrupted_b(
+    transient_package: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    B interrupted after its first committed group and resumed with another memory batch trains like an uninterrupted B.
+
+    One plan under two output roots gives two B leaves of one identity. Group by group both draw the same units at the
+    same committed progress and the same curriculum horizons and origins, train at the same learning rates, and commit
+    the same supervised transitions; the memory batch only splits each group.
+    """
+    root = transient_package["root"]
+    monkeypatch.setenv("STORAGE_ROOT", str(root))
+    plan_path = _authored_fno_plan(
+        train_dataset=transient_package["train_dataset"],
+        destination=root / "parity_fno.yaml",
+        device="cpu",
+        budget_epochs=_INTERRUPTED_K,
+        scheduler=True,
+    )
+    output_roots = {"whole": root / "parity_whole", "resumed": root / "parity_resumed"}
+    for output_root in output_roots.values():
+        experiments.run.run_experiment(plan_path, device="cpu", output_root=output_root, train_stages=("a0",))
+    real_groups = learning.training.loop.train_update_groups
+    real_begin = transient_adapter.TransientTrainingAdapter.begin_group
+    draws: dict[str, list[tuple[Any, ...]]] = {"whole": [], "resumed": []}
+    rates: dict[str, list[float]] = {"whole": [], "resumed": []}
+    state: dict[str, Any] = {"run": "whole", "calls": 0, "interrupt_at": None, "optimizer": None}
+
+    def recording_groups(*args: Any, **kwargs: Any) -> Any:
+        state["calls"] += 1
+        if state["calls"] == state["interrupt_at"]:
+            message = "synthetic interruption after the first committed group"
+            raise KeyboardInterrupt(message)
+        state["optimizer"] = args[2]
+        return real_groups(*args, **kwargs)
+
+    def recording_begin(adapter: Any, group: Any, *, progress: float) -> None:
+        real_begin(adapter, group, progress=progress)
+        draws[state["run"]].append((group.items, progress, adapter._group_draws))
+        rates[state["run"]].extend(param_group["lr"] for param_group in state["optimizer"].param_groups)
+
+    with monkeypatch.context() as recording:
+        recording.setattr(learning.training.loop, "train_update_groups", recording_groups)
+        recording.setattr(transient_adapter.TransientTrainingAdapter, "begin_group", recording_begin)
+        whole = experiments.run.run_experiment(plan_path, device="cpu", output_root=output_roots["whole"], train_stages=("b",))["run_dir"]
+        state.update(run="resumed", calls=0, interrupt_at=2)
+        with pytest.raises(experiments.run.MatchedStageInterrupted) as interrupted:
+            experiments.run.run_experiment(plan_path, device="cpu", output_root=output_roots["resumed"], train_stages=("b",))
+        resumed = interrupted.value.run_dir
+        assert 0 < len(draws["resumed"]) < len(draws["whole"])
+        # The same authored plan with another B memory batch, an execution setting outside identity, continues the leaf.
+        base_path = plan_path.parents[2] / "base.yaml"  # the task base the plan file extends holds its training section
+        base = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+        assert base["training"]["b"]["memory_batch"] == 1
+        base["training"]["b"]["memory_batch"] = 2
+        base_path.write_text(yaml.safe_dump(base, sort_keys=False), encoding="utf-8")
+        state["interrupt_at"] = None
+        experiments.run.run_experiment(plan_path, device="cpu", output_root=output_roots["resumed"], train_stages=("b",))
+
+    assert draws["resumed"] == draws["whole"]
+    assert rates["resumed"] == pytest.approx(rates["whole"], rel=1e-12)
+    b_dirs = {"whole": whole, "resumed": resumed}
+    summaries = {name: experiments.run.read_run_summary(run_dir) for name, run_dir in b_dirs.items()}
+    assert [session["memory_batch"] for session in summaries["resumed"]["runtime_sessions"]] == [1, 2]
+    budgets = {name: {key: value for key, value in summaries[name]["terminal_budget"].items() if key != "train_seconds"} for name in b_dirs}
+    assert budgets["resumed"] == budgets["whole"]
+    assert summaries["resumed"]["training_work"] == summaries["whole"]["training_work"]
+    assert summaries["resumed"]["terminal_curriculum"] == summaries["whole"]["terminal_curriculum"]
+    last = {name: torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False) for name, run_dir in b_dirs.items()}
+    assert last["resumed"]["update_work"] == last["whole"]["update_work"]
 
 
 def _resolved_direct_model_config(
@@ -646,9 +732,8 @@ def _run_direct_cuda_update(config: dict[str, Any], *, root: Path) -> torch.nn.M
         assert any(not torch.equal(previous, current.detach()) for previous, current in zip(before, model.parameters(), strict=False))
         return model
     finally:
-        for value in (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test):
-            if value is not None:
-                _close_loader_dataset(value)
+        for value in (loaders.train, loaders.evaluation):
+            _close_loader_dataset(value)
 
 
 @_CUDA_REQUIRED
@@ -698,8 +783,8 @@ def _assert_completed_inference_and_tracking_lifecycle(
     assert rollout.states.shape == (1, 2, 4, 16, 16)
 
     monkeypatch.setattr(experiments.tracking.importlib, "import_module", lambda _name: pytest.fail("disabled observer imported SDK"))
-    disabled = experiments.tracking.initialize_wandb(config, run_dir=root / "disabled_tracking", ood_roles=())
-    disabled.log_event(1, {"train/loss_total": 1.0, "budget/train_seconds": 1.0})
+    disabled = experiments.tracking.initialize_wandb(config, run_dir=root / "disabled_tracking")
+    disabled.log_event(1, {"train/loss_total": 1.0, "budget/supervised_transitions": 1.0})
     assert not disabled.enabled
     assert not (root / "disabled_tracking").exists()
 
@@ -732,11 +817,21 @@ def _assert_completed_inference_and_tracking_lifecycle(
         "fake",
         history_metric_definitions=definitions,
     )
-    observer.log_event(1, {"train/loss_total": 1.25, "budget/train_seconds": 2.0, "transient/curriculum_max_horizon": 4.0, "ignored": 9.0})
+    observer.log_event(
+        1,
+        {
+            "train/loss_total": 1.25,
+            "budget/supervised_transitions": 6.0,
+            "budget/train_seconds": 2.0,
+            "transient/curriculum_max_horizon": 4.0,
+            "ignored": 9.0,
+        },
+    )
     payload, step = fake_run.logged[0]
     assert step == 1
     assert payload["global_step"] == 1
-    assert payload["train_seconds"] == 2.0
+    assert payload["supervised_transitions"] == 6
+    assert payload["Training/optimisation_seconds"] == 2.0
     assert payload["Overview/train-loss_total"] == 1.25
     assert payload["Training/curriculum-horizon"] == 4.0
     assert "ignored" not in payload

@@ -33,7 +33,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import SequentialSampler, Subset
 
-from src import datasets
+from src import datasets, domain
 from src.experiments import experiments_run as run_service
 from src.experiments.config import experiments_config_loader as config_loader
 
@@ -295,6 +295,9 @@ def _validate_loader_pass(
         "input": (input_mean, input_scale, scaling.decode_inputs),
         "output": (scaling.group("state").mean, scaling.state_scale, scaling.decode_state),
     }
+    boundary_names = datasets.preprocessing.normalization.STEADY_BOUNDARY_STATES
+    input_names = domain.tasks.registry.get_task(scaling.task).input_names
+    boundary = torch.tensor([name in boundary_names for name in input_names], device=scaling.device).view(1, -1, 1, 1)
     for batch in loader:
         x = batch["x"]
         y = batch["y"]
@@ -308,8 +311,12 @@ def _validate_loader_pass(
         )
         _require(x.shape[1] == input_mean.numel(), f"{role} input channels changed")
         _require(y.shape[1] == scaling.state_scale.numel(), f"{role} output channels changed")
-        x_normalized = scaling.encode_inputs(x)
-        y_normalized = scaling.encode_state(y)
+        reference = scaling.state_reference(x)
+        x_normalized = scaling.encode_inputs(x, reference=reference)
+        y_normalized = scaling.encode_state(y, reference=reference)
+        # Physical units of the encoding's mean and scale per case: P for the states and the boundary inputs.
+        per_case = reference.view(-1, 1, 1, 1)
+        units = {"input": torch.where(boundary, per_case, torch.ones_like(per_case)), "output": per_case}
         _require(
             bool(torch.isfinite(x_normalized).all().item()),
             f"{role} normalized inputs are non-finite",
@@ -327,8 +334,8 @@ def _validate_loader_pass(
         if not inverse_checked:
             for tensor_name, original, normalized in (("input", x, x_normalized), ("output", y, y_normalized)):
                 mean, scale, decode = affines[tensor_name]
-                reconstructed = decode(normalized)
-                rounding_scale = original.abs() + mean.abs().view(1, -1, 1, 1) + scale.view(1, -1, 1, 1) + 1.0
+                reconstructed = decode(normalized, reference=reference)
+                rounding_scale = original.abs() + (mean.abs().view(1, -1, 1, 1) + scale.view(1, -1, 1, 1)) * units[tensor_name] + 1.0
                 rounding_bound = 32 * torch.finfo(original.dtype).eps * rounding_scale
                 _require(
                     bool(torch.all((reconstructed - original).abs() <= rounding_bound).item()),
@@ -348,14 +355,19 @@ def _validate_loader_pass(
 
 
 def _fitted_channel_statistics(scaling: TrainScaling, names: tuple[str, ...]) -> tuple[Tensor, Tensor, Tensor]:
-    """Return float64 Train mean, raw std and a fitted-channel mask; a boundary input carries its state's statistics."""
+    """
+    Return float64 Train mean, raw std and a fitted-channel mask of physical channels.
+
+    An output carries its physical state statistics; a boundary input carries the dimensionless statistics of its state
+    that encode it after the division by P.
+    """
     boundary = datasets.preprocessing.normalization.STEADY_BOUNDARY_STATES
-    groups = (scaling.group("static"), scaling.group("state"))
+    static = scaling.group("static")
     means: list[float] = []
     stds: list[float] = []
     for name in names:
+        source = scaling.group("state") if name in boundary else static if name in static.names else scaling.physical_state
         channel = boundary.get(name, name)
-        source = next(group for group in groups if channel in group.names)
         index = source.names.index(channel)
         means.append(float(source.mean[index]))
         stds.append(float(source.std[index]))
@@ -439,9 +451,11 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
     )
     # A steady run has no stage; a transient request was refused above.
     seed_plan = run_service.build_seed_plan(int(effective["run"]["seed"]), stage=None)
+    # The acceptance checks every role's loader coverage without a model; training never gets these held-out loaders.
     built = config_loader.create_dataloaders_from_config(
         effective,
         seed_plan=seed_plan,
+        held_out_loaders=True,
     )
     train_loader = built["train"]
     evaluation_loaders = {
@@ -549,16 +563,18 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
             f"{tensor_role} train-only fitted scales disagree with independent pass",
         )
         floor = datasets.preprocessing.normalization.SCALE_FLOOR
-        expected_scale = fitted_std / fitted_std.clamp_min(floor)
-        nondegenerate = fitted & (fitted_std > floor)
+        # The normalized target follows the statistics that encode a channel: steady outputs the dimensionless state std.
+        encoding_std = scaling.group("state").std.double() if key == "output" else fitted_std
+        # A channel below the floor keeps its target std / floor < 1, so channels on both sides of the floor are compared.
+        expected_scale = encoding_std / encoding_std.clamp_min(floor)
         _require(
             bool(torch.all(torch.abs(normalized_mean[fitted]) <= _NORMALIZED_MEAN_ATOL).item()),
             f"{tensor_role} normalized means are not near zero",
         )
         _require(
             torch.allclose(
-                normalized_std[nondegenerate],
-                expected_scale[nondegenerate],
+                normalized_std[fitted],
+                expected_scale[fitted],
                 rtol=_NORMALIZED_SCALE_RTOL,
                 atol=_NORMALIZED_SCALE_ATOL,
             ),
@@ -588,8 +604,10 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
     for group in persisted_state["groups"].values():
         group["std"] = [0.0] * len(group["std"])
     zero_variance = normalization.TrainScaling.from_state_dict(persisted_state)
-    zero_input = zero_variance.encode_inputs(zero_variance.input_affine()[0].view(1, -1, 1, 1))
-    zero_output = zero_variance.encode_state(zero_variance.group("state").mean.view(1, -1, 1, 1))
+    # A unit reference leaves the encoded means in their own units, so a zero-variance channel encodes its mean to zero.
+    unit_reference = torch.ones(1, dtype=zero_variance.dtype)
+    zero_input = zero_variance.encode_inputs(zero_variance.input_affine()[0].view(1, -1, 1, 1), reference=unit_reference)
+    zero_output = zero_variance.encode_state(zero_variance.group("state").mean.view(1, -1, 1, 1), reference=unit_reference)
     _require(
         bool(torch.isfinite(zero_input).all().item()) and torch.equal(zero_input, torch.zeros_like(zero_input)),
         "input zero-variance scale floor failed",

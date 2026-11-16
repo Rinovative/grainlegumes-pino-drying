@@ -6,7 +6,8 @@ Responsibilities:
   - Build the run split through the shared split builder, with the transient item expansion as its task extension
   - Refuse an Evaluation Dataset on another coordinate grid or spatial view than Train
   - Obtain one-step Train scaling through the shared scaling service
-  - Build the unit-sampled training DataLoader and deterministically batched evaluation DataLoaders
+  - Build the unit-sampled training DataLoader and the deterministically batched validation DataLoader; ID-test and
+    OOD stay split membership and get no loader, since only the separate artifact step evaluates them
 
 Design principles:
   - Complete case roles are selected before transitions or rollout windows expand
@@ -31,7 +32,6 @@ from typing import TYPE_CHECKING, Any, Final, cast
 
 import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from src.datasets import packages
 from src.datasets.contracts import dataset_contracts_grid as grid_contract
@@ -50,6 +50,8 @@ from src.learning.transient.learning_transient_contracts import TransientTensori
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
+    from torch.utils.data import DataLoader, Dataset
+
 _SCALING_SAMPLING: Final = transient_contract.TransientSamplingSpec(mode="one_step_transition")
 _TASK: Final = "transient_drying"
 _UNIT_KIND_BY_MODE: Final[dict[str, units.UnitKind]] = {
@@ -65,9 +67,6 @@ class TransientTrainingLoaders:
 
     train: DataLoader[Any]
     evaluation: DataLoader[Any]
-    material_ood: DataLoader[Any] | None
-    parameter_ood: DataLoader[Any] | None
-    id_test: DataLoader[Any]
     scaling: normalization.TrainScaling
     scaling_artifact: dict[str, Any]
     split: dict[str, Any]
@@ -139,17 +138,9 @@ def _split_identity(dataset: transient.TransientPhysicalDataset) -> dict[str, An
 
 def _batch_keys(dataset: Dataset[Any]) -> tuple[tuple[int, int], ...] | None:
     """Return per-item ``(part, transitions)`` keys when batches must not mix them, else ``None``."""
-    trajectories = isinstance(dataset, transient.TransientPhysicalDataset) and dataset.sampling.mode == "trajectory"
-    if not isinstance(dataset, ConcatDataset) and not trajectories:
+    if not isinstance(dataset, transient.TransientPhysicalDataset) or dataset.sampling.mode != "trajectory":
         return None
-    parts = dataset.datasets if isinstance(dataset, ConcatDataset) else (dataset,)
-    keys: list[tuple[int, int]] = []
-    for index, part in enumerate(parts):
-        if not isinstance(part, transient.TransientPhysicalDataset):
-            msg = "Grouped transient batches require transient Dataset parts."
-            raise TypeError(msg)
-        keys.extend((index, count) for count in part.item_transition_counts())
-    return tuple(keys)
+    return tuple((0, count) for count in dataset.item_transition_counts())
 
 
 def _loader(
@@ -180,9 +171,20 @@ def _loader(
 
 
 def _unit_sampler(
-    dataset: transient.TransientPhysicalDataset, *, full_set_units: int, units_per_update: int, memory_batch: int, seed: int
+    dataset: transient.TransientPhysicalDataset,
+    *,
+    full_set: transient.TransientPhysicalDataset,
+    units_per_update: int,
+    memory_batch: int,
+    seed: int,
 ) -> units.UnitSampler:
-    """Return the resumable sampler whose unit is one Train item: a transition, a window, or a whole trajectory."""
+    """
+    Return the resumable sampler whose unit is one Train item: a transition, a window, or a whole trajectory.
+
+    ``full_set`` is the full Train role under the same sampling (``dataset`` itself without a Train
+    subset): its items are the full-set units, its indexed regular transitions the N of a budget in
+    supervised transitions, whatever windows the sampling cuts.
+    """
     return units.UnitSampler(
         unit_kind=_UNIT_KIND_BY_MODE[dataset.sampling.mode],
         cases=dataset.item_case_indices(),
@@ -191,7 +193,8 @@ def _unit_sampler(
         units_per_update=units_per_update,
         memory_batch=memory_batch,
         seed=seed,
-        full_set_units=full_set_units,
+        full_set_units=len(full_set),
+        full_set_transitions=len(full_set.sample_indices),
     )
 
 
@@ -250,10 +253,10 @@ def create_transient_training_loaders(
     per ID material, and scaling fits on exactly those cases. Train items follow ``train_sampling``, every case
     with at least one item, and a :class:`~src.datasets.runtime.dataset_runtime_units.UnitSampler` groups them
     ``units_per_update`` at a time into memory microbatches of ``memory_batch``; ``loader_settings.batch_size``
-    is the evaluation batch. Validation,
-    ID-test, material-OOD and parameter-OOD items are whole trajectories
+    is the evaluation batch. Validation items are whole trajectories
     (``transient_contract.EVALUATION_SAMPLING``), so checkpoint selection does not depend on the
-    training sample shape. A saved split is replayed only when it equals the
+    training sample shape. ID-test, material-OOD and parameter-OOD cases enter only the split; no loader of them is built,
+    and a material-OOD source is opened only for its split identity and grid view. A saved split is replayed only when it equals the
     rebuilt one. A restored scaling artifact or a cache hit under the same
     scaling identity and ``model_sha256`` (the run's recorded model
     implementation digest, which binds the cache key and not the artifact
@@ -306,7 +309,6 @@ def create_transient_training_loaders(
     train_cases = partition_contract.train_subset_cases(fixed, material_by_case=binding.materials, train_subset=train_subset)
     train_dataset = _select_cases(full_training_dataset, train_cases)
     evaluation_dataset = _select_cases(full_evaluation_dataset, fixed["validation"])
-    id_test_dataset = _select_cases(full_evaluation_dataset, fixed["id_test"])
     material_ood_ids = tuple(material_ood_dataset_ids)
     assignments = packages.declared_evaluation_assignments(_TASK, train_dataset_id, material_ood_ids, storage_root=storage_root)
     loaded = {dataset_id: dataset_for(dataset_id, sampling=transient_contract.EVALUATION_SAMPLING) for dataset_id in material_ood_ids}
@@ -322,10 +324,6 @@ def create_transient_training_loaders(
     splits.reject_role_leakage(
         binding, fixed, {role: [(_binding(source), case_ids) for source, case_ids in declared_parts[role]] for role in splits.OOD_SPLIT_ROLES}
     )
-    parts = {role: [_select_cases(source, case_ids) for source, case_ids in declared_parts[role]] for role in declared_parts}
-    ood_datasets: dict[str, Dataset[Any] | None] = {
-        role: role_parts[0] if len(role_parts) == 1 else ConcatDataset(role_parts) if role_parts else None for role, role_parts in parts.items()
-    }
 
     fitting_dataset = (
         train_dataset
@@ -335,9 +333,9 @@ def create_transient_training_loaders(
     spatial_view = _spatial_view_evidence(train_dataset)
     view_datasets = (
         ("validation", evaluation_dataset),
-        ("id_test", id_test_dataset),
         ("scaling", fitting_dataset),
-        *((f"{role}[{index}]", part) for role, role_parts in parts.items() for index, part in enumerate(role_parts)),
+        # Material-OOD sources are opened only for their split identity and grid view, never as loaders.
+        *((f"material-OOD source {dataset_id}", source) for dataset_id, source in loaded.items() if dataset_id != train_dataset_id),
     )
     for label, dataset in view_datasets:
         if _spatial_view_evidence(dataset) != spatial_view:
@@ -387,31 +385,17 @@ def create_transient_training_loaders(
     )
 
     loader_started = time.perf_counter()
-    # A Train subset keeps the full Train role's unit count for its stage budget.
-    full_set_units = len(train_dataset) if train_subset is None else len(_select_cases(full_training_dataset, fixed["train"]))
-    sampler = _unit_sampler(
-        train_dataset, full_set_units=full_set_units, units_per_update=units_per_update, memory_batch=memory_batch, seed=resolved_loader_seed
-    )
+    # A Train subset keeps the full Train role's unit and transition counts for its stage budget.
+    full_set = train_dataset if train_subset is None else _select_cases(full_training_dataset, fixed["train"])
+    sampler = _unit_sampler(train_dataset, full_set=full_set, units_per_update=units_per_update, memory_batch=memory_batch, seed=resolved_loader_seed)
     train_loader = _loader(train_dataset, loader_settings, batches=sampler, loader_seed=resolved_worker_seed, worker_seed=resolved_worker_seed)
     evaluation_loader = _loader(
         evaluation_dataset, loader_settings, batches=None, loader_seed=resolved_loader_seed + 1, worker_seed=resolved_worker_seed + 1
-    )
-    ood_loaders = {
-        role: None
-        if dataset is None
-        else _loader(dataset, loader_settings, batches=None, loader_seed=resolved_loader_seed + offset, worker_seed=resolved_worker_seed + offset)
-        for (role, dataset), offset in zip(ood_datasets.items(), (2, 4), strict=True)
-    }
-    id_test_loader = _loader(
-        id_test_dataset, loader_settings, batches=None, loader_seed=resolved_loader_seed + 3, worker_seed=resolved_worker_seed + 3
     )
     _emit_startup(startup_callback, "dataloader_ready", workers=loader_settings.num_workers, seconds=time.perf_counter() - loader_started)
     return TransientTrainingLoaders(
         train=train_loader,
         evaluation=evaluation_loader,
-        material_ood=ood_loaders["material_ood"],
-        parameter_ood=ood_loaders["parameter_ood"],
-        id_test=id_test_loader,
         scaling=normalization.admit_scaling_state(envelope["state"], identity=scaling_identity),
         scaling_artifact=envelope,
         split=split_payload,

@@ -145,7 +145,6 @@ def inspect_config(
     *,
     epochs: int | None = None,
     train_dataset: str | None = None,
-    train_seconds: float | None = None,
     rollout_length: int | None = None,
     lr_scale: float | None = None,
     revision: str | None = None,
@@ -170,7 +169,7 @@ def inspect_config(
         saved_resume_config = _saved_resume_config_path(source, resume) if resume is not None else None
         resolved: Mapping[str, Any]
         if saved_resume_config is not None and resume is not None:
-            if any(value is not None for value in (epochs, train_dataset, train_seconds, rollout_length, lr_scale, revision, seed)):
+            if any(value is not None for value in (epochs, train_dataset, rollout_length, lr_scale, revision, seed)):
                 msg = "Saved-effective resume config does not accept semantic overrides; resume the saved config unchanged."
                 raise loader.ConfigError(msg)
             raw = loader.validate_resolved_config(raw, verify_layout_identity=False)
@@ -187,7 +186,6 @@ def inspect_config(
                 raw,
                 epochs=epochs,
                 train_dataset=train_dataset,
-                train_seconds=train_seconds,
                 rollout_length=rollout_length,
                 lr_scale=lr_scale,
                 revision=revision,
@@ -212,7 +210,7 @@ def inspect_config(
         if seed is not None:
             msg = "--seed applies only to the train workflow."
             raise loader.ConfigError(msg)
-        if any(value is not None for value in (train_seconds, rollout_length, lr_scale)):
+        if any(value is not None for value in (rollout_length, lr_scale)):
             raise loader.ConfigError(loader.MATCHED_TRAINING_FLAGS_MESSAGE)
         if train_stages is not None:
             msg = "--train-stages applies only to the train workflow."
@@ -321,7 +319,6 @@ def validate_workflow(
     requested_workflow: str,
     epochs: int | None = None,
     train_dataset: str | None = None,
-    train_seconds: float | None = None,
     rollout_length: int | None = None,
     lr_scale: float | None = None,
     revision: str | None = None,
@@ -348,7 +345,6 @@ def validate_workflow(
         path,
         epochs=epochs,
         train_dataset=train_dataset,
-        train_seconds=train_seconds,
         rollout_length=rollout_length,
         lr_scale=lr_scale,
         revision=revision,

@@ -4,8 +4,9 @@ Responsibilities:
   - Check the half cosine at budget fractions 0, 1/2 and 1, its clipping and its rejection of invalid progress
   - Check that a stage restart starts at lr_scale times the A0 start rate and keeps the Adam moments and step counters
   - Check the plateau comparison kind: no floor, stepped only at validation points
-  - Check the epochs-to-units conversion, independent of k and with the full set's number for a Train subset
-  - Check the validation points of unit and seconds budgets, skipped points, and exact state restoration
+  - Check the passes-to-count conversion, independent of k and with the full set's number for a Train subset
+  - Check the validation points of unit and supervised-transition budgets, skipped points, and exact state restoration
+  - Check that a zero-transition budget (A1 after a first-group divergence) is complete and that seconds never end a stage
 
 Design principles:
   - Small synthetic optimizers and budgets stand in for a training stage; the loop tests own the wiring
@@ -116,24 +117,36 @@ def test_the_plateau_comparison_halves_at_validation_points_without_a_floor() ->
     assert restored.state_dict() == schedule.state_dict()
 
 
-def test_an_epoch_budget_counts_the_full_train_set_independently_of_k_and_of_a_subset() -> None:
-    """A budget of E epochs is E passes over the full Train set in units; a subset sampler keeps the full set's count."""
+def test_a_passes_budget_counts_the_full_train_set_independently_of_k_and_of_a_subset() -> None:
+    """A budget of E passes counts the full Train set's units (A0) or transitions (B: K x N); a subset sampler keeps both full counts."""
     full = units.UnitSampler(unit_kind="case", cases=range(12), keys=None, units_per_update=4, memory_batch=2, seed=0)
-    subset = units.UnitSampler(unit_kind="case", cases=range(3), keys=None, units_per_update=1, memory_batch=1, seed=0, full_set_units=12)
+    subset = units.UnitSampler(
+        unit_kind="window", cases=range(3), keys=None, units_per_update=1, memory_batch=1, seed=0, full_set_units=12, full_set_transitions=50
+    )
 
-    assert budget_state.units_budget(5, full.full_set_units) == budget_state.units_budget(5, subset.full_set_units) == 60
+    assert budget_state.passes_budget(5, full.full_set_units) == budget_state.passes_budget(5, subset.full_set_units) == 60
+    assert (full.full_set_transitions, budget_state.passes_budget(5, subset.full_set_transitions)) == (12, 250)
     with pytest.raises(ValueError, match="full_set_units"):
         units.UnitSampler(unit_kind="case", cases=range(3), keys=None, units_per_update=1, memory_batch=1, seed=0, full_set_units=2)
+    with pytest.raises(ValueError, match="full_set_transitions"):
+        units.UnitSampler(unit_kind="trajectory", cases=range(3), keys=None, units_per_update=1, memory_batch=1, seed=0)
 
 
-def test_unit_points_fall_at_each_twentieth_and_a_multi_point_group_records_the_skipped_points() -> None:
-    """Point j is due at j/20 of the budget; one validation covers a group that crossed several and records the rest."""
-    budget = budget_state.StageBudget(unit="units", total=40)
-    budget.record_group(units=1, train_seconds=0.1)
+@pytest.mark.parametrize("unit", ["units", "supervised_transitions"])
+def test_points_fall_at_each_twentieth_and_a_multi_point_group_records_the_skipped_points(unit: str) -> None:
+    """Point j is due at j/20 of the budget in its own count; one validation covers a group that crossed several and records the rest."""
+    budget = budget_state.StageBudget(unit=unit, total=40)  # type: ignore[arg-type]
+
+    def commit(count: int) -> None:
+        # The other count moves differently (a B window holds several transitions), so only the budget's own count decides.
+        units_, transitions = (count, 5 * count) if unit == "units" else (1, count)
+        budget.record_group(units=units_, supervised_transitions=transitions, train_seconds=100.0)
+
+    commit(1)
     assert (budget.reached_point, budget.validation_due) == (0, False)
-    budget.record_group(units=1, train_seconds=0.1)
+    commit(1)
     assert budget.record_validation() == 1
-    budget.record_group(units=7, train_seconds=0.1)
+    commit(7)
     assert budget.record_validation() == 4
     assert budget.skipped_points == [2, 3]
     with pytest.raises(RuntimeError, match="due"):
@@ -143,46 +156,47 @@ def test_unit_points_fall_at_each_twentieth_and_a_multi_point_group_records_the_
 @pytest.mark.parametrize(
     ("unit", "total", "spends", "point"),
     [
-        ("train_seconds", 0.1, (0.045,), 9),
-        ("train_seconds", 0.1, (0.03, 0.015), 9),
-        ("train_seconds", 0.1, (0.0449,), 8),
-        ("train_seconds", 0.1, (0.015,), 3),
-        ("train_seconds", 0.1, (0.0149999,), 2),
-        ("train_seconds", 0.1, (0.0999999,), 19),
-        # Within the tolerance but below the total: the end is exact, so the stage is not complete (no negative overrun).
-        ("train_seconds", 0.1, (0.1 * (1.0 - 1e-10),), 19),
-        ("units", 3, (1,), 6),
+        ("supervised_transitions", 3, (1,), 6),
+        ("supervised_transitions", 40, (17, 1), 9),
         ("units", 40, (18,), 9),
         ("units", 10**9, (15 * 10**7 - 1,), 2),
         ("units", 10**9, (15 * 10**7,), 3),
-        ("units", 10**9, (10**9 - 1,), 19),
+        ("supervised_transitions", 10**9, (10**9 - 1,), 19),
     ],
 )
-def test_a_spend_exactly_at_a_threshold_reaches_that_point(unit: str, total: float, spends: tuple[float, ...], point: int) -> None:
-    """Point j is reached once the spend reaches j/20 of the budget: units exactly, seconds within rounding, the end exactly."""
+def test_a_spend_exactly_at_a_threshold_reaches_that_point(unit: str, total: int, spends: tuple[int, ...], point: int) -> None:
+    """Point j is reached exactly once the spend reaches j/20 of the budget, an exact integer comparison in both units."""
     budget = budget_state.StageBudget(unit=unit, total=total)  # type: ignore[arg-type]
     for spend in spends:
-        if unit == "units":
-            budget.record_group(units=int(spend), train_seconds=0.1)
-        else:
-            budget.record_group(units=1, train_seconds=spend)
+        budget.record_group(units=spend, supervised_transitions=spend, train_seconds=0.1)
 
     assert budget.reached_point == point
 
 
-def test_seconds_points_and_the_budget_end_are_point_twenty() -> None:
-    """A seconds budget (B, A1) marks points on the optimisation clock; crossing the total is point 20 and ends the stage."""
-    budget = budget_state.StageBudget(unit="train_seconds", total=10.0)
-    budget.record_group(units=3, train_seconds=0.6)
-    assert budget.record_validation() == 1
-    budget.record_group(units=3, train_seconds=9.5)
+def test_the_transition_budget_end_is_point_twenty_and_seconds_never_end_a_stage() -> None:
+    """B and A1 end after the group that crosses their transitions, whatever seconds it took; crossing the total is point 20."""
+    budget = budget_state.StageBudget(unit="supervised_transitions", total=100)
+    budget.record_group(units=1, supervised_transitions=6, train_seconds=1.0e6)
+    assert (budget.record_validation(), budget.complete) == (1, False)
+    budget.record_group(units=3, supervised_transitions=96, train_seconds=0.0)
 
-    assert budget.complete
-    assert budget.progress == 1.0
+    assert (budget.complete, budget.progress, budget.overrun) == (True, 1.0, 2)
     assert budget.record_validation() == budget_state.VALIDATION_POINTS
     assert budget.skipped_points == list(range(2, 20))
     with pytest.raises(RuntimeError, match="completed stage budget"):
-        budget.record_group(units=1, train_seconds=0.1)
+        budget.record_group(units=1, supervised_transitions=1, train_seconds=0.1)
+
+
+def test_a_zero_transition_budget_is_complete_and_only_transition_budgets_may_be_zero() -> None:
+    """An A1 matched to a B that diverged in its first group gets 0 transitions: complete from the start, no group admitted."""
+    budget = budget_state.StageBudget(unit="supervised_transitions", total=0)
+
+    assert (budget.complete, budget.progress, budget.reached_point) == (True, 1.0, 20)
+    with pytest.raises(RuntimeError, match="completed stage budget"):
+        budget.record_group(units=1, supervised_transitions=1, train_seconds=0.1)
+    for unit, total in (("units", 0), ("supervised_transitions", 2.5), ("train_seconds", 10)):
+        with pytest.raises(ValueError, match=r"(?i)budget"):
+            budget_state.StageBudget(unit=unit, total=total)  # type: ignore[arg-type]
 
 
 def test_a_restored_budget_continues_the_exact_rate_sequence_and_rejects_another_budget() -> None:
@@ -193,14 +207,14 @@ def test_a_restored_budget_continues_the_exact_rate_sequence_and_rejects_another
         for _ in range(groups):
             schedule.advance(budget.progress)
             observed.append(optimizer.param_groups[0]["lr"])
-            budget.record_group(units=1, train_seconds=0.5)
+            budget.record_group(units=1, supervised_transitions=3, train_seconds=0.5)
         return observed
 
     def stage() -> tuple[budget_state.StageBudget, optim.LearningRateSchedule, AdamW]:
         optimizer = _stepped_adam()
         schedule = optim.build_scheduler(optimizer, _config({"kind": "cosine"}))
         assert schedule is not None
-        return budget_state.StageBudget(unit="units", total=10), schedule, optimizer
+        return budget_state.StageBudget(unit="supervised_transitions", total=30), schedule, optimizer
 
     uninterrupted = rates(*stage(), groups=10)
     first, schedule, optimizer = stage()
@@ -211,5 +225,7 @@ def test_a_restored_budget_continues_the_exact_rate_sequence_and_rejects_another
 
     assert head + rates(resumed, resumed_schedule, resumed_optimizer, groups=6) == uninterrupted
     assert uninterrupted[-1] > 0.0
-    with pytest.raises(ValueError, match="differs"):
-        budget_state.StageBudget(unit="units", total=11).load_state_dict(first.state_dict())
+    assert resumed.state_dict() == {**first.state_dict(), "units": 10, "supervised_transitions": 30, "train_seconds": 5.0}
+    for unit, total in (("supervised_transitions", 31), ("units", 30)):
+        with pytest.raises(ValueError, match="differs"):
+            budget_state.StageBudget(unit=unit, total=total).load_state_dict(first.state_dict())  # type: ignore[arg-type]

@@ -3,8 +3,8 @@
 Responsibilities:
   - Keep disabled tracking free of SDK imports and tracking side effects
   - Persist opaque fresh identities and exact-resume identities locally first
-  - Publish bounded semantic config, training-event history over the optimisation clock, and terminal summaries
-  - Mirror authoritative ID, OOD, and physics event values without recomputation
+  - Publish bounded semantic config, training-event history over the committed supervised transitions, and terminal summaries
+  - Mirror authoritative validation and physics event values without recomputation
   - Fail closed on requested online or offline observer failures
   - Keep the SDK console silent and the online SDK directory node-local, preserved in the run folder after an observer failure
   - Keep built-in system telemetry secondary to scientific metrics, and bound to the job's allocated GPUs
@@ -34,7 +34,7 @@ import shutil
 import sys
 import tempfile
 import uuid
-from collections.abc import Callable, Collection, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -65,7 +65,6 @@ def automatic_history_metric_definitions(
     cuda_enabled: bool,
     optuna_trial: bool = False,
     task_id: str | None = None,
-    ood_roles: Collection[str] = (),
     rollout_curriculum: bool = False,
 ) -> tuple[wandb_schema.MetricProjection, ...]:
     """Return the ordered curated history contract; the schema module owns sections and key names."""
@@ -75,7 +74,8 @@ def automatic_history_metric_definitions(
         objective_id=objective_id,
         physics_training_enabled=physics_training_enabled,
         physics_monitor_enabled=physics_monitor_enabled,
-        ood_roles=ood_roles,
+        # Training and Optuna evaluate no held-out role, so their history has no OOD series and no OOD page.
+        ood_roles=(),
         cuda_enabled=cuda_enabled,
         optuna_trial=optuna_trial,
         rollout_curriculum=rollout_curriculum,
@@ -115,7 +115,7 @@ class _WandbRun(Protocol):
         """Define one supported metric family and its x-axis contract."""
 
     def log(self, data: Mapping[str, Any]) -> None:
-        """Log one training event; ``train_seconds`` in the data is the x-axis."""
+        """Log one training event; ``supervised_transitions`` in the data is the x-axis."""
 
     def finish(self, exit_code: int = 0) -> None:
         """Finalize the tracking run."""
@@ -395,7 +395,8 @@ def build_semantic_config(
     evaluation_payload["roles"] = {
         "selection": "id",
         "id_interpretation": "in_distribution_validation",
-        "diagnostic": ["material_ood", "parameter_ood", "physics"],
+        # Training never evaluates ID-test or OOD; the separate artifact step owns them.
+        "diagnostic": ["physics"],
         "event_model": "budget_validation_points",
         "validation_points": learning.training.budget.VALIDATION_POINTS,
         "epoch_zero_evaluation": False,
@@ -637,11 +638,12 @@ class WandbSession:
         not sent again, at any step, and a new point is sent even at a lower one.
         The point is persisted before it is sent, so a crash in between loses at
         most that point and never duplicates it. History is logged without W&B's
-        own step, which only counts calls; ``train_seconds`` (the optimisation clock) in the payload is the x-axis.
+        own step, which only counts calls; ``supervised_transitions`` (the stage's committed supervised transitions,
+        a steady run's seen cases) in the payload is the x-axis, so curves of different GPUs and memory batches align.
         """
         # Checked before the disabled return, so runs without W&B also hold the producer to the axis contract.
-        if "budget/train_seconds" not in metrics:
-            msg = "W&B training-event history requires budget/train_seconds, the optimisation clock x-axis."
+        if "budget/supervised_transitions" not in metrics:
+            msg = "W&B training-event history requires budget/supervised_transitions, the x-axis."
             raise TrackingError(msg)
         if self._run is None or self._finished:
             return
@@ -656,13 +658,13 @@ class WandbSession:
         send_training = self._resumed_through_step is None or step > self._resumed_through_step
         send_validation = point is not None and (self._resumed_through_point is None or point > self._resumed_through_point)
 
-        payload: dict[str, float | int] = {"global_step": step, "train_seconds": float(metrics["budget/train_seconds"])}
+        payload: dict[str, float | int] = {"global_step": step, "supervised_transitions": int(metrics["budget/supervised_transitions"])}
         # Projection order, not producer order, so first-appearance panel ordering in W&B follows the layout of the sections.
         for definition in self.history_metric_definitions:
             if definition.source_key in metrics and (send_validation if definition.validation else send_training):
                 payload[definition.wandb_key] = float(metrics[definition.source_key]) * definition.multiplier
         self._last_logged_step = step
-        if payload.keys() <= {"global_step", "train_seconds"}:  # only the hidden axes
+        if payload.keys() <= {"global_step", "supervised_transitions"}:  # only the hidden axes
             return
 
         if send_validation:
@@ -836,13 +838,8 @@ def initialize_wandb(
     previous_last_logged_step: int | None = None,
     previous_last_logged_point: int | None = None,
     state_updater: TrackingStateUpdater | None = None,
-    ood_roles: Collection[str],
 ) -> WandbSession:
-    """Initialize the configured W&B mode with strict identity and metric rules.
-
-    ``ood_roles`` names the non-empty OOD Evaluation parts the run was trained with (its split's ``ood_roles``); only those get W&B rows,
-    so every session of one run, including a resumed one, must pass the same parts.
-    """
+    """Initialize the configured W&B mode with strict identity and metric rules; the history has no held-out series."""
     objective = cast("Mapping[str, Any]", config["evaluation"])["objective"]
     objective_mapping = cast("Mapping[str, Any]", objective)
     objective_id = str(objective_mapping["id"])
@@ -943,7 +940,6 @@ def initialize_wandb(
         cuda_enabled=cuda_enabled,
         optuna_trial=workflow == "optuna_trial",
         task_id=task_id,
-        ood_roles=ood_roles,
         # The resolved training section carries a curriculum only for the stage that draws rollout horizons (Stage B).
         rollout_curriculum="curriculum" in cast("Mapping[str, Any]", config["training"]),
     )
@@ -983,14 +979,14 @@ def initialize_wandb(
             sdk_run.tags = merged_tags
 
         sdk_run.define_metric("global_step", hidden=True, summary="none")
-        sdk_run.define_metric("train_seconds", hidden=True, summary="none")
+        sdk_run.define_metric("supervised_transitions", hidden=True, summary="none")
         for name in wandb_schema.SUMMARY_ONLY_KEYS:
             sdk_run.define_metric(name, hidden=True)
         for definition in history_definitions:
             # summary=None keeps the SDK default, the last value under the history key; "none" keeps a series out of the summary.
             sdk_run.define_metric(
                 definition.wandb_key,
-                step_metric="train_seconds",
+                step_metric="supervised_transitions",
                 step_sync=False,
                 summary=None if definition.in_summary else "none",
             )

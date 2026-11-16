@@ -101,10 +101,10 @@ def test_matched_overrides_reach_loader_before_training_plan_resolution(
         return resolved
 
     monkeypatch.setattr(preflight.loader, "apply_training_overrides", capture)
-    result = preflight.validate_workflow(path, requested_workflow="train", rollout_length=2, train_seconds=3.0, lr_scale=0.5)
+    result = preflight.validate_workflow(path, requested_workflow="train", rollout_length=2, lr_scale=0.5)
 
     assert result.task == "transient_drying"
-    assert (captured["rollout_length"], captured["train_seconds"], captured["lr_scale"]) == (2, 3.0, 0.5)
+    assert (captured["rollout_length"], captured["lr_scale"]) == (2, 0.5)
     training = captured["training"]
     assert training["b"]["sampling"] == {
         "mode": "rollout_window",
@@ -114,14 +114,13 @@ def test_matched_overrides_reach_loader_before_training_plan_resolution(
     }
     assert training["b"]["curriculum"]["lengths"] == [2]
     assert training["b"]["curriculum"]["milestone_fractions"] == [0]
-    assert training["b"]["train_seconds"] == pytest.approx(3.0)
     assert training["b"]["lr_scale"] == training["a1"]["lr_scale"] == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize(
     "override",
-    [{"rollout_length": 6}, {"train_seconds": 1.0}, {"lr_scale": 0.5}],
-    ids=["rollout-length", "train-seconds", "lr-scale"],
+    [{"rollout_length": 6}, {"lr_scale": 0.5}],
+    ids=["rollout-length", "lr-scale"],
 )
 def test_matched_overrides_are_rejected_for_optuna_workflow(
     tmp_path: Path,
@@ -165,7 +164,6 @@ def test_saved_effective_resume_config_is_strictly_validated(
     [
         {"epochs": 4},
         {"train_dataset": "another_dataset"},
-        {"train_seconds": 10.0},
         {"rollout_length": 4},
         {"lr_scale": 0.5},
         {"revision": "fixed"},

@@ -3,9 +3,11 @@
 Responsibilities:
   - Check persisted run catalogs, task-aware workspace dispatch, stage lineage, and comparison
     admission
+  - Check the stage-history read after run admission and the study-summary read
 
 Design principles:
   - Discovery stays read-only and distinguishes readiness from active staging
+  - Histories are written by the real history writer; only the run admission is replaced by a fake lease
 
 This module does NOT:
   - Run training or infer missing artifacts during catalog discovery
@@ -15,9 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 import ipywidgets as widgets
 import pytest
@@ -30,6 +35,10 @@ from src.analysis.evaluation import evaluation_run_discovery as discovery
 from src.analysis.evaluation import evaluation_selection as selection
 from src.analysis.evaluation import evaluation_workspace as workspace
 from src.experiments import experiments_run_identity as identity
+from src.learning.training import learning_training_history as training_history
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +85,7 @@ def _write_run(
     split: bool = True,
     physics: bool | None = False,
     model_kind: str | None = "fno",
+    a0_run_name: str | None = None,
 ) -> Path:
     """Write one compact persisted leaf; its saved split holds the ID Dataset plus one additional OOD part unless ``split`` is false."""
     stage_id = comparison_arm if comparison_arm in {"a0", "b", "a1"} else "a0" if stage == "a" else "b" if stage == "b" else "single"
@@ -117,12 +127,14 @@ def _write_run(
         config["loss"] = {"physics": {"enabled": physics}}
     if evaluation is not None:
         config["evaluation"] = evaluation
-    if stage is not None or comparison_arm is not None:
+    if stage is not None or comparison_arm is not None or a0_run_name is not None:
         config["training"] = {}
         if stage is not None:
             config["training"]["stage"] = stage
         if comparison_arm is not None:
             config["training"]["comparison_arm"] = comparison_arm
+        if a0_run_name is not None:
+            config["training"]["teacher_handoff"] = {"source_run_name": a0_run_name}
     (run_dir / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     (run_dir / "summary.json").write_text(
         json.dumps(
@@ -320,8 +332,9 @@ def test_failed_runs_remain_visible_and_artifacts_report_missing_or_available(
     assert available_record.evaluable
     assert available_record.action_enabled
     assert available_record.artifact_command == (
-        f"./scripts/slurm_ml.sh --mode cpu --partition standard --cpus-per-task 4 --mem 16G --time 02:00:00 artifacts --run-dir {available.resolve()}"
-    )
+        "./scripts/slurm_ml.sh --mode cpu --partition standard --cpus-per-task 4 --mem 16G --time 02:00:00 "
+        f"artifacts --run-dir {available.resolve()} --split id --split material_ood"
+    )  # full coverage names every planned held-out role
 
 
 def test_marker_discovery_does_not_hash_numerical_payloads(
@@ -487,6 +500,7 @@ def test_run_overview_uses_material_first_roles_and_shared_protocol_labels(
         spatial_stride=1,
     )
     controller = workspace._EvaluationWorkspaceController.__new__(workspace._EvaluationWorkspaceController)
+    controller._labels = {record.run_dir: "FNO · seed 17"}
     html = controller._status_html(
         record,
         selected_roles=("id", "material_ood"),
@@ -501,7 +515,7 @@ def test_run_overview_uses_material_first_roles_and_shared_protocol_labels(
     assert "Chickpea · ID · available" in html
     assert "Kidney bean · OOD · available" in html
     assert "Drying group macro RMSE" in html
-    assert "Spatial stride</th><td>1" in html
+    assert re.search(r"Spatial stride</th><td[^>]*>1</td>", html)
     assert "Generate full artifact coverage" not in html
 
 
@@ -584,7 +598,14 @@ def test_workspace_discovers_once_and_renders_missing_artifacts_without_inferenc
     assert "Artifact roles: missing=2" in prepared.summary_text
     controller = prepared._controller
     assert controller is not None
+    assert controller.runs.header.value is True
     controller.runs.select(controller.runs.selected())
+    assert controller.runs.header.value is True  # only a user pick closes the list, not select()
+    grid = controller.view.widget
+    assert len(grid.children) == 3
+    assert grid.children[:2] == (controller.view.content, controller.runs.body)
+    assert controller.panel.children[1] is grid
+    assert isinstance(controller.panel.children[0], widgets.HTML)
     assert len(scans) == 1
     assert controller.runs.boxes
     assert "ID · missing; Material OOD · missing" in controller._details
@@ -598,6 +619,8 @@ def test_workspace_discovers_once_and_renders_missing_artifacts_without_inferenc
     assert len(scans) == 2
     comparison_controller = compared._controller
     assert comparison_controller is not None
+    comparison_controller.runs.select(comparison_controller.runs.selected())
+    assert comparison_controller.runs.header.value is True  # a multiple choice stays open until its header is clicked
     assert "Select at least two runs" in comparison_controller.view.status.text
     assert "Select at least two runs" in comparison_controller._details
     compared.close()
@@ -648,8 +671,7 @@ def test_comparison_workspace_admits_exact_a0_a1_b_stage_semantics(
         def close(self) -> None:
             self.closed = True
 
-    def prepare(selected: tuple[Path, ...], **kwargs: object) -> FakeWorkflow:
-        assert kwargs["auto_build_missing"] is False
+    def prepare(selected: tuple[Path, ...], **_kwargs: object) -> FakeWorkflow:
         calls.append(tuple(selected))
         return FakeWorkflow()
 
@@ -687,6 +709,7 @@ def test_matched_a1_discovery_keeps_distinct_stage_and_parent_group(tmp_path: Pa
             comparison_arm=arm,
             branch_id=branch_id,
             artifact=True,
+            a0_run_name=None if arm == "a0" else "scientific-a0",
         )
         for arm in ("a0", "b", "a1")
     }
@@ -705,9 +728,15 @@ def test_matched_a1_discovery_keeps_distinct_stage_and_parent_group(tmp_path: Pa
         "scientific-a1": "A1",
     }
     assert {run.parent_identity_sha256 for run in catalog.runs} == {None, parent_identity}
-    assert workspace._compatibility_issues(catalog.runs) == ()
+    assert {name: run.a0_run_name for name, run in by_name.items()} == {
+        "scientific-a0": None,
+        "scientific-b": "scientific-a0",
+        "scientific-a1": "scientific-a0",
+    }
+    assert workspace._compatibility_issues(catalog.runs, _labels_of(catalog.runs)) == ()
     relabeled = tuple(replace(run, stage="A0") if run.stage == "B" else run for run in catalog.runs)
-    assert workspace._compatibility_issues(relabeled) == ()  # Stages are selectable attributes; controlled lineage has a separate gate.
+    # Stages are selectable attributes; controlled lineage has a separate gate.
+    assert workspace._compatibility_issues(relabeled, _labels_of(relabeled)) == ()
 
 
 def test_two_matched_branches_share_one_independent_a0_without_parent_conflicts(tmp_path: Path) -> None:
@@ -911,7 +940,7 @@ def test_a_selection_made_while_another_loads_is_the_one_that_stays(tmp_path: Pa
 
     newer, older = workflows["steady_flow"], workflows["transient_drying"]
     assert controller._workflow is newer
-    assert "newer-run" in controller.view.status.text
+    assert controller._labels[steady_run.resolve()] in controller.view.status.text
     assert controller.view.status.level == "normal"
     assert "older load failed" not in controller._details
     assert older.close_count == (0 if older_load_fails else 1)
@@ -1122,7 +1151,7 @@ def test_comparison_rejects_same_objective_with_different_persisted_protocol(
 
     assert {run.evaluation_protocol for run in selected} == {"normalized_drying_group_macro_rmse"}
     assert len({run.evaluation_config_identity for run in selected}) == 2
-    assert workspace._compatibility_issues(selected) == ("Selected runs have incompatible evaluation protocol.",)
+    assert workspace._compatibility_issues(selected, _labels_of(selected)) == ("Selected runs have incompatible evaluation protocol.",)
 
 
 def test_comparison_metadata_rejects_incompatible_scientific_contracts(tmp_path: Path) -> None:
@@ -1130,7 +1159,7 @@ def test_comparison_metadata_rejects_incompatible_scientific_contracts(tmp_path:
     run_dir = _write_run(tmp_path, leaf="reference", artifact=False)
     reference = discovery.discover_evaluation_runs(tmp_path).runs[0]
     compatible = replace(reference, run_dir=run_dir.parent / "compatible-peer")
-    assert workspace._compatibility_issues((reference, compatible)) == ()
+    assert workspace._compatibility_issues((reference, compatible), _labels_of((reference, compatible))) == ()
 
     mismatches = (
         (replace(compatible, task="steady_flow"), "task"),
@@ -1139,7 +1168,7 @@ def test_comparison_metadata_rejects_incompatible_scientific_contracts(tmp_path:
         (replace(compatible, spatial_stride=8), "spatial stride"),
     )
     for peer, expected_label in mismatches:
-        issues = workspace._compatibility_issues((reference, peer))
+        issues = workspace._compatibility_issues((reference, peer), _labels_of((reference, peer)))
         assert len(issues) == 1
         assert expected_label in issues[0]
 
@@ -1284,9 +1313,89 @@ def test_comparison_labels_carry_seed(tmp_path: Path) -> None:
     shared = tuple(run for run in runs if shared_dir in run.run_dir.parents)
     assert len(shared) == 2
     assert {run.seed for run in shared} == {17, 18}
-    labels = workspace._model_labels(shared)
+    labels = workspace._run_labels(shared)
     assert all("seed " in label for label in labels)
     assert len(set(labels)) == 2
+
+
+def test_comparison_labels_name_the_model_family_by_its_display_name(tmp_path: Path) -> None:
+    """A plain and a physics-informed run of one architecture and seed read FNO and PI-FNO, not their architecture descriptor."""
+    _write_run(tmp_path, leaf="plain", family="plain", seed=9)
+    _write_run(tmp_path, leaf="physics", family="physics", seed=9, physics=True)
+    runs = sorted(discovery.discover_evaluation_runs(tmp_path).runs, key=lambda run: run.model_family or "")
+    assert [run.model_family for run in runs] == ["fno", "pi-fno"]
+    assert workspace._run_labels(tuple(runs)) == ("FNO · seed 9", "PI-FNO · seed 9")
+
+
+def _labels_of(runs: Any) -> dict[Path, str]:
+    """Return the short label of each run by its directory, as the workspace controller holds them."""
+    return dict(zip((run.run_dir for run in runs), workspace._run_labels(runs), strict=True))
+
+
+def _label_run(
+    stage: str | None,
+    *,
+    family: str | None = "fno",
+    seed: int | None = 9,
+    run_dir: str = "/x/a",
+    pair: str | None = None,
+    run_name: str | None = None,
+) -> Any:
+    """Return the fields of a discovered run that its short label reads."""
+    return SimpleNamespace(
+        model_family=family,
+        model_label="fno_m2x2_h4_l1",
+        stage=stage,
+        seed=seed,
+        pair_label=pair,
+        config_label=None,
+        dataset_id=None,
+        run_name=run_name or Path(run_dir).name,
+        run_dir=Path(run_dir),
+    )
+
+
+def test_run_label_names_architecture_stage_and_seed_and_omits_an_absent_stage() -> None:
+    """The label reads architecture, stage, seed; a steady run has no stage part."""
+    runs = (_label_run("B"), _label_run("A1", run_dir="/x/b"), _label_run(None, family="pi-uno", run_dir="/x/c"))
+    assert workspace._run_labels(runs) == ("FNO · B · seed 9", "FNO · A1 · seed 9", "PI-U-NO · seed 9")
+
+
+def test_run_labels_stay_unique_through_the_shortest_separating_facet() -> None:
+    """Two runs of one architecture, stage and seed get the facet that tells them apart."""
+    runs = (_label_run("B", run_dir="/x/ep-100/b", pair="ep-100"), _label_run("B", run_dir="/x/ep-200/b", pair="ep-200"))
+    labels = workspace._run_labels(runs)
+    assert len(set(labels)) == 2
+    assert all(label.startswith("FNO · B · seed 9 · ") for label in labels)
+
+
+def test_run_labels_stay_unique_when_no_facet_separates_the_runs() -> None:
+    """Runs no facet can tell apart still get unique labels (full run name, then directory) instead of failing the workspace."""
+    runs = (_label_run("B", run_dir="/x/a/b", run_name="same"), _label_run("B", run_dir="/x/b/a", run_name="same"))
+    labels = workspace._run_labels(runs)
+    assert len(set(labels)) == 2
+    assert all(label.startswith("FNO · B · seed 9 · same") for label in labels)
+
+
+def test_run_label_without_a_resolved_family_keeps_the_model_descriptor() -> None:
+    """A missing or unregistered family falls back to the architecture descriptor instead of failing."""
+    labels = workspace._run_labels((_label_run(None, family=None), _label_run(None, family="bogus", run_dir="/x/b", seed=None)))
+    assert labels == ("fno_m2x2_h4_l1 · seed 9", "fno_m2x2_h4_l1 · seed unavailable")
+
+
+def test_details_table_labels_are_bold_nowrap_and_values_left_aligned(tmp_path: Path) -> None:
+    """Labels stand on one line at the top of their row, values left-aligned right behind them, the model row names label and descriptor."""
+    _write_run(tmp_path, leaf="table")
+    record = discovery.discover_evaluation_runs(tmp_path).runs[0]
+    controller = workspace._EvaluationWorkspaceController.__new__(workspace._EvaluationWorkspaceController)
+    controller._labels = {record.run_dir: "FNO · seed 17"}
+    html = controller._status_html(record, selected_roles=())
+    assert html.count("<th style='font-weight:bold;text-align:left;vertical-align:top;white-space:nowrap;") == html.count("<th ") == 12
+    assert html.count("<td style='text-align:left;vertical-align:top'>") == 12
+    assert "margin-left:0" in html.split("<table style='", 1)[1].split("'", 1)[0]
+    assert f"Model</th><td style='text-align:left;vertical-align:top'>FNO · seed 17 ({record.model_label})</td>" in html
+    controller._labels = {record.run_dir: f"{record.model_label} · seed 17"}  # a descriptor fallback label already names the descriptor
+    assert f"'>{record.model_label} · seed 17</td>" in controller._status_html(record, selected_roles=())
 
 
 def test_ood_role_follows_the_saved_split_and_an_absent_split_has_none(tmp_path: Path) -> None:
@@ -1381,13 +1490,74 @@ def test_colliding_model_labels_are_distinct_at_actual_controller_handoff(tmp_pa
     assert set(selected) == set(paths)
     for path, label in zip(selected, labels, strict=True):
         assert path.relative_to(tmp_path).parts[2].split("-")[0] in label
-        assert "fno_m2x2_h4_l1" in label
-        assert "seed 17" in label
+        assert label.startswith("FNO · seed 17")
     controller = prepared._controller
     assert controller is not None
     listed_names = tuple(str(box.description) for box in controller.runs.boxes.values())
     assert len(set(listed_names)) == len(listed_names) == 2
     prepared.close()
+
+
+def test_single_workspace_passes_the_short_label_and_shows_it_in_the_header(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A single run reaches the workflow under its short label, not the storage alias, and the selector header names it."""
+    _write_run(tmp_path, leaf="only", artifact=True)
+    labels: list[str] = []
+
+    def prepare(_run_dir: Path, **kwargs: Any) -> Any:
+        labels.append(kwargs["label"])
+        return type("SavedSingle", (), {"panel": widgets.Label("saved single"), "close": lambda _self: None})()
+
+    monkeypatch.setattr(workspace.workflow, "prepare_single_model_evaluation_workspace", prepare)
+    prepared = workspace.prepare_single_model_evaluation_workspace(experiments_root=tmp_path)
+    assert labels == ["FNO · seed 17"]
+    controller = prepared._controller
+    assert controller is not None
+    assert controller.runs.header.summary == "Lauf: FNO · seed 17"
+    prepared.close()
+
+
+def test_labels_come_from_the_whole_catalog_so_an_unselected_run_still_separates_the_selected_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two runs of one architecture and seed carry their distinguishing facet in the header and the legend label, whichever is selected."""
+    for name in ("first-experiment", "second-experiment"):
+        _write_run(tmp_path, leaf=name, family=name, artifact=True)
+    labels: list[str] = []
+
+    def prepare(_run_dir: Path, **kwargs: Any) -> Any:
+        labels.append(kwargs["label"])
+        return type("SavedSingle", (), {"panel": widgets.Label("saved single"), "close": lambda _self: None})()
+
+    monkeypatch.setattr(workspace.workflow, "prepare_single_model_evaluation_workspace", prepare)
+    prepared = workspace.prepare_single_model_evaluation_workspace(experiments_root=tmp_path)
+    controller = prepared._controller
+    assert controller is not None
+    assert len(set(controller._labels.values())) == 2
+    first = labels[-1]
+    assert first.startswith("FNO · seed 17 · ")
+    assert controller.runs.header.summary == f"Lauf: {first}"
+    other = next(key for key in controller.runs.boxes if key not in controller.runs.selected())
+    controller.runs.select([other])
+    assert labels[-1] != first
+    assert labels[-1].startswith("FNO · seed 17 · ")
+    assert controller.runs.header.summary == f"Lauf: {labels[-1]}"
+    prepared.close()
+
+
+def test_a_b_or_a1_run_stands_below_its_listed_a0_and_an_orphan_stands_unindented(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The selector places a run under the A0 its saved teacher handoff names; a run whose A0 is not listed keeps its name-order place."""
+    for leaf, name, a0 in (("a", "u__a0", None), ("b", "u__b-a1__b", "u__a0"), ("c", "z__b-a1__a1", "missing__a0")):
+        _write_run(tmp_path, leaf=leaf, run_name=name, a0_run_name=a0)
+    catalog = discovery.discover_evaluation_runs(tmp_path)
+    assert catalog.issues == ()
+    runs = tuple(sorted(catalog.runs, key=lambda run: run.run_name))
+    assert [run.a0_run_name for run in runs] == [None, "u__a0", "missing__a0"]
+    monkeypatch.setattr(workspace._EvaluationWorkspaceController, "_render", lambda _self: None)
+    controller = workspace._EvaluationWorkspaceController(replace(catalog, runs=runs), kind="single", title="t", evaluation_compute_device="cpu")
+    assert [str(box.description) for box in controller.runs.boxes.values()] == ["u__a0", "u__b-a1__b", "z__b-a1__a1"]
+    rows = [row for row in cast("widgets.Box", controller.runs.body).children if isinstance(row, widgets.HBox)]
+    margins = [next(row.layout.margin for row in rows if row.children == (box,)) for box in controller.runs.boxes.values()]
+    assert margins == [None, "0 0 0 24px", None]
 
 
 def test_relocated_current_single_bundle_stays_discoverable(tmp_path: Path) -> None:
@@ -1400,3 +1570,170 @@ def test_relocated_current_single_bundle_stays_discoverable(tmp_path: Path) -> N
     run = catalog.runs[0]
     assert run.run_dir == moved
     assert run.config_label == "authored-experiment/fno_m2x2_h4_l1"
+
+
+_HISTORY_IDENTITY = {"objective": {"id": "rmse", "direction": "minimize"}, "effective_config_digest": "d" * 64}
+_HISTORY_CHECKPOINT = "c" * 64  # the selected checkpoint digest the fake lease admits
+# (epoch, point, global step, objective, ends the epoch): a validation inside epoch 1 (eligible, not the best), one at its end
+# (not eligible), and the budget end in epoch 2 (the best).
+_VALIDATIONS = ((1, 5, 4.0, 0.5, False), (1, 10, 10.0, None, True), (2, 20, 20.0, 0.3, True))
+
+
+def _admitted_history_run(
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch, *, task: str = "steady_flow", summary: dict[str, Any] | None = None, write: bool = True
+) -> None:
+    """Write a two-epoch history with the real writer and admit the run through a fake lease that yields its checkpoint evidence."""
+    run_dir.mkdir()
+    binding = {"task": task, "run_name": "run", "checkpoint_identity": _HISTORY_IDENTITY}
+    if write:
+        writer = training_history.make_epoch_state_callback(run_dir, **binding)
+        for epoch, point, step, value, ends_epoch in _VALIDATIONS:
+            validation = {
+                "global_step": step,
+                "validation/point": float(point),
+                "validation/eligible": float(value is not None),
+                **({} if value is None else {"id/rmse": value}),
+            }
+            writer(epoch, {"global_step": step, "train/loss_total": 1.0 / epoch} if ends_epoch else None, validation)
+    admitted = {
+        "run_dir": run_dir,
+        "config": {"task": task, "run": {"name": "run"}, "model": {"kind": "fno"}, "loss": {"physics": {"enabled": True}}},
+        "summary": {"task": task, **(summary or {})},
+        "checkpoint_identity": _HISTORY_IDENTITY,
+        "selected_checkpoint_sha256": _HISTORY_CHECKPOINT,
+        "best_checkpoint": {"best_epoch": 2, "best_metric": 0.3},
+        "last_checkpoint": {
+            "completed_epoch": 2,
+            "objective_history": [
+                {"point": point, "epoch": epoch, "objective_id": "rmse", "value": value, "bound_violations": {}}
+                for epoch, point, _step, value, _ends in _VALIDATIONS
+            ],
+        },
+    }
+
+    @contextmanager
+    def lease(path: Path | str) -> Iterator[dict[str, Any]]:
+        assert Path(path) == run_dir
+        yield admitted
+
+    monkeypatch.setattr(discovery.experiments.run, "saved_artifact_run_lease", lease)
+
+
+def test_steady_stage_history_is_read_after_admission_with_its_selected_point(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A steady run's history comes back in order, at epoch 0, with the validation point of its best checkpoint."""
+    run_dir = tmp_path / "steady"
+    _admitted_history_run(run_dir, monkeypatch)
+
+    history = discovery.stage_history(run_dir, expected_checkpoint_sha256=_HISTORY_CHECKPOINT)
+
+    assert isinstance(history, discovery.StageHistory)
+    assert (history.stage, history.pipeline, history.start_epoch, history.model_family) == ("steady", "run", 0, "pi-fno")
+    assert (history.objective_id, history.objective_direction, history.selected_point) == ("rmse", "minimize", 20)
+    assert [record["validation/point"] for record in history.validations] == [5.0, 10.0, 20.0]
+    assert [record["epoch"] for record in history.epochs] == [1.0, 2.0]
+
+
+def test_handoff_stage_history_starts_at_its_a0_epoch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A B or A1 stage belongs to its A0's pipeline and starts at the A0 handoff epoch."""
+    run_dir = tmp_path / "b"
+    summary = {"terminal_controller": {"arm": "B"}, "teacher_handoff": {"source_run_name": "a0-run", "best_epoch": 7}}
+    _admitted_history_run(run_dir, monkeypatch, task="transient_drying", summary=summary)
+
+    history = discovery.stage_history(run_dir, expected_checkpoint_sha256=_HISTORY_CHECKPOINT)
+
+    assert isinstance(history, discovery.StageHistory)
+    assert (history.stage, history.pipeline, history.start_epoch) == ("B", "a0-run", 7)
+
+
+def test_a_stage_history_of_another_checkpoint_than_expected_raises_with_both_digests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The admitted run's selected checkpoint digest, read under the lease, must be the expected one; a mismatch is a refusal."""
+    run_dir = tmp_path / "replaced"
+    _admitted_history_run(run_dir, monkeypatch)
+
+    with pytest.raises(RuntimeError, match=rf"{'e' * 64}.*{_HISTORY_CHECKPOINT}|{_HISTORY_CHECKPOINT}.*{'e' * 64}"):
+        discovery.stage_history(run_dir, expected_checkpoint_sha256="e" * 64)
+
+
+@pytest.mark.parametrize("defect", ["missing", "stale_value"])
+def test_unusable_stage_history_is_unavailable_with_its_reason(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str) -> None:
+    """No history, or one the validator refuses (here a stale objective at a non-selected validation), is unavailable, not an error."""
+    run_dir = tmp_path / defect
+    _admitted_history_run(run_dir, monkeypatch, write=defect != "missing")
+    path = training_history.history_path(run_dir)
+    if defect != "missing":
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        persisted["validations"][0]["id/rmse"] = 0.45
+        path.write_text(json.dumps(persisted), encoding="utf-8")
+
+    history = discovery.stage_history(run_dir, expected_checkpoint_sha256=_HISTORY_CHECKPOINT)
+
+    assert isinstance(history, discovery.UnavailableHistory)
+    assert history.run_dir == run_dir
+    assert history.reason
+
+
+def _study_payload(**changes: Any) -> dict[str, Any]:
+    """Return a minimal study summary: one completed, one pruned and one failed trial."""
+    trials = [
+        {"number": 0, "status": "completed", "value": 0.4, "best_objective_so_far": 0.4},
+        {"number": 1, "status": "pruned", "value": None, "best_objective_so_far": 0.4},
+        {"number": 2, "status": "failed", "value": None, "best_objective_so_far": 0.4},
+    ]
+    payload = {
+        "study_name": "study",
+        "objective": {"id": "rmse", "direction": "minimize"},
+        "trial_counts": {"completed": 1, "pruned": 1, "failed": 1, "diverged": 0},
+        "trials": trials,
+    }
+    return {**payload, **changes}
+
+
+def test_study_summary_reads_the_drawn_keys_and_binds_counts_to_trials(tmp_path: Path) -> None:
+    """The reader returns the trials in order and refuses counts that disagree with their statuses."""
+    path = tmp_path / "study_summary.json"
+    path.write_text(json.dumps(_study_payload()), encoding="utf-8")
+    summary = discovery.read_study_summary(path)
+    assert [(trial.number, trial.status, trial.value) for trial in summary.trials] == [
+        (0, "completed", 0.4),
+        (1, "pruned", None),
+        (2, "failed", None),
+    ]
+    assert summary.direction == "minimize"
+
+    path.write_text(json.dumps(_study_payload(trial_counts={"completed": 2, "pruned": 1, "failed": 1})), encoding="utf-8")
+    with pytest.raises(ValueError, match="trial_counts"):
+        discovery.read_study_summary(path)
+
+
+def test_study_summary_best_so_far_follows_completed_and_duplicate_trials_in_the_direction(tmp_path: Path) -> None:
+    """A maximized study whose duplicate trial improves the best is read; the pruned trial's higher value counts for nothing."""
+    trials = [
+        {"number": 0, "status": "completed", "value": 0.4, "best_objective_so_far": 0.4},
+        {"number": 1, "status": "pruned", "value": 0.9, "best_objective_so_far": 0.4},
+        {"number": 2, "status": "duplicate", "value": 0.6, "best_objective_so_far": 0.6},
+    ]
+    path = tmp_path / "study_summary.json"
+    counts = {"completed": 1, "pruned": 1, "duplicate": 1}
+    payload = _study_payload(objective={"id": "r2", "direction": "maximize"}, trial_counts=counts, trials=trials)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert [trial.best_so_far for trial in discovery.read_study_summary(path).trials] == [0.4, 0.4, 0.6]
+
+
+@pytest.mark.parametrize("defect", ["missing_value", "missing_best", "increasing_best", "pruned_best"])
+def test_damaged_study_summary_is_refused(tmp_path: Path, defect: str) -> None:
+    """Missing trial keys and a best so far that breaks the producer's status and direction rules are refused."""
+    payload = _study_payload()
+    trials = payload["trials"]
+    if defect == "missing_value":
+        del trials[1]["value"]
+    elif defect == "missing_best":
+        del trials[2]["best_objective_so_far"]
+    elif defect == "increasing_best":
+        trials[2]["best_objective_so_far"] = 0.5
+    else:
+        # A pruned trial's value never becomes the best.
+        trials[1].update(value=0.1, best_objective_so_far=0.1)
+    path = tmp_path / "study_summary.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"value|best_objective_so_far"):
+        discovery.read_study_summary(path)

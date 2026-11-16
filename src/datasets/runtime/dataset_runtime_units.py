@@ -7,7 +7,7 @@ Responsibilities:
   - Weight every unit by (mean units per Train case) / (units of its case), so every case counts equally per epoch
   - Persist and restore the epoch order and the committed group position exactly
   - Count the distinct cases the committed units cover, from the epoch, its order and the cursor
-  - Carry the full Train role's unit count, which a stage budget in epochs counts also for a Train subset
+  - Carry the full Train role's unit and supervised-transition counts, which a stage budget in passes counts also for a Train subset
   - Partition an item order into key-homogeneous batches for evaluation loaders
 
 Design principles:
@@ -134,6 +134,11 @@ class UnitSampler(Sampler[list[int]]):
     full_set_units : int | None, optional
         Units of the full Train role when the sampler draws from a Train subset (learning curve);
         ``None`` when it draws from the full role. A stage budget in epochs counts these units.
+    full_set_transitions : int | None, optional
+        Supervised transitions N of the full Train role, the sum of its trajectories' transitions,
+        which a budget in supervised transitions counts (B: K x N). ``None`` only where one unit is
+        one supervised prediction (a steady case, a one-step transition), so N is the full-set units;
+        window and trajectory units require it.
 
     """
 
@@ -147,6 +152,7 @@ class UnitSampler(Sampler[list[int]]):
         memory_batch: int,
         seed: int,
         full_set_units: int | None = None,
+        full_set_transitions: int | None = None,
     ) -> None:
         """Bind the units, their case weights and the update grouping."""
         if unit_kind not in UNIT_KINDS:
@@ -167,6 +173,12 @@ class UnitSampler(Sampler[list[int]]):
         if self.full_set_units < self.size:
             message = "full_set_units cannot be smaller than the sampled Train units."
             raise ValueError(message)
+        if full_set_transitions is None and unit_kind in {"window", "trajectory"}:
+            message = "A window or trajectory unit holds several transitions; the sampler needs the full Train set's full_set_transitions."
+            raise ValueError(message)
+        self.full_set_transitions = (
+            self.full_set_units if full_set_transitions is None else _positive_int(full_set_transitions, label="full_set_transitions")
+        )
         self.units_per_update = _positive_int(units_per_update, label="units_per_update")
         self.memory_batch = _positive_int(memory_batch, label="memory_batch")
         self._cases = tuple(cases)

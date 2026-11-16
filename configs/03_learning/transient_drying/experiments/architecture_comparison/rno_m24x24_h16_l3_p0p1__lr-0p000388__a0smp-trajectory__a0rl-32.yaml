@@ -14,12 +14,16 @@ optimizer:
 training:
   units_per_update: 4  # k, whole trajectories per optimizer update (about 400 transitions); 16 would leave only 24 updates per epoch.
   a0:
+    memory_batch: 1  # One whole trajectory at a time; gradients accumulate up to k, so it changes only floating-point rounding, never the science (GPU probe 156).
     sampling:
       mode: trajectory  # RNO trains on whole trajectories cut into consecutive windows in temporal order, the last a shorter rest window.
       rollout_length: 32  # Window length; the hidden state carries across windows while gradients stop at each boundary.
   b:
+    memory_batch: 1  # One whole trajectory at a time in B (GPU probe 156).
     sampling:
       mode: trajectory  # Whole trajectories cut into end-aligned windows in temporal order; a case shorter than one window forms one window.
+  a1:
+    memory_batch: 1  # A1 trains A0's teacher-forced protocol, so it computes as many units at once as A0.
 
 task: transient_drying  # Selects the task contract and its compatible data, model and loss validation.
 base: ../../base.yaml  # Shared task settings; every value set in this file overrides them.

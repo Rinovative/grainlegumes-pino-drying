@@ -3,6 +3,7 @@
 Responsibilities:
   - Preserve the maintained multiscale permeability and porosity construction
   - Use independent label-derived streams for bed, pressure, and moisture fields
+  - Derive the base inlet pressure from the sampled target superficial velocity by Darcy's law on the drawn mean permeability
   - Build a smooth bounded dry-basis initial-moisture field without clipping
 
 Design principles:
@@ -489,8 +490,19 @@ def _porosity_field(
     return porosity, diagnostics
 
 
-def _pressure_boundary(x_grid: np.ndarray, *, values: Mapping[str, Any], random: np.random.Generator) -> tuple[np.ndarray, dict[str, Any]]:
-    """Generate one-dimensional inlet pressure in its case-owned stream."""
+def _pressure_boundary(
+    x_grid: np.ndarray, *, length_y: float, values: Mapping[str, Any], random: np.random.Generator
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Generate one-dimensional inlet pressure in its case-owned stream.
+
+    The base pressure is Darcy's law on the drawn mean permeability,
+    ``p_base = v_s * mu * L_y / kappa_mean``, for the sampled target superficial velocity ``v_s``
+    (``airflow.superficial_velocity``); the inlet profile is ``p_base * (1 + shape)``. Heterogeneity,
+    anisotropy, the shape terms and the Brinkman term move the realised mean superficial velocity away
+    from ``v_s``; the pilot Generation checks that it stays mostly within about 20 %. Forchheimer drag would add
+    ``rho * beta * L_y * v_s**2`` to ``p_base``. The base pressure is neither capped nor used to reject cases.
+    """
+    base = _finite(values, "airflow.superficial_velocity") * domain.physics.contracts.AIR_DYNAMIC_VISCOSITY * length_y / _finite(values, "kappa_mean")
     x_axis = x_grid[0, :]
     normalized_x = (x_axis - np.min(x_axis)) / max(float(np.ptp(x_axis)), np.finfo(np.float64).eps)
     shape = _finite(values, "pressure_bc.sin_amp") * np.sin(
@@ -509,13 +521,19 @@ def _pressure_boundary(x_grid: np.ndarray, *, values: Mapping[str, Any], random:
         for center, sigma in zip(centers, sigmas, strict=True):
             shape += gaussian_amplitude / count * np.exp(-((normalized_x - center) ** 2) / (2.0 * sigma**2))
     shape += _finite(values, "pressure_bc.linear_amp") * (2.0 * normalized_x - 1.0)
-    inlet = _finite(values, "pressure_bc.mean") * (1.0 + shape)
+    inlet = base * (1.0 + shape)
     if not np.isfinite(inlet).all() or np.any(inlet <= 0.0):
         msg = "Generated inlet pressure must remain finite and strictly positive without clipping."
         raise ValueError(msg)
     field = np.zeros_like(x_grid)
     field[0, :] = inlet
-    return field, {"minimum": float(np.min(inlet)), "maximum": float(np.max(inlet)), "unit": "Pa"}
+    return field, {
+        "base": base,
+        "base_formula": f"airflow.superficial_velocity*mu*Ly/kappa_mean with mu={domain.physics.contracts.AIR_DYNAMIC_VISCOSITY!r} Pa*s",
+        "minimum": float(np.min(inlet)),
+        "maximum": float(np.max(inlet)),
+        "unit": "Pa",
+    }
 
 
 def _initial_moisture(
@@ -687,6 +705,7 @@ def _generate_spatial_fields_once(
     )
     pressure, pressure_metadata = _pressure_boundary(
         x_grid,
+        length_y=length_y,
         values=values,
         random=np.random.default_rng(seeds["pressure_bc"]),
     )

@@ -200,7 +200,8 @@ def warm_up_forward(
         raise TypeError(msg)
     model.eval()
     with torch.inference_mode():
-        normalized_inputs = scaling.encode_inputs(raw_inputs.to(device))
+        inputs = raw_inputs.to(device)
+        normalized_inputs = scaling.encode_inputs(inputs, reference=scaling.state_reference(inputs))
         for _ in range(passes):
             synchronize_device(device)
             model(normalized_inputs)

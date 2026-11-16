@@ -11,7 +11,8 @@ Responsibilities:
   - Build tab sets whose headers are equally wide and fit the longest title
 
 Design principles:
-  - A popover body is a child of the panel, never of a row, so a sideways scrolled row cannot misplace or clip it
+  - A popover body is a child of the panel's overlay cell, never of a row, so a sideways scrolled row cannot misplace or clip it
+  - An open body shows all its rows: the overlay cell grows with it and the page scrolls, nothing scrolls inside the body
   - A panel refuses anything but rows and refuses stacked radio groups (rule 18)
   - The plot's top-left corner depends only on the panel's row count, never on what a row shows
   - No output widget and no output capture: a slot swaps its children, so a redraw sends plain widget state only
@@ -212,29 +213,40 @@ def control_rows(rows: Sequence[widgets.Widget]) -> widgets.VBox:
     return block
 
 
-def popover_bodies(rows: Sequence[widgets.Widget], popovers: Sequence[tuple[widgets.ToggleButton, widgets.DOMWidget]]) -> tuple[widgets.Widget, ...]:
+def popover_overlay(
+    content: widgets.Widget, rows: Sequence[widgets.Widget], popovers: Sequence[tuple[widgets.ToggleButton, widgets.DOMWidget]]
+) -> widgets.GridBox:
     """
-    Place each popover body directly below its header's row and return the bodies to add to the panel (F2).
+    Return ``content`` and the popover bodies in one grid cell, each body directly below its header's row (F2).
 
-    A body gets ``left: 0`` and ``top = (row index + 1) * row pitch``; opening one body closes the others.
+    A body gets ``margin-top = (row index + 1) * row pitch`` and overlays the content without moving it; the cell is
+    as tall as the larger of content and body, so an open body is never clipped and the panel grows instead.
+    Opening one body closes the others. Nothing is changed when a call raises.
 
     Raises
     ------
     ValueError
-        If a header is in none of ``rows``.
+        If a header is in none of ``rows``, or more than one header is already open.
 
     """
     headers = [header for header, _body in popovers]
-    bodies: list[widgets.Widget] = []
-    for header, body in popovers:
+    indices: list[int] = []
+    for header in headers:
         index = next((position for position, candidate in enumerate(rows) if _contains(candidate, header)), None)
         if index is None:
             message = "A popover header must stand in one of the panel's rows."
             raise ValueError(message)
+        indices.append(index)
+    if sum(bool(header.value) for header in headers) > 1:
+        message = "At most one popover body may start open."
+        raise ValueError(message)
+    content.layout.grid_area = "1 / 1"
+    cell: list[widgets.Widget] = [content]
+    for (header, body), index in zip(popovers, indices, strict=True):
         body.add_class("glp-popover")
-        body.layout.left = "0px"
-        body.layout.top = f"{(index + 1) * style.ROW_PITCH_PX}px"
-        bodies.append(body)
+        body.layout.grid_area = "1 / 1"
+        body.layout.margin = f"{(index + 1) * style.ROW_PITCH_PX}px 0 0 0"
+        cell.append(body)
 
         def close_others(change: dict[str, Any], header: widgets.ToggleButton = header) -> None:
             if change["new"]:
@@ -243,7 +255,7 @@ def popover_bodies(rows: Sequence[widgets.Widget], popovers: Sequence[tuple[widg
                         other.value = False
 
         header.observe(close_others, names="value")
-    return tuple(bodies)
+    return widgets.GridBox(tuple(cell))
 
 
 class ViewPanel:
@@ -277,8 +289,8 @@ class ViewPanel:
         children: list[widgets.Widget] = [control_rows(self.rows), self.status.widget, self.failure.widget]
         if slot is not None:
             children.append(slot.widget)
-        children.extend(popover_bodies(self.rows, popovers))
-        self.widget = widgets.VBox(tuple(children))
+        self.content = widgets.VBox(tuple(children))
+        self.widget: widgets.Box = popover_overlay(self.content, self.rows, popovers) if popovers else self.content
         self.widget.add_class(style.ROOT_CLASS)
         self.widget.add_class("glp-panel")
         self._on_activate = on_activate

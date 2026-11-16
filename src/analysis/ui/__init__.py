@@ -4,6 +4,7 @@ Reusable notebook controls, viewers, and panel composition.
 Provides:
 - catalog: synthetic catalog of the control standard for the plot-standard notebook
 - controls: primitive controls of the control standard, sized on the column grid
+- figure_layout: panel grids, text sizes, legends, row labels and titles of line, bar, and distribution figures
 - navigation: case, time, and count navigators
 - notebook: notebook-panel construction utilities
 - panel: control rows, view panels, popovers, on-demand views, and tab sets
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import analysis_ui_catalog as catalog
     from . import analysis_ui_controls as controls
+    from . import analysis_ui_figure_layout as figure_layout
     from . import analysis_ui_navigation as navigation
     from . import analysis_ui_notebook as notebook
     from . import analysis_ui_panel as panel
@@ -36,6 +38,7 @@ if TYPE_CHECKING:
 _MODULES = {
     "catalog": "analysis_ui_catalog",
     "controls": "analysis_ui_controls",
+    "figure_layout": "analysis_ui_figure_layout",
     "navigation": "analysis_ui_navigation",
     "notebook": "analysis_ui_notebook",
     "panel": "analysis_ui_panel",
@@ -49,6 +52,7 @@ _MODULES = {
 __all__ = [
     "catalog",
     "controls",
+    "figure_layout",
     "navigation",
     "notebook",
     "panel",

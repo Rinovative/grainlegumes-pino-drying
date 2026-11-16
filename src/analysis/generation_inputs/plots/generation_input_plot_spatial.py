@@ -1,15 +1,18 @@
 """Render coordinated A/B/B-minus-A blocks for generation-input fields.
 
 Responsibilities:
-  - Group maintained channels as rows under three fixed map columns
+  - Group maintained channels as rows of the shared map grid under three columns headed once: Case A, Case B, and
+    Case B minus Case A, each row named once at its left and the figure title carrying the scale state
   - Use independent A/B physical scales unless the local scale lock is enabled
-  - Give every map its own axes-coupled colorbar
-  - Compose two-column distributions, pressure lines, and embedded summaries
+  - Give every map its own unit-bearing slot colour bar as tall as the map
+  - Compose a lower band under the maps with one distribution per field, pressure lines, embedded summaries and
+    optional side plots, whose legends stand inside their axes
 
 Design principles:
   - B-minus-A remains physical, symmetric, and exactly centred at zero; maps, differences and distributions use the
     shared display scales (relative humidity in %, its differences in pp) under the active label style
-  - Distribution axes never participate in map colorbar geometry
+  - The lower band's panels are as wide as the maps together and never take part in the map grid
+  - Summary-table numbers are written compactly and in columns wide enough that they never overlap
   - Incompatible grids are reported without interpolation or resampling
 
 This module does NOT:
@@ -19,6 +22,8 @@ This module does NOT:
 
 from __future__ import annotations
 
+import re
+import textwrap
 from typing import TYPE_CHECKING, Final
 
 import ipywidgets as widgets
@@ -30,6 +35,7 @@ from src.analysis.generation_inputs import generation_input_diagnostics as diagn
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_histograms as histograms
+from src.analysis.ui import analysis_ui_plot_layout as shared_layout
 from src.analysis.ui import tables
 
 from . import generation_input_plot_layout as layout
@@ -39,10 +45,19 @@ if TYPE_CHECKING:
 
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
+    from matplotlib.gridspec import GridSpec
 
+_MAP_COLUMNS: Final = 3  # Case A, Case B, Case B minus Case A
+_ROW_LABEL_WIDTH: Final = 16  # characters per line of a row label: a long field name stays within its map's height
+_MATH_SPAN: Final = re.compile(r"\$[^$]*\$")  # a mathtext span, which a row label never splits
 _MINIMUM_SIDE_PLOT_ROWS: Final = 2
 _SUMMARY_VALUE_COLUMN_COUNT: Final = 4
-_SUMMARY_LABEL_COLUMN_FRACTION: Final = 0.52
+# The summary column of the lower band: its longest row label (2.0 in) and its widest number (-1.234e-10, 0.61 in) each fit
+# their cell inside the cell padding at the table font.
+_SUMMARY_WIDTH_IN: Final = 6.0
+_SUMMARY_ROW_HEIGHT_IN: Final = 0.34  # every row of the summary table, the two-line header included; the table sits at the top of its column
+_LOWER_GAP_IN: Final = 0.5  # the lower band's plots to its summary column
+_SUMMARY_LABEL_COLUMN_FRACTION: Final = 0.45
 _SUMMARY_VALUE_COLUMN_FRACTION: Final = (1.0 - _SUMMARY_LABEL_COLUMN_FRACTION) / _SUMMARY_VALUE_COLUMN_COUNT
 _SUMMARY_COLUMN_WIDTHS: Final = (
     _SUMMARY_LABEL_COLUMN_FRACTION,
@@ -104,6 +119,9 @@ def _draw_distribution(
 ) -> None:
     """Draw A/B field distributions and unambiguous dataset-mean markers on the display scale."""
     first_values, second_values = layout.display_field(first, quantity), layout.display_field(second, quantity)
+    exponent = layout.histogram_exponent(first_values, second_values)
+    scale = 10.0**exponent
+    first_values, second_values = first_values / scale, second_values / scale
     lower, upper = _histogram_bounds(first_values, second_values)
     bins = tuple(float(value) for value in np.linspace(lower, upper, 31))
     histograms.plot_histogram(
@@ -123,7 +141,7 @@ def _draw_distribution(
         label=_case_plot_label(second, "B"),
     )
     first_mean, second_mean = (
-        diagnostics.display_value(quantity, dataset.field_summary_means[(quantity, "mean")], diagnostics.FIELD_UNITS[quantity])
+        diagnostics.display_value(quantity, dataset.field_summary_means[(quantity, "mean")], diagnostics.FIELD_UNITS[quantity]) / scale
         for dataset in (mean_a, mean_b)
     )
     if same_dataset:
@@ -150,17 +168,18 @@ def _draw_distribution(
             label=f"Mean B, n = {mean_b.case_count}",
         )
     axis.set_xlabel(
-        layout.quantity_axis_label(quantity),
-        fontsize=layout.MAP_LAYOUT.label_size,
+        layout.quantity_axis_label(quantity, exponent),
+        fontsize=layout.FIGURE_LAYOUT.label_size,
     )
-    axis.set_ylabel("Cell count", fontsize=layout.MAP_LAYOUT.label_size)
+    axis.ticklabel_format(axis="x", style="plain", useOffset=False)  # the power of ten stands in the unit bracket, never as offset text
+    axis.set_ylabel("Cell count", fontsize=layout.FIGURE_LAYOUT.label_size)
     axis.set_title(
         f"{layout.quantity_label(quantity)} distribution",
-        fontsize=layout.MAP_LAYOUT.axis_title_size,
+        fontsize=layout.FIGURE_LAYOUT.axis_title_size,
     )
-    axis.tick_params(labelsize=layout.MAP_LAYOUT.tick_size)
+    axis.tick_params(labelsize=layout.FIGURE_LAYOUT.tick_size)
     axis.grid(alpha=0.22)
-    axis.legend(fontsize=layout.MAP_LAYOUT.legend_size, ncols=2)
+    axis.legend(fontsize=layout.FIGURE_LAYOUT.legend_size, ncols=2)
 
 
 def _formatted_table_value(value: object) -> str:
@@ -205,16 +224,22 @@ def _draw_summary_table(
         f"Case {second.case.case_index}\n(B)",
         f"Mean B\n(n={mean_b.case_count})",
     )
+    figure = axis.get_figure()
+    if figure is None:
+        msg = "The summary table needs an axis on a figure."
+        raise RuntimeError(msg)
+    axis_height_in = axis.get_position().height * figure.bbox.height / figure.dpi
+    height = min(1.0, (len(cell_text) + 1) * _SUMMARY_ROW_HEIGHT_IN / axis_height_in)
     artist = axis.table(
         cellText=cell_text,
         colLabels=column_labels,
         cellLoc="center",
         colLoc="center",
         colWidths=_SUMMARY_COLUMN_WIDTHS,
-        bbox=Bbox.from_bounds(0.0, 0.0, 1.0, 1.0),
+        bbox=Bbox.from_bounds(0.0, 1.0 - height, 1.0, height),
     )
     artist.auto_set_font_size(False)
-    artist.set_fontsize(layout.MAP_LAYOUT.table_size)
+    artist.set_fontsize(layout.FIGURE_LAYOUT.table_size)
     value_colors = tables.row_local_color_matrix(table)
     for (row, column), cell in artist.get_celld().items():
         if row == 0:
@@ -230,33 +255,10 @@ def _draw_summary_table(
                 cell.set_text_props(color=cell_colors.foreground)
 
 
-def _apply_map_axis_labels(
-    axes: Sequence[Sequence[Axes]],
-) -> None:
-    """Keep coordinate labels only on the outer edges of one map grid."""
-    rows = tuple(tuple(row) for row in axes)
-    for row_index, row in enumerate(rows):
-        for column_index, axis in enumerate(row):
-            bottom = row_index == len(rows) - 1
-            left = column_index == 0
-            axis.set_xlabel(
-                "x [m]" if bottom else "",
-                fontsize=layout.MAP_LAYOUT.label_size,
-            )
-            axis.set_ylabel(
-                "y [m]" if left else "",
-                fontsize=layout.MAP_LAYOUT.label_size,
-            )
-            axis.tick_params(
-                axis="x",
-                labelbottom=bottom,
-                labelsize=layout.MAP_LAYOUT.tick_size,
-            )
-            axis.tick_params(
-                axis="y",
-                labelleft=left,
-                labelsize=layout.MAP_LAYOUT.tick_size,
-            )
+def _row_label(label: str) -> str:
+    """Wrap a row label between words to lines of ``_ROW_LABEL_WIDTH`` characters, never inside a mathtext span."""
+    protected = _MATH_SPAN.sub(lambda match: match.group(0).replace(" ", "\0"), label)
+    return textwrap.fill(protected, _ROW_LABEL_WIDTH, break_long_words=False, break_on_hyphens=False).replace("\0", " ")
 
 
 def _spatial_incompatibility(
@@ -278,7 +280,8 @@ def _spatial_incompatibility(
 
 def _draw_comparison_map_row(
     figure: Figure,
-    axes: tuple[Axes, Axes, Axes],
+    axes: np.ndarray,
+    slots: np.ndarray,
     first: diagnostics.GenerationInputDiagnostics,
     second: diagnostics.GenerationInputDiagnostics,
     quantity: str,
@@ -286,70 +289,67 @@ def _draw_comparison_map_row(
     lock_scale: bool,
     display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> None:
-    """Draw one actual-case A/B/difference row with independent colorbars."""
+    """Draw one actual-case A/B/difference row of the shared map grid, every map with its own unit-bearing colour bar."""
     difference = field_labels.display_values(
         diagnostics.compatible_field_difference(first, second, quantity),
         diagnostics.FIELD_UNITS[quantity],
         field=quantity,
         quantity_kind="difference",
     )
-    first_norm, second_norm = layout.comparison_norms(
-        quantity,
-        layout.display_field(first, quantity),
-        layout.display_field(second, quantity),
-        lock_scale=lock_scale,
+    first_values, second_values = layout.display_field(first, quantity), layout.display_field(second, quantity)
+    first_norm, second_norm = layout.comparison_norms(quantity, first_values, second_values, lock_scale=lock_scale)
+    unit = layout.quantity_colorbar_label(quantity)
+    for axis, slot, values, norm, label in (
+        (axes[0], slots[0], first_values, first_norm, unit),
+        (axes[1], slots[1], second_values, second_norm, unit),
+        (axes[2], slots[2], difference, layout.signed_norm(difference), layout.quantity_colorbar_label(quantity, difference=True)),
+    ):
+        image = layout.draw_field(axis, first, values, norm, display_spatial_stride=display_spatial_stride)
+        shared_layout.add_field_map_colorbar(figure, image, slot, norm, label=label)
+
+
+def _draw_map_rows(
+    first: diagnostics.GenerationInputDiagnostics,
+    second: diagnostics.GenerationInputDiagnostics,
+    quantities: Sequence[str],
+    *,
+    lower_rows: int,
+    lock_scale: bool,
+    display_spatial_stride: display_grid.DisplayStride,
+) -> tuple[Figure, GridSpec]:
+    """
+    Draw the A, B and B-minus-A map rows on the shared map grid and return the figure with the grid of its lower band.
+
+    The columns are headed once above the first row and each row is named once at its left. The lower band below the maps
+    holds ``lower_rows`` rows of ``FIGURE_LAYOUT.distribution_row_height`` as two columns: wide plots on the left, the
+    summary column of ``_SUMMARY_WIDTH_IN`` on the right, together as wide as the maps.
+    """
+    extent = display_grid.physical_extent(first.fields["x"], first.fields["y"])
+    row_height = layout.FIGURE_LAYOUT.distribution_row_height
+    below_in = lower_rows * row_height + (lower_rows - 1) * shared_layout.BAND_GAP_V_IN
+    geometry = shared_layout.plan_geometry(len(quantities), _MAP_COLUMNS, (extent[1] - extent[0], extent[3] - extent[2]), below_in=below_in)
+    figure, axes, slots = shared_layout.map_grid(geometry, extent=extent)
+    for row, quantity in enumerate(quantities):
+        _draw_comparison_map_row(
+            figure, axes[row], slots[row], first, second, quantity, lock_scale=lock_scale, display_spatial_stride=display_spatial_stride
+        )
+    case_a, case_b = first.case.case_index, second.case.case_index
+    difference_header = f"Case {case_b} (B) \N{MINUS SIGN} Case {case_a} (A)"
+    shared_layout.set_column_headers(axes, (f"Case {case_a} (A)", f"Case {case_b} (B)", difference_header), ())
+    shared_layout.set_row_labels(axes, [_row_label(layout.quantity_label(quantity)) for quantity in quantities])
+    left, bottom, width, height = shared_layout.band_rect(geometry, "below")
+    lower = figure.add_gridspec(
+        lower_rows,
+        2,
+        left=left,
+        right=left + width,
+        bottom=bottom,
+        top=bottom + height,
+        width_ratios=(geometry.grid_width - _SUMMARY_WIDTH_IN - _LOWER_GAP_IN, _SUMMARY_WIDTH_IN),
+        wspace=2.0 * _LOWER_GAP_IN / (geometry.grid_width - _LOWER_GAP_IN),
+        hspace=shared_layout.BAND_GAP_V_IN / row_height,
     )
-    difference_norm = layout.signed_norm(difference)
-    first_image = layout.draw_map(
-        axes[0],
-        first,
-        quantity,
-        title=(f"Case {first.case.case_index}\n{layout.quantity_label(quantity)}"),
-        norm=first_norm,
-        display_spatial_stride=display_spatial_stride,
-    )
-    second_image = layout.draw_map(
-        axes[1],
-        second,
-        quantity,
-        title=(f"Case {second.case.case_index}\n{layout.quantity_label(quantity)}"),
-        norm=second_norm,
-        display_spatial_stride=display_spatial_stride,
-    )
-    difference_image = layout.draw_array_map(
-        axes[2],
-        first.fields["x"],
-        first.fields["y"],
-        difference,
-        title=(f"Case {second.case.case_index} - Case {first.case.case_index}\n{layout.quantity_label(quantity)}"),
-        norm=difference_norm,
-        display_spatial_stride=display_spatial_stride,
-    )
-    if lock_scale and first_image.norm is not second_image.norm:
-        msg = "Locked A/B maps must share the exact normalization object."
-        raise RuntimeError(msg)
-    if not lock_scale and first_image.norm is second_image.norm:
-        msg = "Unlocked A/B maps must retain independent normalizations."
-        raise RuntimeError(msg)
-    colorbar_label = layout.quantity_colorbar_label(quantity)
-    layout.add_map_colorbar(
-        figure,
-        first_image,
-        axes[0],
-        label=colorbar_label,
-    )
-    layout.add_map_colorbar(
-        figure,
-        second_image,
-        axes[1],
-        label=colorbar_label,
-    )
-    layout.add_map_colorbar(
-        figure,
-        difference_image,
-        axes[2],
-        label=layout.quantity_colorbar_label(quantity, difference=True),
-    )
+    return figure, lower
 
 
 def _pressure_line(
@@ -394,14 +394,14 @@ def _draw_pressure_comparison(
         first_x,
         first_values,
         color=layout.DATASET_A_COLOR,
-        linewidth=layout.MAP_LAYOUT.line_width,
+        linewidth=layout.FIGURE_LAYOUT.line_width,
         label=_case_plot_label(first, "A"),
     )
     axis.plot(
         second_x,
         second_values,
         color=layout.DATASET_B_COLOR,
-        linewidth=layout.MAP_LAYOUT.line_width,
+        linewidth=layout.FIGURE_LAYOUT.line_width,
         label=_case_plot_label(second, "B"),
     )
     mean_a_x, mean_a_values = _dataset_pressure_line(mean_a)
@@ -414,7 +414,7 @@ def _draw_pressure_comparison(
             mean_a_values,
             color=layout.DATASET_MEAN_COLOR,
             linestyle="--",
-            linewidth=layout.MAP_LAYOUT.line_width,
+            linewidth=layout.FIGURE_LAYOUT.line_width,
             label=f"Dataset mean, n = {mean_a.case_count}",
         )
     else:
@@ -427,7 +427,7 @@ def _draw_pressure_comparison(
             mean_a_values,
             color=layout.DATASET_A_COLOR,
             linestyle="--",
-            linewidth=layout.MAP_LAYOUT.line_width,
+            linewidth=layout.FIGURE_LAYOUT.line_width,
             label=f"Mean A, n = {mean_a.case_count}",
         )
         axis.plot(
@@ -435,21 +435,21 @@ def _draw_pressure_comparison(
             mean_b_values,
             color=layout.DATASET_B_COLOR,
             linestyle="--",
-            linewidth=layout.MAP_LAYOUT.line_width,
+            linewidth=layout.FIGURE_LAYOUT.line_width,
             label=f"Mean B, n = {mean_b.case_count}",
         )
-    axis.set_xlabel("x [m]", fontsize=layout.MAP_LAYOUT.label_size)
+    axis.set_xlabel("x [m]", fontsize=layout.FIGURE_LAYOUT.label_size)
     axis.set_ylabel(
         "Inlet pressure [Pa]",
-        fontsize=layout.MAP_LAYOUT.label_size,
+        fontsize=layout.FIGURE_LAYOUT.label_size,
     )
     axis.set_title(
         "Inlet pressure boundary",
-        fontsize=layout.MAP_LAYOUT.axis_title_size,
+        fontsize=layout.FIGURE_LAYOUT.axis_title_size,
     )
-    axis.tick_params(labelsize=layout.MAP_LAYOUT.tick_size)
+    axis.tick_params(labelsize=layout.FIGURE_LAYOUT.tick_size)
     axis.grid(alpha=0.22)
-    axis.legend(fontsize=layout.MAP_LAYOUT.legend_size, ncols=2)
+    axis.legend(fontsize=layout.FIGURE_LAYOUT.legend_size, ncols=2)
 
 
 def basic_comparison(
@@ -461,76 +461,21 @@ def basic_comparison(
     lock_scale: bool,
     display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure | widgets.HTML:
-    """Render a porosity map row, compact distribution, pressure line, and table."""
+    """Render a porosity map row with a lower band of the compact distribution, the pressure line, and the table."""
     quantities = ("eps_bed", "p_in_bc")
     _validate_quantities(first, quantities)
     _validate_quantities(second, quantities)
     incompatibility = _spatial_incompatibility(first, second, quantities)
     if incompatibility is not None:
         return widgets.HTML(f"<p><b>Spatial comparison unavailable.</b> {incompatibility} Scalar field summaries remain available.</p>")
-    figure, grid = layout.figure_grid(
-        columns=3,
-        row_heights=(
-            layout.MAP_LAYOUT.composite_map_row_height,
-            layout.MAP_LAYOUT.distribution_row_height,
-            layout.MAP_LAYOUT.distribution_row_height,
-        ),
-    )
-    map_axes = (
-        figure.add_subplot(grid[0, 0]),
-        figure.add_subplot(grid[0, 1]),
-        figure.add_subplot(grid[0, 2]),
-    )
-    _draw_comparison_map_row(
-        figure,
-        map_axes,
-        first,
-        second,
-        "eps_bed",
-        lock_scale=lock_scale,
-        display_spatial_stride=display_spatial_stride,
-    )
-    _apply_map_axis_labels((map_axes,))
+    figure, lower = _draw_map_rows(first, second, ("eps_bed",), lower_rows=2, lock_scale=lock_scale, display_spatial_stride=display_spatial_stride)
     same_dataset = mean_a.batch_identity == mean_b.batch_identity
-    distribution_axis = figure.add_subplot(grid[1, :2])
-    _draw_distribution(
-        distribution_axis,
-        first,
-        mean_a,
-        second,
-        mean_b,
-        "eps_bed",
-        same_dataset=same_dataset,
-    )
-    pressure_axis = figure.add_subplot(grid[2, :2])
-    _draw_pressure_comparison(
-        pressure_axis,
-        first,
-        mean_a,
-        second,
-        mean_b,
-        same_dataset=same_dataset,
-    )
-    summary_axis = figure.add_subplot(grid[1:, 2])
-    _draw_summary_table(
-        summary_axis,
-        diagnostics.field_summary_comparison_table(
-            first,
-            mean_a,
-            second,
-            mean_b,
-            quantities=quantities,
-        ),
-        first,
-        mean_a,
-        second,
-        mean_b,
-    )
+    _draw_distribution(figure.add_subplot(lower[0, 0]), first, mean_a, second, mean_b, "eps_bed", same_dataset=same_dataset)
+    _draw_pressure_comparison(figure.add_subplot(lower[1, 0]), first, mean_a, second, mean_b, same_dataset=same_dataset)
+    table = diagnostics.field_summary_comparison_table(first, mean_a, second, mean_b, quantities=quantities)
+    _draw_summary_table(figure.add_subplot(lower[:, 1]), table, first, mean_a, second, mean_b)
     scale_state = "locked A/B scales" if lock_scale else "independent A/B scales"
-    figure.suptitle(
-        f"Basic spatial inputs — {scale_state}",
-        fontsize=layout.MAP_LAYOUT.title_size,
-    )
+    shared_layout.set_map_title(figure, f"Basic spatial inputs — {scale_state}")
     return figure
 
 
@@ -543,105 +488,36 @@ def comparison_block(
     *,
     title: str,
     lock_scale: bool,
-    include_distributions: bool = True,
-    side_plot: Callable[[Axes, Axes], None] | None = None,
+    side_plot: Callable[[Axes], None] | None = None,
     display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure | widgets.HTML:
     """
-    Render A/B/difference maps above two-column distributions and a summary.
+    Render A/B/difference map rows above a lower band of one distribution per field and a summary table.
 
-    Each map retains its own axes-coupled colorbar. Optional side content is
-    placed below the compact summary within the third lower column.
+    Each map has its own unit-bearing colour bar. Optional side content is drawn in the lower band's summary column below
+    the compact summary, with its legend inside its axis.
     """
     selected = _validate_quantities(first, quantities)
     _validate_quantities(second, selected)
     incompatibility = _spatial_incompatibility(first, second, selected)
     if incompatibility is not None:
         return widgets.HTML(f"<p><b>Spatial comparison unavailable.</b> {incompatibility} Scalar field summaries remain available.</p>")
-    lower_row_count = len(selected) if include_distributions else 1
-    row_heights = (layout.MAP_LAYOUT.composite_map_row_height,) * len(selected) + (layout.MAP_LAYOUT.distribution_row_height,) * lower_row_count
-    figure, grid = layout.figure_grid(
-        columns=3,
-        row_heights=row_heights,
+    if side_plot is not None and len(selected) < _MINIMUM_SIDE_PLOT_ROWS:
+        msg = "A side plot requires at least two lower distribution rows."
+        raise ValueError(msg)
+    figure, lower = _draw_map_rows(
+        first, second, selected, lower_rows=len(selected), lock_scale=lock_scale, display_spatial_stride=display_spatial_stride
     )
-    map_axes = []
-    for row, quantity in enumerate(selected):
-        axes = (
-            figure.add_subplot(grid[row, 0]),
-            figure.add_subplot(grid[row, 1]),
-            figure.add_subplot(grid[row, 2]),
-        )
-        map_axes.append(axes)
-        _draw_comparison_map_row(
-            figure,
-            axes,
-            first,
-            second,
-            quantity,
-            lock_scale=lock_scale,
-            display_spatial_stride=display_spatial_stride,
-        )
-    _apply_map_axis_labels(map_axes)
-    lower_start = len(selected)
     same_dataset = mean_a.batch_identity == mean_b.batch_identity
-    distribution_axes: list[Axes] = []
-    if include_distributions:
-        for offset, quantity in enumerate(selected):
-            axis = figure.add_subplot(grid[lower_start + offset, :2])
-            distribution_axes.append(axis)
-            _draw_distribution(
-                axis,
-                first,
-                mean_a,
-                second,
-                mean_b,
-                quantity,
-                same_dataset=same_dataset,
-            )
-    else:
-        empty_axis = figure.add_subplot(grid[lower_start, :2])
-        empty_axis.set_axis_off()
+    for row, quantity in enumerate(selected):
+        _draw_distribution(figure.add_subplot(lower[row, 0]), first, mean_a, second, mean_b, quantity, same_dataset=same_dataset)
     if side_plot is None:
-        summary_axis = figure.add_subplot(grid[lower_start:, 2])
+        summary_axis = figure.add_subplot(lower[:, 1])
     else:
-        if not include_distributions or lower_row_count < _MINIMUM_SIDE_PLOT_ROWS:
-            msg = "A side plot requires at least two lower distribution rows."
-            raise ValueError(msg)
-        summary_axis = figure.add_subplot(grid[lower_start, 2])
-        relation_grid = grid[lower_start + 1 :, 2].subgridspec(
-            2,
-            1,
-            height_ratios=layout.MAP_LAYOUT.relation_height_ratios,
-            hspace=layout.MAP_LAYOUT.relation_vertical_spacing,
-        )
-        side_axis = figure.add_subplot(relation_grid[0, 0])
-        legend_axis = figure.add_subplot(relation_grid[1, 0])
-        legend_axis.set_axis_off()
-        side_plot(side_axis, legend_axis)
-    _draw_summary_table(
-        summary_axis,
-        diagnostics.field_summary_comparison_table(
-            first,
-            mean_a,
-            second,
-            mean_b,
-            quantities=selected,
-        ),
-        first,
-        mean_a,
-        second,
-        mean_b,
-    )
-    if side_plot is not None:
-        layout.align_axis_to_references(
-            figure,
-            summary_axis,
-            distribution_axes[0],
-            right_reference=side_axis,
-        )
+        summary_axis = figure.add_subplot(lower[0, 1])
+        side_plot(figure.add_subplot(lower[1:, 1]))
+    table = diagnostics.field_summary_comparison_table(first, mean_a, second, mean_b, quantities=selected)
+    _draw_summary_table(summary_axis, table, first, mean_a, second, mean_b)
     scale_state = "locked A/B scales" if lock_scale else "independent A/B scales"
-    figure.suptitle(
-        f"{title} — {scale_state}",
-        fontsize=layout.MAP_LAYOUT.title_size,
-    )
+    shared_layout.set_map_title(figure, f"{title} — {scale_state}")
     return figure

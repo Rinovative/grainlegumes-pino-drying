@@ -17,13 +17,19 @@ Grid and horizon are physical model inputs from `configs/01_generation/physical_
 
 ## Model
 
-The two profiles share one physical description and are solved in sequence: the steady profile gives the airflow, the transient profile adds vapour transport, heat transfer and grain moisture on that fixed airflow.
+The two profiles share one physical description and are solved in sequence: the steady profile gives the airflow, the transient profile adds vapour transport, heat transfer and grain moisture on that fixed airflow. The flow is frozen: the template first solves a stationary Brinkman problem with the air properties (viscosity, density) at the reference temperature $T_\mathrm{flow,ref}$ (`T_flow_ref`, `common.yaml:74`) and pressure `p_ref`; the transient step then solves moisture, heat and the grain moisture ODEs on that fixed velocity field and never re-solves the flow.
 
 ### Airflow
 
 The steady profile solves Darcy–Brinkman airflow with heterogeneous permeability `kappa(x)` (tensor $\mathbf K$), porosity $\varepsilon(x)$ and an inlet pressure that varies along x on the inlet edge y = 0 (`p_in_bc`; outlet gauge zero at y = $L_y$). The result $(p, u, v)$ is the steady-flow learning target and the fixed airflow of the transient profile. With viscosity $\mu$ and velocity $\mathbf u$, the momentum residual (as in COMSOL's Brinkman interface for incompressible flow, `src/domain/physics/domain_physics_brinkman.py:25-26`) and the mass balance are
 
 $$\mathbf R=-\nabla p+\nabla\!\cdot\boldsymbol\tau-\mu\,\mathbf K^{-1}\mathbf u=0,\qquad \boldsymbol\tau=\tfrac{\mu}{\varepsilon}\Big(\nabla\mathbf u+\nabla\mathbf u^{\mathsf T}-\tfrac23(\nabla\!\cdot\mathbf u)\,\mathbf I\Big),\qquad \nabla\!\cdot\mathbf u=0 .$$
+
+The airflow level is sampled as a target mean superficial velocity $\bar v_\mathrm s$ (`airflow.superficial_velocity`, ID 0.05–0.30 m/s, OOD 0.40–0.65 m/s), not as a pressure. Generation derives the base inlet pressure per case by Darcy's law on the drawn mean permeability $\bar\kappa$ (`kappa_mean`), with $\mu$ = 1.85075·10⁻⁵ Pa·s (COMSOL air at the template's flow temperature, `src/domain/physics/domain_physics_contracts.py`), and shapes the inlet profile around it:
+
+$$\bar p_\mathrm{in}=\frac{\bar v_\mathrm s\,\mu\,L_y}{\bar\kappa},\qquad p_\mathrm{in,bc}(x)=\bar p_\mathrm{in}\,\big(1+s(x)\big),$$
+
+where $s(x)$ is the sum of the sinusoidal, Gaussian and linear shape terms (`pressure_bc.*`); these terms are not mean-free, so $\bar p_\mathrm{in}$ is not the realised inlet mean. The base pressure is neither capped nor used to reject cases; each case records it with its formula (`spatial_diagnostics.pressure_boundary.base`). Heterogeneity, anisotropy, the shape terms and the Brinkman term move the realised mean superficial velocity away from $\bar v_\mathrm s$; the pilot Generation checks that it stays mostly within about 20 %. With Forchheimer drag the formula would gain $\rho\,\beta\,L_y\,\bar v_\mathrm s^2$.
 
 The sampled permeability scale $\bar\kappa$ (`kappa_mean`) is coupled to packing porosity through a material-calibrated Kozeny–Carman reference trend. With the material reference porosity $\varepsilon_\mathrm{bed,ref}$ (`eps_bed_ref`) and nominal permeability $\kappa_\mathrm{nom}$:
 
@@ -68,6 +74,23 @@ $$X_\mathrm{wb}=\frac{X_\mathrm{db}}{1+X_\mathrm{db}},\qquad X_\mathrm{db}=\frac
 
 Realized packing adjusts the dry bulk density.
 
+### Heat and vapour transport
+
+Grain and air share one temperature field $T$ (local thermal equilibrium). The bed conducts heat with the Maxwell–Eucken effective conductivity, grain as continuous phase and air as dispersed phase at bed porosity $\varepsilon_\mathrm{bed}$, with grain conductivity $k_\mathrm{gr}$ (`k_gr`) and the local air conductivity $k_\mathrm{air}$. Vapour diffuses in the moist air with the free-air coefficient `D_v_air` reduced by COMSOL's Bruggeman model for the effective diffusivity (the template names the model; its exponent is not stored there).
+
+$$k_\mathrm{eff}=k_\mathrm{gr}\,\frac{2k_\mathrm{gr}+k_\mathrm{air}-2\varepsilon_\mathrm{bed}\,(k_\mathrm{gr}-k_\mathrm{air})}{2k_\mathrm{gr}+k_\mathrm{air}+\varepsilon_\mathrm{bed}\,(k_\mathrm{gr}-k_\mathrm{air})} .$$
+
+Only the two lateral walls lose heat to the surroundings; inlet and outlet carry the inflow and outflow conditions. With outward normal $\mathbf n$, the external temperature $T_\mathrm{amb}$ (`T_amb`) and the overall coefficient $U_\mathrm{wall}$ (derived in `common.yaml`, `scientific_fixed_values.U_wall`, from wall thickness `d_wall`, wall conductivity `k_wall` and external coefficient `h_ext`):
+
+$$k_\mathrm{eff}\,\partial_n T=U_\mathrm{wall}\,(T_\mathrm{amb}-T),\qquad U_\mathrm{wall}=\Big(\frac{d_\mathrm{wall}}{k_\mathrm{wall}}+\frac{1}{h_\mathrm{ext}}\Big)^{-1}.$$
+
+<details>
+<summary>Template check and copies of fixed values</summary>
+
+Read from `simulation/transient_drying/transient_drying_template.mph`: the convective heat flux (`U_wall`, `T_amb`) acts on boundaries 1 and 4 (the side walls); boundary 2 is the inlet (`p_in_bc`, `T_in_bc`), boundary 3 the outlet. The moist-air feature selects the Bruggeman model; the heat equation uses the equivalent conductivity `k_eff` above. The template computes `U_wall` itself from its own `d_wall`, `k_wall` and `h_ext`. It holds its own copies of the fixed values of `common.yaml` (equal today), and Generation passes only the case scalars, the grid and the horizon, so editing such a value in the YAML changes the record, not the COMSOL run. The vapour and heat equations are those of COMSOL's built-in interfaces «Equilibrium Moisture Transport in Porous Media» and «Heat Transfer in Moist Porous Media»; the file stores their settings, not the equations, so they are not restated here.
+
+</details>
+
 ### Inlet
 
 The inlet schedule is a semicolon-separated CSV with two header lines:
@@ -86,24 +109,33 @@ The startup phase begins at `T_init`. Its inlet humidity target is the strictest
 $$\varphi_\mathrm{in,start}=\min\Big(\min_x\varphi_\mathrm{eq,init}-\Delta\varphi_\mathrm{dry},\ \varphi_\mathrm{max,start}\Big).$$
 
 <details>
-<summary>Schedule checks, startup contracts, drying target and stop criterion</summary>
+<summary>Schedule checks and startup contracts</summary>
 
 Generation checks the derived relative humidity continuously, including interior extrema. An infeasible stochastic schedule is resampled as a whole. Temperature and humidity ratio then ramp to the canonical schedule at the configured rejoin time. The startup humidity ratio follows psychrometrically. Startup bounds, canonical operating bounds, the COMSOL numerical clip and the physical saturation limit are separate contracts.
+
+</details>
+
+### Stop at the drying target
+
+A transient case stops as soon as the dry-mass fraction above the material's moisture target falls to the tolerance, $f_\mathrm{wet,dm}\le f_\mathrm{wet,dm,max}$ (`f_wet_dm_max`, `common.yaml:249`). The time horizon is only a cap: a run that reaches it without meeting the condition is right-censored.
+
+$$f_\mathrm{wet,dm}=\frac{\int\rho_\mathrm{bu,dry}\,\mathbb 1[X_\mathrm{wb}>X_\mathrm{target,wb}]}{\int\rho_\mathrm{bu,dry}},$$
+
+named `f_wet_dm` in the loader formulas (`generation_cases_config.py:101`).
+
+<details>
+<summary>Stop event, verdict and moisture target</summary>
+
+The template's time-dependent solver carries the stop condition `comp1.f_wet_dm <= f_wet_dm_max` («Stop at Target Moisture», the step after the stop is stored). Python judges the finished case with the configured tolerance, `target_reached = f_wet_dm_final <= f_wet_dm_max` and `hit_t_max` (`generation_publication_storage.py:1187-1190`); `right_censored` is `not target_reached` (`generation_runtime_timing.py:225`). The template's own `f_wet_dm_max` is a copy of the YAML value (equal today), so the stop and the verdict agree only while both copies do.
 
 Each material has one operational drying target on a wet basis:
 
 ```yaml
 target_moisture:
-  target_moisture_wb: 0.12   # 12.0 % wb
+  target_moisture_wb: 0.135   # 13.5 % wb
 ```
 
-The target is the practical safe-storage moisture, normally rounded to a whole wet-basis percentage point; the exact literature or isotherm-derived value remains in provenance. It supplies the COMSOL scalar `X_target_wb`. The stop criterion is spatial: the dry-mass fraction above the target, compared with the configured tolerance,
-
-$$f_\mathrm{wet,dm}=\frac{\int\rho_\mathrm{bu,dry}\,\mathbb 1[X_\mathrm{wb}>X_\mathrm{target,wb}]}{\int\rho_\mathrm{bu,dry}},$$
-
-named `f_wet_dm` in the loader formulas (`generation_cases_config.py`).
-
-A run that reaches the end of its horizon has therefore not necessarily reached the target.
+The target is the practical drying moisture, a multiple of half a wet-basis percentage point (the loader rejects finer steps; 0.135 is valid, 0.1325 is not); the exact literature or isotherm-derived value remains in provenance. It supplies the COMSOL scalar `X_target_wb`.
 
 </details>
 
@@ -120,13 +152,26 @@ The YAML under `configs/01_generation/physical_model/` owns every value; each re
 | Parameter definitions, units, transforms, OOD groups | `configs/01_generation/physical_model/registry.yaml` |
 | Material records and their provenance | `configs/01_generation/physical_model/materials/*.yaml` |
 | Operation and inlet-schedule distributions (registry block `operation`) | `configs/01_generation/physical_model/fixed_bed.yaml` |
-| Bed, permeability, porosity, inlet-pressure and initial-moisture field statistics | `configs/01_generation/physical_model/bed_fields.yaml` |
+| Bed, permeability, porosity, target superficial velocity, inlet-pressure shape and initial-moisture field statistics | `configs/01_generation/physical_model/bed_fields.yaml` |
 | COMSOL template and exported fields per task | `configs/01_generation/physical_model/profiles/*.yaml` |
 | Bibliography | `configs/01_generation/physical_model/sources.yaml` |
 | Formula contract, input-file adapters, schedule rules, steady-flow conditioning, fixed time and storage fields, kinetics OOD records | Loader code (`src/generation/cases/generation_cases_config.py`, `src/generation/contracts/generation_contracts_materials.py`); copied into every scientific record |
 | Design counts per material and design kind, Generation seed base | Dataset plan or Source campaign |
 
 Configured values are modelling and sampling decisions. Each record names its evidence class (measured, fitted, transferred, estimated, derived or synthetic), its `source_refs` and any conversion, fit or applicability limit. A material-level citation is evidence only for the values that reference it. Shared spatial-field statistics are synthetic generator assumptions unless their provenance states otherwise. Material records carry no learning roles; the Dataset plan assigns those.
+
+</details>
+
+<details>
+<summary>Derivation of the ranges and synthetic design values</summary>
+
+A natural support is a design range around the cited evidence, not a measured distribution. Each OOD range lies beyond it with a gap of at least 0.15 and has a width of at least 0.25 of the natural width, both in the transform space of the parameter (`generation_contracts_registry.py`); the loader rejects a range that violates either rule. The OOD supports of the permeability, kinetics, initial moisture and thermal values are synthetic stress ranges placed by this rule, not observed extremes.
+
+- **Permeability** is an apparent value near the operating point of the bed, not a Darcy limit at small velocity; the Darcy model uses it unchanged at every air velocity. The drawn range is the authored support intersected with the Kozeny–Carman band of the natural porosity range (`generation_contracts_porosity.py`), and the resolved material contract stores that drawn range.
+- **Kinetics:** `r_surf_0` and its support carry one factor per material (×5.5; ×10 for rapeseed); `r_int_surf` and `f_surf` keep their design values. Two factors rest on a literature anchor: lentil on Tahmasebi et al. (2025), calibrated at 35 °C and 20 % relative humidity, and rapeseed on Costa et al. (2020). Chickpea, kidney bean, field pea and sunflower seed use the lentil factor as a transfer; for chickpea it is a fallback until a comparable literature end point exists. The OOD records follow from the nominals (slow ×0.25, fast ×3.5 in `r_surf_0`).
+- **Initial moisture:** the authored `field_support` is the admissible range of the generated field. Its lower bound is the target plus `margin_above_target_db`. For lentil, chickpea, kidney bean, field pea and rapeseed the upper bound is the upper `mean_db` plus the upper `amplitude_db`, so the sampler caps the amplitude only for a mean close to the lower bound. Sunflower seed keeps its earlier bounds: its upper field bound lies below the upper `mean_db` plus the upper `amplitude_db`, so the sampler also caps its amplitude at the upper end.
+- **`margin_above_target_db` (0.01 kg/kg, per material) is a synthetic design value** without literature source: it keeps every generated initial field above its target so that no case starts almost dry. It enters the resolved contract as `initial_moisture_field_constraint` and cannot carry a provenance block, because the loader reads it as a scalar.
+- **`boundary_schedule.startup_ramp` (`fixed_bed.yaml`) is a synthetic design value** without literature source: duration (0.5 h), dry margin and humidity ceiling of the inlet handoff from the initial state to the canonical schedule. It has fixed keys and cannot carry a provenance block either. The loader requires the duration to be shorter than the output interval `time.interval` (1 h), so an output interval below 1 h needs a necessity test of the ramp first.
 
 </details>
 

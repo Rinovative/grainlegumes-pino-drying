@@ -16,6 +16,8 @@ Responsibilities:
 Design principles:
   - Candidate IDs are never recycled after a failure
   - Immutable records live in their scientific case's _record/ folder, outside controller state
+  - An immutable record is staged in the campaign's record staging area below .state/, which no reader enumerates, and
+    linked to its name on the same filesystem; it never replaces one, and a second writer must hold identical bytes
   - A reservation survives interruption and is reconciled before new allocation
 
 This module does NOT:
@@ -25,11 +27,14 @@ This module does NOT:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
+import os
 import re
 import shutil
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -53,8 +58,6 @@ _REPLACEMENT_DESIGN_SCHEMA_KIND: Final = "generation_source_replacement_design"
 _REPLACEMENT_DESIGN_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "campaign_plan_sha256",
-        "parent_campaign_digest",
         "parent_batch_id",
         "parent_scientific_config_digest",
         "parent_failed_case_id",
@@ -95,16 +98,49 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _write_new_json(path: Path, value: Mapping[str, Any]) -> None:
-    """Publish one immutable JSON record and reject conflicting prior bytes."""
+def _require_real_staging(staging: Path, *, area: Path) -> None:
+    """Reject a record staging area that is, or lies below, a symlink inside the stage area ``area``."""
+    if any(directory.is_symlink() for directory in (staging, *staging.parents) if directory.is_relative_to(area)):
+        msg = f"Record staging {staging} is or lies below a symlink; an immutable record is staged only inside the stage's .state/."
+        raise ValueError(msg)
+
+
+def _write_new_json(root: Path, path: Path, value: Mapping[str, Any]) -> None:
+    """Publish one immutable JSON record of the campaign at ``root`` without ever replacing a file; reject conflicting bytes.
+
+    The flushed record is staged in the campaign's record staging area below the stage's ``.state/``, which no reader
+    enumerates, and hard-linked to its name, so its own directory never holds anything but final names and a writer
+    that dies leaves its temporary only there. The file server refuses an existing name, whatever this client's cached
+    view of the directory, so concurrent writers never replace each other: the later one compares bytes.
+    """
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8") + b"\n"
+    staging = common.paths.resolve_generation_record_staging_directory(root)
+    _require_real_staging(staging, area=root.parent.parent)  # before mkdir, which would create below a symlink's target
+    staging.mkdir(parents=True, exist_ok=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() or path.is_symlink():
+    _require_real_staging(staging, area=root.parent.parent)
+    if staging.stat().st_dev != path.parent.stat().st_dev:
+        msg = f"Record staging {staging} and {path.parent} are on different filesystems; an immutable record is published by a hard link."
+        raise RuntimeError(msg)
+    descriptor, temporary = tempfile.mkstemp(dir=staging, prefix=f"{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+    except FileExistsError as error:
         if path.is_symlink() or path.read_bytes() != encoded:
             msg = f"Immutable campaign evidence conflicts at {path}."
-            raise FileExistsError(msg)
-        return
-    common.serialization.atomic_write_bytes(path, encoded)
+            raise FileExistsError(msg) from error
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    with contextlib.suppress(OSError):  # best effort, as for atomic replacement: not every filesystem syncs a directory
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def _require_attempt_contract(attempt: Mapping[str, Any], *, label: object) -> None:
@@ -266,7 +302,7 @@ def create_campaign(
         else:
             # Register before the plan so an interrupted creation retries into the same state.
             _register_authored_rate(root, expected, _authored_rate(campaign), storage_root=storage_root)
-            _write_new_json(plan_path, expected)
+            _write_new_json(root, plan_path, expected)
     return root
 
 
@@ -406,7 +442,7 @@ def append_execution_epoch(manifest: Mapping[str, Any], record: Mapping[str, Any
         previous_start=None if not previous else int(previous[-1]["first_submission_index"]),
     )
     path = _epochs_directory(root) / f"epoch_{len(previous) + 1:04d}.json"
-    _write_new_json(path, payload)
+    _write_new_json(root, path, payload)
     return payload
 
 
@@ -469,7 +505,7 @@ def _publish_reserved_case(root: Path, material: str, reservation: Mapping[str, 
     if staging.exists() or staging.is_symlink():
         # A leftover was never published: no reader sees staging, and the controller lock excludes other writers.
         shutil.rmtree(staging)
-    _write_new_json(common.paths.resolve_generation_case_reservation_path(staging), reservation)
+    _write_new_json(root, common.paths.resolve_generation_case_reservation_path(staging), reservation)
     final.parent.mkdir(parents=True, exist_ok=True)
     staging.rename(final)
     return final
@@ -634,7 +670,7 @@ def record_candidate_attempt(
         if not path.exists() and len(existing) + 1 != attempt_index:
             msg = "Attempt index must extend the append-only attempt chain."
             raise ValueError(msg)
-        _write_new_json(path, record)
+        _write_new_json(root, path, record)
     return path
 
 
@@ -702,6 +738,7 @@ def decide_candidate(
             raise ValueError(msg)
     with common.locking.exclusive_file_lock(_controller_lock(root), blocking=True):
         _write_new_json(
+            root,
             path,
             {
                 "schema_kind": "generation_candidate_decision",
@@ -806,7 +843,7 @@ def seal_selected_pool(task: str, campaign_name: str, *, storage_root: Path | st
     root = _root(task, campaign_name, storage_root)
     with common.locking.exclusive_file_lock(_controller_lock(root), blocking=True):
         receipt = _selected_pool_receipt(task, campaign_name, storage_root=storage_root)
-        _write_new_json(common.paths.resolve_generation_selected_pool_path(root), receipt)
+        _write_new_json(root, common.paths.resolve_generation_selected_pool_path(root), receipt)
     return receipt
 
 
@@ -951,6 +988,7 @@ def _append_amendment(
         plan["task"], plan["source_name"], material_family, storage_root=storage_root
     )
     _write_new_json(
+        root,
         directory / f"amendment_{index:04d}.json",
         {
             "schema_kind": _AMENDMENT_SCHEMA_KIND,
@@ -1140,13 +1178,10 @@ def replacement_batch_from_reservation(
         raise ValueError(msg)
     parent = matches[0]
     plan = load_campaign_plan(campaign.profile.id, campaign.source_name, storage_root=storage_root)
-    plan_sha = common.serialization.file_sha256(
-        common.paths.resolve_generation_campaign_plan_path(_root(campaign.profile.id, campaign.source_name, storage_root))
-    )
     if (
         plan["campaign_digest"] != campaign.campaign_digest
-        or design.get("campaign_plan_sha256") != plan_sha
-        or design.get("parent_campaign_digest") != campaign.campaign_digest
+        or (reservation.get("task"), reservation.get("campaign_name"), reservation.get("campaign_digest"))
+        != (campaign.profile.id, campaign.source_name, campaign.campaign_digest)
         or design.get("parent_batch_id") != parent.batch_id
         or design.get("parent_scientific_config_digest") != parent.scientific_config_digest
         or design.get("design_index") != len(parent.case_indices) + ordinal - 1
@@ -1193,7 +1228,6 @@ def materialize_replacement_batch(
         raise ValueError(msg)
     parent = matches[0]
     material = parent.material_family
-    root = _root(campaign.profile.id, campaign.source_name, storage_root)
     records = candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root)
     material_records = [row for row in records if row["reservation"]["material_family"] == material]
     batch_records = [row for row in material_records if row["reservation"]["batch_id"] == batch_id]
@@ -1229,8 +1263,6 @@ def materialize_replacement_batch(
     case_index = len(material_records) + 1
     design = {
         "schema_kind": _REPLACEMENT_DESIGN_SCHEMA_KIND,
-        "campaign_plan_sha256": common.serialization.file_sha256(common.paths.resolve_generation_campaign_plan_path(root)),
-        "parent_campaign_digest": campaign.campaign_digest,
         "parent_batch_id": batch_id,
         "parent_scientific_config_digest": parent.scientific_config_digest,
         "parent_failed_case_id": failed_primary["reservation"]["case_id"],

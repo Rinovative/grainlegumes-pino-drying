@@ -11,21 +11,23 @@ material_scope:
   description: Whole mature uncrushed rapeseed or canola seed
 # The permeability scale kappa_mean is in m^2. Natural support and transform define sampling; ood_supports are separate synthetic stress intervals.
 permeability:
-  nominal: 4.0e-09
+  nominal: 2.0e-09
   support:
-    lower: 2.0e-09
-    upper: 9.0e-09
+    lower: 1.2e-09
+    upper: 3.5e-09
   transform: log
   distribution: uniform_in_log_space
   ood_supports:
-  - lower: 6.0e-10
-    upper: 1.3e-09
-  - lower: 1.44e-08
-    upper: 2.475e-08
+  - lower: 3.0e-10
+    upper: 6.5e-10
+  - lower: 7.2e-09
+    upper: 1.2375e-08
   provenance:
     evidence: engineering_estimate
     source_refs:
-    - canola_airflow
+    - cgc_airflow_resistance_charts
+    - airflow_friesen_huminicki_1986
+    method: Canadian Grain Commission airflow-resistance charts give apparent permeabilities of 2.0, 1.8, 1.6 and 1.55e-09 m^2 for rising air velocity, and Friesen and Huminicki (1986) give 2.3e-09 m^2 at 0.05-0.1 m/s. The earlier value 4.0e-09 m^2 was a Kozeny-Carman estimate with a grain diameter of 2 mm and no airflow data; Jayas et al. (1987) are not used for any value.
     applicability:
       packing: Only for packing bands in each complete density record; generated mean
         eps must pass the material band.
@@ -84,15 +86,15 @@ thermal_properties:
 # Initial moisture is dry basis (kg water/kg dry solids); amplitude controls field variation and field_support bounds generated values.
 initial_moisture:
   mean_db:
-    nominal: 0.13636363636363635
+    nominal: 0.12359550561797752
     support:
-      lower: 0.0989010989010989
-      upper: 0.1904761904761905
+      lower: 0.08695652173913043
+      upper: 0.16279069767441862
     transform: linear
     distribution: uniform
     ood_supports:
-    - lower: 0.23
-      upper: 0.3
+    - lower: 0.18
+      upper: 0.22
     provenance:
       evidence: engineering_estimate
       source_refs:
@@ -127,14 +129,14 @@ initial_moisture:
         gap and width policy.
       verification: mathematically_reproduced
   field_support:
-    lower: 0.0989010989010989
-    upper: 0.1904761904761905
+    lower: 0.07382978723404254
+    upper: 0.1877906976744186
     unit: kg/kg
     provenance:
       evidence: derived
       source_refs:
       - canola_drying
-      method: X_db=X_wb/(1-X_wb)
+      method: X_db=X_wb/(1-X_wb); lower bound is the target 0.06/0.94 plus margin_above_target_db 0.01, upper bound is the upper mean_db 0.14/0.86 plus the upper amplitude_db 0.025.
       verification: mathematically_reproduced
   margin_above_target_db: 0.01
 # Dimensionless support for generated bed-mean porosity; density calibration stores a compatible paired reference state.
@@ -220,9 +222,7 @@ target_moisture:
     evidence: official_industry_target
     source_refs:
     - swiss_oil
-    method: Exact converted safe-storage reference 0.06542056074766356 wb; retain
-      the stricter source-supported practical target of 0.06 wb rather than round
-      upward to 0.07 wb.
+    method: swiss granum oilseeds (2026-03-19) chapter 1.7.1 limits rapeseed to at most 6 % wb, so the practical target is 0.06 wb.
     note: Single practical safe-storage drying target; market acceptance is not
       a separate operational target.
 # Surface/internal moisture-transfer prior: r_surf_0 is a rate, r_int_surf a rate ratio, f_surf a fraction; the loader derives the two OOD records from the nominals.
@@ -230,10 +230,10 @@ two_compartment_kinetics:
   record_id: rapeseed_two_compartment_kinetics_v1
   components:
     r_surf_0:
-      nominal: 2.0e-05
+      nominal: 2.0e-04
       support:
-        lower: 1.1e-05
-        upper: 3.3e-05
+        lower: 1.1e-04
+        upper: 3.3e-04
       transform: log
     r_int_surf:
       nominal: 0.22
@@ -252,13 +252,11 @@ two_compartment_kinetics:
     evidence: calibration_prior
     source_refs:
     - canola_drying
+    method: r_surf_0 and its support are the earlier design values multiplied by 10, so that the thin-layer drying time of rapeseed from 12 to 6 % wb is about 7.8 h at 40 degC, the literature time of Costa et al. (2020, Eq. 12); r_int_surf and f_surf are unchanged.
     applicability:
       evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
         at known T, RH/omega, airflow and product state; T(t) if available
-      limitation: Kinetics were conservatively aligned using a limited numerical pilot
-        to reduce seven-day right-censoring and produce informative neural-operator
-        transients; they were not fitted to experiments or validated as real drying-time
-        predictions.
+      limitation: The rate prior is calibrated to one literature drying time, not fitted to experiments of this bed, and the drying times were not validated as real predictions.
   ood_provenance:
     evidence: synthetic_design
     source_refs: []

@@ -224,13 +224,13 @@ def transient_matched_config(
     seed: int = 17,
 ) -> dict[str, Any]:
     """Return a compact artificial authored matched A0 -> {B, A1} plan owned by the tests."""
-    a0 = {"budget_epochs": 4, "sampling": _teacher_forced_sampling(model_kind=model_kind)}
+    a0 = {"budget_epochs": 4, "memory_batch": 2, "sampling": _teacher_forced_sampling(model_kind=model_kind)}
     b_sampling: dict[str, Any] = {"mode": "rollout_window", "rollout_length": 4, "window_stride": 4, "window_offset": 0}
     if model_kind == "rno":
         b_sampling = {"mode": "trajectory", "rollout_length": 4}
     b = {
-        "train_seconds": 0.25,
         "lr_scale": 1.0,
+        "memory_batch": 1,
         "sampling": b_sampling,
         "curriculum": {"lengths": [2, 4], "milestone_fractions": [0.0, 0.5]},
     }
@@ -238,10 +238,9 @@ def transient_matched_config(
     config["training"] = {
         "mode": "matched_a1_b",
         "units_per_update": 2,
-        "memory_batch": 2,
         "a0": a0,
         "b": b,
-        "a1": {"match_to": "b.train_seconds", "lr_scale": 1.0},
+        "a1": {"lr_scale": 1.0, "memory_batch": 2},
     }
     return config
 

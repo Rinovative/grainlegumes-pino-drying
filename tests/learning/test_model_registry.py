@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check semantic lookup, constructors, axis/depth limits, and cross-resolution admission
+  - Check that FNO, U-NO and RNO couple no samples, so a k x 1 and a 1 x k memory split give one gradient
 
 Design principles:
   - Supplied devices and explicit architecture capabilities govern construction
@@ -452,6 +453,33 @@ def test_rno_label_omits_the_single_admitted_candidate_activation() -> None:
     """The required tanh candidate names no alternative, so it is no label switch."""
     config = {"model": {"kind": "rno", "params": _rno_params()}}
     assert learning.models.naming.architecture_label(config) == "rno_m2x2_h4_l2_p0p1"
+
+
+@pytest.mark.parametrize("model_kind", ["fno", "uno", "rno"])
+def test_every_transient_model_gives_the_same_gradient_for_k_x_1_and_1_x_k(model_kind: str) -> None:
+    """
+    One update of k = 3 units in one microbatch or in three of one gives the same gradient on CPU.
+
+    The loop divides each unit loss by the planned k, so the memory batch is execution only
+    exactly when no layer couples the samples of a microbatch; the RNO reads a two-step sequence.
+    """
+    config = configs.resolve(configs.transient_stage_a_only_config(model_kind=model_kind))
+    torch.manual_seed(0)
+    model = learning.models.factory.build_model(config, device=torch.device("cpu"))
+    shape = (3, 2, 28, 12, 12) if model_kind == "rno" else (3, 28, 12, 12)
+    inputs = torch.randn(shape, generator=torch.Generator().manual_seed(1))
+
+    def gradient(microbatch: int) -> list[torch.Tensor]:
+        model.zero_grad()
+        for start in range(0, len(inputs), microbatch):
+            (model(inputs[start : start + microbatch]).square().flatten(1).mean(dim=1).sum() / len(inputs)).backward()
+        return [parameter.grad.clone() for parameter in model.parameters() if parameter.grad is not None]
+
+    whole, split = gradient(3), gradient(1)
+
+    assert len(whole) == len(split) > 0
+    for together, apart in zip(whole, split, strict=True):
+        torch.testing.assert_close(together, apart, rtol=1e-4, atol=1e-6)
 
 
 @pytest.mark.parametrize("candidate_activation", ["selu", None])

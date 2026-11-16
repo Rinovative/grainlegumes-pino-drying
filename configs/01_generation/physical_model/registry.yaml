@@ -238,14 +238,14 @@ parameters:
     - steady_flow
     - transient_drying
     sampling_order: 18
-  pressure_bc.mean:
+  airflow.superficial_velocity:
     kind: interval
-    unit: Pa
-    transform: linear
+    unit: m/s
+    transform: log
     block: airflow
     ood_group: operation
-    report_symbol: \bar{p}_{\mathrm{in}}
-    description: Base inlet pressure; the inlet profile is this value times (1 + shape), and the sinusoidal and Gaussian shape terms are not mean-free, so it is not the realised inlet mean.
+    report_symbol: \bar{v}_{\mathrm{s}}
+    description: Target mean superficial velocity; Generation derives the base inlet pressure v*mu*L_y/kappa_mean (Darcy on the drawn mean permeability) and the inlet profile is that pressure times (1 + shape), so the realised mean velocity deviates from this target.
     classification: sampled
     profile_applicability:
     - steady_flow

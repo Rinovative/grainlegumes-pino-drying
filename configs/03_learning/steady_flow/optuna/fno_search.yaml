@@ -2,7 +2,7 @@
 # Supervised FNO search: 30 trials of half the 600-epoch budget on validation; copy the selected values into experiments/architecture_comparison/fno_m128x160_h64_l3_p0p1__lr-0p000388.yaml (renamed with the selected learning rate, `lr`) and the pi-fno_search study.
 
 study:
-  n_trials: 30  # Maximum number of trials requested for the study.
+  n_trials: 30  # Total trial allocation of the study, its configured base first; a rerun runs only the trials left.
   seed: 9  # Seed controlling Optuna sampling/pruning randomness.
   budget_fraction: 0.5  # Trial budget as a fraction of the budget K (training.budget_epochs): 300 of 600 passes, each trial with its own cosine.
   sampler:
@@ -16,11 +16,13 @@ study:
     interval_steps: 1  # Validation-point interval between pruning checks.
 
 # One entry per searched config path: name (Optuna parameter name), kind (categorical or float) and its values or low, high and log (default false).
-# Modes and widths are the union of both tasks' FNO studies, not yet filtered by the GPU probe.
+# Admission rule (169 D3): every corner trains within 2x the time per case of the configured experiment and fits in at most 85 %
+# of a V100 (31.75 GiB). Cut by the GPU probes (882530, 882592): 96 channels exceed the V100 or the time limit with any other axis;
+# with 64 channels every corner passes (at most 79.3 % of a V100, 1.3x).
 search_space:
   model.params.n_modes.0: {name: modes_y, kind: categorical, values: [32, 48, 64, 96, 128]}
   model.params.n_modes.1: {name: modes_x, kind: categorical, values: [64, 96, 128, 160]}
-  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [32, 64, 96]}
+  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [32, 64]}
   model.params.n_layers: {name: n_layers, kind: categorical, values: [3, 4]}
   optimizer.lr: {name: lr, kind: float, low: 1.0e-4, high: 1.0e-2, log: true}
   training.units_per_update: {name: k, kind: categorical, values: [2, 4, 8, 16, 32]}  # Cases per update.

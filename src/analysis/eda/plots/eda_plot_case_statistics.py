@@ -32,10 +32,12 @@ from src import analysis
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda.plots import eda_plot_transient as transient_plots
 from src.analysis.presentation import analysis_display_grid as display_grid
+from src.analysis.presentation import analysis_display_labels as display_labels
 from src.analysis.presentation import analysis_field_labels as field_labels
+from src.analysis.presentation import analysis_field_maps as field_maps
 from src.analysis.presentation import analysis_histograms as histograms
 from src.analysis.presentation import analysis_moisture_display as moisture_display
-from src.analysis.presentation import analysis_visual_semantics as visual_semantics
+from src.analysis.ui import analysis_ui_figure_layout as figure_layout
 from src.analysis.ui import analysis_ui_plot_layout as plot_layout
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
@@ -47,6 +49,7 @@ if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
     from src.analysis.eda.eda_dataframe import PublishedTensorValue
+    from src.analysis.presentation.analysis_visual_semantics import SeriesStyle
 
 _STATISTICS_EXCLUDED_PARAMETER_KEYS = frozenset(
     {
@@ -58,11 +61,16 @@ _SCALAR_MATERIAL_FIELDS = transient_contract.TRANSIENT_STEP_CONTRACT.scalar_cond
 _SCALAR_MATERIAL_KEYS = frozenset(field.name for field in _SCALAR_MATERIAL_FIELDS)
 _SCALAR_MATERIAL_NORMALIZED_KEYS = frozenset(key.casefold() for key in _SCALAR_MATERIAL_KEYS)
 _SCALAR_MATERIAL_UNITS = {field.name: field.unit for field in _SCALAR_MATERIAL_FIELDS}
-_HISTOGRAM_SUPTITLE_Y = 0.98
 _SPATIAL_DIMENSIONS = 2
+_FOOTNOTE_INCHES = transient_plots.FOOTNOTE_INCHES
+_STAT_PANEL_IN = (4.0, 2.8)  # one parameter histogram
+_FIELD_PANEL_IN = (4.0, 2.4)  # one min, mean or max histogram of a field
+_HISTOGRAM_ALPHA = 0.35
+_LEGEND_LINE_WIDTH = 2.0  # thin enough that a dashed legend line shows its dashes
+_FIELD_STATISTICS = ("min", "mean", "max")
+_LEGEND_WRAP_WIDTH = transient_plots.LEGEND_WRAP_WIDTH
 
 
-@plot_layout.eda_typography()
 def plot_published_tensor(
     value: PublishedTensorValue,
     *,
@@ -80,7 +88,7 @@ def plot_published_tensor(
     bulk density ``rho_bu_dry``, which it therefore requires.
     """
     unit = moisture_display.field_display_unit(value.name, value.unit)
-    label = moisture_display.display_name(value.name, mathtext=True)
+    label = capabilities.representation_display_name(value.name, value.representation, mathtext=True)
     if moisture_display.is_moisture_field(value.name):
         if rho_bu_dry is None:
             message = f"Showing {value.name} as wet-basis moisture requires the case's dry bulk density."
@@ -88,24 +96,36 @@ def plot_published_tensor(
         values = moisture_display.wet_basis_percent(value.array, rho_bu_dry)
     else:
         values = field_labels.display_values(value.array, value.unit, field=value.name)
-    figure, axis = plt.subplots(figsize=(7.0, 4.8))
+    context = " · ".join(part for part in (case_label, None if transition is None else f"{transition[0]:g} h → {transition[1]:g} h") if part)
+    heading = f"{value.group}: {label}"
+    footnote = f"{value.representation}; full support min={float(np.min(values)):g}, max={float(np.max(values)):g}"
     if values.ndim == _SPATIAL_DIMENSIONS:
         scale = transient_plots.spatial_field_scale(value.name, value.unit, value.representation, values)
+        extent = display_grid.physical_extent(x, y)
+        geometry = plot_layout.plan_geometry(1, 1, (extent[1] - extent[0], extent[3] - extent[2]), row_labels=False, title=bool(context))
+        figure, axes, slots = plot_layout.map_grid(geometry, extent=extent)
         indices = display_grid.display_indices(values.shape, display_spatial_stride)
-        image = axis.pcolormesh(
-            display_grid.display_sample(x, indices),
-            display_grid.display_sample(y, indices),
-            display_grid.display_sample(values, indices),
-            shading="auto",
-            **scale.pcolormesh_kwargs(),
-        )
-        axis.set_aspect("equal")
-        axis.set_xlabel("x [m]")
-        axis.set_ylabel("y [m]")
-        colorbar = figure.colorbar(image, ax=axis, **scale.colorbar_kwargs())
-        colorbar.set_label(f"{label} [{unit}]")
-    elif values.ndim == 1 and value.support == "inlet boundary":
-        inlet_x = x[y == np.min(y)]
+        try:
+            image = axes[0, 0].pcolormesh(
+                display_grid.display_sample(x, indices),
+                display_grid.display_sample(y, indices),
+                display_grid.display_sample(values, indices),
+                shading="auto",
+                **scale.pcolormesh_kwargs(),
+            )
+            plot_layout.add_field_map_colorbar(figure, image, slots[0, 0], scale, label=f"{label} [{unit}]")
+            plot_layout.set_column_headers(axes, [heading], [])
+            if context:
+                plot_layout.set_map_title(figure, context)
+            figure.text(_FOOTNOTE_INCHES[0] / figure.get_figwidth(), _FOOTNOTE_INCHES[1] / figure.get_figheight(), footnote, fontsize=8)
+        except Exception:
+            plt.close(figure)
+            raise
+        return figure
+    figure, axes = figure_layout.panel_figure(1, 1, panel_in=(6.0, 4.0))
+    axis = axes[0, 0]
+    if values.ndim == 1 and value.support == "inlet boundary":
+        inlet_x = x[y == np.min(y)]  # the inlet edge y = min(y) runs along x
         order = np.argsort(inlet_x)
         axis.plot(inlet_x[order], values[order])
         axis.set_xlabel("Inlet x [m]")
@@ -117,10 +137,8 @@ def plot_published_tensor(
         plt.close(figure)
         message = f"Unsupported published tensor support for {value.name}: {values.shape}."
         raise ValueError(message)
-    context = " · ".join(part for part in (case_label, None if transition is None else f"{transition[0]:g} h → {transition[1]:g} h") if part)
-    heading = f"{value.group}: {label}"
-    axis.set_title(f"{context}\n{heading}" if context else heading)
-    figure.text(0.02, 0.02, f"{value.representation}; full support min={float(np.min(values)):g}, max={float(np.max(values)):g}")
+    figure_layout.set_panel_title(axis, f"{context}\n{heading}" if context else heading)
+    figure.supxlabel(footnote, fontsize=figure_layout.TICK_PT)
     return figure
 
 
@@ -294,19 +312,6 @@ def _case_parameter_units(meta: Mapping[str, Any]) -> dict[str, str]:
     return {str(key): str(unit) for key, unit in parameter_units.items() if isinstance(unit, str) and unit}
 
 
-def _dataset_colors(dataset_names: Sequence[str]) -> dict[str, str]:
-    """Return stable colorblind-friendly colors keyed by concise labels."""
-    identities = tuple(
-        visual_semantics.DatasetVisualIdentity(
-            canonical_identity=name,
-            label=name,
-        )
-        for name in dataset_names
-    )
-    colors = visual_semantics.dataset_colors(identities)
-    return {name: colors[name] for name in dataset_names}
-
-
 def _metadata_statistic_key_is_visible(key: str) -> bool:
     """Apply Plot 1-1's exact structural and runtime-limit denylist."""
     normalized = key.strip().casefold().replace("-", "_").replace(" ", "_")
@@ -433,15 +438,45 @@ def _infer_ncols(n_items: int, *, max_cols: int = 5) -> int:
 # ============================================================================
 
 
-@plot_layout.eda_typography()
+def _draw_dataset_histogram(axis: Axes, values: np.ndarray, style: SeriesStyle) -> None:
+    """Draw one dataset's histogram and, for non-constant values, its kernel density in the dataset's color and line style."""
+    artists = histograms.plot_histogram(axis, values, bins=_infer_bins(values), color=style.color, alpha=_HISTOGRAM_ALPHA)
+    if artists.constant_line is None:
+        try:
+            kde = gaussian_kde(values)
+            x = np.linspace(values.min(), values.max(), 300)
+            bw = artists.bin_edges[1] - artists.bin_edges[0]
+            axis.plot(x, kde(x) * values.size * bw, color=style.color, linestyle=style.linestyle, lw=1.6)
+        except LinAlgError:
+            pass
+
+
+def _draw_panel_histograms(axis: Axes, series: Mapping[str, np.ndarray], styles: Mapping[str, SeriesStyle], unit: str | None) -> None:
+    """Draw every dataset's values of one panel; their common power of ten goes into the x label's unit bracket, never into offset text."""
+    series = {name: values for name, values in series.items() if values.size}
+    exponent = field_maps.state_exponent(min(v.min() for v in series.values()), max(v.max() for v in series.values())) if series else 0
+    for name, values in series.items():
+        _draw_dataset_histogram(axis, values / 10.0**exponent, styles[name])
+    axis.ticklabel_format(axis="x", style="plain", useOffset=False)
+    if exponent:
+        axis.set_xlabel(plot_layout.label_with_exponent(f"Value [{unit or '-'}]", exponent))
+
+
+def _dataset_legend(figure: Figure, axes: np.ndarray, active: Sequence[str], styles: Mapping[str, SeriesStyle]) -> None:
+    """Write the dataset legend of a histogram grid."""
+    handles = [Line2D([], [], lw=_LEGEND_LINE_WIDTH, color=styles[name].color, linestyle=styles[name].linestyle) for name in active]
+    names = [display_labels.wrapped_dataset_display_label(name, width=_LEGEND_WRAP_WIDTH) for name in active]
+    figure_layout.add_legend(figure, axes, handles, names, title="Dataset")
+
+
 def _hist_grid(
     *,
     data_by_dataset: dict[str, dict[str, np.ndarray]],
     active_datasets: list[str],
     columns: list[str],
     title: str,
+    styles: Mapping[str, SeriesStyle],
     units_by_column: Mapping[str, str] | None = None,
-    row_spacing: float = 0.34,
 ) -> Figure:
     """
     Create a grid of histogram plots for multiple datasets and columns.
@@ -456,116 +491,44 @@ def _hist_grid(
         List of column names to plot.
     title : str
         Title for the entire figure.
+    styles : Mapping[str, SeriesStyle]
+        Color and line style of every active dataset, resolved by the viewer over all loaded datasets.
     units_by_column : Mapping[str, str] | None, optional
         Authoritative units used for unit-bearing subplot headings.
-    row_spacing : float, optional
-        Explicit GridSpec spacing between histogram rows.
 
     Returns
     -------
     Figure
-        Matplotlib Figure containing the histogram grid.
+        Matplotlib Figure containing the histogram grid; "Counts" labels the first panel of every row.
 
     """
-    dataset_colors = _dataset_colors(active_datasets)
     if not columns:
-        figure, axis = plt.subplots(figsize=(8.0, 3.2), layout=None)
-        figure.subplots_adjust(left=0.08, right=0.96, bottom=0.15, top=0.82)
-        axis.set_axis_off()
-        axis.text(
-            0.5,
-            0.5,
-            "No numeric parameter evidence is available for the selected cases.",
-            ha="center",
-            va="center",
-            transform=axis.transAxes,
+        figure, axes = figure_layout.panel_figure(1, 1, panel_in=(8.0, 3.2))
+        axes[0, 0].set_axis_off()
+        axes[0, 0].text(
+            0.5, 0.5, "No numeric parameter evidence is available for the selected cases.", ha="center", va="center", transform=axes[0, 0].transAxes
         )
-        plot_layout.set_suptitle_over_axes(
-            figure,
-            title,
-            (axis,),
-            y=_HISTOGRAM_SUPTITLE_Y,
-        )
+        figure_layout.set_figure_title(figure, axes, title)
         return figure
 
     ncols = _infer_ncols(len(columns))
     nrows = math.ceil(len(columns) / ncols)
+    figure, grid_axes = figure_layout.panel_figure(nrows, ncols, panel_in=_STAT_PANEL_IN)
+    for axis in grid_axes.flat[len(columns) :]:
+        axis.set_visible(False)
 
-    fig, grid_axes, ax_leg = plot_layout.subplots_with_legend_column(
-        rows=nrows,
-        columns=ncols,
-        column_width=4.0,
-        row_height=2.8,
-        legend_width=3.6,
-        hspace=row_spacing,
-    )
-
-    axes: list[Axes] = []
-    for row in range(nrows):
-        for column in range(ncols):
-            index = row * ncols + column
-            axis = grid_axes[row, column]
-            if index < len(columns):
-                axes.append(axis)
-            else:
-                axis.set_axis_off()
-
-    legend_handles = [Line2D([], [], lw=6, color=dataset_colors[name], alpha=0.6) for name in active_datasets]
-
-    for ax, key in zip(axes, columns, strict=False):
-        for name in active_datasets:
-            vals = data_by_dataset[name].get(key, np.array([]))
-            vals = vals[np.isfinite(vals)]
-            if vals.size == 0:
-                continue
-
-            color = dataset_colors[name]
-            bins = _infer_bins(vals)
-
-            artists = histograms.plot_histogram(
-                ax,
-                vals,
-                bins=bins,
-                color=color,
-                alpha=0.35,
-            )
-            if artists.constant_line is None:
-                try:
-                    kde = gaussian_kde(vals)
-                    x = np.linspace(vals.min(), vals.max(), 300)
-                    bw = artists.bin_edges[1] - artists.bin_edges[0]
-                    ax.plot(x, kde(x) * vals.size * bw, color=color, lw=1.6)
-                except LinAlgError:
-                    pass
-
+    for axis in grid_axes.flat[max(0, len(columns) - ncols) : len(columns)]:  # the last panel of every column, also of one that ends a row early
+        axis.set_xlabel("Value")
+    for axis, key in zip(grid_axes.flat, columns, strict=False):
         unit = None if units_by_column is None else units_by_column.get(key)
-        ax.set_title(
-            key if unit is None else field_labels.field_label_with_unit(key, unit),
-            fontsize=10,
-        )
-        ax.set_ylabel("Count")
-        ax.grid(True, linestyle="--", alpha=0.25)
-
-    plot_layout.configure_bottom_occupied_row_xlabels(
-        axes,
-        columns=ncols,
-        label="Value",
-        hide_upper_tick_labels=False,
-    )
-    ax_leg.legend(
-        legend_handles,
-        active_datasets,
-        title="Dataset",
-        loc="upper left",
-    )
-    plot_layout.set_suptitle_over_axes(
-        fig,
-        title,
-        axes,
-        y=_HISTOGRAM_SUPTITLE_Y,
-    )
-
-    return fig
+        series = {name: data_by_dataset[name].get(key, np.array([])) for name in active_datasets}
+        _draw_panel_histograms(axis, {name: vals[np.isfinite(vals)] for name, vals in series.items()}, styles, unit)
+        figure_layout.set_panel_title(axis, key if unit is None else field_labels.field_label_with_unit(key, unit))
+        axis.grid(True, linestyle="--", alpha=0.25)
+    figure_layout.label_rows_once(grid_axes, "Counts")
+    figure_layout.set_figure_title(figure, grid_axes, title)
+    _dataset_legend(figure, grid_axes, active_datasets, styles)
+    return figure
 
 
 # ============================================================================
@@ -576,6 +539,7 @@ def _hist_grid(
 def plot_meta_statistics(
     *,
     datasets: dict[str, pd.DataFrame],
+    styles: Mapping[str, SeriesStyle],
     resume_cases: int | None = None,
     host: analysis.ui.panel.ViewPanel | None = None,
     export_state: dict[str, Any] | None = None,
@@ -590,6 +554,8 @@ def plot_meta_statistics(
     datasets : dict[str, pandas.DataFrame]
         Labelled EDA frames whose authoritative case metadata contains sampled
         parameter leaves. Frame order defines dataset display order.
+    styles : Mapping[str, SeriesStyle]
+        Color and line style of every dataset, resolved by the viewer over all loaded datasets.
     resume_cases : int | None, optional
         Case count a former viewer of the same datasets showed; it is kept up to the largest dataset.
     host : ViewPanel | None, optional
@@ -688,8 +654,8 @@ def plot_meta_statistics(
             active_datasets=active,
             columns=_visible_metadata_statistic_keys(keys),
             title=f"Generated case parameters — {max_cases} cases",
+            styles=styles,
             units_by_column=units_by_column,
-            row_spacing=0.425,
         )
 
     return analysis.ui.viewers.case_count_view(
@@ -713,6 +679,7 @@ def plot_meta_statistics(
 def plot_meta_parameters(
     *,
     datasets: dict[str, pd.DataFrame],
+    styles: Mapping[str, SeriesStyle],
     resume_cases: int | None = None,
     host: analysis.ui.panel.ViewPanel | None = None,
     export_state: dict[str, Any] | None = None,
@@ -727,6 +694,8 @@ def plot_meta_parameters(
     datasets : dict[str, pandas.DataFrame]
         Labelled transient EDA frames whose ``scalar_conditioning`` mappings
         contain schema-declared case-global material inputs.
+    styles : Mapping[str, SeriesStyle]
+        Color and line style of every dataset, resolved by the viewer over all loaded datasets.
     resume_cases : int | None, optional
         Case count a former viewer of the same datasets showed; it is kept up to the largest dataset.
     host : ViewPanel | None, optional
@@ -812,8 +781,8 @@ def plot_meta_parameters(
             active_datasets=active,
             columns=_scalar_material_parameter_keys(keys),
             title=f"Scalar material conditioning — {max_cases} cases",
+            styles=styles,
             units_by_column=_SCALAR_MATERIAL_UNITS,
-            row_spacing=0.50,
         )
 
     return analysis.ui.viewers.case_count_view(
@@ -837,6 +806,7 @@ def plot_meta_parameters(
 def plot_field_value_distributions(
     *,
     datasets: dict[str, pd.DataFrame],
+    styles: Mapping[str, SeriesStyle],
     resume_cases: int | None = None,
     host: analysis.ui.panel.ViewPanel | None = None,
     export_state: dict[str, Any] | None = None,
@@ -851,6 +821,8 @@ def plot_field_value_distributions(
     datasets : dict[str, pandas.DataFrame]
         Non-empty labelled EDA frames. Every column except ``meta``, ``x``, and
         ``y`` in the first frame is treated as a comparable field array.
+    styles : Mapping[str, SeriesStyle]
+        Color and line style of every dataset, resolved by the viewer over all loaded datasets.
     resume_cases : int | None, optional
         Case count a former viewer of the same datasets showed; it is kept up to the largest dataset.
     host : ViewPanel | None, optional
@@ -891,7 +863,6 @@ def plot_field_value_distributions(
         }
         for name in names
     }
-    dataset_colors = _dataset_colors(names)
     availability = capabilities.availability_note(resolution)
 
     def _plot(max_cases: int, *, datasets: dict[str, pd.DataFrame]) -> Figure:
@@ -930,86 +901,27 @@ def plot_field_value_distributions(
 
         active = list(datasets)
 
-        nrows = len(field_names)
-        ncols = 3
-
-        fig, axes, ax_leg = plot_layout.subplots_with_legend_column(
-            rows=nrows,
-            columns=ncols,
-            column_width=4.0,
-            row_height=2.4,
-            legend_width=3.6,
-        )
-
-        legend_handles = [Line2D([], [], lw=6, color=dataset_colors[name], alpha=0.6) for name in active]
-
+        figure, axes = figure_layout.panel_figure(len(field_names), len(_FIELD_STATISTICS), panel_in=_FIELD_PANEL_IN)
+        for axis in axes[-1]:
+            axis.set_xlabel("Value")
         for i, f in enumerate(field_names):
-            for j, stat in enumerate(["min", "mean", "max"]):
-                ax = axes[i][j]
-
-                for name in active:
-                    field_data = cache[name]["data"].get(f)
-                    if field_data is None:
-                        continue
-                    vals = np.asarray(field_data[stat])
-                    vals = _clip_for_plot(vals)
-                    if vals.size == 0:
-                        continue
-
-                    color = dataset_colors[name]
-                    bins = _infer_bins(vals)
-                    artists = histograms.plot_histogram(
-                        ax,
-                        vals,
-                        bins=bins,
-                        color=color,
-                        alpha=0.35,
-                    )
-                    if artists.constant_line is None:
-                        try:
-                            kde = gaussian_kde(vals)
-                            x = np.linspace(vals.min(), vals.max(), 300)
-                            bw = artists.bin_edges[1] - artists.bin_edges[0]
-                            ax.plot(x, kde(x) * vals.size * bw, color=color, lw=1.6)
-                        except LinAlgError:
-                            pass
-
+            unit = capabilities.field_display_unit(datasets[resolution.datasets_by_field[f][0]], f)
+            for j, stat in enumerate(_FIELD_STATISTICS):
+                ax = axes[i, j]
+                panel = {name: _clip_for_plot(np.asarray(cache[name]["data"][f][stat])) for name in active if f in cache[name]["data"]}
+                _draw_panel_histograms(ax, panel, styles, unit)
                 if i == 0:
-                    ax.set_title(stat)
-                if j == 0:
-                    ax.set_ylabel("Count")
-                    plot_layout.add_channel_row_label(
-                        ax,
-                        capabilities.field_quantity_label(
-                            datasets[resolution.datasets_by_field[f][0]],
-                            f,
-                            mathtext=True,
-                        ),
-                    )
-
+                    figure_layout.set_panel_title(ax, stat)
                 ax.grid(True, linestyle="--", alpha=0.25)
-
-        plot_layout.configure_bottom_occupied_row_xlabels(
-            axes.ravel(),
-            columns=ncols,
-            label="Value",
-            hide_upper_tick_labels=False,
+        figure_layout.label_rows_once(axes, "Counts")
+        figure_layout.set_row_headers(
+            figure,
+            axes,
+            [capabilities.field_quantity_label(datasets[resolution.datasets_by_field[f][0]], f, mathtext=True) for f in field_names],
         )
-        ax_leg.legend(
-            legend_handles,
-            active,
-            title="Dataset",
-            loc="upper left",
-        )
-        plot_layout.set_suptitle_over_axes(
-            fig,
-            f"Field value distributions per channel — {max_cases} cases",
-            axes.ravel(),
-        )
-        if availability:
-            fig.supxlabel(availability, x=0.06, ha="left", fontsize=8)
-
-        return fig
+        figure_layout.set_figure_title(figure, axes, f"Field value distributions per channel — {max_cases} cases", note=availability or None)
+        _dataset_legend(figure, axes, active, styles)
+        return figure
 
     return analysis.ui.viewers.case_count_view(
         _plot,

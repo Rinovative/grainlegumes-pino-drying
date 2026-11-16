@@ -9,6 +9,7 @@ Provides:
 - presentation: ordered generation-input section and view registry
 - selection: shared canonical Dataset A/B and Case A/B session state
 - sources: manifest-driven input-batch grouping and lazy admission
+- template_comparison: paired comparison of two campaigns on the same designs
 - workspace: typed plain-summary and separate-panel notebook preparation
 """
 
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from . import generation_input_presentation as presentation
     from . import generation_input_selection as selection
     from . import generation_input_sources as sources
+    from . import generation_input_template_comparison as template_comparison
     from . import generation_input_workspace as workspace
     from . import plots
 
@@ -35,6 +37,7 @@ _MODULES = {
     "presentation": "generation_input_presentation",
     "selection": "generation_input_selection",
     "sources": "generation_input_sources",
+    "template_comparison": "generation_input_template_comparison",
     "workspace": "generation_input_workspace",
 }
 __all__ = [
@@ -45,6 +48,7 @@ __all__ = [
     "presentation",
     "selection",
     "sources",
+    "template_comparison",
     "workspace",
 ]
 

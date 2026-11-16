@@ -40,12 +40,9 @@ if TYPE_CHECKING:
     import pandas as pd
 
 _SPATIAL_DIMENSIONS = 2
-_DIMENSIONLESS_REPRESENTATIONS = frozenset(
-    {
-        "dimensionless_log10_ratio_to_1_m2",
-        "dimensionless_cross_component_ratio_to_geometric_mean",
-    }
-)
+_LOG10_RATIO = "dimensionless_log10_ratio_to_1_m2"
+_CROSS_RATIO = "dimensionless_cross_component_ratio_to_geometric_mean"
+_DIMENSIONLESS_REPRESENTATIONS = frozenset({_LOG10_RATIO, _CROSS_RATIO})
 
 FieldView = Literal[
     "field_statistics",
@@ -423,6 +420,26 @@ def field_display_trajectory(frame: pd.DataFrame, row: pd.Series, field: str) ->
     return times, means, np.nanmin(shown, axis=(-2, -1)), np.nanmax(shown, axis=(-2, -1))
 
 
+def representation_display_name(field: str, representation: str, *, mathtext: bool = False, control: bool = False) -> str:
+    """Return a field's displayed quantity: log₁₀(κₓₓ / 1 m²) or κₓᵧ / √(κₓₓ κᵧᵧ) name a stored ratio representation, else the plain name."""
+    name = moisture_display.display_name(field, mathtext=mathtext, control=control)
+    if representation == _LOG10_RATIO:
+        return rf"$\log_{{10}}({name.strip('$')}\,/\,1\,\mathrm{{m}}^2)$" if mathtext else f"log₁₀({name} / 1 m²)"
+    if representation != _CROSS_RATIO:
+        return name
+    xx, yy = (moisture_display.display_name(axis, mathtext=mathtext, control=control) for axis in ("Kxx", "Kyy"))
+    if mathtext:
+        return rf"${name.strip('$')}\,/\,\sqrt{{{xx.strip('$')}\,{yy.strip('$')}}}$"
+    return f"{name} / √({xx} {yy})"
+
+
+def field_display_name(frame: pd.DataFrame, field: str, *, mathtext: bool = False, control: bool = False) -> str:
+    """Return the displayed quantity name of one frame's field, naming its stored representation (see :func:`representation_display_name`)."""
+    if moisture_display.is_moisture_field(field):
+        return moisture_display.display_name(field, mathtext=mathtext, control=control)
+    return representation_display_name(field, field_representation(frame, field), mathtext=mathtext, control=control)
+
+
 def field_quantity_label(
     frame: pd.DataFrame,
     field: str,
@@ -431,7 +448,7 @@ def field_quantity_label(
     control: bool = False,
 ) -> str:
     """Return one shared field label in the active style, or for a ``control`` text the symbol or moisture words, with its display unit."""
-    return f"{moisture_display.display_name(field, mathtext=mathtext, control=control)} [{field_display_unit(frame, field, control=control)}]"
+    return f"{field_display_name(frame, field, mathtext=mathtext, control=control)} [{field_display_unit(frame, field, control=control)}]"
 
 
 def resolved_field_labels(

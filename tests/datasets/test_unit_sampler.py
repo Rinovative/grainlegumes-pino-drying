@@ -26,7 +26,9 @@ def _sampler(*, seed: int = 3, memory_batch: int = 2) -> units.UnitSampler:
     """Return a sampler over seven units of three cases (4, 2 and 1 units) with two keys."""
     cases = (0, 0, 0, 0, 1, 1, 2)
     keys = (4, 4, 4, 4, 4, 4, 3)
-    return units.UnitSampler(unit_kind="window", cases=cases, keys=keys, units_per_update=3, memory_batch=memory_batch, seed=seed)
+    return units.UnitSampler(
+        unit_kind="window", cases=cases, keys=keys, units_per_update=3, memory_batch=memory_batch, seed=seed, full_set_transitions=sum(keys)
+    )
 
 
 def _drain(sampler: units.UnitSampler) -> list[tuple[int, ...]]:
@@ -86,7 +88,9 @@ def test_a_mid_epoch_state_reproduces_the_remaining_order_and_rejects_foreign_st
     with pytest.raises(ValueError, match="update-group boundary"):
         units.validate_state({**state, "cursor": 2})
     with pytest.raises(ValueError, match="another unit kind"):
-        units.UnitSampler(unit_kind="trajectory", cases=range(7), keys=None, units_per_update=3, memory_batch=1, seed=0).load_state_dict(state)
+        units.UnitSampler(
+            unit_kind="trajectory", cases=range(7), keys=None, units_per_update=3, memory_batch=1, seed=0, full_set_transitions=27
+        ).load_state_dict(state)
     with pytest.raises(ValueError, match="keys must be exactly"):
         units.validate_state({key: value for key, value in state.items() if key != "generator_state"})
 
@@ -101,7 +105,9 @@ def test_a_continuation_adopts_the_generator_of_a_mid_epoch_teacher_state_and_st
     stream = torch.Generator()
     stream.set_state(torch.tensor(state["generator_state"], dtype=torch.uint8))
 
-    continued = units.UnitSampler(unit_kind="trajectory", cases=range(5), keys=None, units_per_update=2, memory_batch=1, seed=99)
+    continued = units.UnitSampler(
+        unit_kind="trajectory", cases=range(5), keys=None, units_per_update=2, memory_batch=1, seed=99, full_set_transitions=20
+    )
     continued.continue_generator(state)
     assert (continued.epoch, continued.permutation, continued.cursor) == (-1, [], 0)
     continued.begin_epoch(0)

@@ -9,16 +9,14 @@ Provides:
 - tensorizer: physical-batch tensorization and reconstruction
 - scaling: case-equal transient Train scaling fit
 - handoff: immutable transient teacher handoffs
-- history: durable transient completed-epoch history
 """
 
 from . import learning_transient_adapter as adapter
 from . import learning_transient_contracts as contracts
 from . import learning_transient_curriculum as curriculum
 from . import learning_transient_handoff as handoff
-from . import learning_transient_history as history
 from . import learning_transient_rollout as rollout
 from . import learning_transient_scaling as scaling
 from . import learning_transient_tensorizer as tensorizer
 
-__all__ = ["adapter", "contracts", "curriculum", "handoff", "history", "rollout", "scaling", "tensorizer"]
+__all__ = ["adapter", "contracts", "curriculum", "handoff", "rollout", "scaling", "tensorizer"]

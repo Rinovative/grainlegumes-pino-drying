@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Check which budget a matched plan, a stage-A-only A0, and a steady run receive from --epochs
-  - Check that B target, B rollout window, and continuation scale reach exactly their stages
+  - Check that B rollout window and continuation scale reach exactly their stages
   - Check that matched-only overrides are rejected for every other configuration kind
   - Check that only a non-negative integer is admitted as the replicate seed
 
@@ -26,11 +26,11 @@ from support import configs
 from src.experiments.config import experiments_config_loader as loader
 
 _EPOCHS = 6
-_MATCHED_ONLY = ({"rollout_length": 4}, {"train_seconds": 1.0}, {"lr_scale": 0.5})
+_MATCHED_ONLY = ({"rollout_length": 4}, {"lr_scale": 0.5})
 
 
-def test_matched_epochs_override_sets_only_the_a0_budget() -> None:
-    """B and A1 stop at measured seconds, so --epochs sizes A0 alone."""
+def test_matched_epochs_override_sets_the_one_k_of_a0_and_b() -> None:
+    """--epochs binds A0's K, which also sizes B (K x N transitions); A1 matches B's receipt, and B/A1 settings stay."""
     raw = configs.transient_matched_config()
     before = copy.deepcopy(raw)
 
@@ -43,6 +43,7 @@ def test_matched_epochs_override_sets_only_the_a0_budget() -> None:
     assert changed["training"]["a1"] == raw["training"]["a1"]
     assert plan.a0["training"]["budget_epochs"] == _EPOCHS
     assert {config["run"]["layout"]["budget_epochs"] for config in plan.stages} == {_EPOCHS}
+    assert {config["training"]["stage_schedule"]["a0_budget_epochs"] for config in (plan.b, plan.a1)} == {_EPOCHS}
 
 
 def test_stage_a_only_epochs_override_keeps_schedule_budget_equal_to_the_run_budget() -> None:
@@ -80,27 +81,6 @@ def test_seed_override_must_be_a_non_negative_integer() -> None:
     """Reject a negative replicate seed before any layout or seed plan derives from it."""
     with pytest.raises(loader.ConfigError, match="--seed must be a non-negative integer"):
         loader.apply_training_overrides(configs.direct_config(), seed=-1)
-
-
-def test_train_seconds_override_supplies_and_replaces_the_b_target() -> None:
-    """A plan that leaves B's target open becomes runnable once the target is passed."""
-    raw = configs.transient_matched_config()
-    raw["training"]["b"]["train_seconds"] = None
-
-    changed = loader.apply_training_overrides(raw, train_seconds=12)
-    plan = configs.resolve_plan(changed)
-
-    assert changed["training"]["b"]["train_seconds"] == pytest.approx(12.0)
-    assert plan.b["training"]["matched_a1_b"]["train_seconds"] == pytest.approx(12.0)
-    assert raw["training"]["b"]["train_seconds"] is None
-
-
-@pytest.mark.parametrize("value", [0, -1.0, float("nan"), float("inf"), True])
-def test_train_seconds_override_must_be_positive_finite(value: object) -> None:
-    """Reject a B target that could never be reached or measured when the plan resolves."""
-    changed = loader.apply_training_overrides(configs.transient_matched_config(), train_seconds=value)  # type: ignore[arg-type]
-    with pytest.raises(loader.ConfigError, match="train_seconds must be positive and finite"):
-        configs.resolve_plan(changed)
 
 
 def test_lr_scale_override_sets_both_continuations() -> None:
@@ -167,9 +147,9 @@ def test_rollout_length_override_admits_only_curriculum_horizons() -> None:
     [configs.transient_stage_a_only_config, configs.direct_config],
     ids=["stage-a-only", "steady-single-stage"],
 )
-@pytest.mark.parametrize("override", _MATCHED_ONLY, ids=["rollout-length", "train-seconds", "lr-scale"])
+@pytest.mark.parametrize("override", _MATCHED_ONLY, ids=["rollout-length", "lr-scale"])
 def test_matched_only_overrides_are_rejected_for_other_configurations(raw_factory: Any, override: dict[str, Any]) -> None:
-    """B window, B target, and continuation scale have no meaning without a matched plan."""
+    """B window and continuation scale have no meaning without a matched plan."""
     raw = raw_factory()
     before = copy.deepcopy(raw)
 

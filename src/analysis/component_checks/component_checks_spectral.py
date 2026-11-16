@@ -212,7 +212,8 @@ def steady_truncation_errors(reference: SteadyReference, settings: pd.DataFrame)
     """
     Return :func:`truncation_errors` of every steady output field, per case, with the maintained mode pairs.
 
-    The outputs pass through the state encoding of the training scaling, fitted case-equal on the reference membership.
+    The outputs pass through the state encoding of the training scaling, fitted case-equal on the reference membership,
+    so the spectra are those of the dimensionless fields the network learns.
     """
     normalization = datasets.preprocessing.normalization
     grid_shape = (int(reference.outputs.shape[-2]), int(reference.outputs.shape[-1]))
@@ -223,7 +224,7 @@ def steady_truncation_errors(reference: SteadyReference, settings: pd.DataFrame)
         dataset_identity={"dataset_id": reference.dataset_id, "membership": reference.membership},
         train_membership_digest=common.serialization.canonical_json_sha256(list(reference.case_ids)),
     )
-    outputs = scaling.encode_state(reference.outputs.to(scaling.dtype))
+    outputs = scaling.encode_state(reference.outputs.to(scaling.dtype), reference=scaling.state_reference(reference.inputs.to(scaling.dtype)))
     frames = [
         truncation_errors(outputs[index : index + 1], reference.output_fields, mode_pairs=_mode_pairs(settings)).assign(case=label)
         for index, label in enumerate(reference.case_labels)

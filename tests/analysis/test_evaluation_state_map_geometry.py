@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 transient = analysis.evaluation.plots.transient
 layout = analysis.ui.plot_layout
+field_maps = analysis.presentation.field_maps
 FIELDS = ("T", "phi", "w_gr")
 _MAX_DECODING_ERROR_RGB = 8.0  # Euclidean RGB distance of a decoded pixel from its source; a pale-yellow-to-pink flip is about 27
 
@@ -165,10 +166,10 @@ def test_error_scales_reach_the_95th_percentile_symmetric_when_signed_and_mark_t
     assert exact.extend == "max"
     assert exact.normalizer(np.array([5.5, 50.0])).tolist() == [exact.colormap.N - 1, exact.colormap.N]
     reach = 0.011000000000000001  # reach / 11 rounds to exactly 0.001, whose eleven steps end at 0.011
-    rounded = layout.rounded_boundaries(0.0, reach)
+    rounded = field_maps.rounded_boundaries(0.0, reach)
     assert rounded is not None
     assert rounded[-1] >= reach
-    assert layout.rounded_boundaries(0.0, 0.0) is None
+    assert field_maps.rounded_boundaries(0.0, 0.0) is None
 
 
 def test_the_signed_error_scale_is_blue_white_red_symmetric_to_the_larger_percentile_and_fixed_over_all_frames() -> None:
@@ -222,7 +223,7 @@ def test_exact_predictions_keep_a_round_error_scale() -> None:
     """All-zero errors get an explicit nondegenerate scale (signed: symmetric about 0 with a centred white band), never a one-colour constant map."""
     sizes = {}
     for signed in (True, False):
-        boundaries = analysis.evaluation.plots.layout.error_boundaries(np.zeros(4), signed=signed)
+        boundaries = field_maps.error_boundaries(np.zeros(4), signed=signed)
         sizes[signed] = boundaries.size - 1
         assert boundaries[0] == pytest.approx(-boundaries[-1] if signed else 0.0)
     assert sizes == {True: 11, False: 10}  # reach 1: w = 0.2 (11 bands, span 2.2) and step 0.1 (10 bands)
@@ -250,13 +251,13 @@ def _drifting_record() -> Any:
 def _pooled_bands(states: Any) -> Any:
     """Return the round state bands of the 5th to 95th percentile of the temperature pooled over all stored times."""
     pooled = np.concatenate([transient._display_state_values("T", np.asarray(frame[0], dtype=np.float64), error=False).ravel() for frame in states])
-    return analysis.evaluation.plots.layout.state_boundaries(*np.percentile(pooled, (5.0, 95.0)))
+    return field_maps.state_boundaries(*np.percentile(pooled, (5.0, 95.0)))
 
 
 def _frame_bands(states: Any, time: int, *, field: str = "phi", channel: int = 1) -> Any:
     """Return the round state bands of the 5th to 95th percentile of one field at one stored time."""
     shown = transient._display_state_values(field, np.asarray(states[time, channel], dtype=np.float64), error=False)
-    return analysis.evaluation.plots.layout.state_boundaries(*np.percentile(shown, (5.0, 95.0)))
+    return field_maps.state_boundaries(*np.percentile(shown, (5.0, 95.0)))
 
 
 def test_fixed_time_fields_draw_the_pooled_bands_in_every_frame_and_the_prediction_follows_the_lock() -> None:
@@ -389,15 +390,34 @@ def test_a_label_that_rounds_to_zero_prints_as_zero_never_minus_zero() -> None:
     """A single tick and a small negative tick are written at one decimal as 0.0."""
     figure, axis = plt.subplots()
     bar = figure.colorbar(plt.cm.ScalarMappable(norm=Normalize(-1.0, 1.0)), ax=axis)
-    plot_layout = analysis.evaluation.plots.layout
-    assert plot_layout.tick_format(plot_layout.tick_step(np.array([-0.04]))) == plot_layout.TickFormat(1, 0)
-    plot_layout.set_fixed_decimal_ticks(bar, np.array([-0.04]))
+    assert layout.tick_format(layout.tick_step(np.array([-0.04]))) == layout.TickFormat(1, 0)
+    layout.set_fixed_decimal_ticks(bar, np.array([-0.04]))
     figure.canvas.draw()
     assert [text.get_text() for text in bar.ax.get_yticklabels()] == ["0.0"]
-    plot_layout.set_fixed_decimal_ticks(bar, np.array([-0.5, -0.04, 0.5]), plot_layout.TickFormat(1))
+    layout.set_fixed_decimal_ticks(bar, np.array([-0.5, -0.04, 0.5]), layout.TickFormat(1))
     figure.canvas.draw()
     assert [text.get_text() for text in bar.ax.get_yticklabels()] == ["\N{MINUS SIGN}0.5", "0.0", "0.5"]
     plt.close(figure)
+
+
+def test_a_transient_state_outside_a_thousandth_to_ten_thousand_is_refused_instead_of_drawn_without_its_power_of_ten() -> None:
+    """A porosity of about 1e-5 % would need a factor the transient state bars do not carry: ValueError naming the field."""
+    record = _record()
+    record.reference_states[:, 1] = 1.0e-7 * (1.0 + np.linspace(0.0, 1.0, 25).reshape(5, 5))
+    record.predicted_states = record.reference_states.copy()
+    with pytest.raises(ValueError, match=r"'phi'.*power of ten"):
+        transient.plot_state_maps(record, state_fields=("phi",), physical_time=0.0)
+
+
+def test_a_near_uniform_frame_widened_across_ten_thousand_by_the_bar_decimals_is_refused() -> None:
+    """Around 9999.89 °C its own bands stay below 10^4, but the whole-number decimals of the other frames widen it to 9994-10005."""
+    record = _record()
+    ramp = np.linspace(0.0, 1.0, 25).reshape(5, 5)
+    record.reference_states[0, 0] = 273.15 + 9999.887 + 0.005 * ramp
+    record.reference_states[1:, 0] = 273.15 + 9990.0 + 8.0 * ramp
+    record.predicted_states = record.reference_states.copy()
+    with pytest.raises(ValueError, match=r"'T'.*power of ten"):
+        transient.state_map_norms(record, state_fields=("T",), time_indices=range(3), error_mode="Signed error")
 
 
 def test_a_constant_frame_never_sets_the_decimals_of_a_bar() -> None:
@@ -413,7 +433,7 @@ def test_the_mean_error_line_writes_the_power_of_ten_of_its_bar() -> None:
     """A signed bar of band width 5e-5 m/s labels in [10⁻⁵ m/s]; its mean line says 15 times 10⁻⁵ m/s, a coarse bar the plain value."""
     plot_layout = analysis.evaluation.plots.layout
     errors = np.array([1.5e-4, -1.5e-4, np.nan])
-    fine = plot_layout.error_format(plot_layout.error_boundaries(2e-4 * np.linspace(-1.0, 1.0, 21), signed=True), signed=True)
+    fine = layout.error_format(field_maps.error_boundaries(2e-4 * np.linspace(-1.0, 1.0, 21), signed=True), signed=True)
     assert fine.exponent == -5
     power = "10\N{SUPERSCRIPT MINUS}\N{SUPERSCRIPT FIVE}"
     assert plot_layout.mean_error_text(errors, unit="m/s", exponent=fine.exponent) == f"mean |e| = 15 \N{MULTIPLICATION SIGN} {power} m/s"
@@ -427,12 +447,11 @@ def test_the_mean_error_line_writes_the_power_of_ten_of_its_bar() -> None:
 @pytest.mark.parametrize("reach", [3e-4, 2e-3])
 def test_a_fine_error_bar_writes_distinct_labels_of_at_most_three_decimals_with_a_power_of_ten_in_its_unit(reach: float) -> None:
     """A step needing more than three decimals scales the ticks by a power of ten named in the unit, so no two labels agree."""
-    plot_layout = analysis.evaluation.plots.layout
-    boundaries = plot_layout.error_boundaries(np.linspace(-reach, reach, 101), signed=True)
+    boundaries = field_maps.error_boundaries(np.linspace(-reach, reach, 101), signed=True)
     figure, axis = plt.subplots()
     bar = figure.colorbar(plt.cm.ScalarMappable(norm=Normalize(boundaries[0], boundaries[-1])), ax=axis)
     bar.set_label("u [m/s]")
-    plot_layout.set_fixed_decimal_ticks(bar, plot_layout.error_ticks(boundaries, signed=True))
+    layout.set_fixed_decimal_ticks(bar, layout.error_ticks(boundaries, signed=True))
     figure.canvas.draw()
     labels = [text.get_text() for text in bar.ax.get_yticklabels()]
     assert len(labels) == len(set(labels)) == boundaries.size - 1  # one label per band centre
@@ -471,18 +490,16 @@ def test_state_arrows_are_fixed_over_the_frames_of_a_gif_and_follow_the_frame_of
 
 def test_a_step_of_a_quarter_needs_two_decimals_and_a_whole_step_none() -> None:
     """The format follows the decimals the step needs exactly: 0.25 gives 2, 2.5 gives 1, 25 gives 0; a fine error step moves its power of ten out."""
-    plot_layout = analysis.evaluation.plots.layout
-    assert plot_layout.tick_format(0.25) == plot_layout.TickFormat(2)
-    assert plot_layout.tick_format(2.5) == plot_layout.TickFormat(1)
-    assert plot_layout.tick_format(25.0) == plot_layout.TickFormat(0)
-    assert plot_layout.state_format([25.0, 0.25, None]) == plot_layout.TickFormat(2)
-    assert plot_layout.tick_format(2.5e-5) == plot_layout.TickFormat(1, -5)
+    assert layout.tick_format(0.25) == layout.TickFormat(2)
+    assert layout.tick_format(2.5) == layout.TickFormat(1)
+    assert layout.tick_format(25.0) == layout.TickFormat(0)
+    assert layout.state_format([25.0, 0.25, None]) == layout.TickFormat(2)
+    assert layout.tick_format(2.5e-5) == layout.TickFormat(1, -5)
 
 
 def test_state_maps_are_discrete_on_the_rule_boundaries_with_the_decimals_fixed_over_all_frames() -> None:
     """Each frame draws one colour per band of its own percentile bands; the bar labels its boundaries at one decimal count."""
     record = _record()
-    plot_layout = analysis.evaluation.plots.layout
     norms = transient.state_map_norms(record, state_fields=("T",), time_indices=range(3), error_mode="Signed error")
     decimals = set()
     for time, index in ((0.0, 0), (1.0, 1)):
@@ -490,7 +507,7 @@ def test_state_maps_are_discrete_on_the_rule_boundaries_with_the_decimals_fixed_
         figure.canvas.draw()
         image = cast("Any", figure.axes[0].collections[0])
         shown = transient._display_state_values("T", record.reference_states[index, 0], error=False)
-        expected = plot_layout.state_boundaries(*np.percentile(shown, (5.0, 95.0)))
+        expected = field_maps.state_boundaries(*np.percentile(shown, (5.0, 95.0)))
         assert isinstance(image.norm, BoundaryNorm)
         np.testing.assert_allclose(image.norm.boundaries, expected)
         assert expected.size - 1 == image.get_cmap().N  # one colour per band
@@ -510,7 +527,7 @@ def test_a_near_uniform_frame_is_widened_and_never_sets_the_format_or_a_factor_o
     record.reference_states[2, 0] = 300.0 + 4.0 * ramp
     record.predicted_states = record.reference_states.copy()
     norms = transient.state_map_norms(record, state_fields=("T",), time_indices=range(3), error_mode="Signed error")
-    assert norms["T"].state_format == analysis.evaluation.plots.layout.TickFormat(1, 0)
+    assert norms["T"].state_format == layout.TickFormat(1, 0)
     widths, labels = [], []
     for time in (0.0, 1.0):
         figure = transient.plot_state_maps(record, state_fields=("T",), physical_time=time, norms=norms)
@@ -531,7 +548,7 @@ def test_near_uniform_frames_alone_keep_three_decimals_and_a_degenerate_frame_co
     record.reference_states[:, 0] = 300.0 + 4e-5 * np.linspace(0.0, 1.0, 25).reshape(5, 5)
     record.predicted_states = record.reference_states.copy()
     norms = transient.state_map_norms(record, state_fields=("T",), time_indices=range(3), error_mode="Signed error")
-    assert norms["T"].state_format == analysis.evaluation.plots.layout.TickFormat(3)
+    assert norms["T"].state_format == layout.TickFormat(3)
     figure = transient.plot_state_maps(record, state_fields=("T",), physical_time=0.0, norms=norms)
     image = cast("Any", figure.axes[0].collections[0])
     assert image.norm.vmax - image.norm.vmin == pytest.approx(0.011)
@@ -540,7 +557,7 @@ def test_near_uniform_frames_alone_keep_three_decimals_and_a_degenerate_frame_co
     record.reference_states[:, 0, 0, 0] = 300.05  # the 5th and 95th percentiles coincide, the full range is 0.05 K
     record.predicted_states = record.reference_states.copy()
     norms = transient.state_map_norms(record, state_fields=("T",), time_indices=range(3), error_mode="Signed error")
-    assert norms["T"].state_format == analysis.evaluation.plots.layout.TickFormat(3)
+    assert norms["T"].state_format == layout.TickFormat(3)
 
 
 def test_a_near_uniform_steady_state_map_gets_at_most_three_decimals_and_no_factor() -> None:
@@ -554,8 +571,7 @@ def test_a_near_uniform_steady_state_map_gets_at_most_three_decimals_and_no_fact
     figure, axis = plt.subplots()
     bar = figure.colorbar(plt.cm.ScalarMappable(norm=Normalize(boundaries[0], boundaries[-1])), ax=axis)
     bar.set_label("T [°C]")
-    plot_layout = analysis.evaluation.plots.layout
-    plot_layout.set_fixed_decimal_ticks(bar, plot_layout.error_ticks(boundaries, signed=False))
+    layout.set_fixed_decimal_ticks(bar, layout.error_ticks(boundaries, signed=False))
     figure.canvas.draw()
     assert bar.ax.get_ylabel() == "T [°C]"
     assert {len(text.get_text().partition(".")[2]) for text in bar.ax.get_yticklabels()} == {3}
@@ -869,11 +885,11 @@ def test_sample_title_names_the_compact_case_and_the_frame_only_when_comparing_a
         case_label="case_0041",
         frame_name="architecture_comparison__uno_m64x64_h32_l7_p0p1_s1-05-05-1-1-2-2_r0p495__lr-0p000532__a0smp-one-step-transition TEST",
     )
-    single = panel._transient_sample_title(entry, comparison=False)
+    single = panel._transient_sample_title(entry, model_label=None)
     assert "case_0041" in single
     assert entry.case_id not in single
     assert entry.frame_name not in single
-    assert entry.frame_name in panel._transient_sample_title(entry, comparison=True)
+    assert "U-NO · A0" in panel._transient_sample_title(entry, model_label="U-NO · A0")
     record = _record()
     geometry = transient.state_map_geometry(record, state_fields=FIELDS)
     figure, _grid = layout.map_figure(geometry)

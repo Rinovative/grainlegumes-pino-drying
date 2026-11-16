@@ -103,7 +103,9 @@ def _train(
     memory_batch: int, *, budget: training_budget.StageBudget | None = None, dataset: Dataset[dict[str, torch.Tensor]] | None = None
 ) -> tuple[units.UnitSampler, _RecordingSGD, dict[str, float], _ScalarTask]:
     """Run one epoch of three-unit updates and return the sampler, the recorded steps, the telemetry and the task."""
-    sampler = units.UnitSampler(unit_kind="window", cases=_CASES, keys=None, units_per_update=3, memory_batch=memory_batch, seed=4)
+    sampler = units.UnitSampler(
+        unit_kind="window", cases=_CASES, keys=None, units_per_update=3, memory_batch=memory_batch, seed=4, full_set_transitions=len(_CASES)
+    )
     sampler.begin_epoch(0)
     model = _Scalar()
     optimizer = _RecordingSGD(model.parameters())

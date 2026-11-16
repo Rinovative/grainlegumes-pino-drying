@@ -15,13 +15,14 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import BoundaryNorm
 from matplotlib.figure import Figure
 
@@ -36,6 +37,11 @@ from src.analysis.eda import eda_workspace as workspace
 from src.analysis.eda.plots import eda_plot_transient as transient_plots
 from src.analysis.ui import analysis_ui_controls as ui_controls
 from src.datasets.packages import dataset_packages_trajectory as trajectory
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.backend_bases import RendererBase
+    from matplotlib.transforms import Bbox
 
 
 @pytest.fixture
@@ -68,6 +74,20 @@ def transient_frame(transient_package: dict[str, Any]) -> pd.DataFrame:
     assert "case_family" not in frame.iloc[0]["meta"]
     assert frame.iloc[0]["meta"]["parameter_units"]["T_init"] == "K"
     return frame
+
+
+def _tight_bbox(axis: Axes, renderer: RendererBase) -> Bbox:
+    """Return the axis' tight bounding box, which exists once the axis is drawn."""
+    bbox = axis.get_tightbbox(renderer)
+    assert bbox is not None
+    return bbox
+
+
+def _row_start(axis: Axes) -> int:
+    """Return the first grid row of an axis that sits in a grid."""
+    spec = axis.get_subplotspec()
+    assert spec is not None
+    return spec.rowspan.start
 
 
 def _widget_descriptions(widget: Any) -> set[str]:
@@ -118,6 +138,7 @@ def _adaptive_catalog(
             campaign_digest="a" * 64,
             campaign_purpose="family_generalization",
             domain_profile="reference_range",
+            material_family="lentil",
             selected_case_count=1,
             cases=(case,),
         )
@@ -372,7 +393,7 @@ def test_published_tensor_view_steps_stored_transitions_with_the_time_navigator(
         _widget_by_description(view.widget, "Time [h]").value = starts[-1]
         assert f"Time {starts[-1]:g} h" in view.status.text
         assert "→" not in view.status.text
-        title = export_state["fig"].axes[0].get_title()
+        title = export_state["fig"].get_suptitle()
         assert f"{starts[-1]:g} h → {float(time['transition_t_n_plus_1_hours'][-1]):g} h" in title
     finally:
         plt.close("all")
@@ -623,6 +644,32 @@ def test_trajectory_time_views_split_exact_support_at_one_hour() -> None:
     np.testing.assert_array_equal(values, original_values)
 
 
+def test_trajectory_view_draws_its_main_and_startup_windows_through_the_shared_time_helper(transient_frame: pd.DataFrame) -> None:
+    """Every row has the helper's two windows: titles on the top row, main from hour 1, startup 0-1 h on a shared y, time label at the bottom."""
+    label = "Drying · Lentil · ID"
+    figure = transient_plots.plot_state_trajectory_comparison(
+        datasets={label: transient_frame}, case_ids={label: "case_0001"}, styles=transient_plots.batch_styles({label: None}), channels=("T",)
+    )
+    try:
+        windows = transient_plots.time_axis.STARTUP_WINDOWS
+        grid = [
+            axis for axis in figure.axes if axis.axison and (spec := axis.get_subplotspec()) is not None and spec.get_gridspec().ncols == len(windows)
+        ]
+        main, startup = grid[0::2], grid[1::2]  # row-major: the main and the startup axis of each row
+        assert len(main) == len(startup) > 1
+        assert [main[0].get_title(), startup[0].get_title()] == [window.title for window in windows]
+        assert all(axis.get_xlim()[0] == 1.0 for axis in main)
+        assert all(axis.get_xlim() == (0.0, 1.0) for axis in startup)
+        for main_axis, startup_axis in zip(main, startup, strict=True):
+            assert main_axis.get_shared_y_axes().joined(main_axis, startup_axis)
+            assert not startup_axis.yaxis.get_tick_params()["labelleft"]
+        assert all(axis.get_xlabel() == "" and not axis.xaxis.get_tick_params()["labelbottom"] for axis in (*main[:-1], *startup[:-1]))
+        assert main[-1].get_xlabel().startswith("Time")
+        assert startup[-1].get_xlabel() == "Time [h]"
+    finally:
+        plt.close(figure)
+
+
 def test_changed_transient_plot_builders_preserve_authoritative_time_support(
     transient_frame: pd.DataFrame,
 ) -> None:
@@ -641,11 +688,13 @@ def test_changed_transient_plot_builders_preserve_authoritative_time_support(
             datasets={"Drying · Lentil · ID": transient_frame},
             case_ids={"Drying · Lentil · ID": "case_0001"},
             physical_time_hours=1.0,
+            styles=transient_plots.batch_styles({"Drying · Lentil · ID": None}),
             channels=("T",),
         ),
         transient_plots.plot_state_trajectory_comparison(
             datasets={"Drying · Lentil · ID": transient_frame},
             case_ids={"Drying · Lentil · ID": "case_0001"},
+            styles=transient_plots.batch_styles({"Drying · Lentil · ID": None}),
             channels=("T",),
         ),
     )
@@ -658,6 +707,165 @@ def test_changed_transient_plot_builders_preserve_authoritative_time_support(
     finally:
         for figure in figures:
             plt.close(figure)
+
+
+def test_spatial_map_grid_has_a_unit_bar_per_map_an_empty_unavailable_cell_and_grows_with_its_datasets(transient_frame: pd.DataFrame) -> None:
+    """Rows are fields and columns datasets on the common geometry: every map has its own unit bar, an unavailable cell stays empty."""
+    reduced_row = copy.deepcopy(transient_frame.iloc[0].to_dict())
+    reduced_row["static_fields"].pop("p")
+    reduced = pd.DataFrame([reduced_row], index=transient_frame.index.copy())
+    reduced.attrs = copy.deepcopy(transient_frame.attrs)
+    categories = copy.deepcopy(reduced.attrs["field_categories"])
+    categories["static_spatial"] = tuple(field for field in categories["static_spatial"] if field != "p")
+    reduced.attrs["field_categories"] = categories
+    ids = {"A": "case_0001", "B": "case_0001", "C": "case_0001"}
+
+    def draw(frames: dict[str, pd.DataFrame]) -> Figure:
+        case_ids = {label: ids[label] for label in frames}
+        return transient_plots.plot_spatial_field_comparison(datasets=frames, case_ids=case_ids, fields=("T", "p"), physical_time_hours=1.0)
+
+    figure = draw({"A": transient_frame, "B": reduced})
+    wider = draw({"A": transient_frame, "B": reduced, "C": transient_frame})
+    try:
+        maps = [axis for axis in figure.axes if axis.get_aspect() == 1.0 and axis.collections]
+        bars = [axis for axis in figure.axes if axis.get_aspect() != 1.0 and axis.get_visible() and axis.get_ylabel()]
+        assert len(maps) == len(bars) == 3  # T for both datasets, p only for the one that provides it
+        assert all(axis.get_ylabel().endswith("]") for axis in bars)
+        assert any("unavailable" in text.get_text() for axis in figure.axes for text in axis.texts)
+        assert wider.get_figwidth() > figure.get_figwidth()
+    finally:
+        plt.close(figure)
+        plt.close(wider)
+
+
+def test_dataset_styles_keep_material_colors_and_tell_batches_of_one_material_apart() -> None:
+    """Batches of one material share its color and differ in line style and hatch; a lone material stays solid; order colors avoid every material."""
+    semantics = transient_plots.visual_semantics
+    materials = set(semantics.MATERIAL_COLORS.values())
+    assert not materials & set(transient_plots._ORDER_COLORS)
+    styles = transient_plots.batch_styles({"B": "chickpea", "A": "chickpea", "C": "lentil", "D": "unregistered", "E": None})
+    assert styles["A"].color == styles["B"].color == semantics.material_color("chickpea")
+    assert styles["A"].linestyle == "-" != styles["B"].linestyle  # the sorted first label keeps the solid line
+    assert styles["A"].hatch == "" != styles["B"].hatch
+    assert (styles["C"].color, styles["C"].linestyle) == (semantics.material_color("lentil"), "-")
+    assert styles["D"].linestyle == styles["E"].linestyle == "-"
+    assert styles["D"].color != styles["E"].color
+    assert {styles["D"].color, styles["E"].color} <= set(transient_plots._ORDER_COLORS)
+
+
+def test_trajectory_lines_keep_batch_colors_and_line_styles_with_n_t_on_every_row_and_one_outside_legend(transient_frame: pd.DataFrame) -> None:
+    """Two batches of one material draw one color in two line styles; n(t) is on every row; the legend sits right of all axes."""
+    frames = {label: transient_frame.copy() for label in ("A", "B")}
+    styles = transient_plots.batch_styles({"A": "chickpea", "B": "chickpea"})
+    figure = transient_plots.plot_state_trajectory_summary(datasets=frames, max_cases=1, styles=styles, channels=("T",))
+    try:
+        lines = [line for axis in figure.axes for line in axis.get_lines() if line.get_linestyle() != "None"]
+        assert {line.get_color() for line in lines} == {transient_plots.visual_semantics.material_color("chickpea")}
+        assert {line.get_linestyle() for line in lines} == {"-", "--"}
+        twins = [axis for axis in figure.axes if axis.get_ylabel() == "n(t)"]
+        assert len(twins) == 2 * (len(transient_plots._schedule_fields()) + 1)
+        counts = [line for axis in twins for line in axis.get_lines()]
+        assert {line.get_linestyle() for line in counts} == {"-", "--"}  # n(t) carries the batch line style
+        assert {line.get_drawstyle() for line in counts} == {"steps-post"}
+        assert figure.legends
+        assert all(axis.get_legend() is None for axis in figure.axes)
+        assert isinstance(figure.canvas, FigureCanvasAgg)
+        renderer = figure.canvas.get_renderer()
+        right = max(_tight_bbox(axis, renderer).x1 for axis in figure.axes)  # the n(t) tick labels count as panel
+        assert all(legend.get_window_extent(renderer).x0 >= right for legend in figure.legends)
+    finally:
+        plt.close(figure)
+
+
+def test_map_row_without_a_first_column_map_keeps_its_y_labels_on_its_first_visible_map(transient_frame: pd.DataFrame) -> None:
+    """When column 0 of a row is an empty cell the row's y tick labels and ``y [m]`` move to its first map."""
+    reduced_row = copy.deepcopy(transient_frame.iloc[0].to_dict())
+    reduced_row["static_fields"].pop("p")
+    reduced = pd.DataFrame([reduced_row], index=transient_frame.index.copy())
+    reduced.attrs = copy.deepcopy(transient_frame.attrs)
+    categories = copy.deepcopy(reduced.attrs["field_categories"])
+    categories["static_spatial"] = tuple(field for field in categories["static_spatial"] if field != "p")
+    reduced.attrs["field_categories"] = categories
+    figure = transient_plots.plot_spatial_field_comparison(
+        datasets={"A": reduced, "B": transient_frame},
+        case_ids={"A": "case_0001", "B": "case_0001"},
+        fields=("T", "p"),
+        physical_time_hours=1.0,
+    )
+    try:
+        maps = [axis for axis in figure.axes if axis.get_aspect() == 1.0 and axis.collections]
+        assert len(maps) == 3
+        labelled = [axis for axis in maps if axis.get_ylabel() == "y [m]"]
+        assert len(labelled) == 2  # one per map row, whichever column holds its first map
+        assert all(axis.yaxis.get_tick_params()["labelleft"] for axis in labelled)
+    finally:
+        plt.close(figure)
+
+
+def test_two_line_column_header_clears_the_schedule_band_above_the_maps(transient_frame: pd.DataFrame) -> None:
+    """A long two-line dataset label stays below the x label and tick labels of the bottom schedule row."""
+    label = "Lentil · parameter OOD · test · extended campaign with a second long descriptive tail"
+    figure = transient_plots.plot_state_snapshot_comparison(
+        datasets={label: transient_frame},
+        case_ids={label: "case_0001"},
+        physical_time_hours=1.0,
+        styles=transient_plots.batch_styles({label: None}),
+        channels=("T",),
+    )
+    try:
+        figure.canvas.draw()
+        assert isinstance(figure.canvas, FigureCanvasAgg)
+        renderer = figure.canvas.get_renderer()
+        header = next(axis for axis in figure.axes if axis.get_aspect() == 1.0 and axis.title.get_text()).title.get_window_extent(renderer)
+        schedules = [axis for axis in figure.axes if (spec := axis.get_subplotspec()) is not None and spec.get_gridspec().ncols == 2]
+        bottom_row = max(schedules, key=_row_start)
+        texts = [bottom_row.xaxis.label, *bottom_row.get_xticklabels()]
+        lowest = min(text.get_window_extent(renderer).y0 for text in texts if text.get_text())
+        assert header.y1 <= lowest
+    finally:
+        plt.close(figure)
+
+
+def test_single_case_map_figure_names_the_case_in_its_title(transient_frame: pd.DataFrame) -> None:
+    """A figure of one dataset and one case carries the case in its figure title."""
+    figure = transient_plots.plot_spatial_field_comparison(
+        datasets={"A": transient_frame}, case_ids={"A": "case_0001"}, fields=("T",), physical_time_hours=1.0
+    )
+    try:
+        assert "case_0001" in figure.get_suptitle()
+    finally:
+        plt.close(figure)
+
+
+def test_schedule_band_has_no_left_labels_on_startup_axes_and_a_whole_word_legend_at_the_top_frame(transient_frame: pd.DataFrame) -> None:
+    """Startup axes share the row's y axis without tick labels; the legend keeps words whole and starts at the pressure frame."""
+    label = "Lentil · parameter-OOD-extra-long-hyphenated-token · test"
+    figure = transient_plots.plot_state_snapshot_comparison(
+        datasets={label: transient_frame},
+        case_ids={label: "case_0001"},
+        physical_time_hours=1.0,
+        styles=transient_plots.batch_styles({label: None}),
+        channels=("T",),
+    )
+    try:
+        startups = [
+            axis
+            for axis in figure.axes
+            if (spec := axis.get_subplotspec()) is not None and spec.get_gridspec().ncols == 2 and spec.colspan.start == 1
+        ]
+        assert startups
+        for axis in startups:
+            assert axis.get_ylabel() == ""
+            assert not axis.yaxis.get_tick_params()["labelleft"]
+        legend = figure.legends[0]
+        words = {word for text in legend.get_texts() for word in text.get_text().split()}
+        assert set(label.split()) <= words
+        figure.canvas.draw()
+        pressure = max((axis for axis in figure.axes if axis.get_visible()), key=lambda axis: axis.get_position().y1)
+        top = legend.get_window_extent().y1
+        assert abs(top - pressure.get_window_extent().y1) < 1.0
+    finally:
+        plt.close(figure)
 
 
 def test_spatial_maps_lock_full_grid_discrete_permeability_across_display_strides(transient_frame: pd.DataFrame) -> None:

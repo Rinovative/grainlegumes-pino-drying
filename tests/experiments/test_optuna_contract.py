@@ -3,6 +3,8 @@
 Responsibilities:
   - Check search admission, exact types, sampler/pruner projection, the trial budget, transient A0 study admission, and package identity
   - Check that the median pruner starts after trained trials only, never counting a repeated trial
+  - Check that the signature binds the effective sampler (constant_liar off), pruner and Optuna version, that a base
+    outside its own search space is refused, and that a physics twin equals its supervised experiment outside physics
 
 Design principles:
   - Invalid searches and physical-package drift fail before study allocation
@@ -28,6 +30,7 @@ from support import configs, optuna_trials
 from support.synthetic_task import admitted_manifest
 
 from src import common, datasets, experiments
+from src.experiments.config import experiments_config_naming as naming
 from src.experiments.config import experiments_config_preflight as preflight
 from src.experiments.config import experiments_config_transient_plan as transient_plan
 
@@ -264,11 +267,13 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
         return object()
 
     user_attrs: dict[str, Any] = {}
+    enqueued: list[dict[str, Any]] = []
     fake_study = SimpleNamespace(
         direction=SimpleNamespace(name="MINIMIZE"),
         user_attrs=user_attrs,
         trials=[],
         set_user_attr=user_attrs.__setitem__,
+        enqueue_trial=enqueued.append,
         optimize=lambda *_args, **_kwargs: None,
     )
 
@@ -277,8 +282,9 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
         captured["create_study"] = settings
         return fake_study
 
-    def capture_objective(_config: Any, *, sampler_seed: int) -> Callable[[Any], float]:
+    def capture_objective(_config: Any, *, sampler_seed: int, admitted_device: dict[str, str]) -> Callable[[Any], float]:
         captured["trial_sampler_seed"] = sampler_seed
+        captured["admitted_device"] = admitted_device
         return lambda _trial: 0.0
 
     monkeypatch.setattr(optuna.samplers, "TPESampler", capture_sampler)
@@ -297,10 +303,12 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
     pruner_config = loaded.study["pruner"]
     assert result is fake_study
     # A new study stores no trial yet; its sampler seed derives from the study seed and that count, which the invocation
-    # records, and its trials record the same derived seed.
+    # records, and its trials record the same derived seed. TPE never steers away from a trial left running.
     assert captured["sampler"] == {
         "seed": common.random.derive_subseed(loaded.study["seed"], "optuna_sampler_after_0_trials") % 2**32,
         "multivariate": sampler_config["multivariate"],
+        "constant_liar": False,
+        "n_startup_trials": 10,
     }
     assert captured["trial_sampler_seed"] == captured["sampler"]["seed"]
     assert [record["stored_trials"] for key, record in user_attrs.items() if key.startswith("invocation/")] == [0]
@@ -313,13 +321,116 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
     assert user_attrs["sampler_metadata"] == {
         "kind": sampler_config["kind"],
         "multivariate": sampler_config["multivariate"],
+        "constant_liar": False,
+        "n_startup_trials": 10,
         "seed": loaded.study["seed"],
         "invocation_seed": "derived_from_seed_and_stored_trial_count",
+        "optuna_version": optuna.__version__,
     }
-    assert user_attrs["numerical_environment"] == runtime_environment
+    assert user_attrs["numerical_environment"] == {**runtime_environment, "device_model": "cpu"}
+    # Every trial of the invocation must resolve the concrete device the invocation admitted.
+    assert captured["admitted_device"] == {"device": "cpu", "device_model": "cpu"}
+    assert user_attrs["initialization"]["state"] == "complete"
     assert environment_reads == [1]
+    # The configured base is the new study's first trial.
+    assert enqueued == [
+        {"hidden_channels": loaded.base_config["model"]["params"]["hidden_channels"], "learning_rate": loaded.base_config["optimizer"]["lr"]}
+    ]
     assert captured["create_study"]["sampler"] is not None
     assert captured["create_study"]["pruner"] is not None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda study, _patch: study["sampler"].update({"multivariate": not study["sampler"]["multivariate"]}),
+        lambda study, _patch: study["pruner"].update({"n_warmup_steps": study["pruner"]["n_warmup_steps"] + 1}),
+        lambda _study, patch: patch.setattr(optuna_runtime.metadata, "version", lambda _name: "0.0.1"),
+    ],
+    ids=["sampler", "pruner", "optuna-version"],
+)
+def test_the_signature_binds_sampler_pruner_and_the_optuna_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: Callable[[dict[str, Any], pytest.MonkeyPatch], None]
+) -> None:
+    """Another effective sampler or pruner setting, or another Optuna release, is another study that cannot reopen this one."""
+    loaded = optuna_trials.with_configured_identities(optuna_runtime.load_optuna_study_config(_write_study(tmp_path)))
+    baseline = optuna_runtime.build_study_signature(loaded)["digest"]
+    changed = copy.deepcopy(loaded.study)
+    change(changed, monkeypatch)
+
+    assert optuna_runtime.build_study_signature(replace(loaded, study=changed))["digest"] != baseline
+
+
+def test_a_base_value_outside_its_own_search_space_is_refused(tmp_path: Path) -> None:
+    """The embedded base is the study's first trial, so the loader refuses a base its own space cannot sample."""
+    configured = configs.optuna_config()
+    configured["experiment"]["model"]["params"]["hidden_channels"] = 16
+
+    with pytest.raises(ValueError, match="must contain its resolved base value 16"):
+        optuna_runtime.load_optuna_study_config(_write_study(tmp_path, configured))
+
+
+@pytest.mark.parametrize("study_path", sorted((_REPOSITORY / "configs/03_learning").glob("*/optuna/*.yaml")), ids=lambda path: path.stem)
+def test_every_maintained_study_embeds_its_configured_experiment_as_its_base(study_path: Path) -> None:
+    """The base trial is the configured experiment of the study's architecture at the trial budget, in every scientific value."""
+    loader = experiments.config.loader
+    study = optuna_runtime.load_optuna_study_config(study_path, train_dataset="synthetic_dataset")
+    architecture = study_path.stem.removesuffix("_search").removesuffix("_a0")
+    (experiment_path,) = (study_path.parents[1] / "experiments/architecture_comparison").glob(f"{architecture}_m*.yaml")
+    authored = loader.apply_training_overrides(
+        loader.apply_authored_base(loader.load_yaml(experiment_path), origin=experiment_path), train_dataset="synthetic_dataset"
+    )
+    trial, _ = optuna_runtime._trial_experiment(authored, study.study["budget_fraction"])
+    configured = loader.resolve_config(trial, source=naming.config_source_from_path(experiment_path))
+
+    def identity(config: dict[str, Any]) -> dict[str, Any]:
+        payload = optuna_runtime.learning.training.checkpoint.effective_config_identity_payload(config)
+        params = payload["model"]["params"]
+        if payload["model"]["kind"] == "uno":
+            # A U-NO study leaves the schedule unset to search both depths; the configured experiment states its depth's default.
+            params["uno_scalings"] = optuna_runtime.learning.models.factory.resolve_uno_scalings(params["n_layers"], params.get("uno_scalings"))
+        return payload
+
+    assert identity(study.base_config) == identity(configured)
+
+
+def test_a_study_that_is_no_physics_twin_names_no_twin_not_even_null(tmp_path: Path) -> None:
+    """Any twin_of key, an explicit null included, is refused on a study that also searches non-physics values."""
+    configured = configs.optuna_config()
+    configured["study"]["twin_of"] = None
+
+    with pytest.raises(ValueError, match="no other study names one"):
+        optuna_runtime.load_optuna_study_config(_write_study(tmp_path, configured))
+
+
+def _physics_twin_study(tmp_path: Path, *, twin_k: int, names_twin: bool = True) -> Path:
+    """Write a supervised experiment and a study that searches only one physics weight on it, with its own k."""
+    supervised = configs.write_config(tmp_path, configs.direct_config())
+    payload = configs.optuna_config(physics_enabled=True)
+    payload["experiment"]["training"]["units_per_update"] = twin_k
+    payload["search_space"] = {"loss.physics.momentum_weight.target": {"name": "momentum", "kind": "float", "low": 1.0e-3, "high": 1.0e-2}}
+    if names_twin:
+        payload["study"]["twin_of"] = supervised.relative_to(tmp_path / "external", walk_up=True).as_posix()
+    return _write_study(tmp_path / "external", payload)
+
+
+@pytest.mark.parametrize(
+    ("twin_k", "names_twin", "match"),
+    [
+        (2, True, None),
+        (4, True, r"differs from its supervised experiment .* outside loss\.physics in: \['training'\]"),
+        (2, False, "must name its supervised experiment in study.twin_of"),
+    ],
+    ids=["equal-twin", "another-k", "unnamed-twin"],
+)
+def test_a_physics_twin_equals_its_supervised_experiment_outside_physics(tmp_path: Path, twin_k: int, names_twin: bool, match: str | None) -> None:
+    """A study that searches only physics weights names its supervised experiment and differs from it only in loss.physics, k included."""
+    path = _physics_twin_study(tmp_path, twin_k=twin_k, names_twin=names_twin)
+    if match is None:
+        assert optuna_runtime.load_optuna_study_config(path).base_config["training"]["units_per_update"] == twin_k
+        return
+    with pytest.raises(ValueError, match=match):
+        optuna_runtime.load_optuna_study_config(path)
 
 
 @pytest.mark.parametrize(
@@ -547,7 +658,7 @@ def test_best_config_trains_once_copied_into_the_experiments_tree(task: str, tmp
         # A transient study names only its A0 part; B/A1 settings of the architecture experiment appear in its pair folder, not in the name.
         stem = "best"
         # The best trial's rate, no curriculum; its k names the run's seed group, not the config.
-        pinned = "fno_m128x160_h96_l4_p0p1__lr-0p01__a0smp-one-step-transition"
+        pinned = "fno_m96x128_h64_l3_p0p1__lr-0p01__a0smp-one-step-transition"
         assert f"the name is {pinned}; B/A1 settings it sets appear in the pair folder" in header
     target = tmp_path / "configs/03_learning" / task
     (target / "experiments/group").mkdir(parents=True)

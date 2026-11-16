@@ -2,11 +2,13 @@
 
 Responsibilities:
   - Compare secondary relative L2 and H1 metrics without redefining the objective
-  - Render global/local distributions and GT-versus-prediction field means
-  - Plot p, u, v, and TaskSpec velocity-magnitude spatial error reductions
+  - Render global/local distributions and reference-versus-prediction field means
+  - Plot p, u, v, and TaskSpec velocity-magnitude spatial error reductions as field rows by dataset columns on the shared fixed
+    map grid, every map on a round discrete scale locked over its row and every mean error map under one mean-error line
   - Relate field error to target magnitude and left/right boundary distance
 
 Design principles:
+  - Line, bar and distribution figures draw datasets as panels and models as series, in the one fixed style of each model
   - Learned fields, groups, order, and units come from admitted TaskSpec evidence
   - Complete and bounded-prefix reductions are reused through EvaluationSession
   - Local relative error normalizes each case field by its own reference RMS; cases below the field's floor are left
@@ -23,26 +25,29 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.lines import Line2D
+from matplotlib.colors import to_rgb
+from matplotlib.patches import Patch
 from scipy.stats import gaussian_kde
 
 from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.evaluation import evaluation_datasets as dataset_cuts
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_presentation as presentation
 from src.analysis.evaluation import evaluation_session as sessions
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
+from src.analysis.evaluation.evaluation_plot import evaluation_plot_series as series
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
 from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
+from src.analysis.ui import analysis_ui_figure_layout as figure_layout
+from src.analysis.ui import analysis_ui_plot_layout as map_layout
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
 _DEFAULT_CASE_LIMIT = 100
@@ -121,223 +126,206 @@ def _prefix_field(
     return mapping[field.component_fields[0]]
 
 
-def plot_global_error_metrics(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
-    """Compare current secondary relative L2/H1 in the fixed 3 x 2 layout."""
+def plot_global_error_metrics(*, datasets: dataset_cuts.DisplayFrames) -> Figure:
+    """Compare current secondary relative L2/H1: per dataset and norm one row of box plot, density and CDF, the models as series."""
     dataframe.validate_comparison(datasets)
-    names = tuple(datasets)
-    title, count_headings = layout.aggregate_title_context(
-        "Global error metrics",
-        layout.effective_case_counts(datasets),
-    )
-    display_names = tuple(count_headings[name] or name for name in names)
-    if not names:
-        msg = "At least one artifact frame is required."
-        raise ValueError(msg)
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
+    title, count_headings = layout.dataset_title_context("Global error metrics", groups, {key: len(frame) for key, frame in datasets.items()})
     metrics = (("Relative L2", "physical_relative_l2"), ("Relative H1", "physical_relative_h1"))
-    populations = {column: [_finite(datasets[name], column) for name in names] for _label, column in metrics}
-    # Every dataset names, per norm, the cases it shows and the unavailable ones; one without any is drawn nowhere.
-    display_names = tuple(
-        "\n".join((display_name, *(_case_support_text(label, populations[column][index].size, len(datasets[name])) for label, column in metrics)))
-        for index, (name, display_name) in enumerate(zip(names, display_names, strict=True))
-    )
-    palette = [plt.get_cmap("tab10")(index % 10) for index in range(len(names))]
-    figure = plt.figure(figsize=(21, 10))
-    grid = figure.add_gridspec(3, 3, width_ratios=(1.0, 1.0, 0.35), hspace=0.35, wspace=0.25)
-    plot_axes: list[Axes] = []
-    for column_index, (display_name, column) in enumerate(metrics):
-        values_by_dataset = populations[column]
-        box_axis = figure.add_subplot(grid[0, column_index])
-        density_axis = figure.add_subplot(grid[1, column_index])
-        cdf_axis = figure.add_subplot(grid[2, column_index])
-        plot_axes.extend((box_axis, density_axis, cdf_axis))
-        boxes = box_axis.boxplot(
-            values_by_dataset,
-            patch_artist=True,
-            showfliers=True,
-            medianprops={"color": "black", "linewidth": 2},
-        )
-        for patch, color in zip(boxes["boxes"], palette, strict=True):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.65)
-        box_axis.set_xticks([])
-        box_axis.set_title(f"{display_name} - Boxplot")
-        box_axis.set_ylabel(f"{display_name} (dimensionless)")
-        for values, name, color in zip(values_by_dataset, names, palette, strict=True):
-            if values.size == 0:
-                continue
-            if values.size >= _MINIMUM_KDE_SAMPLES and not np.allclose(values, values[0]):
-                coordinates = np.linspace(float(np.min(values)), float(np.max(values)), 400)
-                density_axis.plot(coordinates, gaussian_kde(values)(coordinates), color=color, label=name)
-            else:
-                density_axis.axvline(float(values[0]), color=color, label=name)
-            ordered = np.sort(values)
-            cumulative = np.arange(1, len(ordered) + 1, dtype=float) / len(ordered)
-            cdf_axis.plot(ordered, cumulative, color=color, label=name)
-        density_axis.set_title(f"{display_name} - KDE Density")
-        density_axis.set_xlabel(f"{display_name} (dimensionless)")
-        density_axis.set_ylabel("Density")
-        cdf_axis.set_title(f"{display_name} - CDF")
-        cdf_axis.set_xlabel(f"{display_name} (dimensionless)")
-        cdf_axis.set_ylabel("CDF")
-        if all(np.all(values > 0.0) for values in values_by_dataset):
-            box_axis.set_yscale("log")
-            density_axis.set_xscale("log")
-            cdf_axis.set_xscale("log")
-        for axis in (box_axis, density_axis, cdf_axis):
-            axis.grid(True, which="both", linestyle="--", alpha=0.3)
-    legend_axis = figure.add_subplot(grid[:, 2])
-    legend_axis.axis("off")
-    legend_axis.legend(
-        [Line2D([0], [0], color=color, linewidth=8) for color in palette],
-        display_names,
-        loc="upper left",
-        title=_UNAVAILABLE_CASE_NOTE,
-    )
-    figure.subplots_adjust(top=0.90)
-    layout.title_over_axes(figure, title, plot_axes, y=0.97)
+    unit = f"[{field_labels.display_unit('1')}]"
+    figure, axes = figure_layout.panel_figure(len(groups) * len(metrics), 3)
+    headers: list[str] = []
+    for block, (dataset, models) in enumerate(groups.items()):
+        heading = count_headings[dataset] or dataset
+        for offset, (name, column) in enumerate(metrics):
+            box_axis, density_axis, cdf_axis = axes[block * len(metrics) + offset]
+            headers.append(f"{heading} · {name}")
+            populations = {model: _finite(datasets[key], column) for model, key in models.items()}
+            boxes = box_axis.boxplot(list(populations.values()), patch_artist=True, showfliers=True, medianprops={"color": "black", "linewidth": 2})
+            for patch, key in zip(boxes["boxes"], models.values(), strict=True):
+                patch.set_facecolor(styles[key].color)
+                patch.set_hatch(styles[key].hatch)
+                patch.set_alpha(0.65)
+            box_axis.set_xticks([])
+            box_axis.set_ylabel(f"{name} {unit}")
+            for key, values in zip(models.values(), populations.values(), strict=True):
+                if values.size == 0:
+                    continue
+                style = styles[key]
+                if values.size >= _MINIMUM_KDE_SAMPLES and not np.allclose(values, values[0]):
+                    coordinates = np.linspace(float(np.min(values)), float(np.max(values)), 400)
+                    density_axis.plot(coordinates, gaussian_kde(values)(coordinates), color=style.color, linestyle=style.linestyle)
+                else:
+                    density_axis.axvline(float(values[0]), color=style.color, linestyle=style.linestyle)
+                layout.plot_ecdf(cdf_axis, values, color=style.color, linestyle=style.linestyle)
+            for axis, text in ((box_axis, "Box plot"), (density_axis, "Kernel density"), (cdf_axis, "CDF")):
+                figure_layout.set_panel_title(axis, text)
+                axis.grid(True, which="both", linestyle="--", alpha=0.3)
+            density_axis.set_xlabel(f"{name} {unit}")
+            density_axis.set_ylabel("Density")
+            cdf_axis.set_xlabel(f"{name} {unit}")
+            cdf_axis.set_ylabel("Fraction of cases")
+            # Every model names, per norm, the cases it shows and the unavailable ones; one without any is drawn nowhere.
+            support = [
+                _case_support_text(model if len(models) > 1 else name, values.size, len(datasets[key]))
+                for (model, key), values in zip(models.items(), populations.values(), strict=True)
+            ]
+            cdf_axis.text(0.98, 0.02, "\n".join(support), transform=cdf_axis.transAxes, ha="right", va="bottom", fontsize=figure_layout.TICK_PT)
+            if all(np.all(values > 0.0) for values in populations.values()):
+                figure_layout.set_log_scale(box_axis, "y")
+                figure_layout.set_log_scale(density_axis, "x")
+                figure_layout.set_log_scale(cdf_axis, "x")
+    figure_layout.set_row_headers(figure, axes, headers)
+    layout.add_series_legend(figure, axes, datasets, groups, styles)
+    figure_layout.set_figure_title(figure, axes, title, note=layout.series_note(styles, _UNAVAILABLE_CASE_NOTE))
     return figure
-
-
-def _plot_ecdf(axis: Any, values: np.ndarray, *, color: object, label: str | None = None) -> None:
-    """Plot one finite empirical cumulative distribution without smoothing."""
-    ordered = np.sort(np.asarray(values, dtype=float))
-    cumulative = np.arange(1, ordered.size + 1, dtype=float) / ordered.size
-    axis.step(ordered, cumulative, where="post", color=color, linewidth=2.0, label=label)
 
 
 def plot_predictive_error_distributions(
     *,
-    datasets: Mapping[str, pd.DataFrame],
+    datasets: dataset_cuts.DisplayFrames,
     max_cases: int = _DISTRIBUTION_DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Plot transparent casewise and local predictive-error distributions."""
+    """Plot transparent casewise and local predictive-error distributions: a column per dataset, a row for the casewise norm and one per field."""
     dataframe.validate_comparison(datasets)
     fields = _display_fields(datasets)
     if isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases <= 0:
         msg = "max_cases must be a positive integer."
         raise ValueError(msg)
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
     with sessions.scoped_session(datasets) as active_session:
-        summaries = {id(frame): active_session.prefix_summary(frame, max_cases) for frame in datasets.values()}
-    title, count_headings = layout.aggregate_title_context(
-        "Predictive error distributions (lower is better)",
-        layout.effective_case_counts(datasets, max_cases=max_cases),
+        summaries = {key: active_session.prefix_summary(frame, max_cases) for key, frame in datasets.items()}
+    title, count_headings = layout.dataset_title_context(
+        "Predictive error distributions (lower is better)", groups, layout.effective_case_counts(datasets, max_cases=max_cases)
     )
-    colors = {field.key: plt.get_cmap("tab10")(index % 10) for index, field in enumerate(fields)}
-    figure, axes = plt.subplots(
-        2,
-        len(datasets),
-        figsize=(6.4 * len(datasets), 7.4),
-        squeeze=False,
-        sharey="row",
-        layout="constrained",
-    )
-    for column, (dataset_label, frame) in enumerate(datasets.items()):
-        count = min(max_cases, len(frame))
-        summary = summaries[id(frame)]
-        global_axis = axes[0, column]
-        local_axis = axes[1, column]
-        if not summary.used_count:
-            layout.mark_empty_prefix(global_axis, local_axis, case_count=summary.case_count)
-        else:
-            relative_l2 = _finite(frame, "physical_relative_l2", limit=count)
+    figure, axes = figure_layout.panel_figure(1 + len(fields), len(groups), panel_in=(4.2, 2.6), sharey="row")
+    zero_relative_l2: set[int] = set()  # columns with an exact prediction, whose zero a log axis could not draw
+    for column, (dataset, models) in enumerate(groups.items()):
+        support: list[str] = []
+        below_floor: list[list[str]] = [[] for _field in fields]
+        for model, key in models.items():
+            style, summary = styles[key], summaries[key]
+            if not summary.used_count:
+                layout.mark_empty_prefix(*axes[:, column], case_count=summary.case_count, model=model)
+                continue
+            count = min(max_cases, len(datasets[key]))
+            relative_l2 = _finite(datasets[key], "physical_relative_l2", limit=count)
+            if np.any(relative_l2 <= 0.0):
+                zero_relative_l2.add(column)
             if relative_l2.size:
-                _plot_ecdf(global_axis, relative_l2, color="black")
-            global_axis.text(
-                0.02,
-                0.02,
-                f"{_case_support_text('Relative L2', relative_l2.size, count)}\n{_UNAVAILABLE_CASE_NOTE}",
-                transform=global_axis.transAxes,
-                fontsize="small",
-                va="bottom",
-            )
-        below_floor: list[str] = []
-        for field in fields if summary.used_count else ():
-            local = _prefix_field(summary, field, "local_relative_error")
-            local_axis.plot(
-                local.quantiles,
-                local.probabilities,
-                color=colors[field.key],
-                linewidth=2.0,
-                label=field.matplotlib_label,
-            )
-            if local.unavailable_case_count:
-                below_floor.append(f"{field.matplotlib_label}: {local.unavailable_case_count}")
-        if below_floor:
-            local_axis.text(
-                0.02,
-                0.02,
-                "Cases below the reference floor, left out: " + ", ".join(below_floor),
-                transform=local_axis.transAxes,
-                fontsize="small",
-                va="bottom",
-            )
-        global_axis.set_title(count_headings[dataset_label] or dataset_label)
-        global_axis.set_xlabel("Casewise group-weighted relative L2 [-]")
-        local_axis.set_xlabel("Pointwise |error| / case reference-field RMS [-]")
-        for axis in (global_axis, local_axis):
-            axis.set_xscale("symlog", linthresh=1e-6)
-            axis.set_ylim(0.0, 1.0)
-            axis.grid(True, which="both", linestyle="--", alpha=0.3)
-        if column == 0:
-            global_axis.set_ylabel("Fraction of cases")
-            local_axis.set_ylabel("Fraction of case-gridpoint values")
-    handles = [Line2D([0], [0], color=colors[field.key], linewidth=2.6) for field in fields]
-    figure.legend(
-        handles,
-        [field.matplotlib_label for field in fields],
-        title="Local-error field",
-        loc="outside right upper",
-        frameon=True,
-    )
-    layout.title_over_axes(figure, title, tuple(axes.flat))
+                layout.plot_ecdf(axes[0, column], relative_l2, color=style.color, linestyle=style.linestyle)
+            support.append(_case_support_text(model if len(models) > 1 else "Relative L2", relative_l2.size, count))
+            for row, field in enumerate(fields):
+                local = _prefix_field(summary, field, "local_relative_error")
+                axes[row + 1, column].plot(local.quantiles, local.probabilities, color=style.color, linestyle=style.linestyle, linewidth=2.0)
+                if local.unavailable_case_count:
+                    prefix = f"{model}: " if len(models) > 1 else ""
+                    noun = "case" if local.unavailable_case_count == 1 else "cases"
+                    below_floor[row].append(f"{prefix}{local.unavailable_case_count} {noun} below the reference floor, left out")
+        if support:
+            axes[0, column].text(0.02, 0.02, "\n".join(support), transform=axes[0, column].transAxes, fontsize=figure_layout.TICK_PT, va="bottom")
+        for row, counts in enumerate(below_floor):
+            if counts:
+                axes[row + 1, column].text(
+                    0.02,
+                    0.02,
+                    "\n".join(counts),
+                    transform=axes[row + 1, column].transAxes,
+                    fontsize=figure_layout.TICK_PT,
+                    va="bottom",
+                )
+        figure_layout.set_panel_title(axes[0, column], count_headings[dataset] or dataset)
+    for column, axis in enumerate(axes[0]):  # a log axis labels a range inside one decade too, but draws no exact prediction
+        if column not in zero_relative_l2:
+            figure_layout.set_log_scale(axis, "x")
+    # A pointwise error, and a relative L2 of an exact prediction, can be 0 and is never negative: symlog from 0.
+    for axis in (*(axes[0, column] for column in sorted(zero_relative_l2)), *axes[1:].flat):
+        axis.set_xscale("symlog", linthresh=1e-6)
+        axis.set_xlim(left=0.0)
+    for axis in axes.flat:
+        axis.set_ylim(0.0, 1.0)
+        axis.grid(True, which="both", linestyle="--", alpha=0.3)
+    for axis in axes[0]:  # the x axes are not shared, so every column carries its label
+        axis.set_xlabel(f"Casewise group-weighted relative L2 [{field_labels.display_unit('1')}]")
+    for axis in axes[1:].flat:
+        axis.set_xlabel(f"Pointwise |error| / case reference-field RMS [{field_labels.display_unit('1')}]")
+    figure_layout.label_rows_once(axes[:1], "Fraction of cases")
+    figure_layout.label_rows_once(axes[1:], "Fraction of case-gridpoint values")
+    figure_layout.set_row_headers(figure, axes, ["Casewise relative L2", *(f"Local error · {field.matplotlib_label}" for field in fields)])
+    layout.add_series_legend(figure, axes, datasets, groups, styles)
+    figure_layout.set_figure_title(figure, axes, title, note=layout.series_note(styles, _UNAVAILABLE_CASE_NOTE))
     return figure
 
 
 def plot_mean_field_bias(
     *,
-    datasets: Mapping[str, pd.DataFrame],
+    datasets: dataset_cuts.DisplayFrames,
     max_cases: int = _DISTRIBUTION_DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Render four-row ground-truth versus prediction case-mean panels."""
+    """Render a row per field and a column per dataset of reference versus prediction case means, the models as series with their RMSE and R2."""
     dataframe.validate_comparison(datasets)
     fields = _display_fields(datasets)
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
     with sessions.scoped_session(datasets) as active_session:
-        summaries = {id(frame): active_session.full_summary(frame, max_cases) for frame in datasets.values()}
-    title, count_headings = layout.aggregate_title_context(
-        "GT vs prediction mean",
-        {label: summaries[id(frame)].sample_count for label, frame in datasets.items()},
+        summaries = {key: active_session.full_summary(frame, max_cases) for key, frame in datasets.items()}
+    title, count_headings = layout.dataset_title_context(
+        "Reference vs prediction mean", groups, {key: summary.sample_count for key, summary in summaries.items()}
     )
-    figure, axes = plt.subplots(
-        len(fields),
-        len(datasets),
-        figsize=(6 * len(datasets), 9),
-        squeeze=False,
-    )
-    for column, (label, frame) in enumerate(datasets.items()):
-        summary = summaries[id(frame)]
+    figure, axes = figure_layout.panel_figure(len(fields), len(groups))
+    for column, (dataset, models) in enumerate(groups.items()):
         for row, field in enumerate(fields):
-            reference, prediction = _case_means(summary, field)
-            low = float(min(np.min(reference), np.min(prediction)))
-            high = float(max(np.max(reference), np.max(prediction)))
+            axis, means = axes[row, column], {}
+            for model, key in models.items():
+                reference, prediction = _case_means(summaries[key], field)
+                means[model] = (
+                    field_labels.display_values(reference, field.unit, field=field.key),
+                    field_labels.display_values(prediction, field.unit, field=field.key),
+                )
+            low = min(float(min(np.min(reference), np.min(prediction))) for reference, prediction in means.values())
+            high = max(float(max(np.max(reference), np.max(prediction))) for reference, prediction in means.values())
             if np.isclose(low, high):
                 high += np.finfo(float).eps
-            rmse = float(np.sqrt(np.mean((prediction - reference) ** 2)))
-            denominator = float(np.sum((reference - np.mean(reference)) ** 2))
-            r2 = 1.0 - float(np.sum((prediction - reference) ** 2)) / denominator if denominator > 0.0 else float("nan")
-            axis = axes[row, column]
             axis.plot((low, high), (low, high), "k--", linewidth=1, alpha=0.7)
-            axis.scatter(reference, prediction, s=18, alpha=0.45)
-            heading = count_headings[label] or label
-            prefix = f"{heading}\n" if row == 0 else ""
-            axis.set_title(f"{prefix}{field.matplotlib_label}: RMSE={rmse:.3g}, R2={r2:.3g}", fontsize=11)
-            if column == 0:
-                axis.set_ylabel("Prediction mean")
-            if row == len(fields) - 1:
-                axis.set_xlabel("GT mean")
+            for line, (model, key) in enumerate(models.items()):
+                reference, prediction = means[model]
+                style = styles[key]
+                rmse = float(np.sqrt(np.mean((prediction - reference) ** 2)))
+                denominator = float(np.sum((reference - np.mean(reference)) ** 2))
+                r2 = 1.0 - float(np.sum((prediction - reference) ** 2)) / denominator if denominator > 0.0 else float("nan")
+                axis.scatter(reference, prediction, s=18, alpha=0.45, color=style.color, marker=style.marker or "o")
+                axis.text(
+                    0.03,
+                    0.97 - 0.08 * line,
+                    f"{model + ': ' if len(models) > 1 else ''}{field.metric_label('RMSE')} = {rmse:.3g}, R² = {r2:.3g}",
+                    transform=axis.transAxes,
+                    color=style.color,
+                    fontsize=figure_layout.TICK_PT,
+                    va="top",
+                )
+            axis.set_xlabel(f"Reference mean [{field_labels.display_unit(field.unit, field=field.key)}]")
             axis.grid(alpha=0.3)
-    figure.suptitle(title)
-    figure.subplots_adjust(top=0.90, bottom=0.07, left=0.07, right=0.98, hspace=0.35, wspace=0.25)
+        figure_layout.set_panel_title(axes[0, column], count_headings[dataset] or dataset)
+    for row, field in enumerate(fields):
+        figure_layout.label_rows_once(axes[row : row + 1], f"Prediction mean [{field_labels.display_unit(field.unit, field=field.key)}]")
+    figure_layout.set_row_headers(figure, axes, [field.matplotlib_label for field in fields])
+    layout.add_series_legend(figure, axes, datasets, groups, styles, name_roles=False)  # the panel title names the dataset and so its role
+    figure_layout.set_figure_title(figure, axes, title, note=layout.series_note(styles))
     return figure
+
+
+def _normalized_scale(datasets: Mapping[str, pd.DataFrame], field: presentation.DisplayField) -> error_diagnostics.ReferenceScale | str:
+    """Return the one train-only reference scale that every dataset shares for ``field``, else the reason there is none."""
+    scales = [
+        error_diagnostics.steady_reference_scale(dataframe.require_complete_provenance(frame), field=field.key, unit=field.unit)
+        for frame in datasets.values()
+    ]
+    reason = next((item for item in scales if isinstance(item, str)), None)
+    if reason is not None:
+        return reason
+    try:
+        return error_diagnostics.require_common_reference_scale(cast("list[error_diagnostics.ReferenceScale]", scales))
+    except ValueError as error:
+        return str(error)
 
 
 def _map_figure(
@@ -349,46 +337,69 @@ def _map_figure(
     title: str,
     relative_percent: bool = False,
     signed: bool = False,
+    normalized: bool = False,
+    mean_line: bool = True,
     display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """
-    Render one four-row spatial statistic family.
+    Render one spatial statistic family: a row per display field, a column per dataset, one colour bar per map.
 
-    A ``signed`` statistic is drawn on the symmetric 5th to 95th percentile scale of the selected models and cases, blue-white-red, with
-    arrows for the values beyond.
+    The columns follow the selection, so the figure grows with them (no width cap). Each row has one round scale locked over its
+    maps, with arrows only at the ends of the bars that have values beyond: a ``signed`` statistic is symmetric to the larger absolute
+    5th or 95th percentile, blue-white-red, any other runs from 0 to the 95th percentile. A ``normalized`` statistic is divided by the one
+    train-only reference scale the datasets share; a ``relative_percent`` one names the cases below the field's reference floor. With
+    ``mean_line`` (the error maps, not the standard deviation) one line above each map gives its mean |e|, or "n/a" without a map.
     """
     dataframe.validate_comparison(datasets)
     fields = _display_fields(datasets)
     with sessions.scoped_session(datasets) as active_session:
         summaries = {id(frame): active_session.full_summary(frame, max_cases).require_spatial() for frame in datasets.values()}
+    # The columns of a comparison are the models of one dataset, which the title then names.
+    dataset_labels = {datasets.labels[key][0] for key in datasets} if isinstance(datasets, dataset_cuts.DisplayFrames) else set()
+    if len(dataset_labels) == 1 and (dataset_label := next(iter(dataset_labels))) not in datasets:
+        title = f"{title} · {dataset_label}"
     figure_title, count_headings = layout.aggregate_title_context(
         title,
         {label: summaries[id(frame)].sample_count for label, frame in datasets.items()},
     )
-    figure, axes = layout.map_subplots(rows=len(fields), columns=len(datasets))
+    extents = {summary.grid.extent for summary in summaries.values()}
+    if len(extents) != 1:
+        msg = "The maps of one figure share one physical extent, but the selected datasets have different grids."
+        raise ValueError(msg)
+    extent = next(iter(extents))
+    geometry = map_layout.plan_geometry(len(fields), len(datasets), (extent[1] - extent[0], extent[3] - extent[2]), width_cap=None)
+    figure, axes, slots = map_layout.map_grid(geometry, extent=extent)
+    semantic = (
+        field_maps.FieldMapSemantic.SIGNED_ERROR
+        if signed
+        else field_maps.FieldMapSemantic.RELATIVE_ERROR
+        if relative_percent
+        else field_maps.FieldMapSemantic.ABSOLUTE_ERROR
+    )
+    colorbar_unit = "%" if relative_percent else "1" if normalized else None
+    top_notes: list[str] = []
     for row, field in enumerate(fields):
+        scale = _normalized_scale(datasets, field) if normalized else None
+        reason = scale if isinstance(scale, str) else None
+        divisor = scale.value if isinstance(scale, error_diagnostics.ReferenceScale) else 1.0
         full = {
-            label: _full_array(summaries[id(frame)], field, attribute) * (100.0 if relative_percent else 1.0) for label, frame in datasets.items()
+            label: _full_array(summaries[id(frame)], field, attribute) * (100.0 if relative_percent else 1.0) / divisor
+            for label, frame in datasets.items()
         }
-        colorbar_unit = "%" if relative_percent else field.unit
+        error_unit = field_labels.display_unit(colorbar_unit or field.unit, quantity_kind="difference")
+        unit = f"[{error_unit}]"
+        bar_label = f"{error_diagnostics.NORMALIZED_ERROR_SYMBOL} {unit}" if normalized else unit
         # A relative mean map is all NaN when every case lies below the field's reference floor.
         available = np.concatenate([values[np.isfinite(values)] for values in full.values()])
-        semantic = (
-            field_maps.FieldMapSemantic.SIGNED_ERROR
-            if signed
-            else field_maps.FieldMapSemantic.RELATIVE_ERROR
-            if relative_percent
-            else field_maps.FieldMapSemantic.ABSOLUTE_ERROR
-        )
-        boundaries = layout.error_boundaries(available, signed=signed) if available.size else None
+        boundaries = field_maps.error_boundaries(available, signed=signed) if reason is None and available.size else None
         definition = (
             field_maps.build_field_map(
                 np.append(available, boundaries[[0, -1]]),  # the scale's own ends keep a uniform (all-zero) statistic from being a constant map
                 semantic=semantic,
                 field=field.key,
-                unit=colorbar_unit,
+                unit=colorbar_unit or field.unit,
                 display_transform=metric_label,
-                comparison_scope="selected Evaluation models",
+                comparison_scope=scale.dataset_identity if isinstance(scale, error_diagnostics.ReferenceScale) else "selected Evaluation models",
                 locked_boundaries=boundaries,
                 bound_policy="rounded 5th to 95th percentile, symmetric" if signed else "0 to the rounded 95th percentile",
             )
@@ -398,41 +409,37 @@ def _map_figure(
         for column, (label, frame) in enumerate(datasets.items()):
             summary = summaries[id(frame)]
             values = full[label]
-            heading = count_headings[label] or label
-            prefix = f"{heading}\n" if row == 0 else ""
+            finite = np.isfinite(values)
             below_floor = _relative_unavailable_cases(summary, field) if relative_percent else 0
-            suffix = f"\n{below_floor} of {summary.sample_count} cases below the reference floor, left out" if below_floor else ""
-            axes[row, column].set_title(f"{prefix}{field.matplotlib_label} {metric_label}{suffix}", fontsize=11)
-            axes[row, column].set_aspect("equal")
-            if definition is None or not np.isfinite(values).any():
-                axes[row, column].text(
-                    0.5,
-                    0.5,
-                    "Unavailable: every case lies below the reference floor" if relative_percent else "Unavailable: no finite values",
-                    ha="center",
-                    va="center",
-                    transform=axes[row, column].transAxes,
-                )
+            note = f"{below_floor} of {summary.sample_count} cases below the reference floor, left out" if below_floor else ""
+            if mean_line:  # computed from the displayed map over all its finite cells, "n/a" for an unavailable map
+                exponent = 0 if definition is None else map_layout.error_format(definition.boundaries, signed=signed).exponent
+                shown = values if definition is not None else None
+                mean = layout.mean_error_text(shown, unit=None if normalized else error_unit, exponent=exponent)
+                note = f"{mean}; {note}" if note else mean
+            if row == 0:
+                top_notes.append(note)
+            elif note:
+                map_layout.add_map_note(axes[row, column], note)
+            if definition is None or not finite.any():
+                lacking = "every case lies below the reference floor" if relative_percent else "no finite values"
+                map_layout.empty_cell(axes[row, column], f"Unavailable: {reason or lacking}")
                 continue
             indices = display_grid.display_indices(values.shape, display_spatial_stride)
             x_grid, y_grid = summary.grid.coordinates
-            image = axes[row, column].contourf(
+            image = axes[row, column].pcolormesh(
                 display_grid.display_sample(x_grid, indices),
                 display_grid.display_sample(y_grid, indices),
-                display_grid.display_sample(values, indices),
-                **definition.contourf_kwargs(),
+                np.ma.masked_invalid(display_grid.display_sample(values, indices)),
+                shading="auto",
+                **definition.pcolormesh_kwargs(),
             )
-            colorbar = layout.add_map_colorbar(
-                figure, image, axes[row, column], label=f"[{field_labels.display_unit(colorbar_unit, quantity_kind='difference')}]"
-            )
-            layout.set_fixed_decimal_ticks(colorbar, layout.error_ticks(definition.boundaries, signed=signed))
-    first_summary = summaries[id(next(iter(datasets.values())))]
-    layout.apply_map_grid_axis_labels(
-        axes,
-        x_label=f"x [{first_summary.grid.coordinate_units[0]}]",
-        y_label=f"y [{first_summary.grid.coordinate_units[1]}]",
-    )
-    figure.suptitle(figure_title)
+            extend = field_maps.locked_extend(values[finite], definition.boundaries)
+            map_layout.add_field_map_colorbar(figure, image, slots[row, column], definition, label=bar_label, extend=extend)
+    map_layout.set_column_headers(axes, [count_headings[label] or label for label in datasets], top_notes)
+    map_layout.set_row_labels(axes, [field.matplotlib_label for field in fields])
+    map_layout.set_map_title(figure, figure_title)
+    layout.add_scale_note(figure, shared=False)
     return figure
 
 
@@ -455,7 +462,15 @@ def plot_mean_error_maps(
             display_spatial_stride=display_spatial_stride,
         )
     if error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR:
-        return _plot_normalized_mean_error_maps(datasets=datasets, max_cases=max_cases, display_spatial_stride=display_spatial_stride)
+        return _map_figure(
+            datasets=datasets,
+            max_cases=max_cases,
+            attribute="absolute_error_mean",
+            metric_label="train_state_std_normalized_absolute_error",
+            title="Mean normalized absolute error maps",
+            normalized=True,
+            display_spatial_stride=display_spatial_stride,
+        )
     if error_mode == "MAE":
         return _map_figure(
             datasets=datasets,
@@ -479,75 +494,6 @@ def plot_mean_error_maps(
     raise ValueError(msg)
 
 
-def _plot_normalized_mean_error_maps(
-    *, datasets: Mapping[str, pd.DataFrame], max_cases: int, display_spatial_stride: display_grid.DisplayStride
-) -> Figure:
-    """Use complete-grid mean absolute errors and one common train-only scale."""
-    dataframe.validate_comparison(datasets)
-    fields = _display_fields(datasets)
-    with sessions.scoped_session(datasets) as active_session:
-        summaries = {id(frame): active_session.full_summary(frame, max_cases).require_spatial() for frame in datasets.values()}
-    figure, axes = layout.map_subplots(rows=len(fields), columns=len(datasets))
-    for row, field in enumerate(fields):
-        scales = [
-            error_diagnostics.steady_reference_scale(dataframe.require_complete_provenance(frame), field=field.key, unit=field.unit)
-            for frame in datasets.values()
-        ]
-        reason = next((item for item in scales if isinstance(item, str)), None)
-        if reason is None:
-            try:
-                common_scale = error_diagnostics.require_common_reference_scale(cast("list[error_diagnostics.ReferenceScale]", scales))
-            except ValueError as error:
-                reason = str(error)
-        if reason is None:
-            all_values = [_full_array(summaries[id(other)], field, "absolute_error_mean") / common_scale.value for other in datasets.values()]
-            pooled = np.concatenate([item.ravel() for item in all_values])
-            pooled = pooled[np.isfinite(pooled)]
-            if not pooled.size:
-                reason = "no finite mean error"
-            else:
-                boundaries = layout.error_boundaries(pooled, signed=False)
-                definition = field_maps.build_field_map(
-                    np.append(pooled, boundaries[[0, -1]]),
-                    semantic=field_maps.FieldMapSemantic.ABSOLUTE_ERROR,
-                    field=field.key,
-                    unit="1",
-                    display_transform="train_state_std_normalized_absolute_error",
-                    comparison_scope=common_scale.dataset_identity,
-                    locked_boundaries=boundaries,
-                    bound_policy="0 to the rounded 95th percentile, shared by the models",
-                )
-        for column, (label, frame) in enumerate(datasets.items()):
-            axis = axes[row, column]
-            axis.set_title(f"{field.matplotlib_label} normalized absolute error" + (f"\n{label}" if row == 0 else ""))
-            if reason is not None:
-                axis.text(0.5, 0.5, f"Unavailable: {reason}", ha="center", va="center", wrap=True, transform=axis.transAxes)
-                continue
-            summary = summaries[id(frame)]
-            values = _full_array(summary, field, "absolute_error_mean") / common_scale.value
-            indices = display_grid.display_indices(values.shape, display_spatial_stride)
-            x_grid, y_grid = summary.grid.coordinates
-            image = axis.contourf(
-                display_grid.display_sample(x_grid, indices),
-                display_grid.display_sample(y_grid, indices),
-                display_grid.display_sample(values, indices),
-                **definition.contourf_kwargs(),
-            )
-            axis.set_aspect("equal")
-            colorbar = layout.add_map_colorbar(
-                figure, image, axis, label=f"{error_diagnostics.NORMALIZED_ERROR_SYMBOL} [{field_labels.display_unit('1')}]"
-            )
-            layout.set_fixed_decimal_ticks(colorbar, layout.error_ticks(definition.boundaries, signed=False))
-    first_summary = summaries[id(next(iter(datasets.values())))]
-    layout.apply_map_grid_axis_labels(
-        axes,
-        x_label=f"x [{first_summary.grid.coordinate_units[0]}]",
-        y_label=f"y [{first_summary.grid.coordinate_units[1]}]",
-    )
-    figure.suptitle("Mean normalized absolute error maps")
-    return figure
-
-
 def plot_std_error_maps(
     *,
     datasets: Mapping[str, pd.DataFrame],
@@ -561,70 +507,66 @@ def plot_std_error_maps(
         attribute="signed_error_std",
         metric_label="STD error",
         title="Error standard-deviation maps",
+        mean_line=False,
         display_spatial_stride=display_spatial_stride,
     )
 
 
 def plot_error_vs_target_magnitude(
     *,
-    datasets: Mapping[str, pd.DataFrame],
+    datasets: dataset_cuts.DisplayFrames,
     max_cases: int = _TARGET_MAGNITUDE_DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Render four-channel target-magnitude trends with a dedicated legend."""
+    """Render a row per field and a column per dataset of median error against reference magnitude, the models as series."""
     dataframe.validate_comparison(datasets)
     fields = _display_fields(datasets)
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
     with sessions.scoped_session(datasets) as active_session:
-        summaries = {id(frame): active_session.prefix_summary(frame, max_cases) for frame in datasets.values()}
-    figure_title, count_headings = layout.aggregate_title_context(
-        "Error vs GT magnitude",
-        {label: summaries[id(frame)].case_count for label, frame in datasets.items()},
+        summaries = {key: active_session.prefix_summary(frame, max_cases) for key, frame in datasets.items()}
+    figure_title, count_headings = layout.dataset_title_context(
+        "Error vs reference magnitude", groups, {key: summary.case_count for key, summary in summaries.items()}
     )
-    figure = plt.figure(figsize=(9.5, 9))
-    grid = figure.add_gridspec(len(fields), 2, width_ratios=(1.0, 0.35), hspace=0.35, wspace=0.25)
-    axes = [figure.add_subplot(grid[row, 0]) for row in range(len(fields))]
-    legend_axis = figure.add_subplot(grid[:, 1])
-    legend_axis.axis("off")
-    handles: list[Line2D] = []
+    figure, axes = figure_layout.panel_figure(len(fields), len(groups))
     for row, field in enumerate(fields):
-        axis = axes[row]
-        for label, frame in datasets.items():
-            summary = summaries[id(frame)]
-            display_label = count_headings[label] or label
-            if not summary.used_count:
-                if row == 0:
-                    handles.append(Line2D([], [], linestyle="none", label=f"{display_label}: {layout.empty_prefix_text(summary.case_count)}"))
-                continue
-            trend = _prefix_field(summary, field, "target_magnitude_error")
-            (line,) = axis.plot(trend.centers, trend.medians, marker="o", markersize=4, label=display_label, alpha=0.9)
+        unit = field_labels.display_unit(field.unit, field=field.key, quantity_kind="difference")
+        trends = {key: _prefix_field(summary, field, "target_magnitude_error") for key, summary in summaries.items() if summary.used_count}
+        log_scale = field.label != "p" and all(np.all(trend.centers > 0.0) and np.all(trend.medians > 0.0) for trend in trends.values())
+        for column, (dataset, models) in enumerate(groups.items()):
+            axis = axes[row, column]
+            for model, key in models.items():
+                if key not in trends:
+                    layout.mark_empty_prefix(axis, case_count=summaries[key].case_count, model=model)
+                    continue
+                axis.plot(
+                    trends[key].centers,
+                    trends[key].medians,
+                    color=styles[key].color,
+                    linestyle=styles[key].linestyle,
+                    marker=styles[key].marker or "o",
+                    markersize=4,
+                    alpha=0.9,
+                )
+            if log_scale:
+                figure_layout.set_log_scale(axis, "x")
+                figure_layout.set_log_scale(axis, "y")
+            axis.grid(True, which="both", linestyle="--", alpha=0.3)
             if row == 0:
-                handles.append(line)
-        if field.label != "p":
-            all_positive = all(
-                np.all(_prefix_field(summaries[id(frame)], field, "target_magnitude_error").centers > 0.0)
-                and np.all(_prefix_field(summaries[id(frame)], field, "target_magnitude_error").medians > 0.0)
-                for frame in datasets.values()
-                if summaries[id(frame)].used_count
-            )
-            if all_positive:
-                axis.set_xscale("log")
-                axis.set_yscale("log")
-        axis.set_title(f"{field.matplotlib_label}: MAE vs |GT|")
-        axis.set_ylabel(f"Median MAE [{field.unit}]")
-        axis.grid(True, which="both", linestyle="--", alpha=0.3)
-    axes[-1].set_xlabel("|GT| (bin center)")
-    legend_axis.legend(handles, [str(handle.get_label()) for handle in handles], loc="upper left")
-    figure.subplots_adjust(top=0.92, bottom=0.07, left=0.10, right=0.97)
-    layout.title_over_axes(figure, figure_title, axes, y=0.98)
+                figure_layout.set_panel_title(axis, count_headings[dataset] or dataset)
+            magnitude_label = field.matplotlib_label if field.is_magnitude else f"|{field.matplotlib_label}|"
+            axis.set_xlabel(f"{magnitude_label} reference (bin centre) [{field_labels.display_unit(field.unit, field=field.key)}]")
+        figure_layout.label_rows_once(axes[row : row + 1], f"Median {field.metric_label('MAE')} [{unit}]")
+    layout.add_series_legend(figure, axes, datasets, groups, styles)
+    figure_layout.set_figure_title(figure, axes, figure_title, note=layout.series_note(styles))
     return figure
 
 
 def plot_boundary_error_decomposition(
     *,
-    datasets: Mapping[str, pd.DataFrame],
+    datasets: dataset_cuts.DisplayFrames,
     max_cases: int = _DEFAULT_CASE_LIMIT,
     channels: Sequence[str] = ("p", "u", "v", "U"),
 ) -> Figure:
-    """Render channel-checkbox left/right boundary ratios and an external legend."""
+    """Render channel-checkbox left/right boundary ratios, a panel per dataset with the models as bar clusters shaded by distance band."""
     dataframe.validate_comparison(datasets)
     fields = _display_fields(datasets)
     by_label = {field.label: field for field in fields}
@@ -635,50 +577,50 @@ def plot_boundary_error_decomposition(
     if not active or any(channel not in by_label for channel in active):
         msg = f"Select at least one channel from {tuple(by_label)}."  # noqa: S608
         raise ValueError(msg)
+    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
     with sessions.scoped_session(datasets) as active_session:
-        summaries = {id(frame): active_session.prefix_summary(frame, max_cases) for frame in datasets.values()}
-    figure_title, count_headings = layout.aggregate_title_context(
+        summaries = {key: active_session.prefix_summary(frame, max_cases) for key, frame in datasets.items()}
+    figure_title, count_headings = layout.dataset_title_context(
         "Left/right boundary error ratio vs x-distance (interior reference: >40 %)",
-        {label: summaries[id(frame)].case_count for label, frame in datasets.items()},
+        groups,
+        {key: summary.case_count for key, summary in summaries.items()},
     )
-    figure = plt.figure(figsize=(6 * len(datasets) + 2.5, 5))
-    grid = figure.add_gridspec(1, len(datasets) + 1, width_ratios=(*([1.0] * len(datasets)), 0.35), wspace=0.25)
-    axes = [figure.add_subplot(grid[0, index]) for index in range(len(datasets))]
-    legend_axis = figure.add_subplot(grid[0, -1])
-    legend_axis.axis("off")
-    bar_handles: list[Any] = []
+    figure, axes = figure_layout.panel_figure(1, len(groups), sharey="row")
     positions = np.arange(len(active))
-    width = 0.8 / len(_BAND_LABELS)
-    for axis, (label, frame) in zip(axes, datasets.items(), strict=True):
-        summary = summaries[id(frame)]
-        if not summary.used_count:
-            layout.mark_empty_prefix(axis, case_count=summary.case_count)
-            axis.set_title(count_headings[label] or label)
-            continue
-        means = np.stack([np.asarray(_prefix_field(summary, by_label[channel], "boundary_region_error").means) for channel in active])
-        ratios = np.divide(
-            means,
-            means[:, -1, None],
-            out=np.full_like(means, np.nan),
-            where=means[:, -1, None] > 0.0,
-        )
-        for band_index, band_label in enumerate(_BAND_LABELS):
-            bars = axis.bar(
-                positions + (band_index - (len(_BAND_LABELS) - 1) / 2) * width,
-                ratios[:, band_index],
-                width,
-                label=band_label,
-            )
-            if len(bar_handles) < len(_BAND_LABELS):
-                bar_handles.append(bars[0])
+    bar_count = max(len(models) for models in groups.values()) * len(_BAND_LABELS)
+    width = 0.8 / bar_count
+    shades = np.linspace(0.3, 1.0, len(_BAND_LABELS))  # nearer the boundary is lighter
+
+    def blend(color: str, shade: float) -> tuple[float, float, float]:
+        """Return ``color`` mixed toward white by ``shade`` as an opaque colour, so edge and hatch keep full strength."""
+        red, green, blue = (1.0 - shade * (1.0 - channel) for channel in to_rgb(color))
+        return red, green, blue
+
+    for axis, (dataset, models) in zip(axes[0], groups.items(), strict=True):
+        for slot, (model, key) in enumerate(models.items()):
+            style, summary = styles[key], summaries[key]
+            if not summary.used_count:
+                layout.mark_empty_prefix(axis, case_count=summary.case_count, model=model)
+                continue
+            means = np.stack([np.asarray(_prefix_field(summary, by_label[channel], "boundary_region_error").means) for channel in active])
+            ratios = np.divide(means, means[:, -1, None], out=np.full_like(means, np.nan), where=means[:, -1, None] > 0.0)
+            for band_index, shade in enumerate(shades):
+                offset = slot * len(_BAND_LABELS) + band_index - (bar_count - 1) / 2
+                axis.bar(
+                    positions + offset * width,
+                    ratios[:, band_index],
+                    width,
+                    color=blend(style.color, float(shade)),
+                    edgecolor="white" if shade == 1.0 else style.color,  # the top band is the model colour itself: a white hatch contrasts
+                    hatch=style.hatch,
+                )
         axis.axhline(1.0, color="black", linestyle="--", alpha=0.4)
         axis.set_xticks(positions, [by_label[channel].matplotlib_label for channel in active])
-        axis.set_ylabel("Boundary error ratio (MAE / interior MAE)")
         axis.set_xlabel("Channel")
-        axis.set_title(count_headings[label] or label)
         axis.grid(True, axis="y", linestyle="--", alpha=0.3)
-    if bar_handles:
-        legend_axis.legend(bar_handles, _BAND_LABELS, title="x-distance from left/right boundary", loc="upper left")
-    figure.subplots_adjust(top=0.87, bottom=0.07, left=0.001, right=0.98, wspace=0.25)
-    layout.title_over_axes(figure, figure_title, axes, y=0.97)
+        figure_layout.set_panel_title(axis, count_headings[dataset] or dataset)
+    figure_layout.label_rows_once(axes, f"Boundary error ratio [{field_labels.display_unit('1')}]\n(MAE / interior MAE)")
+    bands = {label: Patch(facecolor=blend("0.0", float(shade))) for label, shade in zip(_BAND_LABELS, shades, strict=True)}
+    layout.add_series_legend(figure, axes, datasets, groups, styles, bars=True, extra={"x-distance from left/right boundary": bands})
+    figure_layout.set_figure_title(figure, axes, figure_title, note=layout.series_note(styles))
     return figure

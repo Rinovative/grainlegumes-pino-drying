@@ -84,7 +84,7 @@ def test_handoff_checkpoint_shares_a0_bytes_and_survives_its_atomic_replacement(
     common.serialization.atomic_write_bytes(best, b"a later best state")
     assert published.read_bytes() == b"selected best state"
     assert not best.samefile(published)
-    handoff.validate_stage_a_handoff(run_dir / handoff.HANDOFF_DIRECTORY, target_config=_config(), device=_DEVICE, expected_source_run_name="a0")
+    handoff.validate_stage_a_handoff(run_dir / handoff.HANDOFF_DIRECTORY, target_config=_config(), expected_source_run_name="a0")
 
 
 def test_failed_hard_link_publishes_nothing_and_does_not_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

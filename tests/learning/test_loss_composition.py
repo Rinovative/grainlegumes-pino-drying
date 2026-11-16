@@ -6,6 +6,7 @@ Responsibilities:
   - Check the group-weighted state loss of both tasks, its velocity vector term, and its absolute H1
     option in metres
   - Check that every physics term carries gradients through the normalizers to the prediction
+  - Check that the physics terms do not change when a case is scaled with its inlet pressure
   - Check that a steady PI update gives the same step for any memory split of its cases
 
 Design principles:
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import torch
 from support import configs
+from support.scaling import steady_scaling
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
 
@@ -70,12 +72,14 @@ class _StateScales:
     names: tuple[str, ...]
     values: tuple[float, ...]
 
-    def decode_inputs(self, value: torch.Tensor) -> torch.Tensor:
+    def decode_inputs(self, value: torch.Tensor, *, reference: torch.Tensor | None = None) -> torch.Tensor:
         """Return the input tensor unchanged."""
+        del reference
         return value
 
-    def decode_state(self, value: torch.Tensor) -> torch.Tensor:
+    def decode_state(self, value: torch.Tensor, *, reference: torch.Tensor | None = None) -> torch.Tensor:
         """Return the state tensor unchanged."""
+        del reference
         return value
 
     def group(self, name: str) -> _StateGroup:
@@ -87,12 +91,14 @@ class _StateScales:
 class IdentityScaling:
     """Decode tensors unchanged for synthetic physical-space tests; every state has Train scale one."""
 
-    def decode_inputs(self, value: torch.Tensor) -> torch.Tensor:
+    def decode_inputs(self, value: torch.Tensor, *, reference: torch.Tensor | None = None) -> torch.Tensor:
         """Return the input tensor unchanged."""
+        del reference
         return value
 
-    def decode_state(self, value: torch.Tensor) -> torch.Tensor:
+    def decode_state(self, value: torch.Tensor, *, reference: torch.Tensor | None = None) -> torch.Tensor:
         """Return the state tensor unchanged."""
+        del reference
         return value
 
     def group(self, name: str) -> _StateGroup:
@@ -130,12 +136,14 @@ class AffineScaling:
         self.inputs = inputs
         self.outputs = outputs
 
-    def decode_inputs(self, value: torch.Tensor) -> torch.Tensor:
+    def decode_inputs(self, value: torch.Tensor, *, reference: torch.Tensor | None = None) -> torch.Tensor:
         """Return physical inputs."""
+        del reference
         return self.inputs.inverse_transform(value)
 
-    def decode_state(self, value: torch.Tensor) -> torch.Tensor:
+    def decode_state(self, value: torch.Tensor, *, reference: torch.Tensor | None = None) -> torch.Tensor:
         """Return physical states."""
+        del reference
         return self.outputs.inverse_transform(value)
 
     def group(self, name: str) -> _StateGroup:
@@ -430,6 +438,33 @@ def test_pi_model_families_share_one_dimensionless_loss_path() -> None:
             assert torch.allclose(components[term], _TARGET_WEIGHTS[term] * value)
 
 
+def test_physics_terms_are_invariant_when_a_case_is_scaled_with_its_inlet_pressure() -> None:
+    """
+    Decode one normalized prediction through a real steady scaling once at P and once at 4P.
+
+    Both inputs encode identically, the decoded physical pressure scale follows P, and every dimensionless
+    physics term is unchanged: the physics loss sees physical values, and the steady representation does
+    not depend on the pressure level.
+    """
+    loss = learning.losses.factory.build_training_loss(_physics_config(), device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
+    scaling = steady_scaling((13, 11), state_mean=0.2, state_std=0.5)
+    loss.set_scaling(scaling)
+    inputs, prediction, _target = _manufactured_batch()
+    scaled_inputs = inputs.clone()
+    scaled_inputs[:, _TASK.input_names.index("p_in_bc")] *= 4.0
+    reference, scaled_reference = scaling.state_reference(inputs), scaling.state_reference(scaled_inputs)
+    encoded = scaling.encode_inputs(inputs, reference=reference)
+    assert torch.equal(encoded, scaling.encode_inputs(scaled_inputs, reference=scaled_reference))
+    normalized = scaling.encode_state(prediction, reference=reference)
+
+    base = loss.compute_physics_diagnostics(normalized, x=encoded, reference=reference)
+    scaled = loss.compute_physics_diagnostics(normalized, x=encoded, reference=scaled_reference)
+
+    torch.testing.assert_close(scaled.scales.pressure, 4.0 * base.scales.pressure)
+    for term in ("momentum_mse", "continuity_mse", "boundary_mse"):
+        torch.testing.assert_close(getattr(scaled, term), getattr(base, term))
+
+
 @pytest.mark.parametrize("term", tuple(_TARGET_WEIGHTS))
 def test_each_physics_term_backpropagates_through_the_normalizers_to_the_prediction(term: str) -> None:
     """
@@ -600,8 +635,8 @@ def test_physics_monitor_is_bounded_and_reports_the_three_terms() -> None:
 class _FailingMonitorLoss(torch.nn.Module):
     """Inject the demonstrated spacing owner below the monitor boundary."""
 
-    def compute_physics_diagnostics(self, _pred: torch.Tensor, *, x: torch.Tensor) -> None:
-        del x
+    def compute_physics_diagnostics(self, _pred: torch.Tensor, *, x: torch.Tensor, reference: torch.Tensor | None) -> None:
+        del x, reference
         msg = "x-coordinate spacing is not uniform within tolerance"
         raise ValueError(msg)
 
