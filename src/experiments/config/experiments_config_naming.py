@@ -5,7 +5,8 @@ Responsibilities:
   - Derive the model label from the resolved architecture and physics-loss settings
   - Derive the config name: the model label plus a token for every shared, single-stage and A0 leaf the config file authors
   - Require every config file's name to equal the derived name and refuse an authored leaf no token shows
-  - Derive B/A1 pair keys (budget, rollout, learning rates, then a token per authored B/A1 leaf), Optuna trial leaves and run and parent names
+  - Derive B/A1 pair keys (rollout, learning rates, then a token per authored B/A1 leaf with the value its stage trains
+    with, and per inherited B window or curriculum value the rollout does not imply), Optuna trial leaves and run and parent names
 
 Design principles:
   - Every name is a pure function of the resolved config, its source and its layout; a config name reads the file's own leaves plus the model label
@@ -281,12 +282,17 @@ def _flatten(node: Any, prefix: str = "") -> dict[str, Any]:
     return {path: value for key, child in node.items() for path, value in _flatten(child, f"{prefix}.{key}" if prefix else str(key)).items()}
 
 
+def _equally_spaced(fractions: Any, count: int) -> bool:
+    """Return whether curriculum milestones are the ``count`` equally spaced ones from 0, as ``--rollout-length`` writes them."""
+    return list(fractions) == [i / count for i in range(count)]
+
+
 def _token_text(token: str, values: list[Any]) -> str:
     """Render leaf values as one name value: a curriculum shows its fractions only when not equally spaced, equal values show once."""
     if token.endswith("cur"):
         lengths, fractions = values
         text = "-".join(_value_token(length) for length in lengths)
-        return text + ("" if list(fractions) == [i / len(lengths) for i in range(len(lengths))] else "-at-" + "-".join(map(_value_token, fractions)))
+        return text + ("" if _equally_spaced(fractions, len(lengths)) else "-at-" + "-".join(map(_value_token, fractions)))
     parts = [_value_token(item) for value in values for item in (value if isinstance(value, list) else [value])]
     return parts[0] if len(values) > 1 and len(set(parts)) == 1 else "-".join(parts)
 
@@ -364,6 +370,21 @@ def validate_config_name(source: ConfigSource, config: Mapping[str, Any]) -> Non
         raise loader.ConfigError(message)
 
 
+def _named_when_inherited(name: str, values: list[Any], rollout: object) -> bool:
+    """Return whether an inherited B window or curriculum value differs from the one B's rollout implies, which ``--rollout-length`` writes.
+
+    No override changes the sampling mode or A1's sampling (A0's, which the config name shows), so those tokens follow the file alone.
+    """
+    if name == "bws":
+        return values != [rollout]
+    if name == "bwo":
+        return values != [0]
+    if name == "bcur":
+        lengths, fractions = values
+        return lengths[-1] != rollout or not _equally_spaced(fractions, len(lengths))
+    return False
+
+
 def pair_key(b_config: Mapping[str, Any], a1_config: Mapping[str, Any], authored: Mapping[str, Any] | None) -> str:
     """Return the directory key of one matched B/A1 pair.
 
@@ -374,18 +395,25 @@ def pair_key(b_config: Mapping[str, Any], a1_config: Mapping[str, Any], authored
         both carry their ``lr_scale``. Their budgets follow from A0's K, which the seed group names.
     authored : Mapping[str, Any] | None
         The plan file's own mapping (``ConfigSource.authored``); ``None`` for a source without a file.
+        It selects the tokens; their values come from the resolved children.
 
     Returns
     -------
     str
-        ``b-a1__rollout-<k>__lr-<x>``; unequal learning-rate scales
+        ``b-a1__rollout-<L>__lr-<x>`` with B's rollout length ``L``; unequal learning-rate scales
         read ``lr-b-<x>__lr-a1-<y>``. One ``__<token>-<value>`` follows for every other B/A1 leaf
-        the file authors (``_PAIR_TOKENS``), so the pair folder, not the config folder holding A0, shows them.
+        the file authors (``_PAIR_TOKENS``), with the value its stage trains with, a CLI override such as
+        ``--rollout-length`` included, so the pair folder, not the config folder holding A0, shows them.
+        An inherited B window or curriculum gets its token too unless B's rollout implies it (stride equal
+        to the rollout, offset 0, a curriculum ending at the rollout at equally spaced milestones): these
+        are the values ``--rollout-length`` writes, so a run whose override rewrote an inherited value
+        never shares the pair folder of a run that kept it.
 
     Raises
     ------
     ConfigError
-        If the file sets part of a multi-leaf token or the key exceeds one path component.
+        If the file sets part of a multi-leaf token or a leaf its stage trains without, or the key exceeds
+        one path component.
 
     """
     protocol = {"b": b_config["training"]["matched_a1_b"], "a1": a1_config["training"]["matched_a1_b"]}
@@ -397,7 +425,23 @@ def pair_key(b_config: Mapping[str, Any], a1_config: Mapping[str, Any], authored
     scales = number(scale_b) if scale_b == scale_a1 else f"b-{number(scale_b)}__lr-a1-{number(scale_a1)}"
     rollout = b_config.get("temporal", {}).get("sampling", {}).get("rollout_length", 1)
     fixed = f"b-a1__rollout-{number(rollout)}__lr-{scales}"
-    key = "__".join([fixed, *_token_texts(_PAIR_TOKENS, _flatten(authored or {}))])
+    trained: dict[str, Any] = {}
+    for stage, config in (("b", b_config), ("a1", a1_config)):
+        trained |= _flatten(config.get("temporal", {}).get("sampling", {}), f"training.{stage}.sampling")
+        trained |= _flatten(config["training"].get("curriculum", {}), f"training.{stage}.curriculum")
+    authored_leaves = _flatten(authored or {})
+    shown: dict[str, Any] = {}
+    for token, paths in _PAIR_TOKENS.items():
+        set_paths = [path for path in paths if path in authored_leaves]
+        dropped = next((path for path in set_paths if path not in trained), None)
+        if dropped is not None:
+            message = f"The plan file sets {dropped!r}, but its stage trains without it: --rollout-length leaves trajectory sampling only its length."
+            raise loader.ConfigError(message)
+        if set_paths:
+            shown |= {path: trained[path] for path in set_paths}
+        elif all(path in trained for path in paths) and _named_when_inherited(token, [trained[path] for path in paths], rollout):
+            shown |= {path: trained[path] for path in paths}
+    key = "__".join([fixed, *_token_texts(_PAIR_TOKENS, shown)])
     try:
         return common.paths.validate_logical_name(key, label="pair key")
     except ValueError as error:

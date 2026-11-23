@@ -4,6 +4,8 @@ Responsibilities:
   - Check that a cut frame recomputes the material-balanced objective of the artifact contract, per material and pooled
   - Check role and material admission: unavailable materials, refused roles, and case-matched comparison cuts
   - Check that transient inventories take the declared case role and resolve choices to frames and cases
+  - Check that a session binds frames and cuts once, admits a cut only as an exact ordered subset of its source, guards their
+    identity on every rebinding and draw, and releases them and its scratch on every failure
 
 Design principles:
   - The expected objective is computed by hand from per-case errors, so a row mean or a mean of roots fails
@@ -16,8 +18,12 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import math
+import mmap
+import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -38,6 +44,7 @@ from src.analysis.presentation import dataset_selection as selection
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from typing import BinaryIO
 
 _TASK = domain.tasks.steady_flow.STEADY_FLOW
 _SCALES = dict.fromkeys(_TASK.output_names, 1.0)
@@ -68,6 +75,7 @@ def _frame(cases: Sequence[tuple[str, str, float]], *, split_role: str = "eval")
             "simulation_case_id": case_id,
             "material_family": material,
             "source_index": _source_index(case_id),
+            "npz_path": f"{case_id}.npz",  # names the case in the role's prediction validity
             "prediction_validity": json.dumps(validity_contract.build_field_prediction_validity(prediction, channels=_TASK.output_names)),
         }
         for index, field in enumerate(_TASK.output_names):
@@ -166,7 +174,8 @@ def test_steady_cut_of_an_unknown_role_or_material_or_an_unavailable_choice_is_r
         {"id": frame}, unavailable=[(selection.DatasetItem(("rapeseed", "id"), "rapeseed", "id", "rapeseed, ID"), "fehlt")]
     )
     unavailable = selection.resolve_choices(inventory, [("rapeseed", "id")], pooled=False)
-    other_role = [selection.DatasetChoice("material_ood", (inventory.items[0],), True, "x")]
+    ood_lentil = selection.DatasetItem(("lentil", "material_ood"), "lentil", "material_ood", "x")
+    other_role = [selection.DatasetChoice("material_ood", (ood_lentil,), True, "x")]
     other_material = [selection.DatasetChoice("id", (selection.DatasetItem(("rapeseed", "id"), "rapeseed", "id", "r"),), True, "y")]
 
     for choices, match in ((unavailable, "unavailable"), (other_role, "holds role"), (other_material, "holds no cases")):
@@ -283,24 +292,233 @@ def test_a_whole_frame_and_a_cut_of_one_role_are_refused_together() -> None:
         dataframe.validate_comparison({"run a": run_a, "run b": cut_b}, verify_grid=False)
 
 
-def test_one_session_keeps_one_canonical_frame_per_run_and_role(tmp_path: Path) -> None:
+def test_a_direct_call_binds_cuts_only_beside_their_source(tmp_path: Path) -> None:
+    """Without its source a cut is refused; beside it, several cuts of one run-role bind once each next to the one canonical frame."""
     frame = _two_material_frame(tmp_path)
-    cuts = datasets.steady_frames({"id": frame}, _separate_choices(frame))
+    cuts = datasets.steady_frames({"id": frame}, _separate_choices(frame))  # cut while no session owns the frame
 
-    with pytest.raises(ValueError, match="run-role key is already bound"):
-        evaluation_session.EvaluationSession(cuts)
+    with pytest.raises(ValueError, match="source"), evaluation_session.scoped_session(cuts):
+        pass
     assert all(evaluation_session.bound_session(cut) is None for cut in cuts.values())
+    with evaluation_session.EvaluationSession({"id": frame, **cuts}) as live:
+        assert [live.full_summary(cut).sample_count for cut in cuts.values()] == [1, 1]
+        assert len(live.canonical_frames) == 1
+        with pytest.raises(ValueError, match="binds once"):
+            live.bind_frame(cuts["lentil, ID"].copy())
 
 
-def test_a_bound_cut_changed_after_binding_is_refused_on_the_next_draw(tmp_path: Path) -> None:
+def test_both_entry_points_bind_a_cut_only_as_an_exact_ordered_subset_of_its_bound_source_with_derived_attrs(tmp_path: Path) -> None:
+    """bind_cut and bind_frame refuse tampering that keeps the membership columns, and a cut whose source is not bound."""
     frame = _two_material_frame(tmp_path)
     lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
-    with evaluation_session.EvaluationSession({"id": frame}):
+    inventory = datasets.steady_inventory({"id": frame})
+    pooled = selection.resolve_choices(inventory, [item.key for item in inventory.items], pooled=True)
+
+    def lentil_cut() -> pd.DataFrame:
+        return datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+
+    tampers = (
+        lambda attrs: attrs["artifact_provenance"]["run"].update(name="steady-other"),
+        lambda attrs: attrs["artifact_provenance"].update(producer={"analysis_sha256": "0" * 64}),
+        lambda attrs: attrs[evaluation_session.SOURCE_PROVENANCE_ATTR]["run"].update(name="steady-other"),
+        lambda attrs: attrs["artifact_provenance"]["selection"].update(effective_case_count=7),
+        lambda attrs: attrs.update(reference_floors={**attrs["reference_floors"], "p": 1.0e9}),
+        lambda attrs: attrs.update(output_groups=list(attrs["output_groups"])),
+        lambda attrs: attrs.update(train_scales={field: 2.0 * scale for field, scale in attrs["train_scales"].items()}),
+        lambda attrs: attrs[dataframe.PRIMARY_OBJECTIVE_ID].update(value=7.0),
+        lambda attrs: attrs.update(dataset_role="material_ood"),
+        lambda attrs: attrs["artifact_provenance"]["evaluation"]["prediction_validity"].update(case_count=7),
+        lambda attrs: attrs["artifact_provenance"]["selection"].update(material_families=["chickpea", "lentil"]),
+        lambda attrs: attrs["artifact_provenance"]["selection"].update(effective_ordered_source_indices_sha256="0" * 64),
+    )
+    tampered = []  # cut while no session owns the frame, so each cut stays unbound
+    for tamper in tampers:
+        tampered.append(lentil_cut())
+        tamper(tampered[-1].attrs)
+    stray_row, single = lentil_cut(), lentil_cut()
+    stray_row["split_local_index"] = 7
+    [both] = datasets.steady_frames({"id": frame}, pooled).values()
+    repeated, reordered = single.iloc[[0, 0]].copy(), both.iloc[::-1].copy()
+    repeated.attrs, reordered.attrs = copy.deepcopy(single.attrs), copy.deepcopy(both.attrs)
+
+    with pytest.raises(ValueError, match="source"):
+        evaluation_session.EvaluationSession({"lentil": single})
+    with evaluation_session.EvaluationSession({"id": frame}) as live:
+        entry_points = (lambda cut: live.bind_cut(frame, cut), live.bind_frame)
+        for cut, bind in itertools.product((*tampered, stray_row, repeated, reordered), entry_points):
+            with pytest.raises(ValueError, match="source"):
+                bind(cut)
+            assert evaluation_session.bound_session(cut) is None
+        live.bind_frame(single)
+        assert lentil_cut() is single  # a redraw returns the cut bound directly
+
+
+def test_a_cut_of_a_bound_cut_binds_apart_from_an_equal_rows_cut_of_the_canonical_frame(tmp_path: Path) -> None:
+    """The recorded source is part of a cut's identity, so the nested cut neither displaces nor invalidates the direct one."""
+    frame = _two_material_frame(tmp_path)
+    inventory = datasets.steady_inventory({"id": frame})
+    pooled = selection.resolve_choices(inventory, [item.key for item in inventory.items], pooled=True)
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+    with evaluation_session.EvaluationSession({"id": frame}) as live:
+        direct = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+        [both] = datasets.steady_frames({"id": frame}, pooled).values()
+        nested = datasets.steady_frames({"id": both}, lentil)["lentil, ID"]
+
+        assert nested is not direct
+        assert evaluation_session.bound_session(nested) is live
+        assert [live.full_summary(cut).sample_count for cut in (direct, nested)] == [1, 1]
+
+
+def test_a_cut_binds_although_its_run_summary_records_a_non_finite_metric(tmp_path: Path) -> None:
+    """A persisted run summary may hold NaN; the cut admission compares such attrs instead of failing to encode them."""
+    frame = _two_material_frame(tmp_path)
+    frame.attrs[dataframe.COMPLETED_RUN_SUMMARY_ATTR] = {"metrics": {"val_rel_l2_p": math.nan}}
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+    with evaluation_session.EvaluationSession({"id": frame}) as live:
+        cut = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+
+        assert evaluation_session.bound_session(cut) is live
+
+
+def test_rebinding_a_held_canonical_frame_returns_its_key_and_refuses_an_invalid_binding(tmp_path: Path) -> None:
+    frame, _grid = steady_frame(tmp_path)
+    with evaluation_session.EvaluationSession({"id": frame}) as live:
+        assert live.bind_frame(frame).token == frame.attrs[evaluation_session.SESSION_KEY_ATTR]
+        path = Path(str(frame.iloc[0]["npz_path"]))
+        witness = path.stat()
+        os.utime(path, ns=(witness.st_atime_ns, witness.st_mtime_ns + 1_000_000_000))
+        with pytest.raises(evaluation_session.EvaluationArtifactChangedError):  # the draw invalidates the binding
+            live.full_summary(frame)
+
+        with pytest.raises(evaluation_session.EvaluationArtifactChangedError, match="new load-only session"):
+            live.bind_frame(frame)
+
+
+def test_a_bound_cut_changed_after_binding_is_refused_on_the_next_draw_and_invalidated(tmp_path: Path) -> None:
+    frame = _two_material_frame(tmp_path)
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+    with evaluation_session.EvaluationSession({"id": frame}) as live:
         cut = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
         cut.attrs[dataframe.PRIMARY_OBJECTIVE_ID] = {**cut.attrs[dataframe.PRIMARY_OBJECTIVE_ID], "value": 0.0}
 
         with pytest.raises(evaluation_session.EvaluationArtifactChangedError, match="cut changed"):
             datasets.steady_frames({"id": frame}, lentil)
+        with pytest.raises(evaluation_session.EvaluationArtifactChangedError):  # its binding is invalidated, not left in use
+            live.full_summary(cut)
+
+
+def test_rebinding_a_cut_whose_payload_changed_after_a_cached_summary_is_refused(tmp_path: Path) -> None:
+    """A rebinding revalidates the bound cut, so fresh payload witnesses never cover a summary cached under the old ones."""
+    frame = _two_material_frame(tmp_path)
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+    cut = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+    with evaluation_session.EvaluationSession({"id": frame, "lentil": cut}) as live:
+        live.full_summary(cut)
+        path = Path(str(cut.iloc[0]["npz_path"]))
+        witness = path.stat()
+        os.utime(path, ns=(witness.st_atime_ns, witness.st_mtime_ns + 1_000_000_000))
+
+        with pytest.raises(evaluation_session.EvaluationArtifactChangedError, match="payload changed"):
+            live.bind_frame(cut)
+        with pytest.raises(evaluation_session.EvaluationArtifactChangedError):
+            live.full_summary(cut)
+
+
+def test_reduction_metadata_changed_after_binding_refuses_cached_and_fresh_summaries(tmp_path: Path) -> None:
+    """Reference floors and the canonical output-group tuple are identity; an equal list in place of the tuple is a change too."""
+    changes = {
+        "floor": lambda attrs: attrs.update(reference_floors={**attrs["reference_floors"], "p": 1.0e9}),
+        "groups-as-list": lambda attrs: attrs.update(output_groups=list(attrs["output_groups"])),
+    }
+    for (name, change), cached in itertools.product(changes.items(), (True, False)):
+        root = tmp_path / f"{name}-{cached}"
+        root.mkdir()
+        frame, _grid = steady_frame(root)
+        with evaluation_session.EvaluationSession({"id": frame}) as live:
+            if cached:
+                live.full_summary(frame)
+            change(frame.attrs)
+
+            with pytest.raises(evaluation_session.EvaluationArtifactChangedError, match="identity changed"):
+                live.full_summary(frame)
+
+
+def _hole_punch_probe() -> tuple[bool, bool]:
+    """Return whether MADV_REMOVE is accepted and whether it visibly frees blocks, on the default temporary directory (the scratch's).
+
+    The session returns a charge exactly when the punch is accepted; a file system may accept it without reporting freed blocks.
+    """
+    size = 256 * mmap.PAGESIZE
+    with tempfile.TemporaryFile() as handle:
+        handle.truncate(size)
+        with mmap.mmap(handle.fileno(), size) as mapping:
+            mapping[:] = b"\1" * size
+            mapping.flush()
+            blocks_before = os.fstat(handle.fileno()).st_blocks
+            try:
+                mapping.madvise(mmap.MADV_REMOVE)
+            except (AttributeError, OSError):
+                return False, False
+        return True, blocks_before > 0 and os.fstat(handle.fileno()).st_blocks == 0
+
+
+def test_a_failed_full_summary_frees_its_scratch_blocks_under_a_kept_traceback_or_keeps_the_charge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The projection keeps its length; its blocks are punched out before the charge returns, which stays reserved if they cannot be.
+
+    An interrupt leaves the scratch by the same rule as a failure.
+    """
+    frame, _grid = steady_frame(tmp_path)
+    read_case = evaluation_session.EvaluationSession._read_case
+    written: list[tuple[BinaryIO, os.stat_result]] = []
+    raised: list[BaseException] = []
+
+    def lose_later_cases(session: evaluation_session.EvaluationSession, source: pd.DataFrame, position: int) -> object:
+        if position:  # the first case's errors are in the projection by now
+            written.extend((path.open("rb"), path.stat()) for path in Path(session._temporary.name).iterdir())
+            raise raised[0]
+        return read_case(session, source, position)
+
+    monkeypatch.setattr(evaluation_session.EvaluationSession, "_read_case", lose_later_cases)
+    accepted, frees = _hole_punch_probe()  # a file system that refuses the punch keeps every charge
+    for punched, error in ((accepted, KeyboardInterrupt()), (False, RuntimeError("payload lost"))):
+        raised[:] = [error]
+        if not punched:
+            monkeypatch.setattr(evaluation_session.mmap, "MADV_REMOVE", -1)  # an advice the kernel refuses
+        with evaluation_session.EvaluationSession({"id": frame}) as live:
+            with pytest.raises(type(error)) as kept:  # kept, so its traceback still maps the projection
+                live.full_summary(frame)
+            [(handle, before)] = written
+            after = os.fstat(handle.fileno())
+
+            assert after.st_size == before.st_size
+            assert live.counters["spill_bytes_current"] == (0 if punched else before.st_size)
+            if punched and frees:
+                assert (before.st_blocks > 0, after.st_blocks) == (True, 0)
+            assert not any(Path(live._temporary.name).iterdir())
+            handle.close()
+            written.clear()
+            del kept
+
+
+def test_a_missing_hole_punch_keeps_the_result_and_the_charge_which_a_later_budget_refusal_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the punch API a build still returns and removes its file; its charge stays, and only then a budget refusal names it."""
+    frame, _grid = steady_frame(tmp_path)
+    with evaluation_session.EvaluationSession({"id": frame}, max_spill_bytes=8) as tight, pytest.raises(MemoryError) as plain:
+        tight.full_summary(frame)
+    assert "hole punch" not in str(plain.value)
+    monkeypatch.delattr(evaluation_session.mmap, "MADV_REMOVE")
+    with evaluation_session.EvaluationSession({"id": frame}) as live:
+        assert live.full_summary(frame).sample_count == len(frame)
+        assert live.counters["spill_bytes_current"] > 0
+        assert not any(Path(live._temporary.name).iterdir())
+        live.max_spill_bytes = live.counters["spill_bytes_current"]
+
+        with pytest.raises(MemoryError, match="hole punch"):
+            live.full_summary(frame, max_cases=1)
 
 
 def test_a_session_whose_second_frame_fails_to_bind_releases_the_first(tmp_path: Path) -> None:
@@ -309,6 +527,38 @@ def test_a_session_whose_second_frame_fails_to_bind_releases_the_first(tmp_path:
     with pytest.raises(ValueError, match="already bound"):
         evaluation_session.EvaluationSession({"first": frame, "same run and cases": frame.copy()})
     assert evaluation_session.bound_session(frame) is None
+
+
+def test_an_interrupted_binding_detaches_every_frame_it_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt while a session binds closes it like any failure, in the constructor and in ``from_loaded_runs``."""
+    frame, _grid = steady_frame(tmp_path)
+    bind_frame = evaluation_session.EvaluationSession.bind_frame
+
+    def bind_then_interrupt(session: evaluation_session.EvaluationSession, *_args: object) -> None:
+        bind_frame(session, frame)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(evaluation_session.EvaluationSession, "bind", bind_then_interrupt)
+    monkeypatch.setattr(evaluation_session.EvaluationSession, "_bind_loaded_runs", staticmethod(bind_then_interrupt))
+    for build in (
+        lambda: evaluation_session.EvaluationSession({"id": frame}),
+        lambda: evaluation_session.EvaluationSession.from_loaded_runs([SimpleNamespace()]),  # type: ignore[list-item]
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            build()
+        assert evaluation_session.bound_session(frame) is None
+
+
+def test_a_cut_records_the_aggregate_and_the_prediction_validity_of_its_own_rows(tmp_path: Path) -> None:
+    frame = _two_material_frame(tmp_path)
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+
+    cut = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+
+    provenance = cut.attrs["artifact_provenance"]
+    assert provenance["aggregate"] == cut.attrs[dataframe.PRIMARY_OBJECTIVE_ID] != frame.attrs[dataframe.PRIMARY_OBJECTIVE_ID]
+    assert provenance["evaluation"] == {"prediction_validity": validity_contract.table_role_prediction_validity(cut)}
+    assert provenance["evaluation"]["prediction_validity"]["case_count"] == len(cut) == 1
 
 
 def test_a_cut_shares_no_nested_attribute_object_with_the_source_frame() -> None:
@@ -369,6 +619,9 @@ def test_a_live_session_binds_each_cut_once_and_redraws_hit_its_caches(tmp_path:
         assert every_material is not frame
         assert live.full_summary(every_material).sample_count == len(frame)
         assert evaluation_session.bound_session(frame) is live
+        # every normal exit returned its scratch charge, unless the file system refused the hole punch
+        accepted, _frees = _hole_punch_probe()
+        assert (live.counters["spill_bytes_current"] == 0) if accepted else (live.counters["spill_bytes_current"] > 0)
 
 
 def test_steady_frames_reject_two_frames_of_one_role() -> None:
@@ -420,3 +673,5 @@ def test_transient_inventory_takes_the_declared_case_role_and_resolves_choices_t
     ]
     with pytest.raises(ValueError, match="unavailable"):
         datasets.transient_contexts(session, selection.resolve_choices(inventory, [("", "material_ood")], pooled=False))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="both refused and loaded"):
+        datasets.transient_inventory(session, refused={"id": "Rolle ist nicht verfügbar"})  # type: ignore[arg-type]

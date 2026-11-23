@@ -3,7 +3,9 @@
 Responsibilities:
   - Check grid validation, exact unions, and latest-snapshot terminal holds
   - Check the choice of time windows by run length and the placement of time numbers and label on a window's axis
-  - Check the τ window: every stored hour of a case in it, its last time at τ = 1, its axis from 0 to 1
+  - Check the drying-phase cohort: the 20-point τ grid, nearest stored states with ties to the earlier, a constant cohort
+    over cases of different length, censored and unknown cases counted and not pooled, the refusal of a reached case without
+    a stored hour after its origin, the t_end summary in fractional hours, the clock and note helpers and the τ axis
 
 Design principles:
   - Canonical physical times are neither interpolated nor aligned by array index
@@ -117,23 +119,50 @@ def test_a_case_under_48_hours_is_in_the_first_window_and_from_the_first_hour_af
     assert first.select(short, end_hours=20.0).all()
 
 
-def test_the_tau_window_holds_every_stored_hour_and_maps_each_cases_last_time_to_one() -> None:
-    """Cases of 118 h and 98 h, stored a hair beyond and below their end too, are whole in the τ window and both end at τ = 1."""
-    window = time_ui.TAU_WINDOW
-    for end in (118.0, 98.0):
-        times = np.arange(0.0, end + 0.1, 2.0)
-        assert window.select(times, end_hours=end).all()
-        tau = window.hours(times, end_hours=end)
-        assert (tau[0], tau[-1]) == (0.0, 1.0)
-        np.testing.assert_allclose(tau, times / end, rtol=0.0, atol=0.0)
-        assert not window.select(np.asarray([end + 1e-6]), end_hours=end).any()
-    with pytest.raises(ValueError, match="end_hours"):
-        window.hours(np.arange(3.0))
+def test_the_phase_cohort_keeps_every_reached_case_at_every_grid_point_and_counts_the_others() -> None:
+    """
+    A 4 h and a 40 h reached case both contribute one stored state at each of the 20 grid points; censored and unknown cases are counted, not pooled.
+
+    Each case takes its stored state nearest to τ = t / t_end, t_end its last stored hour; on a 10 h hourly case every grid point
+    halfway between two stored τ resolves to the earlier state.
+    """
+    short, long_, censored, unknown = np.arange(5.0), np.arange(41.0), np.arange(9.0), np.arange(3.0)
+    cohort = time_ui.phase_cohort((short, long_, censored, unknown), ("reached", "reached", "censored", "unknown"))
+    np.testing.assert_allclose(time_ui.PHASE_GRID, np.arange(1, 21) * 0.05)
+    assert (cohort.cases, cohort.censored, cohort.unknown) == ((0, 1), 1, 1)
+    assert cohort.hours.shape == cohort.states.shape == (2, 20)
+    np.testing.assert_array_equal(cohort.hours[:, -1], [4.0, 40.0])
+    np.testing.assert_array_equal(cohort.hours[0, :4], [0.0, 0.0, 1.0, 1.0])  # τ 0.05, 0.10 nearest 0; 0.15, 0.20 nearest 0.25
+    np.testing.assert_array_equal(cohort.take((short * 10.0, long_ * 10.0, censored, unknown))[1], cohort.hours[1] * 10.0)
+    assert cohort.label() == "t_end 4-40 h, median 22 h; 2 reached, 1 censored, 1 unknown not pooled"
+    assert cohort.hours_label(0.1) == "τ = 0.10: stored t 0-4 h"
+    halves = time_ui.phase_cohort((np.arange(11.0),), ("reached",)).hours[0]
+    np.testing.assert_array_equal(halves[0::2], np.arange(10.0))  # τ 0.05, 0.15, ... lie halfway: the earlier state
+    empty = time_ui.phase_cohort((censored,), ("censored",))
+    assert (empty.cases, empty.hours.shape, empty.label()) == ((), (0, 20), "no reached case to pool; 1 censored not pooled")
+    assert time_ui.phase_cohort((np.arange(5.0), np.arange(6.0)), ("reached",) * 2).label() == "t_end 4-5 h, median 4.5 h; 2 reached"
+    with pytest.raises(ValueError, match="position 1"):  # a reached case stored only at its origin has no phase
+        time_ui.phase_cohort((short, np.zeros(1)), ("reached", "reached"))
+    assert time_ui.phase_cohort((np.zeros(1),), ("censored",)).censored == 1  # a case left out is only counted
+    assert (time_ui.is_phase("phase"), time_ui.is_phase("hours")) == (True, False)
+    with pytest.raises(ValueError, match="time_axis"):
+        time_ui.is_phase("tau")
+    assert time_ui.phase_note({"A": "x", "": "y"}) == "A: x\ny"
+    assert time_ui.phase_note({}) is None
+    assert time_ui.phase_index(0.5) == 9
+    with pytest.raises(ValueError, match="grid"):
+        time_ui.phase_index(0.52)
+    assert [time_ui.completion_status(available=a, reached=r) for a, r in ((True, True), (True, False), (False, True), (True, None))] == [
+        "reached",
+        "censored",
+        "unknown",
+        "unknown",
+    ]
     figure, axis = plt.subplots()
     try:
-        time_ui.style_window_axis(axis, window)
+        time_ui.style_window_axis(axis, time_ui.PHASE_WINDOW)
         assert axis.get_xlim() == (0.0, 1.0)
-        assert axis.get_xlabel() == "τ = t / t_stop [-]"
+        assert axis.get_xlabel() == "τ = t / t_end [-]"
         np.testing.assert_allclose(_ticks(axis), [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     finally:
         plt.close(figure)

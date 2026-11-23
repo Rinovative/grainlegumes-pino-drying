@@ -8,7 +8,8 @@ Responsibilities:
   - Persist immutable run inputs and mutable lifecycle outputs atomically
   - Record every attempt in runtime_sessions: device, driver, precision, and at its end its seconds and committed work
   - Derive the run's total and attempted seconds from its attempts and refuse to continue an earlier attempt schema
-  - Enforce allowed resume config changes and exact last-checkpoint continuation
+  - Enforce allowed resume config changes and exact last-checkpoint continuation, admitting the history read-only
+    before the attempt changes the run
   - Refuse continuing or reusing a run, and handing an A0 to B or A1, when its recorded training code is not current
   - Continue an interrupted run when a start names it, its full saved identity matches and its source binding admits the job
   - Validate the completed/loadable contract consumed by inference and artifacts
@@ -1096,7 +1097,7 @@ def inspect_existing_run_admission(
         reason = issues[0]
     elif status == "completed":
         compatibility = "completed"
-        reason = "The existing run already completed its budget."
+        reason = "The existing run is already completed, at its budget end or after a divergence."
     elif status not in {"running", "interrupted"}:
         compatibility = "incompatible"
         reason = f"Lifecycle status {status!r} is not eligible for explicit checkpoint resume."
@@ -1301,16 +1302,17 @@ def _stage_budget_target(
     *,
     training_units: Mapping[str, Any],
     matched_receipt: Mapping[str, Any] | None,
-) -> tuple[learning.training.budget.BudgetUnit, int]:
+) -> tuple[learning.training.budget.BudgetUnit, int, list[list[int]] | None]:
     """
-    Return one stage's budget unit and total, the one rule for training a stage and admitting its end.
+    Return one stage's budget unit, total and replayed validations, the one rule for training a stage and admitting its end.
 
     ``training_units`` is the stage's unit evidence (:func:`learning.training.loop.unit_evidence`).
     Steady runs and A0 train ``budget_epochs`` passes of the full Train set, counted in seen
     units, so a Train subset gets the full set's number. B trains K x N supervised transitions,
     K A0's budget epochs and N the full Train set's transitions, and A1 exactly the supervised
-    transitions of B's receipt. Only that receipt can hold zero (a B that diverged in its first
-    group), so a zero total is admitted for its A1 and nowhere else.
+    transitions of B's receipt and replays its validations; no other stage replays any. Only that
+    receipt can hold zero (a B that diverged in its first group), so a zero total is admitted for
+    its A1 and nowhere else.
     """
     protocol = config["training"].get("matched_a1_b")
     role = None if protocol is None else protocol["role"]
@@ -1318,14 +1320,14 @@ def _stage_budget_target(
         if matched_receipt is None:
             msg = "A matched A1 requires B's supervised-transition receipt."
             raise RunLifecycleError(msg)
-        return "supervised_transitions", int(matched_receipt["supervised_transitions"])
+        return "supervised_transitions", int(matched_receipt["supervised_transitions"]), [list(entry) for entry in matched_receipt["b_validations"]]
     unit: learning.training.budget.BudgetUnit = "supervised_transitions" if role == "b" else "units"
     count = training_units.get(f"full_set_{'transitions' if role == 'b' else 'units'}")
     if isinstance(count, bool) or not isinstance(count, int):
         msg = f"A {unit} budget requires the stage's full Train set count."
         raise RunLifecycleError(msg)
     epochs = config["training"]["stage_schedule"]["a0_budget_epochs"] if role == "b" else config["training"]["budget_epochs"]
-    return unit, learning.training.budget.passes_budget(int(epochs), count)
+    return unit, learning.training.budget.passes_budget(int(epochs), count), None
 
 
 def _stage_budget(
@@ -1335,13 +1337,15 @@ def _stage_budget(
     matched_receipt: Mapping[str, Any] | None,
 ) -> learning.training.budget.StageBudget:
     """Build one stage's budget from its resolved config (:func:`_stage_budget_target`)."""
-    unit, total = _stage_budget_target(config, training_units=training_units, matched_receipt=matched_receipt)
-    return learning.training.budget.StageBudget(unit=unit, total=total)
+    unit, total, replay = _stage_budget_target(config, training_units=training_units, matched_receipt=matched_receipt)
+    return learning.training.budget.StageBudget(unit=unit, total=total, replay=replay)
 
 
-def _finished_stage_target(run_dir: Path, config: Mapping[str, Any], summary: Mapping[str, Any]) -> tuple[learning.training.budget.BudgetUnit, int]:
+def _finished_stage_target(
+    run_dir: Path, config: Mapping[str, Any], summary: Mapping[str, Any]
+) -> tuple[learning.training.budget.BudgetUnit, int, list[list[int]] | None]:
     """
-    Return the budget unit and total a finished stage's terminal budget must carry.
+    Return the budget unit, total and replayed validations a finished stage's terminal budget must carry.
 
     The same rule as at the stage's start (:func:`_stage_budget_target`): the full Train set
     counts come from the summary's unit evidence, and an A1's receipt from its leaf, bound to
@@ -1428,6 +1432,18 @@ def _validate_training_result_objective(
     if result.get("objective") != objective:
         msg = "Training result objective does not match the resolved experiment objective."
         raise RunLifecycleError(msg)
+
+
+def _history_binding(config: Mapping[str, Any], identity: Mapping[str, Any], last: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Bind a run's history to its identity and to what its last checkpoint counts; a fresh run counts nothing, at step 0."""
+    return {
+        "task": str(config["task"]),
+        "run_name": str(config["run"]["name"]),
+        "checkpoint_identity": identity,
+        "completed_epoch": 0 if last is None else learning.training.checkpoint.recorded_history_epochs(last),
+        "validations": [] if last is None else last["objective_history"],
+        "global_step": 0 if last is None else last["global_step"],
+    }
 
 
 def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
@@ -1626,8 +1642,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
         )
 
         # Both tasks keep the history: a resume first reconciles it to the records its last checkpoint counts.
-        history_epochs = 0
-        history_validations: list[dict[str, Any]] = []
+        saved_last: dict[str, Any] | None = None
         if resume_from is not None:
             saved_last = learning.training.checkpoint.load_checkpoint(
                 resume_from,
@@ -1637,17 +1652,9 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 scheduler_expected=scheduler_expected,
                 require_best=False,
                 adapter_expected=is_transient,
+                resume=True,
             )
-            history_epochs = learning.training.checkpoint.recorded_history_epochs(saved_last)
-            history_validations = saved_last["objective_history"]
-        initial_history = learning.training.history.reconcile_history(
-            run_dir,
-            task=str(config["task"]),
-            run_name=str(config["run"]["name"]),
-            checkpoint_identity=identity,
-            completed_epoch=history_epochs,
-            validations=history_validations,
-        )
+        initial_history = learning.training.history.reconcile_history(run_dir, **_history_binding(config, identity, saved_last))
         history_callback = learning.training.history.make_epoch_state_callback(
             run_dir,
             task=str(config["task"]),
@@ -2255,26 +2262,26 @@ def _validate_transient_summary_evidence(
 
 
 def validate_training_outcome(
-    summary: Mapping[str, Any], *, lifecycle: str, target: tuple[learning.training.budget.BudgetUnit, int]
+    summary: Mapping[str, Any], *, lifecycle: str, target: tuple[learning.training.budget.BudgetUnit, int, list[list[int]] | None]
 ) -> learning.training.budget.StageBudget:
     """
     Admit a finished run's training outcome against its terminal budget and return that budget.
 
-    The one rule for every finished run: the terminal budget has the stage's unit and total
-    (``target``, :func:`_stage_budget_target`), the outcome status is allowed for the run's
-    lifecycle (``completed``: completed or diverged with its best eligible checkpoint;
-    ``unsuccessful``: diverged or no eligible checkpoint), its budget progress is the terminal
-    budget's, and the budget is complete unless the stage diverged. Example: a B that diverged
-    at 30 % of its budget records progress 0.3 and an incomplete budget; the same budget without
-    a divergence is refused, and so is a B budget of zero transitions.
+    The one rule for every finished run: the terminal budget has the stage's unit, total and
+    replayed validations, only an A1's (``target``, :func:`_stage_budget_target`), the outcome
+    status is allowed for the run's lifecycle (``completed``: completed or diverged with its best
+    eligible checkpoint; ``unsuccessful``: diverged or no eligible checkpoint), its budget progress
+    is the terminal budget's, and the budget is complete unless the stage diverged. Example: a B
+    that diverged at 30 % of its budget records progress 0.3 and an incomplete budget; the same
+    budget without a divergence is refused, and so is a B budget of zero transitions or a replay.
     """
     try:
         budget = learning.training.budget.StageBudget(**learning.training.budget.validate_state(summary.get("terminal_budget")))
     except (TypeError, ValueError) as error:
         message = f"Finished run summary terminal budget is invalid: {error}"
         raise RunLifecycleError(message) from error
-    if (budget.unit, budget.total) != target:
-        message = f"Finished run terminal budget {budget.total} {budget.unit} differs from the stage's configured {target[1]} {target[0]}."
+    if (budget.unit, budget.total, budget.replay) != target:
+        message = f"Finished run terminal budget {budget.total} {budget.unit} (replay {budget.replay}) differs from the stage's configured {target}."
         raise RunLifecycleError(message)
     outcome = summary.get("training_outcome")
     if not isinstance(outcome, Mapping) or set(outcome) != _TRAINING_OUTCOME_KEYS:
@@ -2305,7 +2312,7 @@ def _validate_terminal_budget(
     saved_budget: Mapping[str, Any] | None,
     *,
     lifecycle: str,
-    target: tuple[learning.training.budget.BudgetUnit, int],
+    target: tuple[learning.training.budget.BudgetUnit, int, list[list[int]] | None],
 ) -> learning.training.budget.StageBudget:
     """Admit a finished summary's training outcome and require its terminal budget to equal the last checkpoint's."""
     budget = validate_training_outcome(summary, lifecycle=lifecycle, target=target)
@@ -2434,8 +2441,9 @@ def validate_finished_run(run_dir: Path | str) -> dict[str, Any]:
     summary's terminal budget. Only a stage that committed no optimizer group (a divergence in
     its first group, or an A1 matched to such a B) has none; a transient stage's terminal evidence
     keeps its stage's shape either way. Both return the terminal budget
-    their training outcome was admitted against (:func:`validate_training_outcome`). Matched B
-    admission uses it, because B's receipt exists for every end of B.
+    their training outcome was admitted against (:func:`validate_training_outcome`) and the last
+    checkpoint (``None`` without one). Matched B admission uses both, because B's receipt exists
+    for every end of B.
     """
     path = Path(run_dir)
     summary = read_run_summary(path) if common.paths.resolve_run_summary_path(path).is_file() else {}
@@ -2471,7 +2479,7 @@ def validate_finished_run(run_dir: Path | str) -> dict[str, Any]:
     if (saved_budget is None) != (budget.spent == 0) or (saved_budget is None and last.exists()) or summary.get("best_epoch") is not None:
         message = f"Unsuccessful run evidence is inconsistent: {path}"
         raise RunLifecycleError(message)
-    return {"run_dir": path, "summary": dict(summary), "config": dict(config), "terminal_budget": budget}
+    return {"run_dir": path, "summary": dict(summary), "config": dict(config), "terminal_budget": budget, "last_checkpoint": last_payload}
 
 
 def _validate_unsuccessful_history(path: Path, config: Mapping[str, Any], last_payload: Mapping[str, Any] | None) -> None:
@@ -2847,6 +2855,7 @@ def _run_resolved_experiment(
             scheduler_expected=runtime_config.get("scheduler") is not None,
             require_best=False,
             adapter_expected=runtime_config["task"] == "transient_drying",
+            resume=True,
         )
         best_path = common.paths.resolve_best_checkpoint_file(run_dir)
         if last["best_metric"] is None:
@@ -2866,6 +2875,8 @@ def _run_resolved_experiment(
             if best["best_metric"] != last["best_metric"] or best["best_epoch"] != last["best_epoch"]:
                 msg = "Resume run best and last checkpoints disagree about selected objective state."
                 raise RunLifecycleError(msg)
+        # Read-only under the lease, so a history the attempt would refuse changes nothing; the attempt truncates it.
+        learning.training.history.validate_resume_history(run_dir, **_history_binding(runtime_config, identity, last))
 
         result = _execute_prepared_run_locked(
             runtime_config,
@@ -2921,7 +2932,7 @@ def _require_resumable_status(summary: Mapping[str, Any], run_dir: Path) -> None
     """Admit only an interrupted or running run to resume; a finished run is never extended."""
     status = summary.get("status")
     if status == "completed":
-        msg = "A completed run has spent its budget and is never extended; another budget is another run."
+        msg = "A completed run, also one that diverged before its budget end, is never extended; another budget is another run."
         raise ValueError(msg)
     if status not in {"running", "interrupted"}:
         msg = f"Run status {status!r} is not resumable: {run_dir}"
@@ -2936,7 +2947,7 @@ def _existing_run_continuation(
 ) -> dict[str, Any] | None:
     """Decide how a start that names an existing run proceeds.
 
-    Returns the finished outcome when the run already completed its budget,
+    Returns the finished outcome when the run is already completed (also after a divergence),
     ``None`` when it must continue in place after an interruption, and raises
     when it cannot continue.
 
@@ -3031,7 +3042,7 @@ def _matched_failed_stage_recovery(
     *,
     config_path: Path | str,
 ) -> tuple[bool, str]:
-    """Check the persisted resume admission and checkpoint without mutating the leaf."""
+    """Check the persisted resume admission, checkpoint and history without mutating the leaf."""
     if not run_dir.is_dir() or run_dir.is_symlink():
         return False, "No safe persisted stage leaf is available for checkpoint resume."
     try:
@@ -3056,6 +3067,7 @@ def _matched_failed_stage_recovery(
             scheduler_expected=requested.get("scheduler") is not None,
             require_best=False,
             adapter_expected=True,
+            resume=True,
         )
         best_path = common.paths.resolve_best_checkpoint_file(run_dir)
         if last["best_metric"] is None:
@@ -3073,9 +3085,10 @@ def _matched_failed_stage_recovery(
             )
             if best["best_metric"] != last["best_metric"] or best["best_epoch"] != last["best_epoch"]:
                 return False, "Best and last checkpoints disagree about the selected objective."
+        learning.training.history.validate_resume_history(run_dir, **_history_binding(requested, identity, last))
     except Exception:  # noqa: BLE001
-        return False, "Persisted resume state or checkpoint validation failed."
-    return True, "Persisted lifecycle, data state, and checkpoint passed read-only resume checks."
+        return False, "Persisted resume state, checkpoint or history validation failed."
+    return True, "Persisted lifecycle, data state, checkpoint and history passed read-only resume checks."
 
 
 def _run_transient_matched_plan(  # noqa: C901, PLR0912

@@ -7,7 +7,9 @@ Responsibilities:
   - Keep schedule state out of a teacher handoff source, so a continuation inherits only optimizer state
   - Validate the unit sampler's epoch order and committed group position as the exact continuation point
   - Validate checkpoint identity before mutating runtime objects
-  - Carry the committed training-work counts across resume
+  - Admit a continuation source only in the SIF it was produced in, native only natively; reading admits a
+    native and a container checkpoint alike
+  - Carry the committed training-work counts across resume; the global step equals their optimizer steps
   - Validate the objective history: a finite value exactly at eligible validation points, the best among them
   - Record a stage's divergence in its terminal last checkpoint, so a resume finalizes it instead of training on
   - Publish best and last checkpoints through atomic replacement, a new best together with its last
@@ -953,6 +955,7 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     scheduler_expected: bool,
     require_best: bool,
     adapter_expected: bool = False,
+    resume: bool = False,
 ) -> dict[str, Any]:
     """
     Validate a checkpoint completely before runtime state restoration.
@@ -975,6 +978,10 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
 
     adapter_expected : bool, optional
         Require task-owned adapter continuation evidence in the checkpoint.
+    resume : bool, optional
+        Admit the checkpoint as a continuation source: its ``sif_sha256`` must equal
+        the expected one exactly, ``None`` (native) matching only ``None``. Otherwise
+        a native and a container identity are compared without their SIF digest.
 
     Returns
     -------
@@ -1027,11 +1034,17 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     expected = _validate_checkpoint_identity(expected_identity, label="expected identity")
     comparison_identity = copy.deepcopy(identity)
     comparison_expected = copy.deepcopy(expected)
-    actual_sif = comparison_expected["numerical_environment"]["sif_sha256"]
     saved_sif = comparison_identity["numerical_environment"]["sif_sha256"]
-    if actual_sif is None or saved_sif is None:
-        comparison_identity["numerical_environment"]["sif_sha256"] = None
-        comparison_expected["numerical_environment"]["sif_sha256"] = None
+    actual_sif = comparison_expected["numerical_environment"]["sif_sha256"]
+    if saved_sif != actual_sif:
+        # A run continues only in the container it was produced in, the rule of the history's identity digest.
+        if resume:
+            msg = "Exact resume requires the producing SIF identity in the actual training environment; a native run resumes only natively."
+            raise ValueError(msg)
+        # Reading admits a native and a container run alike; two different containers stay incompatible.
+        if actual_sif is None or saved_sif is None:
+            comparison_identity["numerical_environment"]["sif_sha256"] = None
+            comparison_expected["numerical_environment"]["sif_sha256"] = None
     if comparison_identity != comparison_expected:
         msg = "Checkpoint run identity is incompatible with config, task, dataset, split, normalizer, or objective state."
         raise ValueError(msg)
@@ -1045,7 +1058,12 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             msg = f"Checkpoint {label} must be an integer >= {minimum}."
             raise TypeError(msg)
-    validate_update_work(payload["update_work"], training_work=_validate_training_work(payload["training_work"]))
+    training_work = _validate_training_work(payload["training_work"])
+    validate_update_work(payload["update_work"], training_work=training_work)
+    # The loop starts both at zero for a run or stage and advances both by every committed update.
+    if global_step != training_work["optimizer_steps"]:
+        msg = "Checkpoint global_step must equal its committed optimizer steps."
+        raise ValueError(msg)
     budget = budget_state.validate_state(payload["budget_state_dict"])
     if full:
         _require_divergence(payload["divergence"], role=expected_role)
@@ -1057,6 +1075,11 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
             raise ValueError(msg)
         if payload["next_epoch"] != completed_epoch + (0 if _partial_epoch(payload) else 1):
             msg = "Checkpoint next_epoch conflicts with its completed or partial unit-sampler epoch."
+            raise ValueError(msg)
+        # Only a matched A1, the one budget that replays B's validations, stops inside an epoch after its remaining transitions.
+        remaining = budget["total"] - budget["supervised_transitions"]
+        if "stop" in sampler_state and ("replay" not in budget or sampler_state["stop"] != sampler_state["cursor"] + remaining):
+            msg = "Checkpoint sampler stop is not the exact end of a matched A1 of transition units at its remaining budget."
             raise ValueError(msg)
 
     for key in ("model_state_dict", "loss_state_dict", *(("optimizer_state_dict",) if full else ())):
@@ -1235,6 +1258,7 @@ def load_checkpoint(
     scheduler_expected: bool,
     require_best: bool,
     adapter_expected: bool = False,
+    resume: bool = False,
 ) -> dict[str, Any]:
     """
     Load and validate one checkpoint under the strict saved schema.
@@ -1256,6 +1280,8 @@ def load_checkpoint(
 
     adapter_expected : bool, optional
         Require task-owned adapter continuation evidence in the checkpoint.
+    resume : bool, optional
+        Admit it as a continuation source; see :func:`validate_checkpoint`.
 
     Returns
     -------
@@ -1279,6 +1305,7 @@ def load_checkpoint(
         scheduler_expected=scheduler_expected,
         require_best=require_best,
         adapter_expected=adapter_expected,
+        resume=resume,
     )
 
 
@@ -1352,12 +1379,8 @@ def restore_checkpoint(
         scheduler_expected=scheduler is not None,
         require_best=False,
         adapter_expected=adapter_expected,
+        resume=True,
     )
-    saved_sif = checkpoint["identity"]["numerical_environment"]["sif_sha256"]
-    actual_sif = expected_identity["numerical_environment"]["sif_sha256"]
-    if saved_sif is not None and actual_sif != saved_sif:
-        message = "Exact resume requires the retained producing SIF identity in the actual training environment."
-        raise ValueError(message)
     if adapter_expected and adapter is None:
         msg = "Transient checkpoint restoration requires an adapter."
         raise ValueError(msg)
@@ -1518,6 +1541,7 @@ def restore_handoff_checkpoint(
         scheduler_expected=False,
         require_best=True,
         adapter_expected=True,
+        resume=True,
     )
     common_payload = dict(source)
     common_payload.pop("adapter_state_dict")

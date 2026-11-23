@@ -93,7 +93,8 @@ stateDiagram-v2
   successful --> [*]
   note right of failed
     reason_code: stalled, timed_out,
-    solver_error or unclassified
+    solver_error, negative_water_state
+    or unclassified
   end note
   note right of license_blocked
     at the wait cap the case stays license_blocked
@@ -195,8 +196,8 @@ Failures end in a retry, a replacement or a stop that names its next step.
 | 1 | Spatial inputs: texture violates the mean-porosity support | Retry a complete stochastic realization with up to 32 deterministic seed plans; the packing scatter seed stays fixed. Structural and coupling failures stop at once |
 | 2 | Schedules: degenerate or infeasible | Retry with up to 32 seed plans; values are never clipped; exhaustion raises an error. Both retries keep the candidate and its design coordinates |
 | 3 | Licence capacity | Not a case failure: retried inside the allocation (300 s window, 5 s between attempts), then `wait.json` and redispatch after 60 s doubling to at most 300 s; the cumulative wait is capped at 3600 s, beyond it the campaign settles as `license_wait_exhausted` |
-| 4 | Solve the runtime stopped itself | Decided automatically with the typed reason `stalled`, `timed_out` or `solver_error`; the replacement is planned once every original candidate of the batch is terminal |
-| 5 | Export, conversion and validation failures, unclassified solver failures | No automatic retry: the driver stops with the `fail-case` instruction. Inspect the evidence and declare the case failed; its replacement is solved again with COMSOL |
+| 4 | Solve the runtime stopped itself; transient conversion that finds a negative water state | Decided automatically with the typed reason `stalled`, `timed_out`, `solver_error` or `negative_water_state`; the replacement is planned once every original candidate of the batch is terminal |
+| 5 | Other export, conversion and validation failures, unclassified solver failures | No automatic retry: the driver stops with the `fail-case` instruction. Inspect the evidence and declare the case failed; its replacement is solved again with COMSOL |
 | 6 | Controller or publication errors | Automatic feeding stops; rerun the same campaign after inspection. The rerun solves the case again with COMSOL; nothing is reused from the retained output |
 
 <details>
@@ -216,6 +217,7 @@ Failures end in a retry, a replacement or a stop that names its next step.
   - transient: simulated hours of the horizon, `solver_error: COMSOL exited with status 1 at 0.98 h of 168 h simulated after 120 s solving`;
   - steady: the last stationary nonlinear iteration, `solver_error: COMSOL exited with status 1 at nonlinear iteration 37 after 120 s solving`;
   - `no progress reported` only when the solver output holds none (a transient case that ends during its initial stationary airflow solve also names that iteration).
+- `negative_water_state` (transient only): a grain water state `w_surf` or `w_int` is below zero in any regular state, in the exact stop state or in the post-horizon state the conversion otherwise excludes. The rule is strict, without tolerance, and values are never clipped: the conversion fails before any HDF5 is written, so the case is never published. The `validation` attempt (stage `conversion`, not retryable) keeps the numbers in `evidence.negative_water_state`, because compact retention deletes the exports: per compartment the `unit` (kg/m^3), the `minimum`, the `negative_value_count` over all stored states and the `negative_state_count`, plus `first_negative_time_h`, `last_negative_time_h`, `minimum_time_h`, `stored_state_count` (regular and exact stop states only) and `post_horizon_state_checked`; the counts, minima and times include the post-horizon state when one was checked. Its `detail` is a summary rounded to 6 significant digits that names a checked post-horizon state separately; the exact values are in the attempt evidence. For example `negative_water_state: grain water states go below zero (w_surf minimum -0.5 kg/m^3, 1 negative cell values in 1 states; w_int minimum 17.2 kg/m^3, 0 negative cell values in 0 states) from t=172.289 h to t=172.289 h, lowest at t=172.289 h, over 169 stored states and the post-horizon state at t=172.289 h; the case is neither clipped nor published.`
 - Once the step of the case's latest dispatch has terminal Slurm accounting and no dispatch of the case is active, the next feed records the failed decision with that reason and detail. That feed returns without draining a node job; once every original candidate of the batch is terminal, a following feed plans the replacement, unless the batch's minimum success rate has stopped it (see [Replacements](#replacements)).
 
 </details>
@@ -392,7 +394,7 @@ Each atomic publication is one rename of a complete directory: a case appears wi
 | `_record/execution/license/` | Per case below `MATERIAL-REGIME/case_NNNN/`: the licence wait `wait.json`, checkout windows `windows/DISPATCH.json` and status recoveries `status_recoveries/` |
 | `01_generation/.state/` (stage level, outside every campaign) | Lock anchors in `locks/` and staging in `staging/TASK~SOURCE_NAME/` (immutable records, reservations, publications, input transactions, quarantine), named by task, Source, material and regime |
 | `case_NNNN/inputs/` | Case definition, sampled and derived parameters, seeds, rejection evidence, input reference and hashes in `case.json`; the spatial, scalar and schedule inputs in `inputs.h5` |
-| `case_NNNN/_record/attempts/attempt_NNNN.json`, `case_NNNN/_record/decision.json` | Append-only classified attempts (a solver attempt's `reason_code` is `stalled`, `timed_out`, `solver_error` or `unclassified`) and immutable terminal decisions |
+| `case_NNNN/_record/attempts/attempt_NNNN.json`, `case_NNNN/_record/decision.json` | Append-only classified attempts (a solver attempt's `reason_code` is `stalled`, `timed_out`, `solver_error` or `unclassified`; a conversion that found a negative water state records `negative_water_state` with its undershoot numbers in `evidence.negative_water_state`) and immutable terminal decisions |
 | `case_NNNN/_record/attempts/run_NNNN/` | Evidence bundle of one failed execution: receipt, retained payload and predecessor hashes |
 | `result/evidence/status.json`, `timing.json` | Execution outcome and measured timing boundaries |
 | `result/provenance.json` | Content inventory (paths relative to `result/`) and conversion provenance |

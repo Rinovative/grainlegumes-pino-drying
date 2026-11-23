@@ -1,7 +1,7 @@
 """Define semantic completed-output exploratory analysis for transient drying.
 
 Responsibilities:
-  - Summarize physical trajectories on exact physical-time support
+  - Summarize physical trajectories on exact physical-time support, or over the drying phase (``time_ui.phase_cohort``) from completion evidence
   - Report target attainment, censoring, supported schedules, and runtime evidence
   - Assemble backend-neutral scientific views from validated transient runtime items
 
@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from src import domain, generation
+from src.analysis.ui import analysis_ui_time as time_ui
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 _TRANSIENT_TASK_ID: Final = transient_contract.TRANSIENT_PROFILE_ID
@@ -402,6 +403,32 @@ def aggregate_exact_series(
     quantiles = np.asarray([np.quantile(observations[float(time)], (0.1, 0.5, 0.9)) for time in physical_time], dtype=np.float64)
     counts = np.asarray([len(observations[float(time)]) for time in physical_time], dtype=np.int64)
     return physical_time, quantiles[:, 0], quantiles[:, 1], quantiles[:, 2], counts
+
+
+def has_completion_evidence(frame: pd.DataFrame) -> bool:
+    """Return whether every case of ``frame`` carries generated-output ``completion`` evidence, which a published Dataset lacks."""
+    return "completion" in frame.columns and all(isinstance(completion, Mapping) for completion in frame["completion"])
+
+
+def case_completion(row: pd.Series) -> time_ui.Completion:
+    """Return one case row's reference completion from its generated-output ``completion`` evidence; a case without it is unknown."""
+    completion = row.get("completion")
+    reached = completion.get("target_reached") if isinstance(completion, Mapping) else None
+    return time_ui.completion_status(available=isinstance(completion, Mapping), reached=reached)
+
+
+def aggregate_phase_series(
+    times_by_case: Sequence[np.ndarray],
+    values_by_case: Sequence[np.ndarray],
+    completion: Sequence[time_ui.Completion],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, time_ui.PhaseCohort]:
+    """Return q10, median and q90 over ``time_ui.PHASE_GRID`` of the cases ``time_ui.phase_cohort`` pools (NaN without one) and the cohort."""
+    cohort = time_ui.phase_cohort(times_by_case, completion)
+    if not cohort.cases:
+        missing = np.full(time_ui.PHASE_GRID.shape, np.nan)
+        return missing, missing, missing, cohort
+    q10, median, q90 = np.quantile(cohort.take(values_by_case), (0.1, 0.5, 0.9), axis=0)
+    return q10, median, q90, cohort
 
 
 def _distribution(values: np.ndarray, *, configured_horizon_hours: float | None) -> dict[str, Any]:

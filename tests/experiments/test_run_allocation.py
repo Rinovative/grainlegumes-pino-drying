@@ -22,6 +22,7 @@ import multiprocessing as mp
 import queue
 import threading
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -636,6 +637,55 @@ def test_resume_refuses_a_summary_that_records_its_attempts_in_an_earlier_schema
     with pytest.raises(experiments.run.RunLifecycleError, match="earlier summary schema"):
         experiments.run.run_experiment(common.paths.resolve_run_config_path(run_dir), resume=run_dir)
 
+    assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
+
+
+def test_resume_admission_refuses_a_contradictory_history_before_its_attempt_changes_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The resume admission validates the history read-only against the last checkpoint it admits as continuation source.
+
+    A history whose counted epoch ends at the last's step admits the attempt. One that ends after it is refused under the
+    writer lease before the attempt publishes the run as running: the run, its summary and runtime sessions included,
+    stays byte-identical. The last is loaded as continuation source, the best only to be read.
+    """
+    config = configs.resolve(configs.direct_config(), output_root=tmp_path)
+    run_dir = common.paths.resolve_config_run_dir(config)
+    run_state.write_lightweight_run_state(run_dir, config, status="interrupted", completed_epoch=1)
+    identity = {"effective_config_digest": "a" * 64}
+    loads: list[tuple[str, bool]] = []
+    attempts: list[Path] = []
+
+    def load(_path: Path, *, expected_role: str, resume: bool = False, **_kwargs: Any) -> dict[str, Any]:
+        loads.append((expected_role, resume))
+        # The last closed epoch 1 at its one committed update; the best agrees with it.
+        return {"best_metric": 0.5, "best_epoch": 1, "objective_history": [], "global_step": 1}
+
+    def attempt(_config: dict[str, Any], *, run_dir: Path, **_kwargs: Any) -> dict[str, Any]:
+        attempts.append(run_dir)
+        return {}
+
+    monkeypatch.setattr(experiments.run, "_read_saved_data_artifacts", lambda *_args: (SimpleNamespace(as_payload=dict), {}))
+    monkeypatch.setattr(experiments.run, "_validate_saved_data_contract", lambda *_args: None)
+    monkeypatch.setattr(learning.training.checkpoint, "build_checkpoint_identity", lambda *_args, **_kwargs: identity)
+    monkeypatch.setattr(learning.training.checkpoint, "load_checkpoint", load)
+    monkeypatch.setattr(learning.training.checkpoint, "recorded_history_epochs", lambda _payload: 1)
+    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", attempt)
+    binding: dict[str, Any] = {"task": "steady_flow", "run_name": str(config["run"]["name"]), "checkpoint_identity": identity}
+
+    def record_epoch_end(step: float) -> None:
+        learning.training.history.make_epoch_state_callback(run_dir, **binding)(1, {"global_step": step, "train/loss_total": 0.5}, None)
+
+    def resume() -> None:
+        experiments.run._run_resolved_experiment(config, config_path=common.paths.resolve_run_config_path(run_dir), resume=run_dir)
+
+    record_epoch_end(1.0)
+    resume()
+    assert (len(attempts), loads) == (1, [("last", True), ("best", False)])
+    record_epoch_end(2.0)
+    before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
+    with pytest.raises(ValueError, match="global step"):
+        resume()
+    assert len(attempts) == 1
     assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
 
 

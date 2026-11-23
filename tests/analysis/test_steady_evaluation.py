@@ -1042,21 +1042,22 @@ def test_every_steady_registry_entry_builds_with_steady_fields_only(
 ) -> None:
     """Invoke each visible steady entry once, with no view failing, and expose only steady output fields."""
     frame, _x_grid = steady_frame(tmp_path)
-    registry = panel._build_sections(_scope({"Steady fixture": frame}, comparison=False), comparison=False)
-    entries = [entry for section_entries, _section_title in registry.values() for entry in section_entries]
+    with analysis.evaluation.session.EvaluationSession({"Steady fixture": frame}):  # bound like the workflow's frames, so cuts bind beside it
+        registry = panel._build_sections(_scope({"Steady fixture": frame}, comparison=False), comparison=False)
+        entries = [entry for section_entries, _section_title in registry.values() for entry in section_entries]
 
-    assert entries
-    assert len({stem for _title, _factory, stem in entries}) == len(entries)
-    try:
-        for title, factory, stem in entries:
-            analysis.ui.notebook._invoke_dropdown_entry(
-                factory,
-                export_state={"fig": None, "plot_name": stem, "title": title},
-                export_plot_name=stem,
-                export_title=title,
-            )
-    finally:
-        plt.close("all")
+        assert entries
+        assert len({stem for _title, _factory, stem in entries}) == len(entries)
+        try:
+            for title, factory, stem in entries:
+                analysis.ui.notebook._invoke_dropdown_entry(
+                    factory,
+                    export_state={"fig": None, "plot_name": stem, "title": title},
+                    export_plot_name=stem,
+                    export_title=title,
+                )
+        finally:
+            plt.close("all")
     assert not [record.getMessage() for record in caplog.records if "View failed" in record.getMessage()]
     assert {field.key for field in analysis.evaluation.presentation.display_fields(frame)} == {"p", "u", "v", "velocity_magnitude"}
 
@@ -1746,6 +1747,24 @@ def test_prefix_summary_leaves_nonfinite_cases_out_whole_and_counts_them(tmp_pat
     assert empty.fields == alone.fields
     reductions = (empty.local_relative_error, empty.target_magnitude_error, empty.boundary_distance_error, empty.spectra, empty.magnitudes)
     assert not any(reductions)
+
+
+def test_full_summary_leaves_a_nonfinite_case_out_of_the_local_relative_maps_whole(tmp_path: Path) -> None:
+    """A NONFINITE case neither voids a local relative map nor counts as below a floor: the maps are those of the finite case alone."""
+    finite = _nonfinite_frame(tmp_path / "finite", ())
+    mixed = _nonfinite_frame(tmp_path / "mixed", (1,))  # the second case is the only one above the pressure floor
+    with analysis.evaluation.session.EvaluationSession({"finite": finite}) as session:
+        alone = session.full_summary(finite, 1).require_spatial()
+    with analysis.evaluation.session.EvaluationSession({"mixed": mixed}) as session:
+        partial = session.full_summary(mixed).require_spatial()
+
+    assert partial.sample_count == _CASE_COUNT
+    assert (partial.local_relative_nonfinite_cases, alone.local_relative_nonfinite_cases) == (1, 0)  # a plot can name the left-out case
+    for name in ("local_relative_error_mean", "local_relative_unavailable_cases"):
+        np.testing.assert_array_equal(np.asarray(getattr(partial, name)), np.asarray(getattr(alone, name)))
+    for group, magnitude in partial.magnitudes.items():
+        np.testing.assert_array_equal(magnitude.local_relative_error_mean, alone.magnitudes[group].local_relative_error_mean)
+        assert magnitude.local_relative_unavailable_cases == alone.magnitudes[group].local_relative_unavailable_cases
 
 
 def test_prefix_plots_show_an_empty_prefix_instead_of_failing(tmp_path: Path) -> None:

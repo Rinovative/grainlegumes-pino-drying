@@ -49,6 +49,17 @@ def _transition_budget(total: int, spent: int) -> dict[str, Any]:
     }
 
 
+def _b_history(run_dir: Path, validations: list[list[int]]) -> Path:
+    """Write the part of B's history its receipt reads: every validation's point, committed supervised transitions and step 1, 2, ..."""
+    run_dir.mkdir(parents=True)
+    records = [
+        {"validation/point": float(point), "budget/supervised_transitions": float(count), "global_step": float(step)}
+        for step, (point, count) in enumerate(validations, start=1)
+    ]
+    (run_dir / "history.json").write_text(json.dumps({"validations": records}), encoding="utf-8")
+    return run_dir
+
+
 def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     output_root = tmp_path / "outputs"
     pair = "b-a1__rollout-1__lr-1"
@@ -153,7 +164,13 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
         parent_identity_sha256=record["parent_identity_sha256"],
         a0_handoff_sha256=common.serialization.file_sha256(manifest),
         b_config=configs["b"],
-        finished_b={"summary": b_summary, "terminal_budget": artifact.learning.training.budget.StageBudget(**b_summary["terminal_budget"])},
+        finished_b={
+            "run_dir": _b_history(tmp_path / "b_history", [[20, 12]]),
+            "summary": b_summary,
+            "terminal_budget": artifact.learning.training.budget.StageBudget(**b_summary["terminal_budget"]),
+            # B's one update committed its 12 supervised transitions.
+            "last_checkpoint": {"update_work": [[6, 1, 12]]},
+        },
     )
     matched_budget.publish_b_receipt(runs["b"], receipt)
     matched_budget.publish_b_receipt(runs["a1"], receipt)

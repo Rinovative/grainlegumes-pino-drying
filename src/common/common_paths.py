@@ -1272,7 +1272,9 @@ def seed_group_name(layout: Mapping[str, Any]) -> str:
     The result is ``seed-<n>__ep-<epochs>__k-<k>__sch-<schedule>[__rev-<revision>]``: the
     budget in epochs of the full Train set (a transient seed group's A0 budget, which its
     pairs share), the units per update and the learning-rate schedule. A run never changes
-    them, so another value is another run beside the first.
+    them, so another value is another run beside the first. Where the name becomes a
+    directory, :func:`resolve_config_experiment_dir` bounds it like every logical name;
+    a trial lives below its study and never uses it.
     """
     name = (
         f"seed-{layout['seed']}__ep-{_positive_name_integer(layout['budget_epochs'], label='run.layout.budget_epochs')}"
@@ -1365,7 +1367,7 @@ def resolve_config_experiment_dir(
         )
         return study / STUDY_TRIALS_DIRNAME / layout["trial"]
     family = resolve_config_family_dir(config, output_root=root)
-    return family / layout["config_name"] / seed_group_name(layout)
+    return family / layout["config_name"] / validate_logical_name(seed_group_name(layout), label="run.layout seed group")
 
 
 def resolve_config_branch_dir(

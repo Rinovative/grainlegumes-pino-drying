@@ -3,6 +3,9 @@
 Responsibilities:
   - Check matched branches, immutable receipts, exact group cursors, caps, and recovery reporting
   - Check B's K x N and A1's receipt budgets, corrupted receipts, and the one GPU model of a B/A1 pair
+  - Check that a receipt's validation schedule holds the point each count reached and B's checkpoint work at each step
+  - Check that A1 cuts its last group to commit exactly B's transitions and validates at exactly the points B reached,
+    also after a resume inside its stretch, and that only an A1 finishes with a replay or checkpoints a sampler stop
   - Check terminal group cursors, the history count of a divergence inside an epoch, and finalize-only terminal resume
   - Check that an unsuccessful run's epoch history holds exactly the records its last checkpoint counts, none without one
   - Check that a stretch without a committed step adds no point to the tracked step history
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,11 +62,11 @@ class _Clock:
         return self.value
 
 
-def _train_loader(values: TensorDataset, *, seed: int) -> DataLoader[Any]:
-    """Return a loader of single-unit updates driven by its unit sampler."""
+def _train_loader(values: TensorDataset, *, seed: int, unit_kind: datasets.runtime.units.UnitKind = "trajectory", k: int = 1) -> DataLoader[Any]:
+    """Return a loader of ``k``-unit updates (single-unit by default) driven by its unit sampler."""
     units = datasets.runtime.units
     sampler = units.UnitSampler(
-        unit_kind="trajectory", cases=range(len(values)), keys=None, units_per_update=1, memory_batch=1, seed=seed, full_set_transitions=len(values)
+        unit_kind=unit_kind, cases=range(len(values)), keys=None, units_per_update=k, memory_batch=1, seed=seed, full_set_transitions=len(values)
     )
     return DataLoader(values, batch_sampler=sampler)
 
@@ -185,7 +189,7 @@ class _ScaledMSELoss(torch.nn.MSELoss):
 
 class _Metric:
     id = "mse"
-    space = "normalized"
+    space = "physical"
 
     def reset(self) -> None:
         self.values: list[float] = []
@@ -286,15 +290,37 @@ def _completed_b_summary(*, total: int, spent: int, outcome: str = "completed", 
     }
 
 
-def _finished(summary: dict[str, Any]) -> dict[str, Any]:
-    """Return B as validate_finished_run admits it: its summary and the terminal budget the one outcome rule admitted."""
-    target = ("supervised_transitions", summary["terminal_budget"]["total"])
-    return {"summary": summary, "terminal_budget": run_service.validate_training_outcome(summary, lifecycle=summary["status"], target=target)}
+def _finished(summary: dict[str, Any], run_dir: Path | None = None, *, update_work: list[list[int]] | None = None) -> dict[str, Any]:
+    """
+    Return B as validate_finished_run admits it: run directory, summary, the terminal budget the one outcome rule admitted, last checkpoint.
+
+    The last checkpoint's ``update_work`` defaults to one update of B's terminal spend.
+    """
+    target = ("supervised_transitions", summary["terminal_budget"]["total"], None)
+    terminal_budget = run_service.validate_training_outcome(summary, lifecycle=summary["status"], target=target)
+    rows = [[3, 1, terminal_budget.supervised_transitions]] if update_work is None else update_work
+    return {"run_dir": run_dir, "summary": summary, "terminal_budget": terminal_budget, "last_checkpoint": {"update_work": rows}}
 
 
-def _receipt(summary: dict[str, Any]) -> dict[str, Any]:
+def _b_history(run_dir: Path, validations: list[list[int]]) -> Path:
+    """Write the part of B's history its receipt reads: every validation's point, committed supervised transitions and step 1, 2, ..."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    records = [
+        {"validation/point": float(point), "budget/supervised_transitions": float(count), "global_step": float(step)}
+        for step, (point, count) in enumerate(validations, start=1)
+    ]
+    epoch_history.history_path(run_dir).write_text(json.dumps({"validations": records}), encoding="utf-8")
+    return run_dir
+
+
+def _receipt(summary: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    """Return the receipt of a hand-made B summary whose one validation lies at its terminal spend."""
+    spent = summary["terminal_budget"]
+    _b_history(run_dir, [[spent["validated_point"], spent["supervised_transitions"]]] if spent["supervised_transitions"] else [])
     b_config = configs.resolve_plan(configs.transient_matched_config()).b
-    return budget.build_b_receipt(parent_identity_sha256="a" * 64, a0_handoff_sha256="b" * 64, b_config=b_config, finished_b=_finished(summary))
+    return budget.build_b_receipt(
+        parent_identity_sha256="a" * 64, a0_handoff_sha256="b" * 64, b_config=b_config, finished_b=_finished(summary, run_dir)
+    )
 
 
 @pytest.mark.parametrize(
@@ -302,23 +328,75 @@ def _receipt(summary: dict[str, Any]) -> dict[str, Any]:
     [("diverged", True, 6), ("diverged", False, 6), ("no_eligible_checkpoint", False, 21), ("diverged", False, 0)],
     ids=("diverged-with-best", "diverged-without-best", "no-eligible-checkpoint", "diverged-in-first-group"),
 )
-def test_receipt_records_b_actual_transitions_and_end_status_for_every_end_of_b(outcome: str, eligible: bool, spent: int) -> None:
+def test_receipt_records_b_actual_transitions_and_end_status_for_every_end_of_b(tmp_path: Path, outcome: str, eligible: bool, spent: int) -> None:
     """B diverging at 30 % of its budget, in its first group, or ending without an eligible checkpoint still gives A1 its transitions."""
-    receipt = _receipt(_completed_b_summary(total=20, spent=spent, outcome=outcome, eligible=eligible))
+    receipt = _receipt(_completed_b_summary(total=20, spent=spent, outcome=outcome, eligible=eligible), tmp_path)
 
     assert (receipt["budget_unit"], receipt["supervised_transitions"]) == ("supervised_transitions", spent)
     assert (receipt["train_seconds"], receipt["device"]) == (0.5 if spent else 0.0, _PAIR_GPU)
     assert receipt["b_status"] == outcome
-    assert receipt["b_budget_progress"] == pytest.approx(min(1.0, spent / 20))
-    assert receipt["b_eligible_points"] == int(eligible)
+    assert (receipt["b_budget_total"], receipt["b_budget_progress"]) == (20, pytest.approx(min(1.0, spent / 20)))
+    assert (receipt["b_eligible_points"], receipt["b_validations"]) == (int(eligible), [[min(20, spent), spent]] if spent else [])
     assert (receipt["best_checkpoint_sha256"] is not None) is eligible
     assert (receipt["last_checkpoint_sha256"] is not None) is (spent > 0)
     assert budget.validate_b_receipt(receipt) == receipt
     # A1's budget is exactly B's actual transitions, whatever its own Train set; zero is a budget complete from the start.
     plan = configs.resolve_plan(configs.transient_matched_config())
     a1_budget = run_service._stage_budget(plan.a1, training_units={"full_set_transitions": 999}, matched_receipt=receipt)
-    assert (a1_budget.unit, a1_budget.total) == ("supervised_transitions", spent)
+    assert (a1_budget.unit, a1_budget.total, a1_budget.replay) == ("supervised_transitions", spent, receipt["b_validations"])
     assert a1_budget.complete is (spent == 0)
+
+
+@pytest.mark.parametrize(
+    ("validations", "update_work"),
+    [([[6, 6]], [[2, 1, 5], [1, 1, 1]]), ([[5, 5]], [[3, 1, 5]]), ([[6, 6], [6, 6]], [[3, 1, 6]]), ([[5.5, 6]], [[3, 1, 6]])],
+    ids=("count-not-work-at-step", "transitions-not-work", "step-beyond-work", "non-integral-point"),
+)
+def test_a_receipt_count_must_be_bs_checkpoint_work_at_its_validation_step(
+    tmp_path: Path, validations: list[list[int]], update_work: list[list[int]]
+) -> None:
+    """B diverged after 6 transitions; a count other than its checkpoint work at its step, or other total work, gives no receipt."""
+    finished = _finished(_completed_b_summary(total=20, spent=6, outcome="diverged"), _b_history(tmp_path, validations), update_work=update_work)
+    b_config = configs.resolve_plan(configs.transient_matched_config()).b
+
+    with pytest.raises(ValueError, match="checkpoint work"):
+        budget.build_b_receipt(parent_identity_sha256="a" * 64, a0_handoff_sha256="b" * 64, b_config=b_config, finished_b=finished)
+
+
+def test_only_an_a1_finishes_with_a_replay_and_only_with_its_receipts_schedule(tmp_path: Path) -> None:
+    """
+    The one outcome rule compares the terminal budget's unit, total and replay with the stage's target.
+
+    A finished A1 replays exactly its leaf receipt's schedule, so another schedule or none is refused; every other
+    stage replays nothing, so a finished B whose terminal budget carries a replay is refused.
+    """
+    receipt = _receipt(_completed_b_summary(total=20, spent=6, outcome="diverged"), tmp_path / "b")
+    a1_dir = tmp_path / "a1"
+    budget.publish_b_receipt(_b_history(a1_dir, []), receipt)
+    plan = configs.resolve_plan(configs.transient_matched_config())
+    a1_budget = run_service._stage_budget(plan.a1, training_units={}, matched_receipt=receipt)
+    a1_budget.record_group(units=3, supervised_transitions=6, train_seconds=0.5)
+    a1_budget.record_validation()
+    summary = {
+        "terminal_controller": {"matched_receipt_sha256": receipt["receipt_sha256"]},
+        "terminal_budget": a1_budget.state_dict(),
+        "training_outcome": {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None},
+        "validation_plan_deviation": {"skipped_points": a1_budget.skipped_points},
+    }
+
+    target = run_service._finished_stage_target(a1_dir, plan.a1, summary)
+    assert target == ("supervised_transitions", 6, [[6, 6]])
+    assert run_service.validate_training_outcome(summary, lifecycle="completed", target=target).replay == [[6, 6]]
+    for replay in ([[1, 1]], None):
+        other = stage_budget.StageBudget(unit="supervised_transitions", total=6, replay=replay).state_dict()
+        with pytest.raises(run_service.RunLifecycleError, match="differs"):
+            run_service.validate_training_outcome({**summary, "terminal_budget": other}, lifecycle="completed", target=target)
+    b_summary = _completed_b_summary(total=_b_total(), spent=_b_total())
+    b_summary["terminal_budget"]["replay"] = [[20, _b_total()]]
+    with pytest.raises(run_service.RunLifecycleError, match="differs"):
+        run_service.validate_training_outcome(
+            b_summary, lifecycle="completed", target=run_service._finished_stage_target(tmp_path, plan.b, b_summary)
+        )
 
 
 def _redigested(receipt: dict[str, Any], **changes: Any) -> dict[str, Any]:
@@ -342,6 +420,12 @@ def _redigested(receipt: dict[str, Any], **changes: Any) -> dict[str, Any]:
         (lambda receipt: _redigested({key: value for key, value in receipt.items() if key != "optimizer_steps"}), "keys"),
         (lambda receipt: _redigested(receipt, dataset_identity={"train_dataset": "d13"}), "dataset_identity"),
         (lambda receipt: _redigested(receipt, b_budget_progress=0.0), "progress"),
+        (lambda receipt: _redigested(receipt, b_budget_total=22), "progress"),
+        (lambda receipt: _redigested(receipt, b_eligible_points=2), "validation schedule"),
+        (lambda receipt: _redigested(receipt, b_validations=[[20, 20]]), "validation schedule"),
+        (lambda receipt: _redigested(receipt, b_validations=[[20, 21, 0]]), "malformed"),
+        (lambda receipt: _redigested(receipt, b_validations=[[20, 22]]), "malformed"),
+        (lambda receipt: _redigested(receipt, b_validations=[[1, 10], [20, 21]]), "contradicts"),
         (
             lambda receipt: _redigested(
                 receipt,
@@ -384,19 +468,27 @@ def _redigested(receipt: dict[str, Any], **changes: Any) -> dict[str, Any]:
         "missing-field",
         "malformed-field",
         "completed-without-progress",
+        "completed-below-b-budget",
+        "eligible-beyond-schedule",
+        "schedule-before-end",
+        "schedule-shape",
+        "schedule-count-beyond-transitions",
+        "schedule-point-not-reached-at-its-count",
         "zero-transitions-with-progress",
         "zero-transitions-with-best-checkpoint",
     ),
 )
-def test_a_corrupted_receipt_is_rejected_before_any_a1_budget(corrupt: Callable[[dict[str, Any]], dict[str, Any]], match: str) -> None:
+def test_a_corrupted_receipt_is_rejected_before_any_a1_budget(
+    tmp_path: Path, corrupt: Callable[[dict[str, Any]], dict[str, Any]], match: str
+) -> None:
     """An altered, seconds-era or malformed receipt never becomes A1's budget; the digest binds every field."""
-    receipt = corrupt(_receipt(_completed_b_summary(total=20, spent=21)))
+    receipt = corrupt(_receipt(_completed_b_summary(total=20, spent=21), tmp_path))
 
     with pytest.raises(ValueError, match=match):
         budget.validate_b_receipt(receipt)
 
 
-def test_a_b_a1_pair_trains_on_one_gpu_model_while_a0_may_use_any() -> None:
+def test_a_b_a1_pair_trains_on_one_gpu_model_while_a0_may_use_any(tmp_path: Path) -> None:
     """
     A1 runs on its receipt's GPU model and a resumed B on its first attempt's; a fresh B and every A0 bind none.
 
@@ -408,7 +500,7 @@ def test_a_b_a1_pair_trains_on_one_gpu_model_while_a0_may_use_any() -> None:
         return SimpleNamespace(as_dict=lambda: {**device, "cuda_index": 1})
 
     plan = configs.resolve_plan(configs.transient_matched_config())
-    receipt = _receipt(_completed_b_summary(total=20, spent=21))
+    receipt = _receipt(_completed_b_summary(total=20, spent=21), tmp_path)
     run_service._require_pair_device(plan.a1, on(_PAIR_GPU), sessions=[], matched_receipt=receipt)
     run_service._require_pair_device(plan.b, on(other_gpu), sessions=[], matched_receipt=None)
     run_service._require_pair_device(plan.b, on(_PAIR_GPU), sessions=[{**_PAIR_GPU, "cuda_index": 0}], matched_receipt=None)
@@ -573,7 +665,9 @@ def test_an_unsuccessful_run_binds_its_last_checkpoint_and_its_budget_to_its_sum
 
     monkeypatch.setattr(run_service.learning.training.checkpoint, "load_checkpoint", load_last)
 
-    assert run_service.validate_finished_run(run_dir)["terminal_budget"].supervised_transitions == 6
+    finished = run_service.validate_finished_run(run_dir)
+    # B's receipt reads the admitted last checkpoint's committed work, also for a B that ended unsuccessful.
+    assert (finished["terminal_budget"].supervised_transitions, finished["last_checkpoint"]) == (6, admitted)
     assert (loads[0]["path"], loads[0]["expected_role"], loads[0]["expected_identity"]) == (last, "last", {"effective_config_digest": "e" * 64})
     for changed, match in (
         ({"budget_state_dict": {**admitted["budget_state_dict"], "supervised_transitions": 5}}, "disagrees with its last checkpoint"),
@@ -595,7 +689,9 @@ def test_an_unsuccessful_run_binds_its_last_checkpoint_and_its_budget_to_its_sum
 def _write_history(run_dir: Path, checkpoint_identity: dict[str, Any], *, epochs: int, validations: list[dict[str, Any]] | None = None) -> None:
     """Write a B leaf's history through the producer: reset to no record, then one record per objective-history entry and per epoch."""
     binding = {"task": "transient_drying", "run_name": str(configs.resolve_plan(configs.transient_matched_config()).b["run"]["name"])}
-    initial = epoch_history.reconcile_history(run_dir, **binding, checkpoint_identity=checkpoint_identity, completed_epoch=0, validations=[])
+    initial = epoch_history.reconcile_history(
+        run_dir, **binding, checkpoint_identity=checkpoint_identity, completed_epoch=0, validations=[], global_step=0
+    )
     write = epoch_history.make_epoch_state_callback(run_dir, **binding, checkpoint_identity=checkpoint_identity, initial_history=initial)
     entries = validations or []
     for step, entry in enumerate(entries, start=1):
@@ -632,7 +728,8 @@ def test_budget_receipt_is_immutable_and_binds_exact_a0_origin(tmp_path: Path) -
     digest_a = "a" * 64
     digest_b = "b" * 64
     summary = _completed_b_summary(total=20, spent=21)
-    receipt = budget.build_b_receipt(parent_identity_sha256=digest_a, a0_handoff_sha256=digest_b, b_config=b_config, finished_b=_finished(summary))
+    finished = _finished(summary, _b_history(tmp_path / "b", [[20, 21]]))
+    receipt = budget.build_b_receipt(parent_identity_sha256=digest_a, a0_handoff_sha256=digest_b, b_config=b_config, finished_b=finished)
     assert (receipt["protocol"], receipt["budget_unit"], receipt["supervised_transitions"]) == ("matched_a1_b", "supervised_transitions", 21)
     path = budget.publish_b_receipt(tmp_path, receipt)
     assert budget.publish_b_receipt(tmp_path, receipt) == path
@@ -655,11 +752,11 @@ def test_each_stage_starts_its_own_budget_a0_in_full_set_units_b_in_k_times_n_a1
     units = {"full_set_units": 7, "full_set_transitions": 23}
     a0 = run_service._stage_budget(plan.a0, training_units=units, matched_receipt=None)
     b = run_service._stage_budget(plan.b, training_units=units, matched_receipt=None)
-    a1 = run_service._stage_budget(plan.a1, training_units=units, matched_receipt={"supervised_transitions": 31})
+    a1 = run_service._stage_budget(plan.a1, training_units=units, matched_receipt={"supervised_transitions": 31, "b_validations": [[20, 31]]})
 
     assert (a0.unit, a0.total) == ("units", k * 7)
     assert (b.unit, b.total) == ("supervised_transitions", k * 23)
-    assert (a1.unit, a1.total) == ("supervised_transitions", 31)
+    assert (a1.unit, a1.total, a1.replay) == ("supervised_transitions", 31, [[20, 31]])
     with pytest.raises(run_service.RunLifecycleError, match="receipt"):
         run_service._stage_budget(plan.a1, training_units=units, matched_receipt=None)
     with pytest.raises(run_service.RunLifecycleError, match="full Train set count"):
@@ -870,16 +967,27 @@ def test_failed_stage_recovery_checks_saved_checkpoint_and_rejects_missing_state
     monkeypatch.setattr(run_service, "_read_saved_data_artifacts", lambda *_args: (SimpleNamespace(as_payload=dict), {}))
     monkeypatch.setattr(run_service, "_validate_saved_data_contract", lambda *_args: None)
     monkeypatch.setattr(checkpoint_service, "build_checkpoint_identity", lambda *_args, **_kwargs: {})
-    validated_roles: list[str] = []
+    monkeypatch.setattr(checkpoint_service, "recorded_history_epochs", lambda _payload: 1)
+    validated: list[tuple[str, bool]] = []
 
-    def load_valid_checkpoint(path: Path, *, expected_role: str, **_kwargs: Any) -> dict[str, Any]:
+    def load_valid_checkpoint(path: Path, *, expected_role: str, resume: bool = False, **_kwargs: Any) -> dict[str, Any]:
         assert path.is_file()
-        validated_roles.append(expected_role)
-        return {"best_metric": 0.1, "best_epoch": 1, "completed_epoch": 1}
+        validated.append((expected_role, resume))
+        # The last closed epoch 1 at its one committed update.
+        return {"best_metric": 0.1, "best_epoch": 1, "completed_epoch": 1, "objective_history": [], "global_step": 1}
+
+    def record_epoch_end(step: float) -> None:
+        binding: dict[str, Any] = {"task": "transient_drying", "run_name": str(requested["run"]["name"]), "checkpoint_identity": {}}
+        epoch_history.make_epoch_state_callback(run_dir, **binding)(1, {"global_step": step, "train/loss_total": 0.5}, None)
 
     monkeypatch.setattr(checkpoint_service, "load_checkpoint", load_valid_checkpoint)
+    record_epoch_end(1.0)
     assert run_service._matched_failed_stage_recovery(run_dir, requested, config_path=config_path)[0]
-    assert validated_roles == ["last", "best"]
+    # The last is checked as the continuation source, the best only as evidence to read.
+    assert validated == [("last", True), ("best", False)]
+    # A history whose counted epoch ends after the last's step would be refused by the resume, so it is not offered.
+    record_epoch_end(2.0)
+    assert not run_service._matched_failed_stage_recovery(run_dir, requested, config_path=config_path)[0]
     common.paths.resolve_last_checkpoint_file(run_dir).unlink()
     eligible, reason = run_service._matched_failed_stage_recovery(run_dir, requested, config_path=config_path)
     assert not eligible
@@ -1180,6 +1288,167 @@ def test_a_transition_budget_validates_at_its_points_inside_epochs_and_records_t
     assert result["global_step"] == 4
 
 
+class _DivergingAfterGroups(_LoopAdapter):
+    """Diverge in the group after ``groups`` committed ones."""
+
+    def __init__(self, groups: int) -> None:
+        super().__init__()
+        self.limit, self.begun = groups, 0
+
+    def begin_group(self, group: datasets.runtime.units.UnitGroup, *, progress: float) -> None:
+        super().begin_group(group, progress=progress)
+        self.begun += 1
+
+    def unit_losses(
+        self, model: torch.nn.Module, raw_batch: tuple[torch.Tensor], loss: torch.nn.Module, *, positions: tuple[int, ...]
+    ) -> Iterator[adapter_contract.UnitLosses]:
+        if self.begun > self.limit:
+            message = "synthetic non-finite loss"
+            raise FloatingPointError(message)
+        yield from super().unit_losses(model, raw_batch, loss, positions=positions)
+
+
+def _matched_loop(
+    run_dir: Path,
+    arm: str,
+    stage: stage_budget.StageBudget,
+    *,
+    k: int,
+    adapter: _LoopAdapter | None = None,
+    resume: bool = False,
+    interrupt: bool = False,
+) -> tuple[dict[str, Any], list[list[int]]]:
+    """
+    Train a B (window units) or A1 (transition units) in groups of ``k`` over ten one-transition units, writing its history.
+
+    Returns the loop result and every validation's point and committed supervised transitions; ``interrupt`` raises
+    KeyboardInterrupt in the observers of the first event, after its ``last`` was published.
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    values = TensorDataset(torch.arange(1.0, 11.0).reshape(-1, 1))
+    model = torch.nn.Linear(1, 1)
+    validations: list[list[int]] = []
+
+    def observe(_step: int, metrics: dict[str, float]) -> None:
+        if "validation/point" in metrics:
+            validations.append([int(metrics["validation/point"]), int(metrics["budget/supervised_transitions"])])
+        if interrupt:
+            raise KeyboardInterrupt
+
+    result = loop.train_loop(
+        config=_matched_loop_config(arm),
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=SGD(model.parameters(), lr=0.001),
+        train_loader=_train_loader(values, seed=21, unit_kind="window" if arm == "b" else "transition", k=k),
+        eval_loader=DataLoader(values, batch_size=1, shuffle=False, num_workers=0),
+        train_loss=torch.nn.MSELoss(),
+        eval_metrics={"mse": _Metric()},
+        save_dir=run_dir,
+        resume_from=run_dir / "last_checkpoint.pt" if resume else None,
+        checkpoint_identity=_loop_identity(),
+        adapter=adapter or _LoopAdapter(),
+        epoch_state_callback=None
+        if resume
+        else epoch_history.make_epoch_state_callback(run_dir, task="transient_drying", run_name=arm, checkpoint_identity=_loop_identity()),
+        event_callback=observe,
+        budget=stage,
+    )
+    return result, validations
+
+
+def test_a1_cuts_its_last_group_to_commit_exactly_the_receipts_transitions(tmp_path: Path) -> None:
+    """
+    B diverged after 3 supervised transitions; its A1 trains groups of k = 2 transition units.
+
+    A1's second group is cut to the one remaining transition, so A1 commits exactly the receipt's 3, not 4;
+    its sampler state ends inside the epoch, between group boundaries, and a finalize-only resume accepts it.
+    """
+    receipt = _receipt(_completed_b_summary(total=20, spent=3, outcome="diverged", eligible=False), tmp_path / "b")
+
+    def a1_budget() -> stage_budget.StageBudget:
+        return stage_budget.StageBudget(unit="supervised_transitions", total=receipt["supervised_transitions"], replay=receipt["b_validations"])
+
+    result, _validations = _matched_loop(tmp_path / "a1", "a1", a1_budget(), k=2)
+
+    assert (result["budget"]["units"], result["budget"]["supervised_transitions"]) == (3, 3)
+    assert [row[2] for row in result["update_work"]] == [2, 1]
+    last = tmp_path / "a1" / "last_checkpoint.pt"
+    terminal = torch.load(last, map_location="cpu", weights_only=False)
+    assert (terminal["train_sampler_state_dict"]["cursor"], terminal["train_sampler_state_dict"]["stop"]) == (3, 3)
+    assert _matched_loop(tmp_path / "a1", "a1", a1_budget(), k=2, resume=True)[0]["budget"] == result["budget"]
+
+
+def test_an_a1_resumed_inside_its_stretch_validates_at_the_remaining_replay_counts(tmp_path: Path) -> None:
+    """
+    B validated at 2 (point 2) and 5 (point 5) of its 20 and diverged at 7; its A1 trains groups of k = 2 transition units.
+
+    The first stretch validates point 2 at 2 and publishes ``last`` with the stop at 7 and point 5 pending, where an
+    interruption strikes; the resumed A1 validates point 5 at 6 and ends at 7. Only such an A1 checkpoint carries a
+    stop, exactly its cursor plus the remaining transitions: another stop, or this stop in a budget that replays
+    nothing (every A0 or B), is refused by the checkpoint validation that finished-run admission and resume share.
+    """
+    run_dir = tmp_path / "a1"
+
+    def a1_budget() -> stage_budget.StageBudget:
+        return stage_budget.StageBudget(unit="supervised_transitions", total=7, replay=[[2, 2], [5, 5]])
+
+    with pytest.raises(KeyboardInterrupt):
+        _matched_loop(run_dir, "a1", a1_budget(), k=2, interrupt=True)
+    saved = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    assert (saved["train_sampler_state_dict"]["cursor"], saved["train_sampler_state_dict"]["stop"]) == (2, 7)
+
+    result, validations = _matched_loop(run_dir, "a1", a1_budget(), k=2, resume=True)
+
+    assert validations == [[5, 6]]
+    assert [entry["point"] for entry in result["objective_history"]] == [2, 5]
+    assert [row[2] for row in result["update_work"]] == [2, 2, 2, 1]
+    admission = {"expected_identity": _loop_identity(), "expected_role": "last", "payload_kind": "full", "scheduler_expected": False}
+    checkpoint_service.validate_checkpoint(saved, **admission, require_best=False, adapter_expected=True)
+    no_replay = {key: value for key, value in saved["budget_state_dict"].items() if key != "replay"}
+    for changed in ({"train_sampler_state_dict": {**saved["train_sampler_state_dict"], "stop": 9}}, {"budget_state_dict": no_replay}):
+        with pytest.raises(ValueError, match="sampler stop"):
+            checkpoint_service.validate_checkpoint({**saved, **changed}, **admission, require_best=False, adapter_expected=True)
+
+
+@pytest.mark.parametrize(
+    ("b_total", "diverge_after", "a1_counts"),
+    [(40, None, [6, 10, 16, 20, 26, 30, 36, 40]), (150, 4, [10, 16])],
+    ids=("b-completed", "b-diverged"),
+)
+def test_a1_replays_b_validations_with_its_own_grouping(tmp_path: Path, b_total: int, diverge_after: int | None, a1_counts: list[int]) -> None:
+    """
+    B trains groups of 5 transitions, A1 groups of 2: A1 validates once per recorded B validation, at its first group end at or after B's count.
+
+    B over 40 transitions validates 8 times, at 5, 10, ..., 40, not 20 times like an A1 with its own points. B over
+    150 transitions validates at 10 (point 1) and 15 (point 2) and diverges in its fifth group at 20; its A1 validates
+    at 10 and 16 and ends at 20 without a validation. Both arms have the same checkpoint candidates.
+    """
+    adapter = None if diverge_after is None else _DivergingAfterGroups(diverge_after)
+    b_result, b_validations = _matched_loop(
+        tmp_path / "b", "b", stage_budget.StageBudget(unit="supervised_transitions", total=b_total), k=5, adapter=adapter
+    )
+    spent = b_result["budget"]["supervised_transitions"]
+    summary = _completed_b_summary(total=b_total, spent=spent, outcome=b_result["training_outcome"]["status"])
+    summary.update(
+        terminal_budget=b_result["budget"],
+        training_outcome=b_result["training_outcome"],
+        validation_plan_deviation={"skipped_points": b_result["budget"]["skipped_points"]},
+    )
+    plan = configs.resolve_plan(configs.transient_matched_config())
+    finished = _finished(summary, tmp_path / "b", update_work=b_result["update_work"])
+    receipt = budget.build_b_receipt(parent_identity_sha256="a" * 64, a0_handoff_sha256="b" * 64, b_config=plan.b, finished_b=finished)
+    assert receipt["b_validations"] == b_validations
+
+    a1_budget = stage_budget.StageBudget(unit="supervised_transitions", total=receipt["supervised_transitions"], replay=receipt["b_validations"])
+    a1_result, a1_validations = _matched_loop(tmp_path / "a1", "a1", a1_budget, k=2)
+
+    assert [point for point, _count in a1_validations] == [point for point, _count in b_validations]
+    assert [count for _point, count in a1_validations] == a1_counts
+    assert len(a1_result["objective_history"]) == len(b_result["objective_history"])
+    assert a1_result["budget"]["supervised_transitions"] == spent
+
+
 def _windowed_terminal_loop(
     tmp_path: Path,
     *,
@@ -1213,7 +1482,7 @@ def _windowed_terminal_loop(
 
 def test_a1_matched_to_a_b_that_diverged_in_its_first_group_runs_no_update(tmp_path: Path) -> None:
     """B's receipt holds 0 transitions, so A1's budget is complete from the start: no update, no validation, no checkpoint."""
-    receipt = _receipt(_completed_b_summary(total=20, spent=0, outcome="diverged", eligible=False))
+    receipt = _receipt(_completed_b_summary(total=20, spent=0, outcome="diverged", eligible=False), tmp_path / "b")
     plan = configs.resolve_plan(configs.transient_matched_config())
     a1_budget = run_service._stage_budget(plan.a1, training_units={"full_set_transitions": 3}, matched_receipt=receipt)
     events: list[tuple[str, int]] = []
@@ -1419,6 +1688,12 @@ def test_attempts_record_their_seconds_and_committed_work_across_resume(
         "split_indices": {},
     }
     checkpoint_identity = {"effective_config_digest": "a" * 64}
+    resume_loads: list[tuple[str, bool]] = []
+
+    def load_last(*_args: Any, expected_role: str, resume: bool = False, **_kwargs: Any) -> dict[str, Any]:
+        resume_loads.append((expected_role, resume))
+        return {"objective_history": [], "global_step": 0}
+
     stubs = (
         (run_service, "_grid_spacing", lambda *_args: (0.003, 0.003)),
         (run_service.config_loader, "create_dataloaders_from_config", lambda *_args, **_kwargs: loaders),
@@ -1428,7 +1703,7 @@ def test_attempts_record_their_seconds_and_committed_work_across_resume(
         (run_service.learning.training.optim, "build_scheduler", lambda *_args, **_kwargs: None),
         (run_service.learning.training.checkpoint, "build_checkpoint_identity", lambda *_args, **_kwargs: checkpoint_identity),
         # The touched checkpoints are placeholders and the stubbed loop writes no epoch record, so a resume restores none.
-        (run_service.learning.training.checkpoint, "load_checkpoint", lambda *_args, **_kwargs: {"objective_history": []}),
+        (run_service.learning.training.checkpoint, "load_checkpoint", load_last),
         (run_service.learning.training.checkpoint, "recorded_history_epochs", lambda _payload: 0),
         (run_service.tracking, "build_monitor_membership", lambda *_args: None),
     )
@@ -1557,6 +1832,8 @@ def test_attempts_record_their_seconds_and_committed_work_across_resume(
             run_service.execute_prepared_run(resumed_config, **arguments)
     summary = run_service.read_run_summary(run_dir)
     sessions = summary["runtime_sessions"]
+    # The resumed attempt loads its last checkpoint as continuation source before it reconciles the history.
+    assert resume_loads == [("last", True)]
     assert [session["memory_batch"] for session in sessions[-2:]] == [config["training"]["memory_batch"], resumed_config["training"]["memory_batch"]]
     assert summary["status"] == run_status
     second = sessions[-1]["attempt"]
@@ -1609,7 +1886,7 @@ def test_completed_summary_records_its_spent_budget_and_its_plan_deviation(chang
     summary["training_outcome"] = {"status": "completed", "budget_progress": 1.0, "eligible_points": 2, "divergence": None}
     last = terminal.state_dict()
     assert summary["validation_plan_deviation"] == {"skipped_points": [*range(1, 12), *range(13, 20)]}
-    arguments = {"lifecycle": "completed", "target": ("supervised_transitions", 20)}
+    arguments = {"lifecycle": "completed", "target": ("supervised_transitions", 20, None)}
     run_service._validate_terminal_budget(summary, last, **arguments)
 
     change(summary, last)

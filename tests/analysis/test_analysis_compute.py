@@ -250,7 +250,7 @@ def test_transient_aggregate_auto_retains_full_grid_and_reports_cpu_route(monkey
     result = transient_plots._aggregate_snapshot_evidence(
         (record(1.0), record(3.0)),
         state_field=transient_artifact.STATE_ORDER[0],
-        physical_time=1.0,
+        physical_times=(1.0, 1.0),
         compute_device="auto",
         device_evidence=evidence,
     )

@@ -2,7 +2,8 @@
 
 Responsibilities:
   - Shuffle every Train unit once per epoch with one persisted generator
-  - Cut the epoch order into groups of ``units_per_update`` units, the last group of an epoch shorter
+  - Cut the epoch order into groups of ``units_per_update`` units, the last group of an epoch shorter, and the group
+    that reaches a stage's exact end (a matched A1's) cut there
   - Split every group into memory microbatches of at most ``memory_batch`` units that share one collation key
   - Weight every unit by (mean units per Train case) / (units of its case), so every case counts equally per epoch
   - Persist and restore the epoch order and the committed group position exactly
@@ -190,6 +191,21 @@ class UnitSampler(Sampler[list[int]]):
         self.epoch = -1
         self.permutation: list[int] = []
         self.cursor = 0
+        # The epoch position after which the stage commits no unit (end_after); None while it ends at a group boundary.
+        self.stop: int | None = None
+
+    def end_after(self, units: int) -> None:
+        """
+        End the stage exactly ``units`` units after the cursor, inside the current epoch: the group reaching it is cut there.
+
+        A matched A1 of transition units commits exactly B's supervised transitions; its last group,
+        cut to the remaining units, divides by its actual unit count like an epoch's last group.
+        """
+        stop = self.cursor + _positive_int(units, label="units")
+        if self.unit_kind != "transition" or not self.permutation or stop >= self.size:
+            message = "An exact stage end needs transition units and must lie inside the current epoch order."
+            raise ValueError(message)
+        self.stop = stop
 
     def begin_epoch(self, epoch: int) -> None:
         """Draw one new epoch order only after the previous epoch was fully committed."""
@@ -212,7 +228,7 @@ class UnitSampler(Sampler[list[int]]):
         if not self.permutation:
             message = "Unit sampler has no epoch order; call begin_epoch first."
             raise RuntimeError(message)
-        remaining = self.permutation[self.cursor :]
+        remaining = self.permutation[self.cursor : self.stop]
         groups: list[UnitGroup] = []
         for start in range(0, len(remaining), self.units_per_update):
             items = tuple(remaining[start : start + self.units_per_update])
@@ -255,9 +271,10 @@ class UnitSampler(Sampler[list[int]]):
         return math.ceil(self.size / self.units_per_update)
 
     def advance(self, units: int) -> None:
-        """Commit one completed update group of ``units`` units."""
+        """Commit one completed update group of ``units`` units; only the cut group ends at the stage's stop."""
         cursor = self.cursor + _positive_int(units, label="units")
-        if not self.permutation or cursor > self.size or (cursor % self.units_per_update and cursor != self.size):
+        end = self.size if self.stop is None else self.stop
+        if not self.permutation or cursor > end or (cursor % self.units_per_update and cursor != end):
             message = "Unit sampler commit does not end on an update-group boundary of its epoch order."
             raise ValueError(message)
         self.cursor = cursor
@@ -272,6 +289,8 @@ class UnitSampler(Sampler[list[int]]):
             "permutation": list(self.permutation),
             "cursor": self.cursor,
             "generator_state": self.generator.get_state().tolist(),
+            # Only a sampler with an exact stage end (a matched A1 of transition units) carries it.
+            **({} if self.stop is None else {"stop": self.stop}),
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -284,6 +303,7 @@ class UnitSampler(Sampler[list[int]]):
         self.epoch = state["epoch"]
         self.permutation = list(state["permutation"])
         self.cursor = state["cursor"]
+        self.stop = state.get("stop")
 
     def continue_generator(self, state: Mapping[str, Any]) -> None:
         """
@@ -298,6 +318,7 @@ class UnitSampler(Sampler[list[int]]):
         self.epoch = -1
         self.permutation = []
         self.cursor = 0
+        self.stop = None
 
 
 def validate_state(state: Mapping[str, Any]) -> None:
@@ -307,12 +328,14 @@ def validate_state(state: Mapping[str, Any]) -> None:
     Raises
     ------
     ValueError
-        If keys, the unit kind, the order, the epoch or the cursor are invalid, or the
-        cursor does not lie on an update-group boundary.
+        If keys, the unit kind, the order, the epoch, the stop (only a transition sampler's) or the
+        cursor are invalid, or the cursor lies neither on an update-group boundary nor at the epoch
+        end or the stage's stop. Whether a stop belongs to a matched A1 and fits its remaining budget
+        is the checkpoint validation's check.
 
     """
-    if not isinstance(state, Mapping) or set(state) != _STATE_KEYS:
-        message = f"Unit sampler state keys must be exactly {sorted(_STATE_KEYS)}."
+    if not isinstance(state, Mapping) or set(state) - {"stop"} != _STATE_KEYS:
+        message = f"Unit sampler state keys must be exactly {sorted(_STATE_KEYS)}, a transition sampler's with an exact end also stop."
         raise ValueError(message)
     size, epoch, cursor, permutation = state["size"], state["epoch"], state["cursor"], state["permutation"]
     units_per_update = _positive_int(state["units_per_update"], label="units_per_update")
@@ -322,7 +345,12 @@ def validate_state(state: Mapping[str, Any]) -> None:
     if not isinstance(permutation, list) or (permutation and sorted(permutation) != list(range(size))) or (epoch >= 0) != bool(permutation):
         message = "Unit sampler state order is not one permutation of its units for its epoch."
         raise ValueError(message)
-    if type(cursor) is not int or not 0 <= cursor <= len(permutation) or (cursor % units_per_update and cursor != size):
+    stop = state.get("stop")
+    if "stop" in state and (state["unit_kind"] != "transition" or type(stop) is not int or not 0 < stop < len(permutation)):
+        message = "Unit sampler state stop must be a transition sampler's position inside its epoch order."
+        raise ValueError(message)
+    end = len(permutation) if stop is None else stop
+    if type(cursor) is not int or not 0 <= cursor <= end or (cursor % units_per_update and cursor not in {size, stop}):
         message = "Unit sampler state cursor does not lie on an update-group boundary."
         raise ValueError(message)
     generator_state = state["generator_state"]

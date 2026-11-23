@@ -4,6 +4,7 @@ Responsibilities:
   - Derive each case's role from its material role and its Generation design kind
   - Bind ordered Train, validation, ID-test, parameter-OOD and material-OOD membership to explicit material roles
   - Select the Train subset of a run: the first N Train cases per ID material in stored order
+  - Refuse a whole Train role with unequal case counts per ID material, so every ID material weighs equally
   - Refuse training on a Dataset without a fixed partition or without Train cases, for every Dataset view
 
 Design principles:
@@ -98,18 +99,27 @@ def evaluation_cases(partition: Mapping[str, Any], role: str) -> tuple[str, ...]
 def train_subset_cases(partition: Mapping[str, Any], *, material_by_case: Mapping[str, str], train_subset: int | None) -> tuple[str, ...]:
     """Return the run's Train cases: all of them, or the first ``train_subset`` per ID material in stored Train order.
 
+    Training weighs every ID material equally only through equal Train case counts, so a whole Train role with
+    unequal counts per ID material is refused; a subset holds ``train_subset`` cases of each by construction.
+
     Raises
     ------
     ValueError
-        If an ID material holds fewer Train cases than ``train_subset``.
+        If the whole Train role holds unequal case counts per ID material, or an ID material holds fewer Train
+        cases than ``train_subset``.
 
     """
     train = tuple(partition["train"])
-    if train_subset is None:
-        return train
-    by_material: dict[str, list[str]] = {}
+    # Every declared ID material takes part, also one without a Train case.
+    by_material: dict[str, list[str]] = {material: [] for material, role in partition["material_roles"].items() if role == "id"}
     for case_id in train:
         by_material.setdefault(material_by_case[case_id], []).append(case_id)
+    if train_subset is None:
+        counts = {material: len(cases) for material, cases in sorted(by_material.items())}
+        if len(set(counts.values())) > 1:
+            msg = f"The Train role holds unequal case counts per ID material {counts}; every ID material needs the same number."
+            raise ValueError(msg)
+        return train
     short = sorted(material for material, cases in by_material.items() if len(cases) < train_subset)
     if short:
         msg = f"data.train_subset {train_subset} exceeds the Train cases of {short}."

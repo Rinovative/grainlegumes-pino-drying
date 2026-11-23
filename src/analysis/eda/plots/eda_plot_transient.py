@@ -2,7 +2,8 @@
 
 Responsibilities:
   - Render exact physical-time state and static-field snapshots
-  - Plot physical trajectories and simulated-support schedules in a main and a start-up time window (the shared windows of the ui time module)
+  - Plot physical trajectories and simulated-support schedules in a main and a start-up time window (the shared windows of the ui time module);
+    the aggregate state rows alternatively over the drying phase of ``analysis_ui_time.phase_cohort``, its cohort labels in the note
   - Consolidate target outcomes, terminal timing, final moisture, and exact evidence
 
 Design principles:
@@ -660,6 +661,42 @@ def _plot_contributors(
         axis.plot(times, values[0], color=style.color, linestyle=style.linestyle, drawstyle="steps-post", alpha=0.5)
 
 
+def _case_series(frame: pd.DataFrame, field: str, max_cases: int | None) -> tuple[list[np.ndarray], list[np.ndarray], list[time_axis.Completion]]:
+    """Return the stored hours, displayed spatial means and completion of the frame's first ``max_cases`` cases."""
+    cases = [capabilities.case_row(frame, str(case_id)) for case_id in frame.index[:max_cases]]
+    trajectories = [capabilities.field_display_trajectory(frame, case, field)[:2] for case in cases]
+    return [times for times, _means in trajectories], [means for _times, means in trajectories], [transient.case_completion(case) for case in cases]
+
+
+def _plot_phase_row(
+    axes: tuple[Axes, Axes, Axes, Axes],
+    series: Mapping[str, tuple[Sequence[np.ndarray], Sequence[np.ndarray], Sequence[time_axis.Completion]]],
+    styles: Mapping[str, visual_semantics.SeriesStyle],
+    *,
+    first: bool,
+    bottom: bool,
+) -> dict[str, str]:
+    """Draw one state row's pooled median, q10-q90 band and n(τ) per dataset over the phase, hiding the start-up axes; return the cohort labels."""
+    axis, count_axis, *hidden = axes
+    for unused in hidden:
+        unused.set_visible(False)
+    count_axis.set_ylabel("n(τ)")
+    time_axis.style_window_axis(axis, time_axis.PHASE_WINDOW, bottom=bottom)
+    axis.grid(axis="y", alpha=0.20)
+    if first:
+        figure_layout.set_panel_title(axis, time_axis.PHASE_WINDOW.title)
+    labels = {}
+    for label, (times_by_case, means_by_case, completion) in series.items():
+        lower, median, upper, cohort = transient.aggregate_phase_series(times_by_case, means_by_case, completion)
+        style, grid, count = styles[label], time_axis.PHASE_GRID, len(cohort.cases)
+        axis.plot(grid, median, color=style.color, linestyle=style.linestyle)
+        if count >= _MINIMUM_DISPERSION_SUPPORT:
+            axis.fill_between(grid, lower, upper, color=style.color, alpha=0.18)
+        count_axis.plot(grid, np.full(grid.shape, count), color=style.color, linestyle=style.linestyle, drawstyle="steps-post", alpha=0.5)
+        labels[label] = cohort.label()
+    return labels
+
+
 def _trajectory_figure(
     *,
     datasets: Mapping[str, pd.DataFrame],
@@ -667,11 +704,17 @@ def _trajectory_figure(
     case_ids: Mapping[str, str] | None,
     max_cases: int | None,
     styles: Mapping[str, visual_semantics.SeriesStyle],
+    clock: str = "hours",
 ) -> Figure:
-    """Render exact-case or exact-coordinate aggregate schedules and trajectories in the dataset ``styles``."""
+    """Render exact-case or exact-coordinate aggregate schedules and trajectories (aggregate states optionally over the phase) in ``styles``."""
     if not datasets or (case_ids is None) == (max_cases is None):
         message = "Trajectory plotting requires exactly one case map or aggregate bound."
         raise ValueError(message)
+    phase = time_axis.is_phase(clock)
+    if phase and (lacking := [label for label, frame in datasets.items() if not transient.has_completion_evidence(frame)]):
+        message = f"The drying phase pools reached cases, but datasets {lacking} lack completion evidence (published Datasets have none)."
+        raise ValueError(message)
+    phase_notes: dict[str, str] = {}
     resolution = capabilities.resolve_fields(
         datasets,
         view="state_trajectory",
@@ -683,6 +726,8 @@ def _trajectory_figure(
     maximum_count = max(min(max_cases, len(frame)) for frame in datasets.values()) if max_cases is not None else 0
     window_grid = layout.window_axes(figure, figure.add_gridspec(1, 1)[0, 0], time_axis.STARTUP_WINDOWS, [1.0] * rows)
     main_axes, startup_axes = (tuple(window_grid[:, column]) for column in range(len(time_axis.STARTUP_WINDOWS)))
+    for axis, window in zip(window_grid[0], time_axis.STARTUP_WINDOWS, strict=True):
+        figure_layout.set_panel_title(axis, window.title)  # a first state row over the phase retitles its main axis
     legend_panels = window_grid
     main_counts = _contributor_axes(main_axes, maximum_count) if maximum_count else ()
     startup_counts = _contributor_axes(startup_axes, maximum_count) if maximum_count else ()
@@ -740,7 +785,9 @@ def _trajectory_figure(
             )
             if main_support.size:
                 main_times.append(main_support)
-        _configure_split_time_axes(main_axes[index], startup_axes[index], main_times, bottom=index == rows - 1)
+        # Over the phase the state rows read τ, so the last schedule row carries the clock's numbers and label.
+        bottom = index == rows - 1 or (phase and index == len(schedule_fields) - 1)
+        _configure_split_time_axes(main_axes[index], startup_axes[index], main_times, bottom=bottom)
         main_axes[index].grid(axis="y", alpha=0.20)
         startup_axes[index].grid(axis="y", alpha=0.20)
 
@@ -762,6 +809,11 @@ def _trajectory_figure(
             ),
             axis_x=_TRAJECTORY_ROW_LABEL_X,
         )
+        if phase:
+            row_axes = (main_axes[row_index], main_counts[row_index], startup_axes[row_index], startup_counts[row_index])
+            phase_series = {label: _case_series(frame, field, max_cases) for label, frame in compatible.items()}
+            phase_notes |= _plot_phase_row(row_axes, phase_series, styles, first=field_index == 0, bottom=row_index == rows - 1)
+            continue
         main_times = []
         startup_times = []
         for label, frame in compatible.items():
@@ -773,12 +825,7 @@ def _trajectory_figure(
                 if max_cases is None:
                     message = "Aggregate trajectory plotting lost its case bound."
                     raise RuntimeError(message)
-                times_by_case = []
-                means_by_case = []
-                for case_id in tuple(str(value) for value in frame.index[:max_cases]):
-                    case_times, case_means, *_extrema = capabilities.field_display_trajectory(frame, capabilities.case_row(frame, case_id), field)
-                    times_by_case.append(case_times)
-                    means_by_case.append(case_means)
+                times_by_case, means_by_case, _completion = _case_series(frame, field, max_cases)
                 physical_time, lower, median, upper, contributors = transient.aggregate_exact_series(
                     times_by_case,
                     means_by_case,
@@ -811,8 +858,6 @@ def _trajectory_figure(
         main_axes[row_index].grid(axis="y", alpha=0.20)
         startup_axes[row_index].grid(axis="y", alpha=0.20)
 
-    for axis, window in zip(window_grid[0], time_axis.STARTUP_WINDOWS, strict=True):
-        figure_layout.set_panel_title(axis, window.title)
     figure_layout.apply_text_sizes(figure.axes)
     handles: list[Line2D | Patch] = [
         Line2D(
@@ -835,6 +880,7 @@ def _trajectory_figure(
         )
     )
     scope = "single exact cases" if case_ids is not None else "available exact-time support"
+    scope = "states over drying phase, reached cases only" if phase else scope
     figure_layout.set_figure_title(
         figure,
         window_grid,
@@ -843,6 +889,7 @@ def _trajectory_figure(
             if schedule_fields
             else f"Reference physical trajectories — {scope}; full authored schedules unavailable"
         ),
+        note=time_axis.phase_note(phase_notes),
     )
     figure_layout.add_legend(figure, legend_panels, handles, [str(handle.get_label()) for handle in handles], groups={"Datasets": dataset_labels})
     return figure
@@ -854,7 +901,7 @@ def _temporal_support_legend(*, aggregate: bool, schedules: bool) -> list[Line2D
     if aggregate:
         handles.append(Line2D([], [], color="black", drawstyle="steps-post", alpha=0.5, label="n(t): contributors (right axes)"))
     if schedules:
-        handles.extend(Line2D([], [], linestyle="none", label=text) for text in ("Schedules: authored linear rule", "States: observed times only"))
+        handles.extend(Line2D([], [], linestyle="none", label=text) for text in ("Schedules: authored, running cases", "States: observed times only"))
     return handles
 
 
@@ -884,8 +931,13 @@ def plot_state_trajectory_summary(
     max_cases: int,
     styles: Mapping[str, visual_semantics.SeriesStyle],
     channels: Sequence[str] | None = None,
+    time_axis: str = "hours",
 ) -> Figure:
-    """Aggregate observed state times and explicitly authored schedule functions, in the dataset ``styles`` of the viewer."""
+    """
+    Aggregate observed state times and explicitly authored schedule functions, in the dataset ``styles`` of the viewer.
+
+    ``time_axis="phase"`` pools states by ``analysis_ui_time.phase_cohort`` (schedules stay in hours), refusing datasets without completion evidence.
+    """
     if isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases <= 0:
         message = "max_cases must be a positive integer."
         raise ValueError(message)
@@ -895,6 +947,7 @@ def plot_state_trajectory_summary(
         case_ids=None,
         max_cases=max_cases,
         styles=styles,
+        clock=time_axis,
     )
 
 

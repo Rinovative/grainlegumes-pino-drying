@@ -13,7 +13,7 @@ Responsibilities:
   - Keep the transient sample viewer's state-map norms over all stored times for its last case and setting while any
     field is fixed over time
   - Offer the break-even against COMSOL from each run's timing and training evidence, naming a run without it, the
-    transient training curves from a lazy history loader, and the error over time in hours or as τ = t / t_stop
+    transient training curves from a lazy history loader, and the pooled time views over the drying phase or in hours
 
 Design principles:
   - Strict artifact loading and EvaluationSession binding precede construction
@@ -78,6 +78,7 @@ _MINIMUM_VELOCITY_COMPONENTS = 2
 _FRAME_MATERIAL_CONTEXT_SIZE = 2
 _OUTLIER_COUNT = 5
 _CASE_COUNT_STEP = 50
+_CLOCK_OPTIONS: Final = (("Drying phase", "phase"), ("Hours", "hours"))  # the clock of a pooled transient view
 _DEFAULT_TRANSIENT_CHANNELS: Final = ("T", "phi", "w_gr")  # owner 14.11.: checked before any view chose, as in EDA
 _GIF_DPI = 100  # owner 14.11.: tick labels sharp; three states over 169 hourly frames stay under the memory limit
 _GIF_FPS = 3  # the default of the viewer's fps field, which is bounded to 1 to 10
@@ -2158,16 +2159,29 @@ def _make_transient_aggregate_viewer(
         status=status,
         on_change=lambda _selection: cast("ViewPanel", view).request(render),
     )
+    clock_mode = ui.controls.choice_group(_CLOCK_OPTIONS, value="hours")
+    percent = [round(100 * float(point)) for point in ui.time.PHASE_GRID]  # the slider steps through the phase grid in percent
+    phase = ui.navigation.CountControl(
+        value=percent[len(percent) // 2 - 1],
+        minimum=percent[0],
+        maximum=percent[-1],
+        step=percent[1] - percent[0],
+        description="Phase [%]",
+        on_change=lambda _phase: cast("ViewPanel", view).request(render),
+    )
     error_mode = ui.controls.error_mode_group("transient") if plot_kind == "mean_error" else None  # the std maps keep one meaning
     rows = [
         ui.panel.row(choice.selector.header, count.widget),
         ui.panel.row(channels.checks.widget),
-        ui.panel.row(clock.widget),
+        ui.panel.row(clock_mode, clock.widget, phase.widget),
         *([ui.panel.row(error_mode)] if error_mode is not None else []),
     ]
 
     def render_now() -> None:
         current = cast("ViewPanel", view)
+        at_phase = clock_mode.value == "phase"
+        ui.controls.set_visible(clock.widget, not at_phase)  # only the chosen clock's navigator shows
+        ui.controls.set_visible(phase.widget, at_phase)
         selected = channels.checks.selected
         shown = series()
         if not shown:
@@ -2176,9 +2190,13 @@ def _make_transient_aggregate_viewer(
         if not selected:
             ui.viewers.clear_view(current, "Select at least one compatible channel.", **export)
             return
-        physical_time = clock.selection.physical_time
-        supported = {label: tuple(record for record in records if physical_time in record.physical_times) for label, records in shown.items()}
-        coverage = f"Exact t={physical_time:g} h support · " + "; ".join(f"{label}: n(t)={len(records)}" for label, records in supported.items())
+        physical_time, tau = clock.selection.physical_time, phase.value / 100
+        if at_phase:  # every record passes: the builder pools the reached ones and names its cohort
+            when, supported, coverage, time_part = {"phase": tau}, shown, f"Drying phase τ={tau:.2f}", f"tau_{tau:.2f}"
+        else:
+            when, time_part = {"physical_time": physical_time}, f"t_{physical_time:g}h"
+            supported = {label: tuple(record for record in records if physical_time in record.physical_times) for label, records in shown.items()}
+            coverage = f"Exact t={physical_time:g} h support · " + "; ".join(f"{label}: n(t)={len(records)}" for label, records in supported.items())
         if selection_state is not None:
             _publish_transient_capabilities(
                 selection_state, admitted_fields, all_case_ids, physical_times=clock.times_h, channels=selected, physical_time=physical_time
@@ -2186,14 +2204,14 @@ def _make_transient_aggregate_viewer(
         plot_func: Callable[..., Figure]
         if plot_kind == "predicted_reference":
             plot_func = analysis.evaluation.plots.transient.plot_predicted_vs_reference_channels
-            kwargs: dict[str, Any] = {"state_fields": selected, "physical_time": physical_time, "styles": session.series_styles()}
+            kwargs: dict[str, Any] = {"state_fields": selected, **when, "styles": session.series_styles()}
         else:
             plot_func = analysis.evaluation.plots.transient.plot_aggregate_error_maps
             preference = evaluation_compute_device
             requested_device = preference.requested if isinstance(preference, compute.AnalysisComputePreference) else preference
             kwargs = {
                 "state_fields": selected,
-                "physical_time": physical_time,
+                **when,
                 "statistic": "mean" if plot_kind == "mean_error" else "std",
                 "compute_device": requested_device,
             }
@@ -2209,7 +2227,7 @@ def _make_transient_aggregate_viewer(
                     str(export_plot_name or plot_kind),
                     f"cases_{count.value}",
                     f"channel_{'-'.join(selected)}",
-                    f"t_{physical_time:g}h",
+                    time_part,
                     "aggregate",
                 )
             )
@@ -2251,6 +2269,8 @@ def _make_transient_aggregate_viewer(
     channels.checks.observe(lambda: cast("ViewPanel", view).request(render))
     if error_mode is not None:
         error_mode.observe(lambda _change: cast("ViewPanel", view).request(render), names="value")
+    clock_mode.observe(lambda _change: cast("ViewPanel", view).request(render), names="value")
+    ui.controls.set_visible(phase.widget, False)  # hours first
     subscribe_device()
     view.request(refresh)
     return view
@@ -2323,16 +2343,18 @@ def _make_transient_scope_viewer(
         step=_CASE_COUNT_STEP,
         on_change=lambda _count: cast("ViewPanel", view).request(render),
     )
-    time_axis = ui.controls.choice_group((("Hours", "hours"), ("τ = t / t_stop", "tau"))) if plot_kind == "error_time" else None
+    pooled_time = plot_kind in {"trajectory", "error_time"}
+    time_axis = ui.controls.choice_group(_CLOCK_OPTIONS, value="phase")  # placed in the row of the pooled time views only
     rows = [
         ui.panel.row(choice.selector.header, scope, count.widget, navigator.widget),
-        ui.panel.row(channels.checks.widget, *([time_axis] if time_axis else [])),
+        ui.panel.row(channels.checks.widget, *([time_axis] if pooled_time else [])),
     ]
 
     def update_scope_row() -> None:
-        """Expose only the navigator of the active scope: the case count (aggregate) or the case (single)."""
+        """Expose only the navigator of the active scope: the case count (aggregate) or the case (single), and the clock only in aggregate."""
         ui.controls.set_visible(count.widget, scope.value == "aggregate")
         ui.controls.set_visible(navigator.widget, scope.value == "single")
+        ui.controls.set_visible(time_axis, scope.value == "aggregate")
 
     def render_now() -> None:
         current = cast("ViewPanel", view)
@@ -2354,18 +2376,14 @@ def _make_transient_scope_viewer(
                 channels=selected,
                 case_id=None if entry is None else entry.case_id,
             )
+        clock = str(time_axis.value) if pooled_time and scope.value == "aggregate" else "hours"  # a single case keeps its hours
         plot_func: Callable[..., Figure]
         if plot_kind == "trajectory":
             plot_func = analysis.evaluation.plots.transient.plot_state_trajectory_summary
-            kwargs: dict[str, Any] = {"state_fields": selected, "styles": session.series_styles()}
+            kwargs: dict[str, Any] = {"state_fields": selected, "styles": session.series_styles(), "time_axis": clock}
         elif plot_kind == "error_time":
             plot_func = analysis.evaluation.plots.transient.plot_error_over_physical_time
-            kwargs = {
-                "scaling_states": scaling_states,
-                "state_fields": selected,
-                "styles": session.series_styles(),
-                "time_axis": cast("widgets.ToggleButtons", time_axis).value,
-            }
+            kwargs = {"scaling_states": scaling_states, "state_fields": selected, "styles": session.series_styles(), "time_axis": clock}
         else:
             plot_func = analysis.evaluation.plots.transient.plot_error_vs_target_magnitude
             kwargs = {"state_fields": selected, "styles": session.series_styles()}
@@ -2377,7 +2395,7 @@ def _make_transient_scope_viewer(
             case_part = f"case_{entry.case_id}" if entry is not None else f"cases_{count.value}"
             export_state["filename_stem"] = "__".join(
                 ("transient_drying", str(export_plot_name or plot_kind), str(scope.value), case_part, f"channel_{'-'.join(selected)}")
-                + ((str(time_axis.value),) if time_axis else ())
+                + ((clock,) if pooled_time else ())
             )
 
     def rebind_now() -> None:
@@ -2411,8 +2429,7 @@ def _make_transient_scope_viewer(
     choice.selector.observe(lambda: cast("ViewPanel", view).request(rebind))
     channels.checks.observe(lambda: cast("ViewPanel", view).request(render))
     scope.observe(lambda _change: scope_changed(), names="value")
-    if time_axis is not None:
-        time_axis.observe(lambda _change: cast("ViewPanel", view).request(render), names="value")
+    time_axis.observe(lambda _change: cast("ViewPanel", view).request(render), names="value")
     update_scope_row()
     view.request(render)
     return view
@@ -2714,6 +2731,34 @@ def _transient_runtime_entry(session: TransientEvaluationSession, kind: str) -> 
     return build
 
 
+def _transient_relative_norm_entry(session: TransientEvaluationSession) -> Callable[..., ViewPanel]:
+    """Bind the relative norms of every frame to one lazy view with the pooled views' clock choice, the drying phase first."""
+
+    def build(
+        *,
+        export_state: dict[str, Any] | None = None,
+        export_plot_name: str | None = None,
+        export_title: str | None = None,
+    ) -> ViewPanel:
+        ui = analysis.ui
+        export: dict[str, Any] = {"export_state": export_state, "export_plot_name": export_plot_name, "export_title": export_title}
+        clock = ui.controls.choice_group(_CLOCK_OPTIONS, value="phase")
+        view = ui.panel.ViewPanel([ui.panel.row(clock)], slot=ui.panel.PlotSlot())
+
+        def render_now() -> None:
+            curves = {name: session.relative_norm_curve(name, time_axis=str(clock.value)) for name in session.frame_names}
+            plot = analysis.evaluation.plots.transient.plot_relative_norms_over_time
+            if ui.viewers.render_view(view, plot, args=(curves,), kwargs={"styles": session.series_styles()}, **export) and export_state is not None:
+                export_state["filename_stem"] = "__".join(("transient_drying", str(export_plot_name or "relative_norms"), str(clock.value)))
+
+        render = _guard(view, export, render_now)
+        clock.observe(lambda _change: view.request(render), names="value")
+        view.request(render)
+        return view
+
+    return build
+
+
 def _build_transient_sections(
     *,
     session: TransientEvaluationSession,
@@ -2899,14 +2944,8 @@ def _build_transient_sections(
         temporal_entries.extend(
             (
                 ("Reference vs prediction trajectories", scoped_view("trajectory"), "reference_prediction_trajectories"),
-                ("Error over physical time", scoped_view("error_time"), "error_over_physical_time"),
-                (
-                    "Relative norms over physical time",
-                    lambda: plots.plot_relative_norms_over_time(
-                        {name: session.relative_norm_curve(name) for name in session.frame_names}, styles=session.series_styles()
-                    ),
-                    "relative_norms_over_physical_time",
-                ),
+                ("Error over drying phase and hours", scoped_view("error_time"), "error_over_physical_time"),
+                ("Relative norms over drying phase and hours", _transient_relative_norm_entry(session), "relative_norms_over_physical_time"),
             )
         )
     if has_horizon:

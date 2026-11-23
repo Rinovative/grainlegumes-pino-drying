@@ -107,7 +107,7 @@ A stage token is the stage prefix plus a suffix, for example `a0smp` or `bws`. A
 <details>
 <summary><strong>Pair folder</strong></summary>
 
-The B/A1 pair folder below A0 reads `b-a1__rollout-<L>__lr-<X>`, for example `b-a1__rollout-32__lr-1__bsmp-rollout-window__bws-32__bwo-0` (58 bytes). It names no budget: B's K x N supervised transitions follow from A0's `budget_epochs` K, which the seed group names, and A1's from B's receipt. `rollout` is B's rollout length `training.b.sampling.rollout_length` (or `--rollout-length`), and `lr` the shared `lr_scale` of B and A1, written `lr-b-<X>__lr-a1-<Y>` when they differ. Then follow the B/A1 tokens the plan file sets:
+The B/A1 pair folder below A0 reads `b-a1__rollout-<L>__lr-<X>`, for example `b-a1__rollout-32__lr-1__bsmp-rollout-window__bws-32__bwo-0` (58 bytes). It names no budget: B's K x N supervised transitions follow from A0's `budget_epochs` K, which the seed group names, and A1's from B's receipt. `rollout` is B's rollout length `training.b.sampling.rollout_length` (or `--rollout-length`), and `lr` the shared `lr_scale` of B and A1, written `lr-b-<X>__lr-a1-<Y>` when they differ. Then follow the B/A1 tokens the plan file sets, and the B window stride, window offset or curriculum it inherits when that value differs from the one B's rollout implies (stride = rollout, offset 0, a curriculum that ends at the rollout with equally spaced milestones), so a `--rollout-length` run that rewrites an inherited value never shares a pair folder with the run that keeps it:
 
 | Token | Meaning | Config key |
 | --- | --- | --- |
@@ -146,5 +146,5 @@ An Optuna study also states `study.seed`, `study.budget_fraction`, a median prun
 | Seed | Where | Value |
 | --- | --- | --- |
 | Generation `seed_base` | `02_datasets/<task>/*.yaml` | 9200 (transient), 9300 (steady); every design seed derives from it, the material and the design kind, so there is no split seed; the transient pilot plan `pilot.yaml` uses 9250, so no pilot case enters a production Dataset |
-| Learning `run.seed` | `03_learning/<task>/base.yaml` | 9; the replicate runs use 9, 19 and 29 through `train --seed N`, which keeps the config name (the W&B group) and the layout parent and lands in `seed-N__ep-E__k-K__sch-S` |
+| Learning `run.seed` | `03_learning/<task>/base.yaml` | 9; the replicate runs use 9, 19 and 29 through `train --seed N`, which keeps the config name (the W&B group) and the layout parent and lands in `seed-N__ep-E__k-k__sch-S` |
 | Optuna `study.seed` | `03_learning/<task>/optuna/*.yaml` | 9 |

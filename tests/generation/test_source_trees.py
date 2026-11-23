@@ -266,6 +266,50 @@ def test_prune_deletes_only_old_unused_trees_and_their_leases(tree_fixture: tupl
     assert aged["kept"] == []
 
 
+def test_an_interrupted_removal_leaves_no_partial_tree_and_the_next_prune_finishes_it(tree_fixture: tuple, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prune killed during the recursive delete must not leave a partial tree under the name a launcher reuses."""
+    module, _repository, _snapshots, trees = tree_fixture
+    _plain_tree(trees, _OLD_TREE, age=3 * _DAY)
+    live = module["prune_source_trees"].__globals__  # run_path returns a copy; the function resolves its names here
+    discard = live["_discard_directory"]
+
+    def killed(_path: Path) -> None:
+        raise KeyboardInterrupt  # stands in for the kill after the first entries are gone
+
+    monkeypatch.setitem(live, "_discard_directory", killed)
+    with pytest.raises(KeyboardInterrupt):
+        module["prune_source_trees"](trees, set(), now=_NOW)
+    assert not (trees / _OLD_TREE).exists()
+    (leftover,) = (path for path in trees.iterdir() if path.name.startswith(f".staging-{_OLD_TREE}-"))
+    monkeypatch.setitem(live, "_discard_directory", discard)
+    assert module["prune_source_trees"](trees, set(), now=_NOW)["removed"] == [leftover.name]
+    assert not leftover.exists()
+
+
+def test_staging_cleanup_waits_for_the_tree_lock_and_skips_a_quarantine_removed_meanwhile(tree_fixture: tuple) -> None:
+    """Two prunes started together: the second waits while the first discards its quarantine and must not fail on it."""
+    module, _repository, _snapshots, trees = tree_fixture
+    quarantine = trees / f".staging-{_OLD_TREE}-cccccccc"
+    (quarantine / "inner").mkdir(parents=True)
+    os.utime(quarantine, (_NOW - 3 * _DAY, _NOW - 3 * _DAY))
+    started = threading.Event()
+    result: dict[str, Any] = {}
+
+    def prune() -> None:
+        started.set()
+        result.update(module["prune_source_trees"](trees, set(), now=_NOW))
+
+    with module["_tree_lock"](trees, _OLD_TREE, exclusive=True):
+        worker = threading.Thread(target=prune)
+        worker.start()
+        started.wait(timeout=5)
+        worker.join(timeout=0.5)
+        assert worker.is_alive()  # the staging cleanup waits for the tree lock
+        module["_discard_directory"](quarantine)  # the first prune finishes its quarantine
+    worker.join(timeout=5)
+    assert result == {"removed": [], "kept": []}
+
+
 def test_prune_rechecks_under_the_tree_lock_and_keeps_a_tree_reused_meanwhile(tree_fixture: tuple) -> None:
     """A launcher holding the shared lock while it refreshes an old tree wins against a prune that started before."""
     module, _repository, _snapshots, trees = tree_fixture
@@ -383,7 +427,7 @@ def test_active_job_ids_follow_squeue_and_array_syntax(
 
     monkeypatch.setattr(subprocess, "run", run)
     assert module["_active_slurm_job_ids"]() == expected
-    assert calls[0][:3] == ["squeue", "-h", "-u"]
+    assert calls[0][:4] == ["squeue", "-h", "--all", "-u"]
     assert calls[0][-2:] == ["-o", "%i"]
 
 

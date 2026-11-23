@@ -5,13 +5,14 @@ Responsibilities:
   - Refuse frames that do not record one common valid analysis producer
   - Aggregate complete-dataset endpoint and cumulative error statistics
   - Rank frames by the selection objective of their complete autonomous rollouts
-  - Reduce the relative norms of complete rollouts per physical time with their supported case counts
+  - Reduce the relative norms of complete rollouts per physical time, or per drying-phase point of ``time_ui.phase_cohort``,
+    with their supported case counts, and classify each full rollout's reference completion from its persisted target evidence
   - Expose bounded case and dataset views
   - Resolve the series styles of the comparison once over all loaded frames, for every transient view
 
 Design principles:
   - Persisted scaling is reconstructed exactly and never refitted
-  - Origin states are excluded from every error reduction
+  - Origin states are excluded from every error reduction over hours; a drying-phase point may resolve to the origin
   - Fixed horizons remain exact semantic values, not display labels
   - A group with any non-finite prediction value reports support counts instead of error metrics
   - The objective and the per-field RMSE, MAE and relative norms of every table, ranking, and B/A pipeline error come from
@@ -39,6 +40,7 @@ import pandas as pd
 
 from src import common, datasets, domain, learning
 from src.analysis.artifacts import contracts
+from src.analysis.ui import analysis_ui_time as time_ui
 
 from . import evaluation_prediction_validity as validity_contract
 from . import evaluation_transient_artifact as sequence_artifact
@@ -292,6 +294,12 @@ def _target_values(
         ):
             gap_errors.append(admitted_prediction - admitted_reference)
     return np.asarray(predicted, dtype=object), np.asarray(reference, dtype=object), time_errors, predicted_gaps, reference_gaps, gap_errors
+
+
+def reference_completion(record: Any) -> time_ui.Completion:
+    """Return a full rollout's reference completion from its persisted target evidence: reached, censored or unknown."""
+    target = _require_mapping(_record_value(record, "target"), label="record target")
+    return time_ui.completion_status(available=target.get("reference_available") is True, reached=target.get("reference_reached"))
 
 
 def _empty_plausibility() -> metrics.PlausibilityDiagnostics:
@@ -1021,31 +1029,43 @@ class TransientEvaluationSession:
         styles.update(series.select_styles(members, styles))
         return styles
 
-    def relative_norm_curve(self, frame_name: str) -> pd.DataFrame:
+    def relative_norm_curve(self, frame_name: str, *, time_axis: str = "hours") -> pd.DataFrame:
         """
-        Return the relative L2 and H1 of one frame's complete autonomous rollouts at every exact physical time.
+        Return the relative L2 and H1 of one frame's complete autonomous rollouts at every exact physical time or phase point.
 
         At each post-origin time every case present enters the material-case mean of its
         per-case norm, as the horizon value does. A case whose predicted state at that time
         is non-finite, or whose reference lies below the field's floor, stays in ``cases``
         and only lowers ``supported_cases``; its other times count. Columns:
         ``physical_time``, ``metric_id``, ``value`` (NaN when a material has no supported
-        case), ``cases`` and ``supported_cases``.
+        case), ``cases`` and ``supported_cases``. With ``time_axis="phase"`` the clock column is
+        ``phase``, every grid point of ``time_ui.phase_cohort``, and ``attrs["phase_label"]`` names the cohort.
         """
+        phase = time_ui.is_phase(time_axis)
         reduction = learning.metrics.metrics
         floors = {field: domain.tasks.registry.get_task("transient_drying").reference_floor(field) for field in sequence_artifact.STATE_ORDER}
-        # Per exact time: (material, field statistics of the state, or None when the predicted state is non-finite).
+        # Per exact time or phase point: (material, field statistics of the state, or None when the predicted state is non-finite).
         by_time: dict[float, list[tuple[str, np.ndarray | None]]] = {}
         # Loaded artifacts hold array-free summaries; the full records carry the states.
-        for record in self.full_autonomous_records(frame_name):
-            prediction = np.asarray(_record_value(record, "predicted_states"), dtype=np.float64)[1:]
-            reference = np.asarray(_record_value(record, "reference_states"), dtype=np.float64)[1:]
+        records = self.full_autonomous_records(frame_name)
+        # Each pooled record with the states it contributes: every post-origin state, or its phase states (the origin a candidate).
+        pooled: list[tuple[Any, np.ndarray | slice]] = [(record, slice(1, None)) for record in records]
+        attrs: dict[str, str] = {}
+        if phase:
+            completion: list[time_ui.Completion] = [reference_completion(record) for record in records]
+            cohort = time_ui.phase_cohort([_record_value(record, "physical_times") for record in records], completion)
+            pooled = [(records[case], states) for case, states in zip(cohort.cases, cohort.states, strict=True)]
+            by_time, attrs = {float(point): [] for point in time_ui.PHASE_GRID}, {"phase_label": cohort.label()}
+        for record, states in pooled:
+            prediction = np.asarray(_record_value(record, "predicted_states"), dtype=np.float64)[states]
+            reference = np.asarray(_record_value(record, "reference_states"), dtype=np.float64)[states]
             spacing = metrics.grid_spacing(_static_conditioning(record, grid_shape=reference.shape[-2:]))
             rows = metrics.state_field_statistics(prediction, reference, spacing=spacing)
-            times = np.asarray(_record_value(record, "physical_times"), dtype=np.float64)[1:]
+            times = time_ui.PHASE_GRID if phase else np.asarray(_record_value(record, "physical_times"), dtype=np.float64)[states]
             material = _material_family(record)
             for time, state, sums in zip(times, prediction, rows, strict=True):
                 by_time.setdefault(float(time), []).append((material, sums if np.isfinite(state).all() else None))
+        clock = "phase" if phase else "physical_time"
         result: list[dict[str, Any]] = []
         for time, cases in sorted(by_time.items()):
             for norm in reduction.RELATIVE_NORMS:
@@ -1054,17 +1074,19 @@ class TransientEvaluationSession:
                         (material, None if sums is None else reduction.case_relative_norm(sums[index], norm=norm, floor=floors[field]))
                         for material, sums in cases
                     ]
-                    value = reduction.material_case_mean(per_case)
+                    value = reduction.material_case_mean(per_case) if per_case else None  # a phase point of a frame without a reached case
                     result.append(
                         {
-                            "physical_time": time,
+                            clock: time,
                             "metric_id": f"physical_relative_{norm}_{field}",
                             "value": math.nan if value is None else value,
                             "cases": len(cases),
                             "supported_cases": sum(case_value is not None for _material, case_value in per_case),
                         }
                     )
-        return pd.DataFrame.from_records(result, columns=["physical_time", "metric_id", "value", "cases", "supported_cases"])
+        curve = pd.DataFrame.from_records(result, columns=[clock, "metric_id", "value", "cases", "supported_cases"])
+        curve.attrs.update(attrs)
+        return curve
 
     def _reduce_summaries(self, *, modes: tuple[str, ...]) -> tuple[TransientSessionSummary, ...]:
         """Reduce exact record groups per material, mode, and horizon."""

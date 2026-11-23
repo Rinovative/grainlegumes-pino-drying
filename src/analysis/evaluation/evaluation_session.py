@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Bind caches to canonical run, role, membership, and output-manifest identity
+  - Derive the attrs of a dataset cut and admit a cut only as an exact ordered subset of its bound source
   - Reuse immutable selected cases under explicit entry and byte limits
   - Compute all-field full-membership and bounded-prefix reductions once
   - Expose operation and retained-byte counters for reproducible benchmarks
@@ -13,6 +14,7 @@ Design principles:
   - Exact spatial quantiles use bounded session-owned scratch, not case retention
   - Local-error curves use one bounded empirical-quantile definition
   - A case whose reference RMS lies below the field's floor has no local relative error; it is counted, never stabilised
+  - A case with a non-finite reference or error value is left out of local relative errors whole and counted apart, never below a floor
   - Direct plot calls receive a scoped ephemeral session without global state
 
 This module does NOT:
@@ -22,10 +24,11 @@ This module does NOT:
 
 Notes:
   Session lifecycle:
-    - Bind provenance-complete frames directly or from strict loaded-run results; bind_cut binds a dataset cut of a bound frame once.
+    - Bind provenance-complete frames directly or from strict loaded-run results; a dataset cut binds only beside its bound source.
     - Use load_case for immutable selected cases, full_summary for full-membership or bounded all-field spatial reductions, and prefix_summary for
       deterministic saved-order prefix diagnostics.
-    - Close explicitly or use context management to detach frames, release caches, and remove session scratch.
+    - Close explicitly or use context management to detach frames, release caches, and remove session scratch; a failed or interrupted
+      binding closes the session it was building.
   Identity and scratch:
     - Frame and payload witnesses guard access; changed evidence invalidates associated case and summary caches.
     - Exact spatial reductions use session-owned temporary projections within explicit byte limits.
@@ -36,11 +39,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import mmap
 import tempfile
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager, suppress
+from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass, replace
 from itertools import pairwise
 from numbers import Integral
@@ -51,12 +57,13 @@ from typing import TYPE_CHECKING, Any, Self, cast
 import numpy as np
 
 from src import common
+from src.analysis.artifacts import contracts
 from src.analysis.evaluation import evaluation_case as cases
 from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Hashable, Iterable, Iterator
 
     import pandas as pd
 
@@ -64,6 +71,11 @@ if TYPE_CHECKING:
 
 SESSION_ATTR = "_evaluation_session"
 SESSION_KEY_ATTR = "_evaluation_artifact_key"
+# A dataset cut keeps the unchanged provenance of the frame it was cut from under this attr, which marks the frame as a cut.
+SOURCE_PROVENANCE_ATTR = "source_artifact_provenance"
+# Live references and caches on a frame, which a cut never inherits: this session's binding and the exact-grid cache of
+# the comparison admission (a deepcopy of the session returns the session itself, so a copied reference would stay live).
+_RUNTIME_ATTRS = frozenset({SESSION_ATTR, SESSION_KEY_ATTR, "_exact_comparison_grid_cache"})
 LOCAL_EMPIRICAL_QUANTILE_DEFINITION = "local_relative_error_empirical_quantiles"
 _MINIMUM_MAGNITUDE_COMPONENTS = 2
 LOCAL_EMPIRICAL_QUANTILE_GRID_SIZE = 1025
@@ -93,6 +105,7 @@ __all__ = [
     "PrefixMagnitudeSummary",
     "SpectralFieldSummary",
     "bound_session",
+    "cut_attrs",
     "radial_power_spectrum",
     "scoped_session",
 ]
@@ -223,9 +236,11 @@ class FullMagnitudeSummary:
     """
     Store complete spatial reductions for one TaskSpec vector-group magnitude.
 
-    ``local_relative_error_mean`` averages only the cases whose magnitude reference RMS
+    ``local_relative_error_mean`` averages only the finite cases whose magnitude reference RMS
     reaches the largest component floor (all NaN when none does);
-    ``local_relative_unavailable_cases`` counts the others.
+    ``local_relative_unavailable_cases`` counts the finite cases below it. A case with a
+    non-finite value is left out of both; the full summary's ``local_relative_nonfinite_cases``
+    counts it.
     """
 
     component_fields: tuple[str, ...]
@@ -260,8 +275,12 @@ class FullEvaluationSummary:
     local_relative_error_mean : numpy.ndarray | None
         Pointwise mean of ``|error|`` over the case's reference RMS of the field, over only
         the cases whose reference RMS reaches the field's floor; all NaN for a field without one.
+        A case with any non-finite reference or error value is left out whole, never imputed.
     local_relative_unavailable_cases : numpy.ndarray | None
-        Per-field number of cases below the field's reference floor.
+        Per-field number of finite cases below the field's reference floor.
+    local_relative_nonfinite_cases : int | None
+        Number of cases left out of every local relative map, field and magnitude, for a
+        non-finite reference or error value.
     signed_error_std, absolute_error_q90 : numpy.ndarray | None
         Pointwise signed-error standard deviation and exact q90 absolute error.
     case_reference_means, case_prediction_means : numpy.ndarray
@@ -285,6 +304,7 @@ class FullEvaluationSummary:
     absolute_error_mean: np.ndarray | None
     local_relative_error_mean: np.ndarray | None
     local_relative_unavailable_cases: np.ndarray | None
+    local_relative_nonfinite_cases: int | None
     signed_error_std: np.ndarray | None
     absolute_error_q90: np.ndarray | None
     case_reference_means: np.ndarray
@@ -602,22 +622,9 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _frame_identity_payload(frame: pd.DataFrame) -> dict[str, Any]:
-    """
-    Return identity-bearing attrs and exact ordered row membership.
-
-    Parameters
-    ----------
-    frame : pandas.DataFrame
-        Evaluation artifact frame with canonical membership columns.
-
-    Returns
-    -------
-    dict[str, Any]
-        Hash-ready identity attrs plus ordered case and payload membership.
-
-    """
-    membership = [
+def _membership(frame: pd.DataFrame) -> list[tuple[int, int, int, str]]:
+    """Return the exact ordered ``(case_index, source_index, split_local_index, npz_path)`` membership of a frame's rows."""
+    return [
         (int(case_index), int(source_index), int(split_local_index), str(npz_path))
         for case_index, source_index, split_local_index, npz_path in zip(
             frame["case_index"].tolist(),
@@ -627,15 +634,37 @@ def _frame_identity_payload(frame: pd.DataFrame) -> dict[str, Any]:
             strict=True,
         )
     ]
+
+
+def _shaped(value: Any) -> Any:
+    """Return a value with every nested tuple and list tagged by its type, which the JSON-normalized digest would equate."""
+    if isinstance(value, Mapping):
+        return {key: _shaped(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return {type(value).__name__: [_shaped(item) for item in value]}
+    return value
+
+
+def _frame_identity_payload(frame: pd.DataFrame) -> dict[str, Any]:
+    """
+    Return the identity-bearing attrs, including the output groups and reference floors the reductions read, and the ordered row membership.
+
+    The output groups keep their container types: the strict group lookup refuses a list in place of the canonical tuple,
+    which the JSON-normalized digest would not tell apart. A cut's recorded source provenance is identity too, so a cut
+    of a cut and a cut of the canonical frame holding the same rows are two cuts, neither taken for a changed other.
+    """
     return {
         "task_id": frame.attrs.get("task_id"),
         "output_fields": frame.attrs.get("output_fields"),
         "output_units": frame.attrs.get("output_units"),
         "input_fields": frame.attrs.get("input_fields"),
         "input_units": frame.attrs.get("input_units"),
+        "output_groups": _shaped(frame.attrs.get("output_groups")),
+        "reference_floors": frame.attrs.get("reference_floors"),
         "artifact_root": frame.attrs.get("artifact_root"),
         "artifact_provenance": frame.attrs.get("artifact_provenance"),
-        "membership": membership,
+        SOURCE_PROVENANCE_ATTR: frame.attrs.get(SOURCE_PROVENANCE_ATTR),
+        "membership": _membership(frame),
     }
 
 
@@ -685,27 +714,38 @@ def _artifact_key(frame: pd.DataFrame) -> ArtifactKey:
     )
 
 
-def _require_unchanged_cut(registered: pd.DataFrame, fresh: pd.DataFrame) -> None:
+def _same_cut(registered: pd.DataFrame, fresh: pd.DataFrame) -> bool:
     """
-    Refuse a registered dataset cut whose rows or any attr of the freshly built cut changed after binding.
+    Return whether a registered dataset cut still has the rows and every attr of the freshly built cut.
 
     Attrs the fresh cut lacks (the session reference and caches consumers add) are ignored. Attr values are compared
     through one canonical digest, so NaN and nested containers compare stably.
-
-    Raises
-    ------
-    EvaluationArtifactChangedError
-        If the rows differ, or an attr of the fresh cut is missing or different on the registered cut.
-
     """
     canonical = common.serialization.canonical_json_sha256
-    if (
-        not registered.equals(fresh)
-        or not fresh.attrs.keys() <= registered.attrs.keys()
-        or canonical(_jsonable({key: registered.attrs[key] for key in fresh.attrs})) != canonical(_jsonable(fresh.attrs))
-    ):
-        msg = "A bound dataset cut changed after binding. Reload the run into a new session."
-        raise EvaluationArtifactChangedError(msg)
+    return (
+        registered.equals(fresh)
+        and fresh.attrs.keys() <= registered.attrs.keys()
+        and canonical(_jsonable({key: registered.attrs[key] for key in fresh.attrs})) == canonical(_jsonable(fresh.attrs))
+    )
+
+
+def _is_cut_of(cut: pd.DataFrame, source: pd.DataFrame) -> bool:
+    """
+    Return whether a frame holds an exact ordered subset of the rows of ``source`` with the attrs a cut of them has.
+
+    The rows must be source rows in source order, each at most once (``source_index`` is unique in an admitted frame),
+    and every attr :func:`cut_attrs` derives for them must be present and equal, container types included. The digest
+    admits non-finite values, which a persisted run summary may hold.
+    """
+    positions = dict(zip(source["source_index"].tolist(), range(len(source)), strict=True))
+    rows = [positions.get(int(index), -1) for index in cut["source_index"].tolist()]
+    if not all(earlier < later for earlier, later in pairwise([-1, *rows])) or not cut.equals(source.iloc[rows]):
+        return False
+    derived = cut_attrs(source, cut)
+    canonical = common.serialization.canonical_json_sha256
+    return derived.keys() <= cut.attrs.keys() and canonical(_jsonable(_shaped({key: cut.attrs[key] for key in derived}))) == canonical(
+        _jsonable(_shaped(derived))
+    )
 
 
 def _payload_paths(frame: pd.DataFrame) -> tuple[Path, ...]:
@@ -1291,7 +1331,8 @@ class EvaluationSession:
         Raises
         ------
         ValueError
-            If any resource limit is not a positive integer.
+            If any resource limit is not a positive integer or a supplied frame fails :meth:`bind`, for example a
+            dataset cut listed before the canonical frame it was cut from.
         TypeError, ComparisonCompatibilityError
             If an optionally supplied frame lacks complete artifact identity.
 
@@ -1316,6 +1357,7 @@ class EvaluationSession:
         self._case_bytes = 0
         self._aggregate_bytes = 0
         self._spill_bytes = 0
+        self._stranded_spill_bytes = 0  # the part of the charge whose blocks a hole punch could not free
         self._temporary = tempfile.TemporaryDirectory(prefix="evaluation-session-")
         self._statistics: dict[str, int] = {
             "npz_opens": 0,
@@ -1340,8 +1382,8 @@ class EvaluationSession:
         if datasets is not None:
             try:
                 self.bind(datasets)
-            except Exception:
-                # Release the frames bound so far and the scratch directory; nobody else holds this session.
+            except BaseException:
+                # Release the frames bound so far and the scratch directory, also on an interrupt; nobody else holds this session.
                 self.close()
                 raise
 
@@ -1389,7 +1431,7 @@ class EvaluationSession:
         session = cls(**limits)
         try:
             cls._bind_loaded_runs(session, runs)
-        except Exception:
+        except BaseException:
             session.close()
             raise
         else:
@@ -1568,6 +1610,9 @@ class EvaluationSession:
         """
         Bind validated frames while excluding presentation labels from identity.
 
+        Frames bind in mapping order, so a dataset cut binds only when the canonical frame it was cut from is bound
+        already or listed earlier.
+
         Parameters
         ----------
         datasets : Mapping[str, pandas.DataFrame]
@@ -1580,7 +1625,7 @@ class EvaluationSession:
             If the session lifetime already ended.
         ValueError, TypeError, ComparisonCompatibilityError
             If input is empty, already belongs to another session, or lacks exact
-            artifact identity.
+            artifact identity, or (ValueError) a dataset cut's canonical source is neither bound nor listed earlier.
 
         """
         self._require_open()
@@ -1594,10 +1639,14 @@ class EvaluationSession:
         """
         Bind one provenance-complete frame and return its exact artifact key.
 
+        A dataset cut (a frame recording its source provenance) binds only through :meth:`bind_cut`, against the
+        canonical frame of its run-role, which must already be bound here. A frame this session already holds is
+        revalidated, never rebound, so fresh payload witnesses cannot cover values cached under the old ones.
+
         Parameters
         ----------
         frame : pandas.DataFrame
-            Strictly admitted evaluation artifact frame.
+            Strictly admitted evaluation artifact frame or dataset cut of one.
 
         Returns
         -------
@@ -1609,8 +1658,11 @@ class EvaluationSession:
         EvaluationSessionClosedError
             If the session is closed.
         ValueError
-            If another live session owns the frame or the canonical run-role key
-            is already bound to a different frame.
+            If another live session owns the frame, the canonical run-role key is already bound to a different
+            frame, or a cut lacks its bound source, is refused by :meth:`bind_cut`, or equals a cut already bound.
+        EvaluationArtifactChangedError
+            If the binding of the frame, or for a cut that of its source or of the cut registered under its key, is
+            invalid or its identity or a payload witness changed.
         TypeError, ComparisonCompatibilityError
             If the frame lacks complete completed-run provenance.
         OSError
@@ -1618,10 +1670,17 @@ class EvaluationSession:
 
         """
         with self._lock:
+            if id(frame) in self._bindings:
+                return self._binding(frame).key
             key = self._attach(frame)
+            if SOURCE_PROVENANCE_ATTR in frame.attrs:
+                source = self._canonical_frames.get((key.run_name, key.split_role))
+                if source is None or self.bind_cut(source, frame) is not frame:
+                    msg = "A dataset cut binds once, and only in a session that holds its source frame."
+                    raise ValueError(msg)
+                return key
             canonical_key = (key.run_name, key.split_role)
-            existing_frame = self._canonical_frames.get(canonical_key)
-            if existing_frame is not None and existing_frame is not frame:
+            if canonical_key in self._canonical_frames:
                 msg = f"Canonical evaluation run-role key is already bound: {canonical_key!r}."
                 raise ValueError(msg)
             self._register(frame, key)
@@ -1649,20 +1708,29 @@ class EvaluationSession:
         EvaluationSessionClosedError
             If the session is closed.
         ValueError
-            If ``source`` is not bound to this session or another live session owns ``cut``.
+            If ``source`` is not bound to this session, another live session owns ``cut``, or ``cut`` is not an exact
+            ordered subset of the rows of ``source`` with the attrs :func:`cut_attrs` derives for them.
         EvaluationArtifactChangedError
-            If the source identity or one of its payload witnesses changed, or the registered cut changed after binding.
+            If the binding of the source or of the registered cut is invalid or its identity or a payload witness changed,
+            or the registered cut no longer equals ``cut``; a changed registered cut is invalidated before the error.
         TypeError, ComparisonCompatibilityError
             If the cut lacks complete completed-run provenance.
 
         """
         with self._lock:
             self._binding(source)
-            registered = self._cuts.get(_artifact_key(cut))
-            if registered is not None:
-                _require_unchanged_cut(registered, cut)
-                return registered
             key = self._attach(cut)
+            if not _is_cut_of(cut, source):
+                msg = "A dataset cut must hold an exact ordered subset of its source's rows with the attrs derived from them."
+                raise ValueError(msg)
+            registered = self._cuts.get(key)
+            if registered is not None:
+                binding = self._binding(registered)
+                if not _same_cut(registered, cut):
+                    self._invalidate(binding)
+                    msg = "A bound dataset cut changed after binding. Reload the run into a new session."
+                    raise EvaluationArtifactChangedError(msg)
+                return registered
             self._register(cut, key)
             self._cuts[key] = cut
             return cut
@@ -1677,9 +1745,8 @@ class EvaluationSession:
         return _artifact_key(frame)
 
     def _register(self, frame: pd.DataFrame, key: ArtifactKey) -> None:
-        """Record the binding of one frame under its key and attach this session to its attrs."""
-        token = _digest(_frame_identity_payload(frame))
-        self._bindings[id(frame)] = _Binding(frame=frame, key=key, frame_token=token, witnesses=_witnesses(frame))
+        """Record the binding of one frame under its key, whose frame digest is its identity token, and attach this session to its attrs."""
+        self._bindings[id(frame)] = _Binding(frame=frame, key=key, frame_token=key.frame_digest, witnesses=_witnesses(frame))
         frame.attrs[SESSION_ATTR] = self
         frame.attrs[SESSION_KEY_ATTR] = key.token
 
@@ -1884,50 +1951,64 @@ class EvaluationSession:
         self._statistics["aggregate_bytes_peak"] = max(self._statistics["aggregate_bytes_peak"], self._aggregate_bytes)
         return value
 
-    def _reserve_spill(self, size: int, *, name: str) -> Path:
+    @contextmanager
+    def _spill(self, shape: tuple[int, ...], *, name: str) -> Iterator[np.ndarray]:
         """
-        Reserve bounded session scratch and return its private file path.
+        Reserve bounded session scratch for one float64 projection on a private mapped file and free it on every exit.
 
         Parameters
         ----------
-        size : int
-            Projection bytes to charge before file creation.
+        shape : tuple[int, ...]
+            Projection shape; its float64 bytes are charged before the file is created.
         name : str
             Private filename within the session temporary directory.
 
-        Returns
-        -------
-        pathlib.Path
-            Reserved path for a session-owned memory-mapped projection.
+        Yields
+        ------
+        numpy.ndarray
+            Writable projection on a shared mapping of the file. On exit a hole punch frees its blocks, the charge
+            returns only if that succeeded (a refused, unavailable or interrupted punch keeps it), and the file is
+            removed either way.
 
         Raises
         ------
         MemoryError
-            If the reservation exceeds the remaining scratch budget.
+            If the reservation exceeds the remaining scratch budget; the message names any charge still held by
+            earlier projections whose blocks the hole punch could not free.
 
         """
+        size = math.prod(shape) * np.dtype(np.float64).itemsize
         if self._spill_bytes + size > self.max_spill_bytes:
             msg = f"Evaluation scratch projection requires {size} bytes, above remaining max_spill_bytes budget."
+            if self._stranded_spill_bytes:
+                msg += f" Earlier projections still hold {self._stranded_spill_bytes} bytes of it: the hole punch could not free their blocks."
             raise MemoryError(msg)
         self._spill_bytes += size
         self._statistics["spill_bytes_peak"] = max(self._statistics["spill_bytes_peak"], self._spill_bytes)
-        return Path(self._temporary.name) / name
-
-    def _release_spill(self, size: int, path: Path) -> None:
-        """
-        Release accounted scratch bytes and remove the private file.
-
-        Parameters
-        ----------
-        size : int
-            Reserved byte charge being released.
-        path : pathlib.Path
-            Session-private projection path to unlink when present.
-
-        """
-        self._spill_bytes -= size
-        with suppress(OSError):
-            path.unlink(missing_ok=True)
+        path = Path(self._temporary.name) / name
+        freed = True  # until the file is mapped, removing it frees its blocks
+        try:
+            with path.open("w+b") as handle:
+                handle.truncate(size)
+                mapping = mmap.mmap(handle.fileno(), size)
+            freed = False
+            try:
+                yield np.ndarray(shape, dtype=np.float64, buffer=mapping)
+            finally:
+                # A kept traceback can hold a view past the unlink, so the length never changes under the mapping: the hole
+                # punch frees the blocks and leaves such a view reading zeros. Closing is no option, since NumPy holds no
+                # buffer export on the mapping: close() succeeds under a live view (probed with NumPy 2.4.6). A platform
+                # without the punch API (AttributeError) keeps the charge like a file system that refuses the punch.
+                with suppress(OSError, AttributeError):
+                    mapping.madvise(mmap.MADV_REMOVE)
+                    freed = True
+        finally:
+            if freed:
+                self._spill_bytes -= size
+            else:
+                self._stranded_spill_bytes += size
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
 
     def full_summary(
         self,
@@ -1956,20 +2037,13 @@ class EvaluationSession:
         magnitude_count = len(magnitude_specs)
         summary_field_count = field_count + magnitude_count
         height, width = first.shape
-        error_bytes = count * summary_field_count * height * width * np.dtype(np.float64).itemsize
-        error_path = self._reserve_spill(error_bytes, name=f"full-error-{self._statistics['full_scans']}.bin")
-        error_store = np.memmap(
-            error_path,
-            dtype=np.float64,
-            mode="w+",
-            shape=(count, summary_field_count, height, width),
-        )
         reference_sum = np.zeros_like(first.reference, dtype=np.float64)
         prediction_sum = np.zeros_like(first.prediction, dtype=np.float64)
         magnitude_reference_sum = np.zeros((magnitude_count, height, width), dtype=np.float64)
         magnitude_prediction_sum = np.zeros((magnitude_count, height, width), dtype=np.float64)
         local_relative_error_sum = np.zeros((summary_field_count, height, width), dtype=np.float64)
         local_relative_supported = np.zeros(summary_field_count, dtype=np.int64)
+        local_relative_nonfinite_cases = 0
         # A case below a field's reference floor has no relative error for it: left out of the mean and counted.
         reference_floors = np.asarray(
             [dataframe.reference_floor(frame, (field,)) for field in first.fields]
@@ -1993,7 +2067,7 @@ class EvaluationSession:
 
         def consume(case: cases.EvaluationCase, position: int) -> None:
             """Accumulate one immutable admitted case into every shared reduction."""
-            nonlocal residual_error, pressure_error, spatial_error
+            nonlocal residual_error, pressure_error, spatial_error, local_relative_nonfinite_cases
             case_reference_means[position] = np.mean(case.reference, axis=(1, 2))
             case_prediction_means[position] = np.mean(case.prediction, axis=(1, 2))
             magnitude_reference = np.empty((magnitude_count, height, width), dtype=np.float64)
@@ -2019,10 +2093,14 @@ class EvaluationSession:
                 magnitude_prediction_sum[:] += magnitude_prediction
                 case_error = np.concatenate((case.error, magnitude_prediction - magnitude_reference))
                 error_store[position] = case_error
-                reference_rms = np.sqrt(np.mean(np.concatenate((case.reference, magnitude_reference)) ** 2, axis=(1, 2)))
-                supported = reference_rms >= reference_floors
-                local_relative_error_sum[supported] += np.abs(case_error[supported]) / reference_rms[supported, None, None]
-                local_relative_supported[:] += supported
+                # A case with a non-finite value is left out of the relative means whole, as in the prefix, and counted apart from the floor.
+                if not validity_contract.finite_case_mask(np.concatenate((case.reference, case.error))[None])[0]:
+                    local_relative_nonfinite_cases += 1
+                else:
+                    reference_rms = np.sqrt(np.mean(np.concatenate((case.reference, magnitude_reference)) ** 2, axis=(1, 2)))
+                    supported = reference_rms >= reference_floors
+                    local_relative_error_sum[supported] += np.abs(case_error[supported]) / reference_rms[supported, None, None]
+                    local_relative_supported[:] += supported
             if residual_error is None:
                 if set(case.residuals) != required_residuals or not compatible:
                     residual_error = "Spatial residual aggregation requires identical full grids and array semantics."
@@ -2039,7 +2117,8 @@ class EvaluationSession:
                     pressure_predicted[position] = predicted
                     pressure_error_values[position] = absolute_error
 
-        try:
+        # Reserved only now, so a failure of the lookups above cannot hold a charge.
+        with self._spill((count, summary_field_count, height, width), name=f"full-error-{self._statistics['full_scans']}.bin") as error_store:
             consume(first, 0)
             for position in range(1, count):
                 case = self._read_case(frame, position)
@@ -2068,7 +2147,7 @@ class EvaluationSession:
                 all_local_relative_mean = np.full_like(local_relative_error_sum, np.nan)
                 with_support = local_relative_supported > 0
                 all_local_relative_mean[with_support] = local_relative_error_sum[with_support] / local_relative_supported[with_support, None, None]
-                local_relative_unavailable = count - local_relative_supported
+                local_relative_unavailable = count - local_relative_nonfinite_cases - local_relative_supported
                 local_relative_mean: np.ndarray | None = all_local_relative_mean[:field_count]
                 local_relative_unavailable_fields: np.ndarray | None = local_relative_unavailable[:field_count]
                 signed_std: np.ndarray | None = all_signed_std[:field_count]
@@ -2096,9 +2175,6 @@ class EvaluationSession:
                 reference_mean = prediction_mean = signed_mean = absolute_mean = local_relative_mean = signed_std = absolute_q90 = None
                 local_relative_unavailable_fields = None
                 magnitude_summaries = {}
-        finally:
-            error_store.flush()
-            self._release_spill(error_bytes, error_path)
 
         if residual_error is None:
             momentum_mean: np.ndarray | None = cast("np.ndarray", momentum_sum) / count
@@ -2126,6 +2202,7 @@ class EvaluationSession:
             absolute_error_mean=None if absolute_mean is None else _readonly(absolute_mean),
             local_relative_error_mean=None if local_relative_mean is None else _readonly(local_relative_mean),
             local_relative_unavailable_cases=None if local_relative_unavailable_fields is None else _readonly(local_relative_unavailable_fields),
+            local_relative_nonfinite_cases=None if local_relative_unavailable_fields is None else local_relative_nonfinite_cases,
             signed_error_std=None if signed_std is None else _readonly(signed_std),
             absolute_error_q90=None if absolute_q90 is None else _readonly(absolute_q90),
             case_reference_means=_readonly(case_reference_means),
@@ -2210,15 +2287,6 @@ class EvaluationSession:
         field_count = len(first.fields)
         magnitude_specs = _magnitude_group_specs(frame, first)
         height, width = first.shape
-        point_count = height * width
-        projection_bytes = count * (2 * field_count + 2) * point_count * np.dtype(np.float64).itemsize
-        projection_path = self._reserve_spill(projection_bytes, name=f"prefix-{self._statistics['prefix_scans']}.bin")
-        projection = np.memmap(
-            projection_path,
-            dtype=np.float64,
-            mode="w+",
-            shape=(count, 2 * field_count + 2, height, width),
-        )
         spacings = np.zeros((count, 2), dtype=np.float64)
         used = 0
 
@@ -2256,13 +2324,12 @@ class EvaluationSession:
             spacings[used] = cases.grid_spacing(case)
             used += 1
 
-        try:
+        with self._spill((count, 2 * field_count + 2, height, width), name=f"prefix-{self._statistics['prefix_scans']}.bin") as projection:
             consume(first)
             for position in range(1, count):
                 case = self._read_case(frame, position)
                 self._statistics["prefix_case_visits"] += 1
                 consume(case)
-            projection.flush()
             references = projection[:used, :field_count]
             errors = projection[:used, field_count : 2 * field_count]
             distances = projection[:used, -2]
@@ -2362,9 +2429,6 @@ class EvaluationSession:
                 spectra=MappingProxyType(spectra),
                 magnitudes=MappingProxyType(magnitude_summaries),
             )
-        finally:
-            projection.flush()
-            self._release_spill(projection_bytes, projection_path)
 
     def close(self) -> None:
         """
@@ -2394,6 +2458,54 @@ class EvaluationSession:
             self._cuts.clear()
             self._temporary.cleanup()
             self._closed = True
+
+
+def cut_attrs(source: pd.DataFrame, rows: pd.DataFrame) -> dict[Hashable | None, Any]:
+    """
+    Return the attrs of a dataset cut of ``source`` holding ``rows``: the one derivation that bind_cut verifies.
+
+    Parameters
+    ----------
+    source : pandas.DataFrame
+        Provenance-complete frame the rows were taken from.
+    rows : pandas.DataFrame
+        Kept rows of ``source`` in source order.
+
+    Returns
+    -------
+    dict[Hashable | None, Any]
+        Deep copies of the source's attrs without live references and caches, the source's provenance under
+        ``SOURCE_PROVENANCE_ATTR``, and a provenance whose selection, aggregate and prediction validity describe the rows
+        alone; the primary objective is that aggregate, recomputed material-balanced on the rows.
+
+    Raises
+    ------
+    TypeError, ComparisonCompatibilityError
+        If ``source`` lacks complete completed-run provenance.
+
+    """
+    provenance = dataframe.require_complete_provenance(source)
+    aggregate = contracts.aggregate_normalized_group_macro_rmse(
+        rows,
+        output_groups=provenance["evaluator"]["output_groups"],
+        train_scales=source.attrs["train_scales"],
+        reference_floors=source.attrs["reference_floors"],
+    )
+    attrs: dict[Hashable | None, Any] = {key: deepcopy(value) for key, value in source.attrs.items() if key not in _RUNTIME_ATTRS}
+    attrs["artifact_provenance"] = {
+        **attrs["artifact_provenance"],
+        "selection": {
+            **attrs["artifact_provenance"]["selection"],
+            "effective_ordered_source_indices_sha256": contracts.ordered_indices_sha256(int(index) for index in rows["source_index"]),
+            "effective_case_count": len(rows),
+            "material_families": sorted({material for _case_id, material in contracts.artifact_case_membership(rows)}),
+        },
+        "aggregate": deepcopy(dict(aggregate)),
+        "evaluation": {"prediction_validity": validity_contract.table_role_prediction_validity(rows)},
+    }
+    attrs[SOURCE_PROVENANCE_ATTR] = deepcopy(dict(provenance))
+    attrs[dataframe.PRIMARY_OBJECTIVE_ID] = dict(aggregate)
+    return attrs
 
 
 def bound_session(frame: pd.DataFrame) -> EvaluationSession | None:
@@ -2448,7 +2560,8 @@ def scoped_session(datasets: Mapping[str, pd.DataFrame]) -> Iterator[EvaluationS
     Raises
     ------
     ValueError
-        If input is empty or compared frames mix session ownership.
+        If input is empty, compared frames mix session ownership, or, without a shared session, a dataset cut is not
+        listed after the canonical frame it was cut from.
     EvaluationSessionClosedError
         If a frame references a released session.
     TypeError, ComparisonCompatibilityError, OSError

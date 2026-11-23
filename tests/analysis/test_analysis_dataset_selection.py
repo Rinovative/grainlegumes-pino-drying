@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check group order, separate and pooled choices, their labels, and the handling of unavailable items
+  - Check that a choice holds only items of its own group
 
 Design principles:
   - Choices follow inventory order, so the selection order never changes what is drawn
@@ -59,6 +60,25 @@ def test_pooled_choice_merges_a_group_and_names_how_many_materials_it_holds() ->
     assert partial[0].members == (("lentil", "id"), ("chickpea", "id"))
     assert [choice.label for choice in everything] == ["ID, alle Materialien", "lentil, Material OOD"]
     assert [choice.label for choice in selection.resolve_choices(inventory, [("chickpea", "id")], pooled=True)] == ["chickpea, ID"]
+
+
+def test_a_pooled_label_counts_the_unavailable_materials_of_its_group() -> None:
+    inventory = selection.DatasetInventory(
+        [_item("lentil", "id"), _item("chickpea", "id")],
+        group_order=selection.EVALUATION_GROUP_ORDER,
+        group_labels=_LABELS,
+        poolable=True,
+        unavailable=[(_item("kidney_bean", "id"), "keine gemeinsamen Fälle in run b")],
+    )
+
+    choices = selection.resolve_choices(inventory, [item.key for item in inventory.items], pooled=True)
+
+    assert [choice.label for choice in choices] == ["ID, 2 von 3 Materialien"]  # never «alle» while a material of the group is unavailable
+
+
+def test_a_choice_refuses_items_of_another_group() -> None:
+    with pytest.raises(ValueError, match="holds items of groups"):
+        selection.DatasetChoice("id", (_item("lentil", "id"), _item("lentil", "material_ood")), True, "lentil")
 
 
 def test_unavailable_items_stay_apart_and_are_never_pooled() -> None:

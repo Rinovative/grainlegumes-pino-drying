@@ -143,6 +143,20 @@ def test_a_trial_run_identity_names_the_trial_budget_its_k_and_the_schedule_its_
     assert trial_layout(2)["a0_id"] != layout["a0_id"]
 
 
+def test_a_study_revision_is_bounded_by_the_study_directory_not_by_a_seed_group_trials_never_use(tmp_path: Path) -> None:
+    """Trials live below their study: a revision that fills the study directory name loads; one character more is a config error."""
+    path = _write_study(tmp_path)
+    layout = optuna_runtime.load_optuna_study_config(path).base_config["run"]["layout"]
+    revision = "r" * (255 - len(common.paths.study_group_name(layout["config_name"], layout["budget_epochs"], "")))
+    assert len(common.paths.seed_group_name({**layout, "revision": revision})) > 255  # the seed group would not fit one component
+
+    study = optuna_runtime.load_optuna_study_config(path, revision=revision)
+    study_dir = common.paths.resolve_config_run_dir(study.base_config).parents[1]
+    assert study_dir.name == common.paths.study_group_name(layout["config_name"], layout["budget_epochs"], revision)
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"study directory must not exceed 255 UTF-8 bytes"):
+        optuna_runtime.load_optuna_study_config(path, revision=f"{revision}r")
+
+
 @pytest.mark.parametrize(
     ("spec", "error", "match"),
     [
@@ -765,6 +779,30 @@ def test_best_config_of_an_a0_study_puts_a_searched_k_at_the_plan_level(tmp_path
     # The study's experiment is its plan, so A0's own settings stay under the A0 stage, without a curriculum.
     assert training["a0"]["sampling"] == payload["experiment"]["training"]["a0"]["sampling"]
     assert "curriculum" not in training["a0"]
+
+
+@pytest.mark.parametrize(
+    ("task", "budget_path"),
+    [("steady_flow", ("training", "budget_epochs")), ("transient_drying", ("training", "a0", "budget_epochs"))],
+)
+def test_best_config_states_the_budget_k_an_epochs_override_gave_the_study(task: str, budget_path: tuple[str, ...], tmp_path: Path) -> None:
+    """A study run with --epochs derives its trials from that K, so its exported config states it and a copy trains the study's budget."""
+    if task == "steady_flow":
+        study = optuna_runtime.load_optuna_study_config(_write_study(tmp_path / "external"), epochs=6)
+    else:
+        source = configs.write_yaml(tmp_path / "external" / "a0-study.yaml", configs.optuna_transient_a0_config())
+        study = optuna_runtime.load_optuna_study_config(source, epochs=6, train_dataset="synthetic_transient_train")
+    paths = _study_paths(tmp_path / "study")
+    best = {"hidden_channels": 12, "learning_rate": 0.002}
+
+    optuna_runtime._publish_study_lifecycle_summary(
+        paths, {"study_name": "s", "best_trial_number": 1, "best_objective": 0.5, "best_parameters": best}, study
+    )
+
+    node: Any = yaml.safe_load((paths.study_dir / "best_config.yaml").read_text(encoding="utf-8"))
+    for key in budget_path:
+        node = node[key]
+    assert node == study.study["full_budget_epochs"] == 6
 
 
 def test_a_study_without_the_task_base_is_refused_when_it_loads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

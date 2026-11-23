@@ -871,7 +871,7 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
         )
         assert analysis.evaluation.artifact_loader.load_run_artifacts(moved).selected_checkpoint_sha256 == checkpoint_digest
         # Exercise the same continuation service used by ordinary resolved launches.
-        with pytest.raises(ValueError, match="A completed run has spent its budget and is never extended"):
+        with pytest.raises(ValueError, match="A completed run, also one that diverged before its budget end, is never extended"):
             experiments.run._run_resolved_experiment(
                 copy.deepcopy(completed_lifecycle.config),
                 config_path=common.paths.resolve_run_config_path(moved),

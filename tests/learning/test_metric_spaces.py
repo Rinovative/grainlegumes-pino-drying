@@ -4,6 +4,7 @@ Responsibilities:
   - Check named channels, physical inverse transforms, units, and mixed-unit rejection
   - Check that a prediction that overflows on decoding counts as a non-finite validation case
   - Check that the physical evaluation view decodes with each case's inlet-pressure reference
+  - Check that validation's normalized field errors equal the artifact values and leave the objective unchanged
 
 Design principles:
   - Metric-space routing transforms physical tensors exactly once
@@ -29,6 +30,8 @@ _NORMALIZED_FIELD_METRICS = tuple(metric for metric in _TASK.default_metrics if 
 _PHYSICAL_FIELD_METRICS = tuple(
     metric for metric in _TASK.default_metrics if metric.kind == "rmse" and metric.space == "physical" and len(metric.fields) == 1
 )
+# The checkpoint objective of the fixed two-case input below, recorded before the normalized field errors moved to physical statistics.
+_OBJECTIVE_ON_FIXED_INPUT = 9.39927782715339
 
 
 class UnitErrorModel(torch.nn.Module):
@@ -42,15 +45,15 @@ class UnitErrorModel(torch.nn.Module):
         )
 
 
-def _metrics(*metric_ids: str) -> dict[str, learning.metrics.metrics.DatasetMetric]:
-    """Build a selected subset of resolved default metrics."""
+def _metrics(*metric_ids: str, scales: torch.Tensor | None = None) -> dict[str, learning.metrics.metrics.DatasetMetric]:
+    """Build a selected subset of resolved default metrics with the physical Train scales ``scales`` (default two)."""
     config = configs.resolve(configs.direct_config())
     selected = [metric for metric in config["evaluation"]["metrics"] if metric["id"] in metric_ids]
     config["evaluation"]["metrics"] = selected
     return learning.metrics.metrics.build_evaluation_metrics(
         config,
         device=torch.device("cpu"),
-        output_scales=torch.full((_TASK.out_channels,), 2.0),
+        output_scales=torch.full((_TASK.out_channels,), 2.0) if scales is None else scales,
     )
 
 
@@ -116,6 +119,50 @@ def test_physical_views_equal_the_physical_targets_through_the_inlet_pressure_re
 
     for definition in _PHYSICAL_FIELD_METRICS:
         assert values[definition.id] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_validation_normalized_field_errors_are_the_artifact_values_and_the_objective_is_unchanged() -> None:
+    """
+    Two cases with inlet pressures 3 and 0.5 and per-field physical Train scales 2, 3 and 4.
+
+    Validation's ``normalized_rmse_<f>`` and ``normalized_mae_<f>`` equal what the artifacts compute with
+    ``field_metric_values`` from the physical case statistics (physical error over the physical Train scale),
+    not the error of the encoded states; the checkpoint objective keeps its exact value.
+    """
+    shape, spacing = (6, 6), (0.2, 0.2)
+    scales = torch.arange(2.0, 2.0 + _TASK.out_channels)
+    normalized_ids = [f"normalized_{kind}_{field}" for kind in ("rmse", "mae") for field in _TASK.output_names]
+    metrics = _metrics(_GROUP_OBJECTIVE.id, *normalized_ids, scales=scales)
+    scaling = steady_scaling(shape, state_mean=10.0, state_std=2.0)
+    inputs = torch.cat([steady_inputs(1, shape, inlet_pressure=3.0), steady_inputs(1, shape, inlet_pressure=0.5)])
+    targets = torch.linspace(1.0, 50.0, 2 * _TASK.out_channels * 36).reshape(2, _TASK.out_channels, *shape)
+    prediction = torch.linspace(-1.0, 1.5, 2 * _TASK.out_channels * 36).reshape(2, _TASK.out_channels, *shape)
+    raw_batch = {"x": inputs, "y": targets, "meta": {"simulation_case_id": ["case-a", "case-b"], "material_family": ["lentil", "pea"]}}
+    values = learning.training.loop.eval_one_epoch(
+        _FixedOutputModel(prediction),
+        [raw_batch],  # type: ignore[arg-type]
+        metrics,
+        torch.device("cpu"),
+        scaling,
+    )
+
+    reduction = learning.metrics.metrics
+    physical = scaling.decode_state(prediction, reference=scaling.state_reference(inputs))
+    rows = reduction.field_statistics(physical, targets, grid_spacing=spacing)
+    cases = [
+        reduction.CaseStatistics(case, material, _TASK.output_names, rows[row])
+        for row, (case, material) in enumerate((("case-a", "lentil"), ("case-b", "pea")))
+    ]
+    expected, _unavailable = reduction.field_metric_values(
+        cases,
+        train_scales={field: float(scale) for field, scale in zip(_TASK.output_names, scales, strict=True)},
+        reference_floors={field: _TASK.reference_floor(field) for field in _TASK.output_names},
+        output_groups=_TASK.output_groups,
+    )
+    assert {metric_id: values[metric_id] for metric_id in normalized_ids} == pytest.approx(
+        {metric_id: expected[metric_id] for metric_id in normalized_ids}, rel=1e-12
+    )
+    assert values[_GROUP_OBJECTIVE.id] == _OBJECTIVE_ON_FIXED_INPUT
 
 
 def test_validation_produces_the_curated_relative_l2_above_the_reference_floors() -> None:

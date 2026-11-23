@@ -8,7 +8,9 @@ Responsibilities:
 Design principles:
   - Choices follow the inventory and group order, never the order of the selection
   - A pooled choice with a single item is that item, so its label and its draw equal the separate one
-  - Unknown keys, a pooled request on a non-poolable inventory, and inconsistent inventories fail closed
+  - A pooled label counts the group's unavailable items among its n materials, so it never claims all while one is unavailable
+  - Unknown keys, a pooled request on a non-poolable inventory, a choice holding another group's item, and inconsistent inventories
+    fail closed
 
 This module does NOT:
   - Load frames, recompute any objective, or decide which views may pool
@@ -81,6 +83,13 @@ class DatasetChoice:
     available: bool
     label: str
 
+    def __post_init__(self) -> None:
+        """Require every item to belong to the choice's group, which decides the frame a view cuts."""
+        stray = sorted({item.group for item in self.items} - {self.group})
+        if stray:
+            message = f"Dataset choice of group {self.group!r} holds items of groups {stray}."
+            raise ValueError(message)
+
     @property
     def members(self) -> tuple[Hashable, ...]:
         """Return the item keys the choice draws."""
@@ -133,7 +142,7 @@ def resolve_choices(inventory: DatasetInventory, selected: Iterable[Hashable], *
     for group in inventory.group_order:
         members = tuple(item for item in inventory.items if item.group == group and item.key in chosen)
         if pooled and members:
-            total = sum(item.group == group for item in inventory.items)
+            total = sum(item.group == group for item in (*inventory.items, *refused.values()))
             choices.append(DatasetChoice(group, members, True, _pooled_label(inventory.group_labels[group], members, total)))
         else:
             choices.extend(DatasetChoice(group, (item,), True, item.label) for item in members)
@@ -142,7 +151,7 @@ def resolve_choices(inventory: DatasetInventory, selected: Iterable[Hashable], *
 
 
 def _pooled_label(group_label: str, members: tuple[DatasetItem, ...], total: int) -> str:
-    """Name a pooled choice by its group and how many of the group's materials it merges."""
+    """Name a pooled choice by its group and how many of the group's ``total`` materials, unavailable ones included, it merges."""
     if len(members) == 1:
         return members[0].label
     if len(members) == total:

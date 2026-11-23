@@ -2,7 +2,7 @@
 # The code holds no default for what this file states; configs/README.md lists every key a config chain must state.
 
 training:
-  budget_epochs: 600  # Budget K in passes over the full Train set, counted in seen units (a Train subset gets the same number); validation and the physics monitor run at each 1/20 of it; ID test and OOD are never evaluated in training, only by the separate artifact step. It names the run (seed-N__ep-E__k-K__sch-S), so another budget is another run; a study trains a fraction of it.
+  budget_epochs: 600  # Budget K in passes over the full Train set, counted in seen units (a Train subset gets the same number); validation and the physics monitor run at each 1/20 of it; ID test and OOD are never evaluated in training, only by the separate artifact step. It names the run (seed-N__ep-E__k-k__sch-S), so another budget is another run; a study trains a fraction of it.
   units_per_update: 16  # k, Train cases per optimizer update (one case is one unit); every case counts once per epoch.
   memory_batch: 16  # Cases computed at once; gradients accumulate up to k, so it changes only floating-point rounding, never the science.
 

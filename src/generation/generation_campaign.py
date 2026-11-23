@@ -7,8 +7,10 @@ Responsibilities:
   - Derive one scheduler row per dispatch from step accounting, the allocation state, and the worker receipts
   - Replay a persisted cancellation on every feed until the node jobs have ended
   - Record the success decision of a validly published case whose step ended without writing it
-  - Record the failed decision of a case whose solve the runtime stopped itself (stalled, timed out, solver error) once its step ended
-  - Record each attempt's typed runtime reason; write the derived ``cases.csv`` view when the campaign settles complete
+  - Record the failed decision of a case whose solve the runtime stopped itself (stalled, timed out, solver error) or whose
+    conversion found a negative water state, once its step ended
+  - Record each attempt's typed runtime or conversion reason (a negative water state with its numbers); write the derived
+    ``cases.csv`` view when the campaign settles complete
   - Validate terminal case evidence and publish exact campaign inventories
 
 Design principles:
@@ -39,7 +41,7 @@ Notes:
     - Resolve an interrupted node-job submission, read the scheduler, then observe ended node jobs and finish pending leases.
     - Finish interrupted drains and interrupted dispatches before any new work.
     - Reconcile every case, decide each validly published case whose step ended undecided, and check completion by candidate decisions.
-    - Decide each runtime-stopped solve whose latest dispatch has terminal step accounting and no active dispatch; a feed
+    - Decide each runtime-stopped solve or negative water state whose latest dispatch has terminal step accounting and no active dispatch; a feed
       that records one returns at once, so the next feed plans its replacement before any idle node job is drained.
     - On completion seal the selected pool, write ``cases.csv`` atomically, and drain every node job.
     - Dispatch cases into node jobs with free ticket capacity, and submit a node job on a free seat when none has.
@@ -3342,9 +3344,10 @@ def _reconcile_runtime_failure_decisions(
     *,
     storage_root: Path | str | None,
 ) -> bool:
-    """Record the failed decision of every undecided candidate whose solve the runtime stopped itself; return whether any was recorded.
+    """Record the failed decision of every undecided candidate whose failure is decided automatically; return whether any was recorded.
 
-    Only a non-retryable solver attempt with a runtime reason (stalled, timed out, solver error) qualifies, and only when
+    Only a non-retryable attempt whose class and reason are in ``AUTOMATIC_FAILURE_REASONS`` qualifies (a solver attempt
+    the runtime stopped itself, or a validation attempt whose conversion found a negative water state), and only when
     it belongs to the case's latest started dispatch, that dispatch has terminal step accounting, and no dispatch of the
     case is active. Anything else, an unclassified solver failure included, waits for an explicit decision.
     """
@@ -3355,13 +3358,17 @@ def _reconcile_runtime_failure_decisions(
     recorded = False
     for row in candidate_records:
         attempt = row["attempts"][-1] if row["attempts"] else None
-        if row["decision"] is not None or attempt is None or attempt["reason_code"] not in lifecycle_service.RUNTIME_SOLVER_REASONS:
+        if (
+            row["decision"] is not None
+            or attempt is None
+            or (attempt["class"], attempt["reason_code"]) not in lifecycle_service.AUTOMATIC_FAILURE_REASONS
+        ):
             continue
         dispatches = _case_dispatches(manifest, lifecycle_service.execution_batch(campaign, row["reservation"]), str(row["reservation"]["case_id"]))
         key = attempt["evidence"].get("dispatch_key")
         if not dispatches or _record_dispatch_key(dispatches[-1]) != key or key not in scheduler["accounted"]:
             continue
-        if attempt["class"] == "solver" and _failure_decision_blocker(manifest, campaign, row, scheduler) is None:
+        if _failure_decision_blocker(manifest, campaign, row, scheduler) is None:
             _record_failure_decision(
                 manifest, campaign, row, reason_code=str(attempt["reason_code"]), detail=str(attempt["detail"]), storage_root=storage_root
             )
@@ -4938,8 +4945,13 @@ def run_campaign_case_job(
             if failure_stage == "publication"
             else "controller"
         )
-        # A solver attempt records how the runtime classified the stop; the exception type stays in the evidence.
+        # A solver attempt records how the runtime classified the stop, a typed conversion rejection its reason and numbers;
+        # the exception type stays in the evidence.
         solver_reason = getattr(error, "runtime_reason", None) or lifecycle_service.UNCLASSIFIED_SOLVER_REASON
+        validation_reason = getattr(error, "validation_reason", None) if failure_class == "validation" else None
+        evidence = {**_dispatch_evidence_fields(dispatch), "exception_type": type(error).__name__}
+        if validation_reason is not None:
+            evidence[validation_reason] = getattr(error, "validation_evidence", None)
         lifecycle_service.record_candidate_attempt(
             campaign.profile.id,
             campaign.source_name,
@@ -4948,10 +4960,10 @@ def run_campaign_case_job(
             attempt_index=len(attempts[0]["attempts"]) + 1,
             stage=failure_stage,
             failure_class=failure_class,
-            reason_code=solver_reason if failure_class == "solver" else type(error).__name__,
+            reason_code=solver_reason if failure_class == "solver" else validation_reason or type(error).__name__,
             retryable=failure_class in {"controller", "publication"},
             detail=str(error) or type(error).__name__,
-            evidence={**_dispatch_evidence_fields(dispatch), "exception_type": type(error).__name__},
+            evidence=evidence,
             storage_root=storage_root,
         )
         raise

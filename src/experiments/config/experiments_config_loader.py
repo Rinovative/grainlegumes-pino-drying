@@ -151,6 +151,12 @@ _SECTION_KEYS = {
     ),
     "tracking": frozenset({"wandb"}),
 }
+# Training keys only a transient stage reads; a steady run states its budget, k and memory batch alone.
+_TRANSIENT_TRAINING_KEYS = _SECTION_KEYS["training"].difference({"budget_epochs", *_REQUIRED_TRAINING_KEYS})
+# The training loop records an ID metric's history keys as ``id/<id>``, ``id/guardrail/one_step/<id>`` and ``id/<id>/component/<name>``,
+# the longest with a relative norm's unavailable case count; an id is bounded so that each fits the history's key bound.
+_LONGEST_METRIC_KEY_DECORATION = len("id/") + len(f"/component/{metric_registry.UNAVAILABLE_CASE_VALUES}")
+_MAX_METRIC_ID_LENGTH = learning.training.history.MAX_METRIC_KEY_LENGTH - _LONGEST_METRIC_KEY_DECORATION
 
 
 def _as_mapping(value: Any, *, path: str) -> dict[str, Any]:
@@ -619,8 +625,8 @@ def _validate_evaluation(config: dict[str, Any], *, task: domain.tasks.spec.Task
         path = f"evaluation.metrics[{index}]"
         metric = _as_mapping(raw_metric, path=path)
         metric_id = metric.get("id")
-        if not isinstance(metric_id, str) or not metric_id:
-            msg = f"{path}.id must be a non-empty string."
+        if not isinstance(metric_id, str) or not metric_id or len(metric_id) > _MAX_METRIC_ID_LENGTH:
+            msg = f"{path}.id must be a non-empty string of at most {_MAX_METRIC_ID_LENGTH} characters, got {metric_id!r}."
             raise ConfigError(msg)
         if metric_id in metric_by_id:
             msg = f"Duplicate evaluation metric id {metric_id!r} at {path}."
@@ -883,7 +889,7 @@ def _validate_data_section(data: dict[str, Any]) -> None:
         msg = "data.persistent_workers requires data.num_workers > 0."
         raise ConfigError(msg)
     try:
-        common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
+        common.paths.validate_logical_name(data.get("train_dataset"), label="data.train_dataset")
     except ValueError as error:
         raise ConfigError(str(error)) from error
     _configured_dataset_list(data, path="data", key="material_ood_datasets", allow_empty=True)
@@ -904,7 +910,7 @@ def _validate_data_section(data: dict[str, Any]) -> None:
 def _validate_scheduler(scheduler: Mapping[str, Any]) -> None:
     """Admit the cosine without parameters, or the plateau comparison variant with its factor and patience."""
     kind = scheduler.get("kind")
-    if kind not in _SCHEDULER_KEYS_BY_KIND:
+    if not isinstance(kind, str) or kind not in _SCHEDULER_KEYS_BY_KIND:
         msg = f"Unknown scheduler kind {kind!r}. Available: {sorted(_SCHEDULER_KEYS_BY_KIND)}, or scheduler: null for a constant rate."
         raise ConfigError(msg)
     expected = _SCHEDULER_KEYS_BY_KIND[kind]
@@ -1139,7 +1145,10 @@ def _validate_run_layout(config: Mapping[str, Any], *, verify_identity: bool) ->
     """Share lexical validation while reserving live identity checks for execution."""
     run = _as_mapping(config.get("run"), path="run")
     layout = dict(_as_mapping(run.get("layout"), path="run.layout"))
-    common.paths.resolve_config_run_dir(config)
+    try:
+        common.paths.resolve_config_run_dir(config)
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
     if (
         layout["task"] != config["task"]
         or layout["dataset"] != layout_dataset(config)
@@ -1327,11 +1336,17 @@ def _validate_transient_extensions(  # noqa: C901
     config["_transient_tensorizer"] = tensorizer
 
 
-def _reject_transient_roots_for_steady(config: Mapping[str, Any]) -> None:
-    """Keep the steady configuration schema byte-for-byte semantic compatible."""
+def _reject_transient_keys_for_steady(config: Mapping[str, Any]) -> None:
+    """Keep the steady configuration schema byte-for-byte semantic compatible: no transient root key and no set transient training key."""
     unexpected = sorted({"input_profile", "temporal"}.intersection(config))
     if unexpected:
         _raise_config_error(f"Steady-flow config does not admit transient root key(s): {unexpected}.")
+    # A transient stage_schedule would name the seed group after its A0 budget (layout_run_terms) while the run trains its own.
+    # A null key states nothing, and steady configs saved with one (teacher_handoff: null) keep loading.
+    training = _as_mapping(config.get("training"), path="training")
+    unexpected = sorted(key for key in _TRANSIENT_TRAINING_KEYS.intersection(training) if training[key] is not None)
+    if unexpected:
+        _raise_config_error(f"Steady-flow config does not admit transient training key(s): {unexpected}.")
 
 
 def apply_epoch_budget(raw: Mapping[str, Any], epochs: int | None) -> dict[str, Any]:
@@ -1517,7 +1532,7 @@ def resolve_config(
     if is_transient:
         _validate_transient_extensions(effective, authored=user_config)
     else:
-        _reject_transient_roots_for_steady(user_config)
+        _reject_transient_keys_for_steady(user_config)
 
     model = _as_mapping(effective["model"], path="model")
     kind = model.get("kind")
@@ -1680,7 +1695,7 @@ def _validate_resolved_config(config: Mapping[str, Any], *, verify_layout_identi
         _validate_transient_extensions(effective)
         tensorizer = effective.pop("_transient_tensorizer")
     else:
-        _reject_transient_roots_for_steady(effective)
+        _reject_transient_keys_for_steady(effective)
         tensorizer = None
     model = _as_mapping(effective["model"], path="model")
     kind = model.get("kind")

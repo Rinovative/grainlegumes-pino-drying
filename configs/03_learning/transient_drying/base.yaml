@@ -6,7 +6,7 @@ training:
   units_per_update: 16  # k, units per optimizer update in every stage: FNO and UNO one transition in A0 and A1 and one rollout window in B; the RNO one whole trajectory (its configs set 4). Every Train case counts equally per epoch.
   # Each experiment states training.a0/b/a1.memory_batch, the units computed at once per stage (no default here).
   a0:
-    budget_epochs: 100  # K, one value for every architecture: A0 trains K passes over the full Train set in seen units, B K x N supervised transitions (N the full Train set's transitions); the best validation checkpoint is handed to B and A1, and an A0 study trains a fraction of it. --epochs overrides it and names another run (seed-N__ep-E__k-K__sch-S).
+    budget_epochs: 100  # K, one value for every architecture: A0 trains K passes over the full Train set in seen units, B K x N supervised transitions (N the full Train set's transitions); the best validation checkpoint is handed to B and A1, and an A0 study trains a fraction of it. --epochs overrides it and names another run (seed-N__ep-E__k-k__sch-S).
   b:
     lr_scale: 1.0  # B restarts its own schedule at lr_scale times A0's start rate and keeps only A0's Adam moments and step counters. B stops after the group that crosses K x N supervised transitions; there is no epoch cap.
     sampling:

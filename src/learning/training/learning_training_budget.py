@@ -5,12 +5,14 @@ Responsibilities:
   - Convert a budget in passes over the full Train set into its count, independently of units_per_update
   - Sum every committed optimizer group's units, supervised transitions and optimisation seconds
   - Derive the completed budget fraction that drives the learning-rate schedule and the curriculum, and the overrun
-  - Mark the validation points at j/20 of the budget and record points a group crossed without its own validation
+  - Mark the validation points at j/20 of the budget, for a matched A1 at B's recorded validations, and record points a
+    group crossed without its own validation
+  - Validate a replayed validation schedule, the one rule for an A1 budget and for B's receipt
   - Persist and restore the exact budget state
 
 Design principles:
   - Progress counts only committed optimizer groups, so a resume restores it exactly
-  - Point j is due once the committed spend reaches j/20 of the budget; point 20 is the budget end
+  - Point j is due once the committed spend reaches j/20 of the budget (point 20 is the budget end), or B's count at j in a replay
   - Both budget units are exact integers, so every threshold is an exact integer comparison
   - Optimisation seconds are measured and reported, never budgeted: hardware and node load change no step count
   - One validation covers every point the last group crossed; the others are plan deviations, never validated again
@@ -29,6 +31,8 @@ from typing import Any, Final, Literal
 
 BudgetUnit = Literal["units", "supervised_transitions"]
 VALIDATION_POINTS: Final = 20
+# One replayed validation: its point and the committed supervised transitions at it.
+_REPLAY_ENTRY: Final = 2
 _STATE_KEYS: Final = frozenset({"unit", "total", "units", "supervised_transitions", "train_seconds", "validated_point", "skipped_points"})
 
 
@@ -56,6 +60,23 @@ def _finite_nonnegative(value: object, *, label: str) -> float:
     return float(value)
 
 
+def validate_replay(replay: object, *, total: int) -> None:
+    """Require a replayed schedule of ``[point, count]`` entries with strictly ascending points (1 to 20) and counts up to ``total``."""
+    entries = replay if isinstance(replay, list) and all(isinstance(entry, list) and len(entry) == _REPLAY_ENTRY for entry in replay) else None
+    values = [value for entry in entries or () for value in entry]
+    points, counts = values[::2], values[1::2]
+    if (
+        entries is None
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+        or points != sorted(set(points))
+        or counts != sorted(set(counts))
+        or not all(1 <= point <= VALIDATION_POINTS for point in points)
+        or not all(1 <= count <= total for count in counts)
+    ):
+        msg = f"Budget replay must list [point, committed transitions] with ascending points 1 to 20 and positive counts, got {replay!r}."
+        raise ValueError(msg)
+
+
 def passes_budget(budget_epochs: int, full_set_count: int) -> int:
     """
     Return a budget of ``budget_epochs`` passes over the full Train set in that set's count.
@@ -76,7 +97,13 @@ class StageBudget:
     transitions. ``units``, ``supervised_transitions`` and ``train_seconds`` are the committed
     totals of this stage; the seconds are only reported. ``validated_point`` is the last
     validation point (0 before the first); ``skipped_points`` are crossed points whose group
-    also crossed a later point and so were validated together with it.
+    also crossed a later point and so were validated together with it. ``replay``, set only for
+    a matched A1, is B's validation schedule from its receipt, ``[point, committed transitions]``
+    per validation B ran: A1 reaches point j once it committed B's transitions of point j and
+    no other point, so it validates once per B validation, at its first group end at or after
+    B's count; a group that reaches two of them validates once and skips the earlier point.
+    Example: B validated ``[[2, 5], [5, 10]]`` and diverged at 12; A1 in groups of 2 validates
+    point 2 at 6 and point 5 at 10, and ends at 12 without a validation.
     """
 
     unit: BudgetUnit
@@ -86,6 +113,7 @@ class StageBudget:
     train_seconds: float = 0.0
     validated_point: int = 0
     skipped_points: list[int] = field(default_factory=list)
+    replay: list[list[int]] | None = None
 
     def __post_init__(self) -> None:
         """Reject an inconsistent budget state."""
@@ -99,6 +127,8 @@ class StageBudget:
         else:
             msg = f"Budget unit must be 'units' or 'supervised_transitions', got {self.unit!r}."
             raise ValueError(msg)
+        if self.replay is not None:
+            validate_replay(self.replay, total=self.total)
         _nonnegative_int(self.units, label="Budget units")
         _nonnegative_int(self.supervised_transitions, label="Budget supervised_transitions")
         _finite_nonnegative(self.train_seconds, label="Budget train_seconds")
@@ -126,8 +156,8 @@ class StageBudget:
 
     @property
     def complete(self) -> bool:
-        """Return whether the committed work reached the budget (validation point 20)."""
-        return self._reaches(VALIDATION_POINTS)
+        """Return whether the committed work reached the budget (validation point 20 unless the points replay B's)."""
+        return self.spent >= self.total
 
     @property
     def progress(self) -> float:
@@ -139,9 +169,12 @@ class StageBudget:
         """
         Return the number of validation thresholds the committed work reached.
 
-        Threshold j is ``j * total / 20``, the last one ``total`` itself, and every
-        threshold, completion included, is reached by the same rule (``_reaches``).
+        Threshold j is ``j * total / 20``, the last one ``total`` itself, and every threshold,
+        completion included, is reached by the same rule (``_reaches``). With ``replay`` it is the
+        last replayed point whose count the committed work reached (0 before the first).
         """
+        if self.replay is not None:
+            return max((point for point, count in self.replay if count <= self.spent), default=0)
         return sum(1 for point in range(1, VALIDATION_POINTS + 1) if self._reaches(point))
 
     def _reaches(self, point: int) -> bool:
@@ -188,13 +221,14 @@ class StageBudget:
             "train_seconds": self.train_seconds,
             "validated_point": self.validated_point,
             "skipped_points": list(self.skipped_points),
+            **({} if self.replay is None else {"replay": [list(entry) for entry in self.replay]}),
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore a state of this budget; reject another unit or total."""
+        """Restore a state of this budget; reject another unit, total or replayed schedule."""
         restored = StageBudget(**validate_state(state))
-        if (restored.unit, restored.total) != (self.unit, self.total):
-            msg = f"Saved budget {restored.total} {restored.unit} differs from this stage's {self.total} {self.unit}."
+        if (restored.unit, restored.total, restored.replay) != (self.unit, self.total, self.replay):
+            msg = f"Saved budget {restored.total} {restored.unit} (replay {restored.replay}) differs from this stage's {self.total} {self.unit}."
             raise ValueError(msg)
         self.units = restored.units
         self.supervised_transitions = restored.supervised_transitions
@@ -204,8 +238,8 @@ class StageBudget:
 
 
 def validate_state(state: object) -> dict[str, Any]:
-    """Return an isolated copy of a valid budget state; reject a malformed one."""
-    if not isinstance(state, Mapping) or set(state) != _STATE_KEYS:
-        msg = f"Budget state keys must be exactly {sorted(_STATE_KEYS)}."
+    """Return an isolated copy of a valid budget state, ``replay`` only for a matched A1; reject a malformed one."""
+    if not isinstance(state, Mapping) or set(state) - {"replay"} != _STATE_KEYS or state.get("replay", []) is None:
+        msg = f"Budget state keys must be exactly {sorted(_STATE_KEYS)}, a matched A1's also replay."
         raise ValueError(msg)
-    return StageBudget(**{key: state[key] for key in _STATE_KEYS}).state_dict()
+    return StageBudget(**state).state_dict()

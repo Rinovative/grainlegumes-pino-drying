@@ -145,6 +145,9 @@ ANALYSIS_PROJECTIONS: Final[dict[str, common.code_identity.CodeProjection]] = {
             "learning/training/learning_training_budget.py": (
                 "admission of a completed lineage from its recorded budget state, bound by the checkpoint and receipt digests"
             ),
+            "learning/training/learning_training_history.py": (
+                "admission of B's receipt, rebuilt from B's history file and required to equal the persisted receipt digest"
+            ),
             "learning/transient/learning_transient_handoff.py": (
                 "training handoff publication; artifacts use only its directory name and bind the manifest bytes by digest"
             ),

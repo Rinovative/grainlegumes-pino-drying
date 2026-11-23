@@ -5,14 +5,17 @@ Responsibilities:
   - Resolve comparison master timelines without interpolating scientific arrays
   - Format physical-time axes without resampling authoritative coordinates
   - Define the time windows of a line figure (the EDA start-up view, the evaluation's first, middle and last day, the
-    normalized time τ = t / t_stop of each case's own end) and style one axis per window: limits, ticks, and the time
-    label under the bottom row only
+    drying phase τ) and style one axis per window: limits, ticks, and the time label under the bottom row only
+  - Own the drying-phase rule of every pooled transient view (``phase_cohort``): τ = t / t_end on a fixed 20-point grid, the
+    nearest stored state per case and point, the reached-only cohort with its censored and unknown counts and its label, and
+    the views' hours-or-phase clock and per-series note
 
 Design principles:
   - Physical time comes only from validated caller-supplied coordinates
   - Axis conversion and locators never change stored scientific values
   - A window keeps the data in hours and lets only its ticks and label read in days, so its unit may follow the shown data
-  - A τ window compares its bounds on the unrounded clock scaled by each case's end, so every stored hour in [0, end] lies in it
+  - A phase cohort is the same at every grid point, one stored state per reached case and point (ties to the earlier), never
+    interpolated; a case without completion evidence is unknown, and a reached case without a post-origin hour is refused
 
 This module does NOT:
   - Interpolate, align scientific arrays, or infer time coordinates
@@ -32,7 +35,7 @@ import numpy as np
 from src.analysis.presentation import analysis_field_labels as field_labels
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from matplotlib.axes import Axes
 
@@ -45,6 +48,10 @@ _HOUR_TICK_STEP_HOURS: Final = 6.0  # an hour window of at least the span below 
 _HOUR_TICK_MIN_SPAN_HOURS: Final = 12.0
 _EMPTY_WINDOW_HOURS: Final = 1.2  # span of an open window without any shown data
 _TAU_TICK_STEP: Final = 0.2
+_PHASE_POINTS: Final = 20  # the drying-phase grid τ = 0.05, 0.10, ..., 1.00
+_PHASE_TIE: Final = 1.0e-9  # in τ: states this close to equally near count as a tie, which the earlier one takes
+
+type Completion = Literal["reached", "censored", "unknown"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,9 +138,8 @@ class TimeWindow:
     so cases of different duration share one last window; ``trim_end_hours`` leaves the last hours of each case to that
     window, so the window beside it stops at each case's own end minus them, and ``not_before_hours`` leaves the clock hours
     up to it to the window before. ``open_start`` leaves the start hour itself to the window before, so a stored hour never
-    lies in two windows. A window in unit ``"1"`` counts the normalized time τ = t / ``end_hours`` of each case: its bounds
-    are fractions of the case's end and its coordinate is τ. A window that needs a case's end refuses a call without
-    ``end_hours``.
+    lies in two windows. A window that needs a case's end refuses a call without ``end_hours``. A window in unit ``"1"``
+    (``PHASE_WINDOW``) only styles an axis of the drying phase τ, whose values the caller resolves through ``phase_cohort``.
     """
 
     title: str
@@ -154,10 +160,8 @@ class TimeWindow:
         return end_hours
 
     def hours(self, physical_hours: Sequence[float] | np.ndarray, *, end_hours: float | None = None) -> np.ndarray:
-        """Return the window coordinate of stored hours: the clock, the hours before ``end_hours`` or τ = t / ``end_hours`` (unit "1")."""
+        """Return the window coordinate of stored hours: the clock, or the hours before ``end_hours``."""
         values = np.asarray(physical_hours, dtype=np.float64)
-        if self.unit == "1":
-            return values / self._required_end(end_hours)
         end = self._required_end(end_hours) if self.before_end or self.trim_end_hours else 0.0
         return np.round(values - end, _BEFORE_END_DECIMALS) if self.before_end else values
 
@@ -170,8 +174,7 @@ class TimeWindow:
         """
         clock = np.asarray(physical_hours, dtype=np.float64)
         shift = self._required_end(end_hours) if self.before_end else 0.0
-        scale = self._required_end(end_hours) if self.unit == "1" else 1.0
-        lower, upper, tolerance = self.start_hours * scale + shift, self.stop_hours * scale + shift, _WINDOW_TOLERANCE_HOURS
+        lower, upper, tolerance = self.start_hours + shift, self.stop_hours + shift, _WINDOW_TOLERANCE_HOURS
         inside = (clock > lower + tolerance) if self.open_start else (clock >= lower - tolerance)
         inside &= (clock <= upper + tolerance) & (clock > self.not_before_hours + tolerance)
         if self.trim_end_hours:
@@ -179,13 +182,120 @@ class TimeWindow:
         return inside
 
 
+@dataclass(frozen=True, slots=True)
+class PhaseCohort:
+    """
+    The reached cases pooled over the drying-phase grid and the stored state each contributes at every grid point.
+
+    ``cases`` are the input positions of the pooled cases; ``states`` and ``hours`` (``[pooled case, grid point]``) hold the
+    index and the hour of the stored state each takes, so ``hours[:, -1]`` is each case's t_end, its last stored hour.
+    """
+
+    cases: tuple[int, ...]
+    states: np.ndarray
+    hours: np.ndarray
+    censored: int
+    unknown: int
+
+    def take(self, values_by_case: Sequence[np.ndarray]) -> np.ndarray:
+        """Return ``[pooled case, grid point]`` values from per-case series aligned with the input cases and their stored times."""
+        return np.asarray([np.asarray(values_by_case[case])[states] for case, states in zip(self.cases, self.states, strict=True)])
+
+    def label(self) -> str:
+        """Return the effective time of the pooled cases (t_end min-max and median in hours) and the reached, censored and unknown counts."""
+        left_out = ", ".join(f"{count} {name}" for name, count in (("censored", self.censored), ("unknown", self.unknown)) if count)
+        excluded = f"{left_out} not pooled" if left_out else ""
+        if not self.cases:
+            return "; ".join(filter(None, ("no reached case to pool", excluded)))
+        ends = self.hours[:, -1]
+        span = f"t_end {_hours_text(ends.min())}-{_hours_text(ends.max())} h, median {_hours_text(np.median(ends))} h"
+        return f"{span}; " + ", ".join(filter(None, (f"{len(self.cases)} reached", excluded)))
+
+    def hours_label(self, phase: float) -> str:
+        """Return the range of stored hours the pooled cases resolve at one grid phase."""
+        selected = self.hours[:, phase_index(phase)]
+        if not selected.size:
+            return f"τ = {phase:.2f}: no stored state"
+        return f"τ = {phase:.2f}: stored t {_hours_text(selected.min())}-{_hours_text(selected.max())} h"
+
+
 # The EDA's schedule and trajectory views: the day-scale main view from hour 1, then the hour-scale start-up view.
 STARTUP_WINDOWS: Final = (
     TimeWindow("Physical time from 1 h to final support", 1.0, math.inf, "d", 1.0),
     TimeWindow("Startup: 0-1 h", 0.0, 1.0, "h", 0.34),
 )
-# The evaluation's whole run in normalized time τ = t / t_stop, t_stop the end each case passes as ``end_hours``.
-TAU_WINDOW: Final = TimeWindow("whole run, τ = t / t_stop", 0.0, 1.0, "1", 1.0)
+# The pooled views' drying phase τ = t / t_end: its axis, and its fixed grid of 20 post-origin points 0.05, ..., 1.
+PHASE_WINDOW: Final = TimeWindow("drying phase, τ = t / t_end", 0.0, 1.0, "1", 1.0)
+PHASE_GRID: Final = np.arange(1, _PHASE_POINTS + 1) / _PHASE_POINTS
+
+
+def _hours_text(hours: float) -> str:
+    """Return hours with at most one decimal, the one number format of the phase labels."""
+    return f"{round(float(hours), 1):g}"
+
+
+def is_phase(time_axis: str) -> bool:
+    """Return whether a pooled view's clock is the drying phase; a clock other than ``"hours"`` or ``"phase"`` raises ``ValueError``."""
+    if time_axis not in {"hours", "phase"}:
+        message = f"time_axis must be 'hours' or 'phase', not {time_axis!r}."
+        raise ValueError(message)
+    return time_axis == "phase"
+
+
+def phase_note(texts: Mapping[str, str]) -> str | None:
+    """Return one «series: text» line per pooled series (the text alone for an unlabelled one), ``None`` without any series."""
+    return "\n".join(f"{label}: {text}" if label else text for label, text in texts.items()) or None
+
+
+def completion_status(*, available: bool, reached: object) -> Completion:
+    """Classify a case's reference completion from existing evidence: reached, censored (stopped without the target) or unknown."""
+    if not available or not isinstance(reached, bool):
+        return "unknown"
+    return "reached" if reached else "censored"
+
+
+def phase_index(phase: float) -> int:
+    """Return the position of one phase on ``PHASE_GRID``; a phase off the grid raises ``ValueError``."""
+    matches = np.flatnonzero(np.isclose(PHASE_GRID, float(phase), rtol=0.0, atol=_PHASE_TIE))
+    if matches.size != 1:
+        message = f"Drying phase {phase!r} is not on the 20-point phase grid 0.05, 0.10, ..., 1.00."
+        raise ValueError(message)
+    return int(matches[0])
+
+
+def phase_cohort(times_by_case: Sequence[Sequence[float] | np.ndarray], completion: Sequence[Completion]) -> PhaseCohort:
+    """
+    Pool the reached cases over ``PHASE_GRID``: each contributes its stored state nearest to τ = t / t_end at every grid point.
+
+    t_end is a case's last stored hour (at most one interval before its exact stop), so every reached case spans the whole
+    grid; every stored state of ``times_by_case``, the origin included, is a candidate, a tie goes to the earlier state and
+    nothing is interpolated. Censored and unknown cases are counted, not pooled. A reached case whose last stored hour is not
+    after 0 h has no phase and raises ``ValueError`` naming its position.
+    """
+    if len(times_by_case) != len(completion) or any(status not in {"reached", "censored", "unknown"} for status in completion):
+        message = "A phase cohort needs one completion status (reached, censored or unknown) per case."
+        raise ValueError(message)
+    cases, states, hours = [], [], []
+    for case, (times, status) in enumerate(zip(times_by_case, completion, strict=True)):
+        if status != "reached":
+            continue
+        clock = np.asarray(validated_times(times), dtype=np.float64)
+        if clock[-1] <= 0.0:
+            message = f"The reached case at position {case} ends at {clock[-1]:g} h, so it has no drying phase τ = t / t_end."
+            raise ValueError(message)
+        distance = np.abs(clock[:, None] / clock[-1] - PHASE_GRID[None, :])
+        nearest = np.argmax(distance <= distance.min(axis=0) + _PHASE_TIE, axis=0)  # the first, earliest, of equally near states
+        cases.append(case)
+        states.append(nearest)
+        hours.append(clock[nearest])
+    shape = (len(cases), PHASE_GRID.size)
+    return PhaseCohort(
+        cases=tuple(cases),
+        states=np.asarray(states, dtype=np.int64).reshape(shape),
+        hours=np.asarray(hours, dtype=np.float64).reshape(shape),
+        censored=sum(status == "censored" for status in completion),
+        unknown=sum(status == "unknown" for status in completion),
+    )
 
 
 def format_terminal_physical_time_hours(
@@ -322,7 +432,7 @@ def style_window_axis(axis: Axes, window: TimeWindow, *, shown_end_hours: float 
     axis.xaxis.set_minor_locator(mticker.NullLocator())
     axis.grid(axis="x", which="major", alpha=0.25)
     axis.tick_params(axis="x", labelbottom=bottom)
-    label = f"τ = t / t_stop [{field_labels.display_unit('1')}]" if unit == "1" else f"Time{' before end' if window.before_end else ''} [{unit}]"
+    label = f"τ = t / t_end [{field_labels.display_unit('1')}]" if unit == "1" else f"Time{' before end' if window.before_end else ''} [{unit}]"
     axis.set_xlabel(label if bottom else "")
 
 

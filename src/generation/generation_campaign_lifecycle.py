@@ -5,6 +5,7 @@ Responsibilities:
   - Reserve material-local case IDs durably before case execution
   - Record distinct operational attempts and terminal candidate decisions
   - Require a solver attempt's reason to be the runtime's typed stop reason (stalled, timed_out, solver_error) or unclassified
+  - Own the attempt reasons the campaign decides as failed by itself (typed solver stops and negative_water_state)
   - Derive deterministic selected-success membership from canonical evidence
   - Pre-register a Dataset plan's minimum success rate per material at creation and append later explicit lowerings with their reason,
     each as one atomic numbered record of the material
@@ -45,6 +46,7 @@ from src.generation.cases import generation_cases_seeding as seeding
 from src.generation.cases import generation_cases_selection as selection_service
 from src.generation.contracts import generation_contracts_campaign_identity as identity
 from src.generation.contracts import generation_contracts_material_registry as material_registry
+from src.generation.publication import generation_publication_storage as storage_service
 
 _SHA256: Final = re.compile(r"[0-9a-f]{64}\Z")
 _ORIGINS: Final = frozenset({"primary", "replacement"})
@@ -53,6 +55,11 @@ _ATTEMPT_SCHEMA_KIND: Final = "generation_candidate_attempt"
 # A solver attempt's reason is the runtime's own classification of the stop (its RuntimeFailureReason) or ``unclassified``.
 RUNTIME_SOLVER_REASONS: Final = frozenset({"stalled", "timed_out", "solver_error"})
 UNCLASSIFIED_SOLVER_REASON: Final = "unclassified"
+# The (class, reason) pairs of a non-retryable attempt that the campaign decides as failed by itself: a runtime-stopped
+# solve and a conversion that found a negative stored water state. Every other failure waits for an explicit decision.
+AUTOMATIC_FAILURE_REASONS: Final = frozenset(
+    {*(("solver", reason) for reason in RUNTIME_SOLVER_REASONS), ("validation", storage_service.NegativeWaterStateError.reason_code)}
+)
 _AMENDMENT_SCHEMA_KIND: Final = "generation_minimum_success_rate_amendment"
 _REPLACEMENT_DESIGN_SCHEMA_KIND: Final = "generation_source_replacement_design"
 _REPLACEMENT_DESIGN_KEYS: Final = frozenset(

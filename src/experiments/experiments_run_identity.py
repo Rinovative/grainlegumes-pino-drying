@@ -506,6 +506,10 @@ def resolve_readonly_experiment_child(
             if not isinstance(evidence, Mapping) or evidence.get("resolved_config_sha256") != resolved_config_digest(config):
                 msg = "Incomplete parent child config disagrees with its persisted run identity."
                 raise ValueError(msg)
+            # Without a saved checkpoint identity the stage digest is recomputed from the saved config, as a resume does.
+            if training_checkpoint.config_digest(config) != child["semantic_config_sha256"]:
+                msg = "Incomplete parent child scientific identity disagrees with its immutable parent."
+                raise ValueError(msg)
     return resolved
 
 

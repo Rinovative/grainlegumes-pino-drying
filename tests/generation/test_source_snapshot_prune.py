@@ -169,8 +169,18 @@ def test_a_recent_change_keeps_the_snapshot(store: _Store, recent: str) -> None:
     target = store.snapshots / name / "untracked" if recent == "snapshot" else lock
     os.utime(target, (store.now - 60, store.now - 60))
     result = store.prune(apply=True)
-    assert result == (_outcome() if recent == "snapshot" else _outcome(skipped=f"{store.trees} changed within the last 24 h"))
+    assert result == (_outcome() if recent == "snapshot" else _outcome(skipped=f"{store.trees} changed within the last 1 h"))
     assert (store.snapshots / name / "snapshot.json").is_file()
+
+
+def test_a_change_older_than_the_quiet_hour_no_longer_keeps_the_snapshot(store: _Store) -> None:
+    name = _snapshot(store.storage, "1")
+    lock = _lock(store.trees, name)
+    for target in (store.snapshots / name / "untracked", lock):
+        os.utime(target, (store.now - 2 * 3600, store.now - 2 * 3600))
+    result = store.prune(apply=True)
+    assert result["orphans"] == [name]
+    assert not (store.snapshots / name).exists()
 
 
 def test_defective_snapshots_are_reported_and_kept(store: _Store) -> None:
@@ -259,7 +269,7 @@ def test_a_routine_stop_in_the_recheck_only_skips(store: _Store, monkeypatch: py
     answers = iter([(True, True), (change != "queue", True)])
     _on_first_lock(store, monkeypatch, lambda: os.utime(lock, (store.now, store.now)) if change == "trees" else None)
     result = store.prune(apply=True, scheduler=lambda: next(answers))
-    skipped = "Slurm queue not empty" if change == "queue" else f"{store.trees} changed within the last 24 h"
+    skipped = "Slurm queue not empty" if change == "queue" else f"{store.trees} changed within the last 1 h"
     assert result == _outcome(skipped=skipped)
     assert (store.snapshots / name / "snapshot.json").is_file()
 
@@ -428,9 +438,9 @@ def test_command_line_prints_sorted_json_queries_slurm_and_exits_two_on_a_refusa
     binary.mkdir()
     log = tmp_path / "slurm.log"
     for tool in ("squeue", "sacct"):
-        (binary / tool).write_text(f'#!/bin/sh\necho "{tool} $*" >> "{log}"\n', encoding="utf-8")
+        (binary / tool).write_text(f'#!/bin/sh\necho "{tool} $*${{SQUEUE_PARTITION:+ filtered}}" >> "{log}"\n', encoding="utf-8")
         (binary / tool).chmod(0o755)
-    environment = {**os.environ, "PATH": f"{binary}{os.pathsep}{os.environ['PATH']}"}
+    environment = {**os.environ, "PATH": f"{binary}{os.pathsep}{os.environ['PATH']}", "SQUEUE_PARTITION": "gpu"}
 
     def run(*extra: str) -> subprocess.CompletedProcess[str]:
         command = [sys.executable, str(_SCRIPT), "--prune-snapshots", str(store.storage), str(store.trees), *extra]
@@ -440,8 +450,9 @@ def test_command_line_prints_sorted_json_queries_slurm_and_exits_two_on_a_refusa
     assert (report.returncode, json.loads(report.stdout)) == (0, _outcome(orphans=[name], bytes=_size(store.snapshots / name)))
     assert list(json.loads(report.stdout)) == sorted(_outcome())
     queries = log.read_text(encoding="utf-8").splitlines()
-    assert [line.split(" -u ")[0] for line in queries] == ["squeue -h -t all", "sacct -X -n -P"]
-    assert queries[1].endswith("-S now-24hours -o JobID")
+    assert [line.split(" -u ")[0] for line in queries] == ["squeue -h --all -t all", "sacct -X -n -P"]
+    assert not any(line.endswith(" filtered") for line in queries)  # an inherited SQUEUE_PARTITION never reaches the clients
+    assert queries[1].endswith("-S now-3600 -o JobID")
     defective = "0" * 12 + "-" + "0" * 12
     (store.snapshots / defective).mkdir()
     applied = run("--apply")

@@ -4,7 +4,7 @@ Responsibilities:
   - Map authoritative training-event metrics to the W&B sections of both tasks, in this order: Overview, Training, Loss, Residuals,
     Fields, Physical, Norms, Moisture and OneStep (transient only), Performance, Optuna; a section appears when its series exist
   - Name the summary-only keys that W&B receives as hidden metrics, so end values make no panel and no section
-  - Select the series that change during a run or compare ID with OOD, for the task and the run's loss, monitor, OOD and device settings
+  - Select the series that change during a run, for the task and the run's loss, monitor and device settings
   - Derive the terminal-summary key that a projected evaluation series keeps
   - Apply presentation-only unit projections without recomputing scientific values
   - Derive group, job type and name of a run from its saved layout and training stage
@@ -12,16 +12,14 @@ Responsibilities:
 Design principles:
   - Local training and evaluation metrics remain authoritative
   - W&B history is a bounded projection, not a mirror of all telemetry
-  - Keys have one slash; a comparison section is a sequence of pages with one column per quantity and two rows, the ID row above
-    the OOD row (3 x 2 in most sections, 4 x 2 in steady Fields, 2 x 2 in Norms), set as that many columns in the saved view; the
-    order of the names after the slash equals the position order, row-major and page after page, under byte-wise, case-insensitive
-    and punctuation-ignoring collation (lower-case labels, no two names first differing at ``-`` versus ``_``); projections are
-    emitted in that same order
+  - Keys have one slash; a comparison section is a sequence of pages with one column per quantity and one row, the ID validation
+    series (3 columns in most sections, 4 in steady Fields, 2 in Norms), set as that many columns in the saved view; the order of
+    the names after the slash equals the position order, row-major, under byte-wise, case-insensitive and punctuation-ignoring
+    collation (lower-case labels, no two names first differing at ``-`` versus ``_``); projections are emitted in that same order
   - A page needs all quantities of its comparison section; the maintained configs keep them all
   - The same name means the same logic in both tasks; the ID validation series is labelled ``id_validation``, never ``id``, which
     names the ID test of the evaluation artifacts
-  - A comparison page pairs ID with one OOD part, ID above OOD (``<part>-id_validation-<q>`` over ``<part>-ood-<q>``); the ID series
-    feeds one destination per page, and an unconfigured OOD part drops its page, and without any OOD part the ID series stand alone
+  - Training and Optuna evaluate no held-out role, so the history holds no OOD series; the artifact step evaluates OOD
   - Performance and Optuna keys carry no role token
 
 This module does NOT:
@@ -38,11 +36,9 @@ from typing import TYPE_CHECKING, Any, Final
 from src import common
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping, Sequence
+    from collections.abc import Mapping, Sequence
 
 _GIB: Final = float(1024**3)
-# Source role of the evaluation loaders to the label of its series in the W&B keys; the ID role is the validation series, not the ID test.
-_ROLES: Final = (("id", "id_validation"), ("material_ood", "material"), ("parameter_ood", "parameter"))
 # Keys the tracker writes only to the run summary, never to history; W&B gets them as hidden metrics (a trailing ``*`` is a prefix glob),
 # so they stay in the run table and make no panel or section.
 SUMMARY_ONLY_KEYS: Final = (
@@ -115,35 +111,19 @@ class MetricProjection:
 
 def _is_validation_source(source_key: str) -> bool:
     """Return whether a source key is filled only at validation points."""
-    prefixes = ("id/", "material_ood/", "parameter_ood/", "physics/id/", "system/id_evaluation_")
+    prefixes = ("id/", "physics/id/", "system/id_evaluation_")
     return source_key.startswith(prefixes) or source_key == "optuna/best_objective"
 
 
 def selected_summary_key(source_key: str) -> str | None:
     """Return the ``selected/`` summary key under which the checkpoint evaluation publishes a projected source, if it does."""
-    if source_key.startswith(tuple(f"{role}/" for role, _label in _ROLES)):
+    if source_key.startswith("id/"):
         return f"selected/{source_key}"
     if source_key.startswith("physics/id/"):
         return f"selected/physics/{source_key.removeprefix('physics/id/')}"
     if source_key.startswith("physics/train/") and source_key.endswith("_weight"):
         return f"selected/training/{source_key.removeprefix('physics/train/')}"
     return None
-
-
-def _comparison_pairs(section: str, quantities: Sequence[tuple[str, str]], ood_roles: Collection[str]) -> list[tuple[str, str]]:
-    """Return one page per configured OOD part: its ID series, then its OOD series, each over the section's quantities.
-
-    Without any OOD part, the ID series stand alone as ``id_validation-<q>``.
-    """
-    if not any(role in ood_roles for role, _part in _ROLES[1:]):
-        return [(f"id/{source}", f"{section}/{_ROLES[0][1]}-{name}") for name, source in quantities]
-    return [
-        (f"{role}/{source}", f"{section}/{part}-{label}-{name}")
-        for ood_role, part in _ROLES[1:]
-        if ood_role in ood_roles
-        for role, label in (_ROLES[0], (ood_role, "ood"))
-        for name, source in quantities
-    ]
 
 
 def curated_metric_projections(
@@ -153,16 +133,13 @@ def curated_metric_projections(
     objective_id: str,
     physics_training_enabled: bool,
     physics_monitor_enabled: bool,
-    ood_roles: Collection[str],
     cuda_enabled: bool,
     optuna_trial: bool,
     rollout_curriculum: bool,
 ) -> tuple[MetricProjection, ...]:
     """Return the ordered curated history of one run; a series no producer fills is not listed.
 
-    ``ood_roles`` names the configured (non-empty) OOD parts, ``material_ood`` and/or ``parameter_ood``; an empty part
-    adds no Overview series and no comparison page;
-    with neither part, each comparison section shows the ID series alone. One source may feed several destinations, the ID series of each page.
+    Each comparison section shows the ID validation series alone, one column per quantity.
     ``rollout_curriculum`` marks a transient run whose stage draws rollout horizons (Stage B); only it fills the curriculum series.
 
     The transient objective and metrics are configurable (``evaluation.objective.id``, ``evaluation.metrics``), so the transient series
@@ -173,15 +150,8 @@ def curated_metric_projections(
     if not isinstance(objective_id, str) or not objective_id:
         message = "W&B projection requires a non-empty objective identifier."
         raise ValueError(message)
-    unknown = set(ood_roles).difference(role for role, _label in _ROLES[1:])
-    if unknown:
-        message = f"W&B projection names unknown OOD roles {sorted(unknown)}."
-        raise ValueError(message)
     transient = task_id == "transient_drying"
-    roles = [(role, label) for role, label in _ROLES if role == "id" or role in ood_roles]
-    pairs = [(f"{role}/{objective_id}", f"Overview/objective-{label}") for role, label in roles]
-    pairs.append(("train/loss_total", "Overview/train-loss_total"))
-    pairs += [(f"{role}/objective_difference", f"Overview/transfer_gap-{label}") for role, label in roles[1:]]
+    pairs = [(f"id/{objective_id}", "Overview/objective-id_validation"), ("train/loss_total", "Overview/train-loss_total")]
     # The budget fraction drives the schedule and the validation points; the committed supervised transitions are the x-axis
     # of every chart (a steady case is one), and the optimisation seconds, which budget nothing, are their own curve.
     pairs.append(("budget/progress", "Training/budget-progress"))
@@ -217,11 +187,10 @@ def curated_metric_projections(
     available = {str(metric["id"]) for metric in evaluation_metrics} - {objective_id}
     for section, quantities in (_TRANSIENT_COMPARISONS if transient else _STEADY_COMPARISONS).items():
         shown = [(name, source.format(objective=objective_id)) for name, source in quantities]
-        pairs += _comparison_pairs(section, [(name, source) for name, source in shown if "/" in source or source in available], ood_roles)
+        pairs += [(f"id/{source}", f"{section}/id_validation-{name}") for name, source in shown if "/" in source or source in available]
     if transient:
         pairs += [
-            (f"{role}/{template.format(field)}", f"OneStep/{label}-{kind}-{name}")
-            for role, label in roles
+            (f"id/{template.format(field)}", f"OneStep/id_validation-{kind}-{name}")
             for kind, template in (("one_step", "guardrail/one_step/normalized_rmse_{}"), ("rollout", "normalized_rmse_{}"))
             for name, field in _TRANSIENT_FIELDS
             if f"normalized_rmse_{field}" in available

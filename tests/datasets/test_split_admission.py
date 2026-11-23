@@ -175,7 +175,14 @@ _SUBSET_TRAIN = ("l1", "l2", "l3", "l4", "c1", "c2", "c3", "c4")
 def test_a_reopened_train_part_must_be_exactly_its_saved_train_subset(train_subset: int | None, case_ids: list[str], refused: bool) -> None:
     """The saved Train membership equals the first ``train_subset`` Train cases per ID material, in order; null is the whole Train role."""
     cases = {case_id: ("lentil" if case_id.startswith("l") else "chickpea", f"s{case_id}") for case_id in _SUBSET_TRAIN}
-    partition = {"train": list(_SUBSET_TRAIN), "validation": [], "id_test": [], "parameter_ood": [], "ood": []}
+    partition = {
+        "material_roles": {"lentil": "id", "chickpea": "id"},
+        "train": list(_SUBSET_TRAIN),
+        "validation": [],
+        "id_test": [],
+        "parameter_ood": [],
+        "ood": [],
+    }
     binding = replace(_binding("train_data", cases, kind="train"), case_partition=partition)
     payload_identity = {"fingerprint": "f" * 64, "spatial_shape": [8, 8]}
     runtime = types.SimpleNamespace(manifest_binding=binding, payload_identity=payload_identity)

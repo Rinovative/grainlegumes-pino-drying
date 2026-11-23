@@ -2153,13 +2153,16 @@ def _authored_difference(
 
 
 def _best_experiment_yaml(config: OptunaStudyConfig, summary: Mapping[str, Any], study_name: str) -> str:
-    """Return the best trial as an experiment config on the task's ``base.yaml`` that trains once copied into ``experiments/``."""
+    """Return the best trial and the study's K as an experiment config on the task's ``base.yaml`` that trains once copied to ``experiments/``."""
     overrides = {
         parameter.path: parameter.value if parameter.kind == "fixed" else summary["best_parameters"][parameter.name]
         for parameter in config.search_space
     }
     authored = experiments.config.loader.load_yaml(config.path)["experiment"]
-    merged = experiments.config.loader.apply_authored_base(authored, origin=config.path)
+    # The trials derive from the study's K, an --epochs override included, so the export states that K wherever it differs from the base.
+    merged = experiments.config.loader.apply_epoch_budget(
+        experiments.config.loader.apply_authored_base(authored, origin=config.path), config.study["full_budget_epochs"]
+    )
     for path, value in overrides.items():
         # An omitted default is absent from the authored block: its first missing level is copied from the resolved config.
         authored_node: Any = merged

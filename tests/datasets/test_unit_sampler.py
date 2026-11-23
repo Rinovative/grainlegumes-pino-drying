@@ -87,6 +87,12 @@ def test_a_mid_epoch_state_reproduces_the_remaining_order_and_rejects_foreign_st
         reference.advance(2)
     with pytest.raises(ValueError, match="update-group boundary"):
         units.validate_state({**state, "cursor": 2})
+    # Only a transition sampler with an exact stage end (a matched A1) carries a stop; a window sampler's state never does.
+    assert "stop" not in state
+    with pytest.raises(ValueError, match="transition sampler"):
+        units.validate_state({**state, "cursor": 2, "stop": 2})
+    with pytest.raises(ValueError, match="transition units"):
+        reference.end_after(1)
     with pytest.raises(ValueError, match="another unit kind"):
         units.UnitSampler(
             unit_kind="trajectory", cases=range(7), keys=None, units_per_update=3, memory_batch=1, seed=0, full_set_transitions=27

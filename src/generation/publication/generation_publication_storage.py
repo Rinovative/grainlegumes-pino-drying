@@ -3,11 +3,13 @@
 Responsibilities:
   - Map explicit profile-config headers to stable logical fields
   - Validate Cartesian static/transient data, schedules, globals, and final status
+  - Reject a transient case with a negative stored or post-horizon water state (negative_water_state) and record its undershoot numbers
   - Validate float32 conversion before atomic compressed HDF5 publication
 
 Design principles:
   - CSV is a temporary adapter; case.h5 is the sole canonical case payload
   - No COMSOL tag, expression, sign convention, or filename is inferred
+  - Solved fields are never clipped; a negative stored water state fails the case without tolerance
   - HDF5 field ordering, units, hashes, and identities are explicit metadata
 
 This module does NOT:
@@ -33,7 +35,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import h5py
 import numpy as np
@@ -64,6 +66,7 @@ _FLOAT32_VALIDATION_CHUNK_VALUES = 1_000_000
 _SHA256_HEX_LENGTH = 64
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
 _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND = "vp2_case_scientific_provenance"
+_WATER_STATE_FIELDS = ("w_surf", "w_int")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +89,29 @@ class TransientBulkMoistureConsistency:
     rtol: float
     atol: float
     matches: bool
+
+
+class NegativeWaterStateError(ValueError):
+    """Reject a transient case whose grain water states go below zero, carrying the JSON-ready undershoot numbers."""
+
+    reason_code: ClassVar[str] = "negative_water_state"
+
+    def __init__(self, evidence: Mapping[str, Any], *, post_horizon_time: float | None = None) -> None:
+        """Initialize the failure from its recorded numbers; the detail is a summary rounded to 6 significant digits."""
+        self.evidence = dict(evidence)
+        compartments = "; ".join(
+            f"{name} minimum {self.evidence[name]['minimum']:g} {self.evidence[name]['unit']}, "
+            f"{self.evidence[name]['negative_value_count']} negative cell values in {self.evidence[name]['negative_state_count']} states"
+            for name in _WATER_STATE_FIELDS
+        )
+        checked = f"{self.evidence['stored_state_count']} stored states"
+        if post_horizon_time is not None:
+            checked += f" and the post-horizon state at t={post_horizon_time:g} h"
+        super().__init__(
+            f"{self.reason_code}: grain water states go below zero ({compartments}) "
+            f"from t={self.evidence['first_negative_time_h']:g} h to t={self.evidence['last_negative_time_h']:g} h, "
+            f"lowest at t={self.evidence['minimum_time_h']:g} h, over {checked}; the case is neither clipped nor published."
+        )
 
 
 def time_classification_tolerance(time_contract: Mapping[str, Any]) -> float:
@@ -524,6 +550,45 @@ def _combined_state_time(
     if exact_stop_time is None:
         return regular_time
     return np.concatenate((regular_time, np.asarray([exact_stop_time], dtype=np.float64)))
+
+
+def _require_non_negative_water_states(
+    regular_time: np.ndarray,
+    regular_fields: np.ndarray,
+    exact_stop_time: float | None,
+    exact_stop_fields: np.ndarray | None,
+    post_horizon_time: float | None,
+    post_horizon_fields: np.ndarray | None,
+) -> None:
+    """Raise ``NegativeWaterStateError`` when a stored or the excluded post-horizon state holds a negative w_surf or w_int value."""
+    state_time = _combined_state_time(regular_time, exact_stop_time, exact_stop_fields)
+    states = list(regular_fields) if exact_stop_fields is None else [*regular_fields, exact_stop_fields]
+    evidence: dict[str, Any] = {"stored_state_count": int(state_time.size), "post_horizon_state_checked": post_horizon_fields is not None}
+    if post_horizon_time is not None and post_horizon_fields is not None:
+        # The excluded state still counts, so the horizon admission never meets a negative state as a generic error.
+        state_time = np.concatenate((state_time, np.asarray([post_horizon_time], dtype=np.float64)))
+        states.append(post_horizon_fields)
+    negative_states = np.zeros(state_time.size, dtype=bool)
+    lowest = np.full(state_time.size, np.inf)
+    for name in _WATER_STATE_FIELDS:
+        index = profiles.TRANSIENT_FIELD_NAMES.index(name)
+        minima = np.asarray([np.min(state[index]) for state in states], dtype=np.float64)
+        counts = np.asarray([np.count_nonzero(state[index] < 0.0) for state in states], dtype=np.int64)
+        evidence[name] = {
+            "unit": profiles.TRANSIENT_FIELD_UNITS[index],
+            "minimum": float(minima.min()),
+            "negative_value_count": int(counts.sum()),
+            "negative_state_count": int(np.count_nonzero(counts)),
+        }
+        negative_states |= counts > 0
+        lowest = np.minimum(lowest, minima)
+    if not negative_states.any():
+        return
+    negative_times = state_time[negative_states]
+    evidence["first_negative_time_h"] = float(negative_times[0])
+    evidence["last_negative_time_h"] = float(negative_times[-1])
+    evidence["minimum_time_h"] = float(state_time[int(np.argmin(lowest))])
+    raise NegativeWaterStateError(evidence, post_horizon_time=post_horizon_time if post_horizon_fields is not None else None)
 
 
 def transient_bulk_moisture_tolerance(
@@ -2459,6 +2524,10 @@ def convert_exports_to_hdf5(
             exports,
             x_axis=x_axis,
             y_axis=y_axis,
+        )
+        # Decision 14.4 (a): a negative stored water state fails the case strictly, without tolerance or clipping.
+        _require_non_negative_water_states(
+            transient_time, transient_fields, exact_stop_time, exact_stop_fields, post_horizon_time, post_horizon_fields
         )
         scalar_names = profiles.scalar_input_fields(config.profile.id)
         f_surf = float(scalar_values[scalar_names.index("f_surf")])

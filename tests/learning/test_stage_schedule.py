@@ -187,6 +187,29 @@ def test_the_transition_budget_end_is_point_twenty_and_seconds_never_end_a_stage
         budget.record_group(units=1, supervised_transitions=1, train_seconds=0.1)
 
 
+def test_a_replayed_schedule_merges_two_counts_one_group_reaches_into_one_validation_and_restores_exactly() -> None:
+    """
+    An A1 replaying B's validations at 5 (point 2) and 10 (point 5) of 12 transitions, with an RNO-like group of 11.
+
+    That group reaches both counts, so it validates once at point 5 and records 1 to 4 as skipped (B's point 2 merged);
+    the last transition ends the budget at 12 without a point. The replayed schedule is part of the state: a restore
+    under another schedule is refused, and so is a schedule beyond the budget.
+    """
+    replay = [[2, 5], [5, 10]]
+    budget = budget_state.StageBudget(unit="supervised_transitions", total=12, replay=replay)
+    budget.record_group(units=1, supervised_transitions=11, train_seconds=0.1)
+    assert (budget.complete, budget.record_validation(), budget.skipped_points) == (False, 5, [1, 2, 3, 4])
+    budget.record_group(units=1, supervised_transitions=1, train_seconds=0.1)
+    assert (budget.complete, budget.validation_due, budget.reached_point) == (True, False, 5)
+    restored = budget_state.StageBudget(unit="supervised_transitions", total=12, replay=replay)
+    restored.load_state_dict(budget.state_dict())
+    assert restored.state_dict() == budget.state_dict()
+    with pytest.raises(ValueError, match="replay"):
+        budget_state.StageBudget(unit="supervised_transitions", total=12, replay=[[2, 5]]).load_state_dict(budget.state_dict())
+    with pytest.raises(ValueError, match="replay"):
+        budget_state.StageBudget(unit="supervised_transitions", total=8, replay=replay)
+
+
 def test_a_zero_transition_budget_is_complete_and_only_transition_budgets_may_be_zero() -> None:
     """An A1 matched to a B that diverged in its first group gets 0 transitions: complete from the start, no group admitted."""
     budget = budget_state.StageBudget(unit="supervised_transitions", total=0)

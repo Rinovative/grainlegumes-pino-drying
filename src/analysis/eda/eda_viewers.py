@@ -668,7 +668,8 @@ def _make_transient_trajectory_view(
     scope = _scope_group(selection_state, "transient_trajectories")
     styles = _dataset_styles(catalog)
     channels = _Channels("Transient state channels", selection_state, "transient_trajectory_fields", local.status)
-    rows = [ui.panel.row(scope, count.control.widget, local.case.widget), ui.panel.row(channels.checks.widget)]
+    clock = ui.controls.choice_group((("Drying phase", "phase"), ("Hours", "hours")), value="phase")  # the aggregate state rows' clock
+    rows = [ui.panel.row(scope, count.control.widget, local.case.widget, clock), ui.panel.row(channels.checks.widget)]
     view, guarded = _surface(local, rows, export)
 
     @guarded
@@ -677,6 +678,9 @@ def _make_transient_trajectory_view(
         if not view.active:
             return
         frames = local.selected_frames()
+        # The phase needs every case's completion evidence, which published Datasets lack; without it the view stays in hours.
+        offered = scope.value == "aggregate" and bool(frames) and all(transient.has_completion_evidence(frame) for frame in frames.values())
+        ui.controls.set_visible(clock, offered)
         if not frames:
             ui.viewers.clear_view(view, "Select at least one transient dataset.", **export)
             return
@@ -688,6 +692,7 @@ def _make_transient_trajectory_view(
         if scope.value == "aggregate":
             plot_function = plots.transient.plot_state_trajectory_summary
             kwargs: dict[str, Any] = {"datasets": frames, "max_cases": count.value, "channels": selected_channels, "styles": styles}
+            kwargs["time_axis"] = str(clock.value) if offered else "hours"
         else:
             case_ids = local.selected_case_ids()
             if not case_ids:
@@ -723,6 +728,7 @@ def _make_transient_trajectory_view(
 
     channels.observe(render)
     count.observe(render)
+    clock.observe(lambda _change: render(), names="value")
     scope.observe(scope_changed, names="value")
     update_scope_row()
     local.set_callback(rebind_and_render)

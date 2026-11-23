@@ -36,7 +36,7 @@ storage/
   02_datasets/
     <task>/<dataset>/                                  lentil-train32-val8-test8+chickpea-train32-val8-test8+kidney-bean-ood16__ref-range__sobol-seed-9200
   03_experiments/
-    <task>/<dataset>[__train-<N>]/<family>/<config_name>/seed-N__ep-E__k-K__sch-S[__rev-<label>]/   one experiment (train-N only with data.train_subset), mirroring configs/03_learning/<task>/experiments/<family>/<config_name>.yaml
+    <task>/<dataset>[__train-<N>]/<family>/<config_name>/seed-N__ep-E__k-k__sch-S[__rev-<label>]/   one experiment (train-N only with data.train_subset), mirroring configs/03_learning/<task>/experiments/<family>/<config_name>.yaml
       a0/, b-a1__rollout-<L>__lr-<X>[__<token>-<value>...]/{b,a1}/                         transient stages (steady runs keep their files directly here)
     <task>/<dataset>[__train-<N>]/optuna/<study>__ep-E[__rev-<label>]/trials/<NNNN>__<model label>__<values>/
   source_snapshots/<commit12>-<fp12>/                  exact source bytes (commit, diff, untracked files) shared by Generation, Datasets and ML

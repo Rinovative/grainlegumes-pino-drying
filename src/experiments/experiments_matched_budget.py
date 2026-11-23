@@ -3,11 +3,11 @@
 Responsibilities:
   - Bind finished B work, counted in the supervised transitions of its admitted terminal budget, to the exact parent identity
     and A0 handoff
-  - Record B's actual supervised transitions and end status (completed, diverged, no eligible checkpoint), so A1 always gets them
+  - Record B's actual supervised transitions, budget total, progress, eligible points and end status (completed, diverged,
+    no eligible checkpoint), the comparison's one source of B's end, so A1 always gets them
+  - Record B's validation schedule from its admitted history, bound to its last checkpoint's work, which A1 replays
   - Report B's optimisation seconds, which budget nothing, and bind the one GPU model of the B/A1 pair
-  - Carry B's budget progress and eligible points, the comparison's one source of B's end
-  - Validate the exact receipt keys and field types, end status against budget progress, exact transition count (zero only
-    after a first-group divergence), device and identity digests
+  - Validate the exact receipt keys, field types and their agreement with B's transitions and budget total
   - Publish one receipt and admit it before its selected A1 continuation
 
 Design principles:
@@ -17,7 +17,7 @@ Design principles:
 
 This module does NOT:
   - Measure training time or execute B or A1 optimization
-  - Open training artifacts to validate their contents or select a checkpoint
+  - Validate training artifacts or select a checkpoint; B's history and last checkpoint are read as run admission admitted them
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from typing import Any
 
 from src import common
 from src.learning.training import learning_training_budget as stage_budget
+from src.learning.training import learning_training_history as training_history
 from src.learning.transient import learning_transient_handoff as transient_handoff
 
 from . import experiments_run_identity as run_identity
@@ -64,8 +65,10 @@ _RECEIPT_KEYS = frozenset(
         "objective",
         "initialization",
         "b_status",
+        "b_budget_total",
         "b_budget_progress",
         "b_eligible_points",
+        "b_validations",
         "optimizer_steps",
         "terminal_epoch",
         "best_epoch",
@@ -111,6 +114,7 @@ def _validate_field_types(value: Mapping[str, Any]) -> None:
         "model": isinstance(value["model"], Mapping),
         "objective": isinstance(value["objective"], Mapping),
         "spatial_stride": _count(value["spatial_stride"], minimum=1),
+        "b_budget_total": _count(value["b_budget_total"], minimum=1),
         "optimizer_steps": _count(value["optimizer_steps"]),
         "terminal_epoch": _count(value["terminal_epoch"]),
         "best_epoch": value["best_epoch"] is None or _count(value["best_epoch"]),
@@ -118,6 +122,55 @@ def _validate_field_types(value: Mapping[str, Any]) -> None:
     invalid = sorted(key for key, ok in valid.items() if not ok)
     if invalid:
         msg = f"B train budget receipt fields {invalid} have an invalid type."
+        raise ValueError(msg)
+
+
+def _validation_schedule(finished_b: Mapping[str, Any], *, transitions: int) -> list[list[int]]:
+    """
+    Return B's validations as ``[point, committed supervised transitions]`` from its history, none without a committed group.
+
+    Run admission bound every history validation record's point to B's last checkpoint; its count must be the supervised
+    transitions of that checkpoint's ``update_work`` rows (one per committed update) up to the record's ``global_step``,
+    and B's transitions the sum of all rows.
+    """
+    if transitions == 0:
+        return []
+    records = json.loads(training_history.history_path(Path(str(finished_b["run_dir"]))).read_text(encoding="utf-8"))["validations"]
+    rows = finished_b["last_checkpoint"]["update_work"]
+    entries = [[record["validation/point"], record["budget/supervised_transitions"], record["global_step"]] for record in records]
+    integral = all(not isinstance(value, bool) and isinstance(value, (int, float)) and value % 1 == 0 for entry in entries for value in entry)
+    work = [row[2] for row in rows]
+    if (
+        not integral
+        or transitions != sum(work)
+        or any(not 0 < step <= len(work) or count != sum(work[: int(step)]) for _point, count, step in entries)
+    ):
+        msg = "B's history validation records lack an integral point, count or step, or B's transitions or a count are not B's checkpoint work."
+        raise ValueError(msg)
+    return [[int(point), int(count)] for point, count, _step in entries]
+
+
+def _validate_schedule(value: Mapping[str, Any], *, transitions: int, total: int) -> None:
+    """
+    Require B's validations at the point each count reached, ``min(20, 20 * count // total)``, bounding the eligible points.
+
+    The shape is A1's replay rule (ascending points and counts within B's transitions); a B that spent its budget
+    ends with point 20 at its transitions. Example: B's budget 40, validations ``[[2, 5], [5, 10]]`` after 12
+    diverged transitions admit at most two eligible points; ``[[1, 5]]`` is refused, count 5 reaches point 2.
+    """
+    schedule = value["b_validations"]
+    try:
+        stage_budget.validate_replay(schedule, total=transitions)
+    except ValueError as error:
+        msg = f"B train budget receipt validation schedule is malformed: {error}"
+        raise ValueError(msg) from error
+    points = stage_budget.VALIDATION_POINTS
+    if (
+        any(point != min(points, points * count // total) for point, count in schedule)
+        or value["b_eligible_points"] > len(schedule)
+        or (transitions >= total) != (schedule[-1:] == [[points, transitions]])
+    ):
+        msg = "B train budget receipt validation schedule contradicts B's budget, end or eligible points."
         raise ValueError(msg)
 
 
@@ -149,8 +202,10 @@ def build_b_receipt(
     """
     Bind terminal B optimization work and B's end status to its exact common A0 branch point.
 
-    ``finished_b`` is B as ``experiments_run.validate_finished_run`` admitted it: its summary
-    and the terminal budget its training outcome was checked against. The receipt records
+    ``finished_b`` is B as ``experiments_run.validate_finished_run`` admitted it: its run
+    directory, whose history gives B's validation schedule, its last checkpoint, whose update work
+    binds the schedule's counts, its summary and the terminal budget its training outcome was
+    checked against. The receipt records
     B's actual committed supervised transitions also when B diverged or has no eligible
     checkpoint, so A1 always trains exactly these transitions. Example: B diverges at 30 % of
     its budget; the receipt holds those transitions and A1 trains them; a B that diverged in its
@@ -187,8 +242,11 @@ def build_b_receipt(
         "initialization": protocol["initialization"],
         # B's end as the comparison reads it, also when B has no artifact of its own.
         "b_status": outcome["status"],
+        "b_budget_total": budget.total,
         "b_budget_progress": outcome["budget_progress"],
         "b_eligible_points": outcome["eligible_points"],
+        # B's checkpoint candidates: A1 validates once per entry, at its first group end at or after the count.
+        "b_validations": _validation_schedule(finished_b, transitions=budget.supervised_transitions),
         "optimizer_steps": controller["post_handoff_optimizer_steps"],
         "terminal_epoch": b_summary["terminal_epoch"],
         "best_epoch": b_summary["best_epoch"],
@@ -203,10 +261,11 @@ def validate_b_receipt(value: object) -> dict[str, Any]:
     Validate an immutable receipt without opening training artifacts.
 
     A receipt holds exactly the fields :func:`build_b_receipt` writes, each with its type, and
-    B's end status agrees with its budget progress: a completed or no-eligible B spent its
-    budget (progress 1), a diverged B did not, and only a B that diverged in its first group
-    has progress 0, 0 transitions, no optimizer step and no checkpoint. Example: a receipt that
-    claims ``completed`` at progress 0 is refused even with a recomputed digest.
+    B's end status agrees with its budget progress, its transitions over its budget total: a
+    completed or no-eligible B spent its budget (progress 1), a diverged B did not, and only a
+    B that diverged in its first group has progress 0, 0 transitions, no optimizer step and no
+    checkpoint. Its validation schedule passes :func:`_validate_schedule`. Example: a receipt
+    that claims ``completed`` at progress 0 is refused even with a recomputed digest.
     """
     if (
         not isinstance(value, dict)
@@ -253,8 +312,9 @@ def validate_b_receipt(value: object) -> dict[str, Any]:
     ):
         msg = "B train budget receipt budget progress, eligible points or selected epoch are invalid."
         raise ValueError(msg)
-    # Only a diverged B stops before its budget, and only one without a committed group stays at progress 0.
-    if (progress == 1.0) != (status != "diverged") or (progress == 0.0) != (transitions == 0):
+    # B's progress is its committed transitions over its own budget, exactly 1 once spent; only a diverged B stops before it.
+    total = value["b_budget_total"]
+    if progress != (1.0 if transitions >= total else transitions / total) or (transitions >= total) != (status != "diverged"):
         msg = f"B train budget receipt end status {status!r} contradicts its budget progress {progress} for {transitions} transitions."
         raise ValueError(msg)
     # A B without a committed group has no optimizer step, no checkpoint and no validation point.
@@ -263,6 +323,7 @@ def validate_b_receipt(value: object) -> dict[str, Any]:
     if transitions == 0 and (any(token is not None for token in checkpoints) or value["optimizer_steps"] != 0 or eligible_points != 0):
         msg = "B train budget receipt names a checkpoint, optimizer steps or eligible points although B committed no group."
         raise ValueError(msg)
+    _validate_schedule(value, transitions=transitions, total=total)
     if transitions > 0 and value["optimizer_steps"] == 0:
         msg = "B train budget receipt commits supervised transitions without an optimizer step."
         raise ValueError(msg)

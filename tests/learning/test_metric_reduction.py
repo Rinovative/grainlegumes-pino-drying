@@ -170,9 +170,8 @@ def test_field_metrics_reduce_cases_then_materials_alike_in_validation_and_artif
     for index, (case_id, material) in enumerate(rows):
         cases = learning.metrics.metrics.CaseMembership((case_id,), (material,))
         for metric in metrics.values():
-            divisor = 1.0 if metric.space == "physical" else scale
             row = slice(index, index + 1)
-            metric.update(prediction[row] / divisor, target[row] / divisor, space=metric.space, batch_index=index, cases=cases)
+            metric.update(prediction[row], target[row], space="physical", batch_index=index, cases=cases)
     validation = learning.metrics.metrics.finalize_metrics(metrics)
 
     sums = learning.metrics.metrics.field_statistics(prediction, target, grid_spacing=spacing)

@@ -228,8 +228,7 @@ def _prepare_batch(
     Move one raw batch to the device and standardize it with the Train scaling when one is given.
 
     Model inputs are always standardized; targets are standardized for training
-    and stay physical for evaluation, whose views derive the standardized target
-    once. The final batch contains tensor ``x`` and ``y`` keys on the device and,
+    and stay physical for evaluation. The final batch contains tensor ``x`` and ``y`` keys on the device and,
     with a scaling, the per-case ``reference`` P derived once from the physical inputs,
     which every later encode or decode of the batch takes.
     """
@@ -372,7 +371,7 @@ def train_update_groups(
     group, the budget records its units, supervised transitions and optimisation seconds, the schedule sets the rate
     of the new committed budget fraction and the adapter, if any, records its work.
     Training stops after the group that reaches a validation point or completes the
-    budget, or at the epoch end.
+    budget, or at the epoch end; a sampler stop (``UnitSampler.end_after``) cuts the group that reaches it.
 
     Parameters
     ----------
@@ -705,12 +704,12 @@ def eval_one_epoch(
     bound_cases: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, float]:
     """
-    Execute evaluation with explicit tensor spaces and dataset accumulation.
+    Execute evaluation on physical tensors with dataset accumulation.
 
     Evaluation preprocessing standardizes model inputs while preserving physical
-    targets. This function derives standardized targets once with the Train
-    state scale and physical predictions once by its inverse.
-    Metrics accumulate sufficient statistics and finalize only after the loader.
+    targets. This function derives physical predictions once by the inverse of
+    the Train state scale. Metrics accumulate sufficient statistics and finalize
+    only after the loader.
 
     Parameters
     ----------
@@ -719,11 +718,11 @@ def eval_one_epoch(
     eval_loader : Iterable[Any]
         Loader providing task ``x`` and ``y`` batches.
     eval_metrics : dict[str, Any]
-        Metric-ID keyed explicit-space dataset accumulators.
+        Metric-ID keyed physical-space dataset accumulators.
     device : torch.device
         Concrete device receiving prepared batches.
     scaling : Any | None, optional
-        Train scaling that builds the standardized and physical views.
+        Train scaling that decodes the physical predictions; without one (a synthetic task) the model predicts them.
 
     adapter : Any | None, optional
         Task-owned batch and continuation-state adapter; mutually exclusive with scaling where accepted.
@@ -740,9 +739,7 @@ def eval_one_epoch(
     Raises
     ------
     ValueError
-        If metric IDs, spaces, or tensor views are inconsistent.
-    RuntimeError
-        If the Train scaling or a requested tensor space is unavailable.
+        If metric IDs, spaces (every metric accumulates physical tensors), or tensor views are inconsistent.
 
     Notes
     -----
@@ -762,12 +759,6 @@ def eval_one_epoch(
             raise ValueError(msg)
         metric.reset()
 
-    metric_spaces = {str(getattr(metric, "space", "")) for metric in eval_metrics.values()}
-    requires_physical = "physical" in metric_spaces
-    if requires_physical and scaling is None:
-        msg = "Physical evaluation metrics require the Train scaling."
-        raise RuntimeError(msg)
-
     nonfinite_cases = 0
     with torch.no_grad():
         for batch_index, raw_batch in enumerate(eval_loader):
@@ -775,33 +766,17 @@ def eval_one_epoch(
             batch = _prepare_batch(raw_batch, device, scaling, training=False)
             pred_normalized = model(batch["x"])
             # A finite normalized prediction can still overflow on decoding; either view makes the case non-finite.
-            pred_physical = scaling.decode_state(pred_normalized, reference=batch["reference"]) if scaling is not None and requires_physical else None
-            finite = pred_normalized.flatten(1).isfinite().all(1)
-            if pred_physical is not None:
-                finite &= pred_physical.flatten(1).isfinite().all(1)
+            pred_physical = pred_normalized if scaling is None else scaling.decode_state(pred_normalized, reference=batch["reference"])
+            finite = pred_normalized.flatten(1).isfinite().all(1) & pred_physical.flatten(1).isfinite().all(1)
             nonfinite_cases += int((~finite).sum().item())
             if nonfinite_cases:
                 # An incomplete validation reports no metric value, so the remaining batches are only counted.
                 continue
-            views: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-            if scaling is None:
-                views["normalized"] = (pred_normalized, batch["y"])
-            else:
-                views["normalized"] = (pred_normalized, scaling.encode_state(batch["y"], reference=batch["reference"]))
-                if pred_physical is not None:
-                    views["physical"] = (pred_physical, batch["y"])
-
             for metric in eval_metrics.values():
-                space = str(metric.space)
-                try:
-                    pred_view, target_view = views[space]
-                except KeyError as error:
-                    msg = f"Metric {metric.id!r} requested unavailable tensor space {space!r}."
-                    raise RuntimeError(msg) from error
                 metric.update(
-                    pred_view,
-                    target_view,
-                    space=space,
+                    pred_physical,
+                    batch["y"],
+                    space="physical",
                     batch_index=batch_index,
                     **({"cases": cases} if getattr(metric, "requires_cases", False) else {}),
                 )
@@ -928,14 +903,9 @@ def _eval_adapter_one_epoch(
             ):
                 msg = "Adapter evaluation views must be BLCHW tensors of one shape."
                 raise ValueError(msg)
-            normalized = (views.normalized_prediction.flatten(0, 1), views.normalized_target.flatten(0, 1))
-            physical = (views.physical_prediction.flatten(0, 1), views.physical_target.flatten(0, 1))
+            pred, target = views.physical_prediction.flatten(0, 1), views.physical_target.flatten(0, 1)
             for metric_id, metric in eval_metrics.items():
-                pred, target = normalized if metric.space == "normalized" else physical if metric.space == "physical" else (None, None)
-                if pred is None:
-                    msg = f"Metric {metric.id!r} requested unavailable space."
-                    raise RuntimeError(msg)
-                kwargs: dict[str, Any] = {"space": metric.space, "batch_index": batch_index}
+                kwargs: dict[str, Any] = {"space": "physical", "batch_index": batch_index}
                 if cases is not None and getattr(metric, "requires_cases", False):
                     kwargs["cases"] = cases.repeat(reference.shape[1])
                 mask = views.valid_mask
@@ -943,12 +913,7 @@ def _eval_adapter_one_epoch(
                     kwargs["mask"] = mask.flatten(0, 1)
                 metric.update(pred, target, **kwargs)
                 if one_step_finite:
-                    one_step = (
-                        views.one_step_normalized_prediction.flatten(0, 1)
-                        if metric.space == "normalized"
-                        else views.one_step_physical_prediction.flatten(0, 1)
-                    )
-                    guardrails[metric_id].update(one_step, target, **kwargs)
+                    guardrails[metric_id].update(views.one_step_physical_prediction.flatten(0, 1), target, **kwargs)
             if views.f_surf is not None:
                 _add_case_moisture(moisture, views, cases)
     # Finite physical-bound violations are diagnostics of every validation, never a stop or a selection criterion.
@@ -1078,7 +1043,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
 
     Training runs epoch after epoch until the stage budget is complete. An event ends
     every stretch of training: the group that reaches a validation point (also inside an
-    epoch), the epoch end or the budget end. At a reached point the
+    epoch), the epoch end or the budget end, to which a matched A1 of transition units cuts its last group. At a reached point the
     model is validated once and the bounded physics monitor runs on the validation prefix; points
     the same group also crossed are recorded as skipped in the budget. ``last_checkpoint.pt``
     is published at an event that (1) brought a new best, (2) ends the loop, (3) finds no
@@ -1187,6 +1152,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         msg_0 = "Matched training requires its transient adapter."
         raise TypeError(msg_0)
     sampler = train_unit_sampler(train_loader)
+    # A matched A1 of transition units commits exactly B's transitions; an RNO trajectory unit cannot be cut exactly.
+    exact_end = matched_protocol and config["training"]["comparison_arm"] == "a1" and sampler.unit_kind == "transition"
     best_kind = checkpoints.best_payload_kind(config)
 
     if not isinstance(device, torch.device) or device.type not in {"cpu", "cuda"}:
@@ -1241,6 +1208,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             scheduler_expected=scheduler is not None,
             require_best=False,
             adapter_expected=adapter is not None,
+            resume=True,
         )
         restored = checkpoints.restore_checkpoint(
             last_payload,
@@ -1394,6 +1362,9 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         epoch_complete = False
         while not (epoch_complete or ends_loop):
             event_started = time.perf_counter()
+            if exact_end and -budget.overrun < sampler.size - sampler.cursor:
+                # The budget ends inside this epoch: the group reaching it is cut to the remaining transition units.
+                sampler.end_after(-budget.overrun)
             with _training_phase("training_epoch", completed_epoch):
                 train_metrics = train_update_groups(
                     model,
@@ -1407,6 +1378,9 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
                     adapter=adapter,
                     attempt=attempt,
                 )
+            if exact_end and budget.overrun > 0:
+                msg = f"A matched A1 must commit exactly B's transitions, one per unit; it exceeded them by {budget.overrun}."
+                raise RuntimeError(msg)
             optimizer_steps = int(train_metrics.pop("optimizer_steps"))
             global_step += optimizer_steps
             training_work["optimizer_steps"] += optimizer_steps

@@ -238,7 +238,7 @@ def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monke
         payload_kind="full",
         identity=identity,
         completed_epoch=2,
-        global_step=5,
+        global_step=1,
         model=source_model,
         optimizer=source_optimizer,
         scheduler=None,
@@ -286,23 +286,27 @@ def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monke
     assert target["generator_state"] == source["generator_state"]
     assert (target["epoch"], target["permutation"], target["cursor"]) == (-1, [], 0)
     assert target_adapter.value == 9
-    assert restored["source_global_step"] == 5
-    assert restored["restored_common_state"]["global_step"] == 5
+    assert restored["source_global_step"] == 1
+    assert restored["restored_common_state"]["global_step"] == 1
 
-    incompatible_runtime = copy.deepcopy(identity["numerical_environment"])
-    incompatible_runtime["numpy"] = "different-producing-runtime"
-    before = copy.deepcopy(model.state_dict())
-    monkeypatch.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda: incompatible_runtime)
-    with pytest.raises(ValueError, match="identity is incompatible"):
-        learning.training.checkpoint.restore_handoff_checkpoint(
-            payload,
-            expected_source_identity=identity,
-            model=model,
-            optimizer=optimizer,
-            loss=loss,
-            train_loader=loader,
-        )
-    _assert_equal(before, model.state_dict())
+    # Another runtime is refused, and so is another container: the handoff runs only where the teacher was produced.
+    for key, value, refusal in (
+        ("numpy", "different-producing-runtime", "identity is incompatible"),
+        ("sif_sha256", "a" * 64, "producing SIF identity"),
+    ):
+        incompatible_runtime = {**identity["numerical_environment"], key: value}
+        before = copy.deepcopy(model.state_dict())
+        monkeypatch.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda runtime=incompatible_runtime: runtime)
+        with pytest.raises(ValueError, match=refusal):
+            learning.training.checkpoint.restore_handoff_checkpoint(
+                payload,
+                expected_source_identity=identity,
+                model=model,
+                optimizer=optimizer,
+                loss=loss,
+                train_loader=loader,
+            )
+        _assert_equal(before, model.state_dict())
 
 
 def test_handoff_restore_rejects_an_evaluation_best_before_mutation() -> None:
@@ -314,7 +318,7 @@ def test_handoff_restore_rejects_an_evaluation_best_before_mutation() -> None:
         payload_kind="evaluation",
         identity=identity,
         completed_epoch=1,
-        global_step=2,
+        global_step=1,
         model=source_model,
         optimizer=source_optimizer,
         scheduler=None,

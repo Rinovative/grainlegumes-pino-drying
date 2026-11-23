@@ -7,14 +7,14 @@ Responsibilities:
     for the cells beyond (on the state bars fixed over the scaled times), error scales (signed by default) fixed over the
     scaled times, tick decimals fixed per colour bar over the scaled times, one scale note under the title and a mean |e|
     line above each error map
-  - Draw exact-time aggregate error maps on the same geometry: a row per field, a column per context, the signed mean by
-    default (or the absolute or train-sigma-normalized one), one round scale per row locked over the contexts, a unit on every bar
+  - Draw aggregate error maps and parity at one exact time or drying phase on the same geometry: a row per field, a column per context,
+    the signed mean by default (or the absolute or train-sigma-normalized one), one round scale per row locked over the contexts, a unit on every bar
   - Plot physical state trajectories and exact grain-moisture derivations, and the error over physical time, in time
-    windows (the first 24 h, the middle in days, the last 24 h): a prediction-minus-reference row under each state mean,
-    one labelled line per distinct target moisture on the grain moisture, a case-count row, one legend outside at the top right;
-    the error over time alternatively over the normalized time τ = t / t_stop in equal τ bins
+    windows (the first 24 h, the middle in days, the last 24 h) or over the drying phase: a prediction-minus-reference row
+    under each state mean, one labelled line per distinct target moisture on the grain moisture, a case-count row, one legend
+    outside at the top right
   - Plot rollout error across horizons and reduction scopes
-  - Plot per-field relative norms over physical time with their supported case counts
+  - Plot per-field relative norms over physical time or the drying phase with their supported case counts
   - Present target, matched-compute, pipeline-degradation, and timing evidence; duration ratios as the median of the paired
     per-case ratios with their 10th to 90th percentile as error bar
 
@@ -31,8 +31,8 @@ Design principles:
   - Normalized errors stay on the stored states and saved train scales
   - Physical times are selected exactly and never nearest-neighbour substituted
   - Cases of different duration share the last window as hours before their own end; the windows only select stored times
-  - In τ, every case starts at t = 0 and keeps its own stored times: a bin averages each case's values inside it before the
-    cases are reduced; a case of the error over time without a time after its origin is refused, never dropped
+  - Over the drying phase every view pools by ``time_ui.phase_cohort`` (reference and prediction on the reference's τ) and
+    names its cohort label; a case of the error over time without a time after its origin is refused, never dropped
   - A duration ratio is drawn on its log scale only when its median and percentiles are positive and finite
   - Endpoint and cumulative reductions remain visually and semantically distinct
 
@@ -62,6 +62,7 @@ from matplotlib.ticker import MaxNLocator
 from src import datasets, domain, learning
 from src.analysis.evaluation import evaluation_transient_artifact as artifact
 from src.analysis.evaluation import evaluation_transient_comparison as comparison
+from src.analysis.evaluation import evaluation_transient_session as transient_session
 from src.analysis.evaluation import evaluation_transient_timing as timing
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as plot_layout
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_series as series
@@ -78,8 +79,6 @@ from src.analysis.ui import analysis_ui_plot_layout as layout
 from src.analysis.ui import analysis_ui_time as time_ui
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-
     from matplotlib.axes import Axes
     from matplotlib.colors import Colormap
     from matplotlib.figure import Figure
@@ -106,7 +105,7 @@ _WINDOW_PANEL_WIDTH_IN = 4.4  # one time window's column; the legend grows the f
 _WINDOW_ROW_HEIGHT_IN = 2.6
 _HALF_ROW = 0.5  # a difference or case-count row against a full row of 1
 _SAME_END_HOURS = 1.0e-6  # cases ending within this of each other share the clock in the last window
-_TAU_TOLERANCE = 1.0e-9  # in bin widths: a τ on a bin edge belongs to the bin below, whatever the rounding
+_FOOTER_LINE_IN = 0.15  # one 8 pt line of a map footer: the band below the maps grows by this per phase-note line
 _REFERENCE_LINE: Final = {"linewidth": 3.2, "alpha": 0.35}  # the reference is wide and pale beside the prediction in its series style
 _PREDICTION_WIDTH = 1.6
 _SCOPE_MARKERS: Final = {"cumulative": "o", "endpoint": "s"}  # A4: colour and line style belong to entity and role
@@ -897,17 +896,17 @@ def _aggregate_exact_time_errors(rows: Sequence[tuple[np.ndarray, np.ndarray]], 
 
 
 def _shared_windows(
-    admitted: Mapping[str, tuple[Any, ...]], *, exclude_origin: bool, normalized: bool = False
+    admitted: Mapping[str, tuple[Any, ...]], *, exclude_origin: bool, phase: bool
 ) -> tuple[tuple[time_ui.TimeWindow, ...], dict[str, np.ndarray]]:
     """
-    Return the time windows of all contexts and the final hour of every record (its t_stop), per context.
+    Return the time windows of all contexts and the final hour of every record, per context.
 
-    ``normalized`` gives the one τ window; otherwise cases of one duration share the clock, and the last window counts hours
-    before each case's own end.
+    ``phase`` gives the one drying-phase window; otherwise cases of one duration share the clock, and the last window counts
+    hours before each case's own end.
     """
     ends = {label: _record_end_hours(records, exclude_origin=exclude_origin) for label, records in admitted.items()}
-    if normalized:
-        return (time_ui.TAU_WINDOW,), ends
+    if phase:
+        return (time_ui.PHASE_WINDOW,), ends
     longest = max(float(values.max()) for values in ends.values())
     shortest = min(float(values.min()) for values in ends.values())
     return time_ui.drying_windows(longest, before_end=longest - shortest > _SAME_END_HOURS), ends
@@ -922,36 +921,15 @@ def _window_rows(window: time_ui.TimeWindow, rows: Sequence[tuple[np.ndarray, np
     return shown
 
 
-def _tau_bin_count(records: Iterable[Any]) -> int:
-    """
-    Return the number of equal τ bins, each at least as wide as the widest stored step of any case divided by its end.
-
-    Every case must start at t = 0 and hold a time after it: its steps in τ are then no wider than a bin, so it has a stored
-    time in every bin, and τ = t / t_stop is the fraction of its run. A case starting later is refused, since it would miss the
-    early bins and shrink their cohort unseen.
-    """
-    widest = 0.0
-    for record in records:
-        grid = np.asarray(_value(record, "physical_times"), dtype=np.float64)
-        if grid[0] != 0.0:
-            msg = f"τ = t / t_stop requires every case to start at t = 0; case {_value(record, 'case_id')!r} starts at {grid[0]:g} h."
-            raise ValueError(msg)
-        widest = max(widest, float(np.max(np.diff(grid)) / grid[-1]))
-    return max(1, math.floor(1.0 / widest + _TAU_TOLERANCE))
+def _phase_cohort(records: Sequence[Any]) -> time_ui.PhaseCohort:
+    """Return the phase cohort of records over all their stored times, each classified by its reference completion."""
+    completion: list[time_ui.Completion] = [transient_session.reference_completion(record) for record in records]
+    return time_ui.phase_cohort([_value(record, "physical_times") for record in records], completion)
 
 
-def _tau_binned(rows: Sequence[tuple[np.ndarray, np.ndarray]], bin_count: int) -> list[tuple[np.ndarray, np.ndarray]]:
-    """
-    Average each row's values over the τ bins ((k - 1) / ``bin_count``, k / ``bin_count``], each drawn at its upper edge.
-
-    A row keeps its own stored times: its bin value is the mean over its stored τ inside, non-finite when one of them is.
-    """
-    binned = []
-    for tau, values in rows:
-        index = np.clip(np.ceil(tau * bin_count - _TAU_TOLERANCE).astype(np.int64) - 1, 0, bin_count - 1)
-        present = np.unique(index)
-        binned.append(((present + 1) / bin_count, np.asarray([np.mean(values[index == bin_index]) for bin_index in present], dtype=np.float64)))
-    return binned
+def _phase_rows(cohort: time_ui.PhaseCohort, rows: Sequence[tuple[np.ndarray, np.ndarray]]) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return each pooled case's values at its phase states, on the phase grid, in the exact-time row form."""
+    return [(time_ui.PHASE_GRID, values) for values in cohort.take([values for _times, values in rows])]
 
 
 def _window_figure(windows: Sequence[time_ui.TimeWindow], heights: Sequence[float]) -> tuple[Figure, np.ndarray]:
@@ -1076,7 +1054,7 @@ def _finish_window_figure(
     axes[last_row, 0].yaxis.set_major_locator(MaxNLocator(integer=True))
     figure_layout.set_figure_title(figure, axes, title, note=note)
     _legend(figure, axes)
-    if target_axis is not None:
+    if target_axis is not None and target_levels:  # a phase view without a pooled case draws no target
         _label_target_lines(figure, target_axis, target_levels)  # after the legend, on the final y scale of the row
     return figure
 
@@ -1086,23 +1064,28 @@ def plot_state_trajectory_summary(
     *,
     state_fields: Sequence[str],
     styles: series.SeriesStyles,
+    time_axis: Literal["hours", "phase"] = "hours",
 ) -> Figure:
     """
-    Plot material-aware aggregate or single-case trajectories on exact times, in time windows.
+    Plot material-aware aggregate or single-case trajectories on exact times, in time windows, or over the drying phase.
 
     Each state has a row of reference and prediction means with a half-height row of prediction minus reference below it,
     where a non-finite value that voids a score is marked; the grain moisture also carries one line per distinct wet-basis
     target moisture of the shown cases. A last row counts the cases with a stored time at each exact time, the same for every state.
+    With ``time_axis="phase"`` the series pool by ``time_ui.phase_cohort``, the targets of pooled cases only, the note naming each cohort.
     A series takes its style from the comparison's ``styles`` (``series.comparison_styles``) by its records' identity; its reference is
     drawn wide and pale under its prediction.
     """
     fields = _selected_fields(state_fields)
+    phase = time_ui.is_phase(time_axis)
     admitted = {label: tuple(records) for label, records in series.items()}
     if not admitted or any(not label or not records for label, records in admitted.items()):
         msg = "Trajectory summaries require labelled non-empty record groups."
         raise ValueError(msg)
     styles = _record_styles(admitted, styles)
-    windows, ends = _shared_windows(admitted, exclude_origin=False)
+    windows, ends = _shared_windows(admitted, exclude_origin=False, phase=phase)
+    cohorts = {label: _phase_cohort(records) for label, records in admitted.items()} if phase else {}
+    shown_cases = [record for label, records in admitted.items() for case, record in enumerate(records) if not phase or case in cohorts[label].cases]
     figure, axes = _window_figure(windows, [height for _field in fields for height in (1.0, _HALF_ROW)] + [_HALF_ROW])
     try:
         target_axis, target_levels = None, []
@@ -1119,11 +1102,12 @@ def plot_state_trajectory_summary(
                 style = styles[label]
                 line = {"color": style.color, "linestyle": style.linestyle}
                 for column, window in enumerate(windows):
-                    shown_reference = _window_rows(window, reference_rows, ends[label])
+                    shown_reference = _phase_rows(cohorts[label], reference_rows) if phase else _window_rows(window, reference_rows, ends[label])
                     if not any(times.size for times, _values in shown_reference):
                         continue
                     reference_summary = _aggregate_exact_time_values(shown_reference)
-                    prediction_summary = _aggregate_exact_time_values(_window_rows(window, prediction_rows, ends[label]))
+                    shown_prediction = _phase_rows(cohorts[label], prediction_rows) if phase else _window_rows(window, prediction_rows, ends[label])
+                    prediction_summary = _aggregate_exact_time_values(shown_prediction)
                     time = reference_summary.times
                     axis = quantity_axes[column]
                     axis.plot(time, reference_summary.mean, **line, **_REFERENCE_LINE, label=f"{label} · Reference")
@@ -1135,20 +1119,22 @@ def plot_state_trajectory_summary(
                         difference_axes[column], time, (reference_summary.invalid_count + prediction_summary.invalid_count) > 0, color=style.color
                     )
                     if row == 0:
-                        _draw_case_count(axes[-1, column], time, reference_summary.count, style=style, label=f"{label} n(t)")
+                        _draw_case_count(axes[-1, column], time, reference_summary.count, style=style, label=f"{label} {_count_symbol(windows)}")
             if field == _GRAIN_MOISTURE_FIELD:
                 target_axis = quantity_axes[0]
-                target_levels = _draw_target_lines(quantity_axes, [record for records in admitted.values() for record in records])
+                target_levels = _draw_target_lines(quantity_axes, shown_cases)
             quantity_axes[0].set_ylabel(_display_label(field))
             difference_axes[0].set_ylabel(f"pred \N{MINUS SIGN} ref [{_display_unit(field, difference=True)}]")
             for axis in difference_axes:
                 axis.axhline(0.0, color="0.6", linewidth=0.8)
+        where = "spatial means at each case's stored state nearest to each phase point" if phase else "exact-time spatial means"
+        note = f"{where}; bands require {_count_symbol(windows)} ≥ 2"
         return _finish_window_figure(
             figure,
             axes,
             windows,
-            "Reference vs prediction trajectories",
-            note=plot_layout.series_note(styles, "exact-time spatial means; bands require n(t) ≥ 2"),
+            "Reference vs prediction trajectories over drying phase" if phase else "Reference vs prediction trajectories",
+            note=plot_layout.series_note(styles, note, time_ui.phase_note({label: cohort.label() for label, cohort in cohorts.items()})),
             target_axis=target_axis,
             target_levels=target_levels,
         )
@@ -1162,8 +1148,9 @@ def _normalized_squared_error_trajectory(
     *,
     scaling_state: Mapping[str, Any],
     fields: Sequence[str],
+    origin: bool = False,
 ) -> tuple[np.ndarray, Mapping[str, np.ndarray]]:
-    """Return the saved-scale per-channel mean squared error over the grid at exact post-origin times."""
+    """Return the saved-scale per-channel mean squared error over the grid at exact post-origin times, or at all with ``origin``."""
     selected_fields = tuple(fields)
     if not selected_fields or set(selected_fields).difference(artifact.STATE_ORDER):
         msg = "Normalized error trajectories require stored transient states."
@@ -1175,11 +1162,12 @@ def _normalized_squared_error_trajectory(
     if reference.shape != prediction.shape or reference.ndim != _STATE_ARRAY_RANK:
         msg = "Normalized error trajectories require aligned state arrays."
         raise ValueError(msg)
-    normalized_error = (scaling.encode_state(prediction) - scaling.encode_state(reference)).detach().cpu().numpy()
+    first = 0 if origin else 1
+    normalized_error = (scaling.encode_state(prediction) - scaling.encode_state(reference)).detach().cpu().numpy()[first:]
     result = {
-        field: np.mean(np.square(normalized_error[1:, artifact.STATE_ORDER.index(field)], dtype=np.float64), axis=(1, 2)) for field in selected_fields
+        field: np.mean(np.square(normalized_error[:, artifact.STATE_ORDER.index(field)], dtype=np.float64), axis=(1, 2)) for field in selected_fields
     }
-    return times[1:], result
+    return times[first:], result
 
 
 def plot_error_over_physical_time(
@@ -1188,44 +1176,45 @@ def plot_error_over_physical_time(
     scaling_states: Mapping[str, Mapping[str, Any]],
     state_fields: Sequence[str],
     styles: series.SeriesStyles,
-    time_axis: Literal["hours", "tau"] = "hours",
+    time_axis: Literal["hours", "phase"] = "hours",
 ) -> Figure:
     """
-    Plot saved-scale channel errors over exact physical time, or over the normalized time τ, by context, in the comparison's ``styles``.
+    Plot saved-scale channel errors over exact physical time, or over the drying phase, by context, in the comparison's ``styles``.
 
     In hours the line is the normalized RMSE of the cases present at each exact time, reduced like every reported field RMSE
     (root after the material-case mean of the per-case mean squared error); the band spans the 10th to 90th quantile of the
-    per-case RMSEs. With ``time_axis="tau"`` each case's times become τ = t / t_stop, t_stop its last stored time, so every case
-    ends at τ = 1; τ is cut into equal bins no narrower than any case's widest stored step (``_tau_bin_count``), a case's value
-    in a bin is the mean of its per-time mean squared errors there, and the cases are reduced per bin as per exact time above.
-    A record without a time after its origin, and in τ a case that does not start at t = 0, raise ``ValueError``.
+    per-case RMSEs. With ``time_axis="phase"`` the contexts pool by ``time_ui.phase_cohort`` over all stored states, the origin
+    included, and the cases are reduced per phase point as per exact time; the note names each context's cohort label. A record
+    without a time after its origin raises ``ValueError``, in phase mode only a reached one (``time_ui.phase_cohort``).
     """
-    if time_axis not in {"hours", "tau"}:
-        msg = f"time_axis must be 'hours' or 'tau', not {time_axis!r}."
-        raise ValueError(msg)
+    phase = time_ui.is_phase(time_axis)
     fields = tuple(field for field in _selected_fields(state_fields) if field in artifact.STATE_ORDER)
     admitted = {label: tuple(records) for label, records in series.items()}
     if not fields or not admitted or set(admitted) != set(scaling_states):
         msg = "Error-over-time series require stored fields and matching scaling contexts."
         raise ValueError(msg)
     styles = _record_styles(admitted, styles)
-    normalized = time_axis == "tau"
-    windows, ends = _shared_windows(admitted, exclude_origin=True, normalized=normalized)
-    bin_count = _tau_bin_count(record for records in admitted.values() for record in records) if normalized else 0
+    windows, ends = _shared_windows(admitted, exclude_origin=not phase, phase=phase)
     count_symbol = _count_symbol(windows)
+    cohorts: dict[str, time_ui.PhaseCohort] = {}
     figure, axes = _window_figure(windows, [*([1.0] * len(fields)), _HALF_ROW])
     try:
         for label, records in admitted.items():
-            trajectories = [_normalized_squared_error_trajectory(record, scaling_state=scaling_states[label], fields=fields) for record in records]
+            trajectories = [
+                _normalized_squared_error_trajectory(record, scaling_state=scaling_states[label], fields=fields, origin=phase) for record in records
+            ]
             materials = [_record_material(record) for record in records]
+            if phase:
+                cohorts[label] = _phase_cohort(records)
+                materials = [materials[case] for case in cohorts[label].cases]
             style = styles[label]
             for row, field in enumerate(fields):
                 rows = [(record_times, values[field]) for record_times, values in trajectories]
                 for column, window in enumerate(windows):
-                    shown = _window_rows(window, rows, ends[label])
+                    shown = _phase_rows(cohorts[label], rows) if phase else _window_rows(window, rows, ends[label])
                     if not any(times.size for times, _values in shown):
                         continue
-                    summary = _aggregate_exact_time_errors(_tau_binned(shown, bin_count) if normalized else shown, materials=materials)
+                    summary = _aggregate_exact_time_errors(shown, materials=materials)
                     axis = axes[row, column]
                     line = {"color": style.color, "linestyle": style.linestyle, "linewidth": 2.0}
                     axis.plot(summary.times, summary.mean, **line, label=f"{label} · material-case RMSE")
@@ -1237,10 +1226,11 @@ def plot_error_over_physical_time(
                         _draw_case_count(axes[-1, column], summary.times, summary.count, style=style, label=f"{label} {count_symbol}")
         for row, field in enumerate(fields):
             axes[row, 0].set_ylabel(f"{field_labels.metric_label('nRMSE', field, mathtext=True)} [{field_labels.display_unit('1')}]")
-        where = f"in each of {bin_count} equal τ bins, each case first averaged over its stored times there" if normalized else "at each exact time"
-        note = f"root of the material-case mean squared error {where}; per-case RMSE 10th-90th bands require {count_symbol} ≥ 2"
-        title = "Error over normalized time" if normalized else "Error over physical time"
-        return _finish_window_figure(figure, axes, windows, title, note=plot_layout.series_note(styles, note))
+        where = "at each case's stored state nearest to each phase point" if phase else "at each exact time"
+        reduction = f"root of the material-case mean squared error {where}; per-case RMSE 10th-90th bands require {count_symbol} ≥ 2"
+        title = "Error over drying phase" if phase else "Error over physical time"
+        note = plot_layout.series_note(styles, reduction, time_ui.phase_note({label: cohort.label() for label, cohort in cohorts.items()}))
+        return _finish_window_figure(figure, axes, windows, title, note=note)
     except Exception:
         plt.close(figure)
         raise
@@ -1248,12 +1238,12 @@ def plot_error_over_physical_time(
 
 def plot_relative_norms_over_time(curves: Mapping[str, pd.DataFrame], *, styles: series.SeriesStyles) -> Figure:
     """
-    Plot the per-field relative L2 and H1 of complete rollouts over physical time with their supported case counts.
+    Plot the per-field relative L2 and H1 of complete rollouts over physical time or the drying phase with their supported case counts.
 
-    ``curves`` maps a session frame name to :meth:`TransientEvaluationSession.relative_norm_curve`. A gap is
-    a time without a supported case in some material; the step line counts the supported cases. A curve takes its frame's style
-    of the comparison's ``styles`` (:meth:`TransientEvaluationSession.series_styles`); a name the comparison lacks raises
-    ``ValueError``. One legend stands outside right.
+    ``curves`` maps a session frame name to :meth:`TransientEvaluationSession.relative_norm_curve`, all in hours or all over
+    the phase (a ``phase`` column; the note shows each frame's cohort label). A gap is a time without a supported case in some
+    material; the step line counts the supported cases. A curve takes its frame's style of the comparison's ``styles``
+    (:meth:`TransientEvaluationSession.series_styles`); a name the comparison lacks raises ``ValueError``. One legend stands outside right.
     """
     if not curves or any(frame.empty for frame in curves.values()):
         msg = "Relative-norm curves require at least one labelled non-empty curve."
@@ -1261,29 +1251,40 @@ def plot_relative_norms_over_time(curves: Mapping[str, pd.DataFrame], *, styles:
     if missing := [label for label in curves if label not in styles]:
         msg = f"Relative-norm curves {missing} are no frames of the comparison's styles."
         raise ValueError(msg)
-    all_times = np.concatenate([frame["physical_time"].to_numpy(dtype=np.float64) for frame in curves.values()])
-    display_time = time_ui.physical_time_display(all_times, preferred_unit="auto")
+    phase = {"phase" in frame for frame in curves.values()}
+    if len(phase) != 1:
+        msg = "Relative-norm curves of one figure must all be in hours or all over the drying phase."
+        raise ValueError(msg)
+    clock = "phase" if phase == {True} else "physical_time"
+    all_times = np.concatenate([frame[clock].to_numpy(dtype=np.float64) for frame in curves.values()])
+    display_time = None if clock == "phase" else time_ui.physical_time_display(all_times, preferred_unit="auto")
     figure, axes = plt.subplots(2, len(artifact.STATE_ORDER), figsize=(5.0 * len(artifact.STATE_ORDER), 7.6), layout="constrained", squeeze=False)
     for row, norm in enumerate(("l2", "h1")):
         for column, field in enumerate(artifact.STATE_ORDER):
             axis = axes[row, column]
             support_axis = axis.twinx()
             for label, frame in curves.items():
-                selected = frame.loc[frame["metric_id"] == f"physical_relative_{norm}_{field}"].sort_values("physical_time")
-                plotted_time = display_time.values(selected["physical_time"].to_numpy(dtype=np.float64))
+                selected = frame.loc[frame["metric_id"] == f"physical_relative_{norm}_{field}"].sort_values(clock)
+                plotted_time = selected[clock].to_numpy(dtype=np.float64)
+                plotted_time = plotted_time if display_time is None else display_time.values(plotted_time)
                 style = styles[label]
                 line = {"color": style.color, "linestyle": style.linestyle}
                 axis.plot(plotted_time, selected["value"].to_numpy(dtype=np.float64), **line, linewidth=2.0, label=label)
                 support_axis.step(plotted_time, selected["supported_cases"], where="mid", **line, alpha=0.4)
-            display_time.configure(axis)
+            if display_time is None:
+                time_ui.style_window_axis(axis, time_ui.PHASE_WINDOW)
+            else:
+                display_time.configure(axis)
             figure_layout.set_panel_title(axis, field_labels.metric_label(f"rel. {norm.upper()}", field, mathtext=True))
             axis.grid(alpha=0.25)
             support_axis.set_ylim(bottom=0)
             if column == len(artifact.STATE_ORDER) - 1:
-                support_axis.set_ylabel("Supported cases n(t)")
+                support_axis.set_ylabel(f"Supported cases {'n(τ)' if clock == 'phase' else 'n(t)'}")
         axes[row, 0].set_ylabel(f"Relative {norm.upper()} [-]")
-    note = plot_layout.series_note(styles, "per-case ratios, equal over cases and materials; gaps are unavailable")
-    figure_layout.set_figure_title(figure, axes, "Relative norms over physical time", note=note)
+    labels = time_ui.phase_note({label: frame.attrs["phase_label"] for label, frame in curves.items()}) if clock == "phase" else None
+    note = plot_layout.series_note(styles, "per-case ratios, equal over cases and materials; gaps are unavailable", labels)
+    title = "Relative norms over drying phase" if clock == "phase" else "Relative norms over physical time"
+    figure_layout.set_figure_title(figure, axes, title, note=note)
     _legend(figure, axes)
     return figure
 
@@ -1292,16 +1293,16 @@ def _aggregate_snapshot_evidence(  # noqa: PLR0915 -- one bounded physical snaps
     records: Sequence[Any],
     *,
     state_field: str,
-    physical_time: float,
+    physical_times: Sequence[float],
     compute_device: str = "cpu",
     device_evidence: dict[str, str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Pool exact-time case evidence without stacking complete trajectories.
 
-    Returns the grid coordinates, the pooled mean absolute, mean signed (``error_sum`` over the count) and signed-error standard
-    deviation maps in displayed difference units, and the displayed case spatial means (see ``_spatial_means``) of reference and
-    prediction. A cell any case left non-finite is NaN in all three maps.
+    ``physical_times`` holds each record's stored hour. Returns the grid coordinates, the pooled mean absolute, mean signed
+    (``error_sum`` over the count) and signed-error standard deviation maps in displayed difference units, and the displayed
+    case spatial means (see ``_spatial_means``) of reference and prediction. A cell any case left non-finite is NaN in all three maps.
     """
     if state_field not in {*artifact.STATE_ORDER, _GRAIN_MOISTURE_FIELD}:
         msg = f"Aggregate transient snapshot field is unsupported: {state_field!r}."
@@ -1349,11 +1350,11 @@ def _aggregate_snapshot_evidence(  # noqa: PLR0915 -- one bounded physical snaps
         cuda_prediction.clear()
         cuda_masks.clear()
 
-    for record in admitted:
+    for record, record_time in zip(admitted, physical_times, strict=True):
         if _value(record, "mode") != "autonomous_full" or _value(record, "requested_horizon") != "full":
             msg = "Aggregate transient snapshots require complete autonomous rollouts only."
             raise ValueError(msg)
-        time_index, _selected_time = _time_index(record, physical_time)
+        time_index, _selected_time = _time_index(record, record_time)
         reference = np.asarray(_value(record, "reference_states"), dtype=np.float64)
         prediction = np.asarray(_value(record, "predicted_states"), dtype=np.float64)
         static = np.asarray(_value(record, "static_conditioning"), dtype=np.float64)
@@ -1481,6 +1482,25 @@ def _labelled_record_series(
     return series
 
 
+def _snapshot_selection(
+    series: Mapping[str, tuple[Any, ...]], *, physical_time: float | None, phase: float | None
+) -> tuple[dict[str, tuple[Any, ...]], dict[str, list[float]], str, str | None]:
+    """Return each context's records (at a phase those ``time_ui.phase_cohort`` pools), their stored hours, the title's time and the phase note."""
+    if physical_time is not None and phase is None:
+        return dict(series), {label: [physical_time] * len(records) for label, records in series.items()}, f"t={physical_time:g} h", None
+    if phase is None or physical_time is not None:
+        msg = "Aggregate snapshots select exactly one of an exact physical time and a drying phase."
+        raise ValueError(msg)
+    index = time_ui.phase_index(phase)
+    cohorts = {label: _phase_cohort(records) for label, records in series.items()}
+    selected = {label: tuple(series[label][case] for case in cohort.cases) for label, cohort in cohorts.items()}
+    note = time_ui.phase_note({label: f"{cohort.hours_label(phase)}; {cohort.label()}" for label, cohort in cohorts.items()})
+    if not any(selected.values()):
+        msg = f"No reached case to pool at drying phase {phase:.2f}: {note}"
+        raise ValueError(msg)
+    return selected, {label: cohort.hours[:, index].tolist() for label, cohort in cohorts.items()}, f"τ={phase:.2f}", note
+
+
 def _aggregate_divisors(
     series: Mapping[str, Sequence[Any]],
     fields: Sequence[str],
@@ -1511,8 +1531,9 @@ def plot_aggregate_error_maps(
     records: Sequence[Any] | Mapping[str, Sequence[Any]],
     *,
     state_fields: Sequence[str],
-    physical_time: float,
     statistic: str,
+    physical_time: float | None = None,
+    phase: float | None = None,
     compute_device: str = "cpu",
     error_mode: str = error_diagnostics.DEFAULT_ERROR_MODE,
     reference_scales: Mapping[str, Mapping[str, error_diagnostics.ReferenceScale | str]] | None = None,
@@ -1520,6 +1541,8 @@ def plot_aggregate_error_maps(
     """
     Plot exact-time mean or standard-deviation error maps on the fixed map-grid geometry: a row per field, a column per context.
 
+    The maps pool every record at one exact ``physical_time`` or the ``time_ui.phase_cohort`` of one drying ``phase`` (exactly
+    one is given; a footer band under the maps names the resolved hours and cohorts).
     The mean map follows ``error_mode``: the signed mean of prediction minus reference (default, blue-white-red), the mean absolute
     error, or the mean absolute error over the train sigma, which needs ``reference_scales`` (context, then field) and is refused
     unless every shown context has the same one, and for water, which is shown in wet-basis percentage points. The standard
@@ -1533,20 +1556,22 @@ def plot_aggregate_error_maps(
     if error_mode not in error_diagnostics.TRANSIENT_ERROR_MODES:
         msg = f"Aggregate error mode must be one of {error_diagnostics.TRANSIENT_ERROR_MODES}, not {error_mode!r}."
         raise ValueError(msg)
-    series = _labelled_record_series(records, allow_empty_contexts=True)
+    series, selected_times, time_text, phase_note = _snapshot_selection(
+        _labelled_record_series(records, allow_empty_contexts=True), physical_time=physical_time, phase=phase
+    )
     signed = statistic == "mean" and error_mode == error_diagnostics.SIGNED_ERROR
     normalized = statistic == "mean" and error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
     divisors = _aggregate_divisors(series, fields, reference_scales) if normalized else {}
     cells: dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     routes: set[str] = set()
-    for column, current_records in enumerate(series.values()):
+    for column, (context, current_records) in enumerate(series.items()):
         for row, field in enumerate(fields):
             if current_records:
                 device_evidence: dict[str, str] = {}
                 x_values, y_values, absolute, signed_mean, std_error, *_ = _aggregate_snapshot_evidence(
                     current_records,
                     state_field=field,
-                    physical_time=physical_time,
+                    physical_times=selected_times[context],
                     compute_device=compute_device,
                     device_evidence=device_evidence,
                 )
@@ -1558,7 +1583,9 @@ def plot_aggregate_error_maps(
         msg = "The maps of one figure share one physical extent, but the shown contexts have different grids."
         raise ValueError(msg)
     extent = next(iter(extents))
-    geometry = layout.plan_geometry(len(fields), len(series), (extent[1] - extent[0], extent[3] - extent[2]), width_cap=None)
+    footer = "\n".join(filter(None, (phase_note, "; ".join(sorted(routes)))))
+    below = _FOOTER_LINE_IN * (phase_note.count("\n") + 1) if phase_note else 0.0  # the phase note's lines never reach the maps
+    geometry = layout.plan_geometry(len(fields), len(series), (extent[1] - extent[0], extent[3] - extent[2]), width_cap=None, below_in=below)
     figure, axes, slots = layout.map_grid(geometry, extent=extent)
     top_notes: list[str] = []
     for row, field in enumerate(fields):
@@ -1578,7 +1605,7 @@ def plot_aggregate_error_maps(
             elif note:
                 layout.add_map_note(axes[row, column], note)
             if cell is None:
-                layout.empty_cell(axes[row, column], "No case at this exact time")
+                layout.empty_cell(axes[row, column], "No case at this exact time" if phase is None else "No reached case to pool")
                 continue
             values = cell[2]
             finite = np.isfinite(values)
@@ -1592,10 +1619,10 @@ def plot_aggregate_error_maps(
     layout.set_row_labels(axes, [_display_symbol(field) for field in fields])
     statistic_label = f"Mean {_ERROR_HEADERS[error_mode].lower()}" if statistic == "mean" else "Standard deviation of signed error"
     total_cases = sum(len(current_records) for current_records in series.values())
-    layout.set_map_title(figure, f"{statistic_label} at t={physical_time:g} h — {total_cases} case-context observations")
+    layout.set_map_title(figure, f"{statistic_label} at {time_text} — {total_cases} case-context observations")
     plot_layout.add_scale_note(figure, shared=False)
-    if routes:
-        figure.text(0.5, 0.01, "; ".join(sorted(routes)), ha="center", va="bottom", fontsize=8, color="0.3")
+    if footer:
+        figure.text(0.5, 0.01, footer, ha="center", va="bottom", fontsize=8, color="0.3")
     return figure
 
 
@@ -1603,12 +1630,15 @@ def plot_predicted_vs_reference_channels(
     records: Sequence[Any] | Mapping[str, Sequence[Any]],
     *,
     state_fields: Sequence[str],
-    physical_time: float,
     styles: series.SeriesStyles,
+    physical_time: float | None = None,
+    phase: float | None = None,
 ) -> Figure:
-    """Plot exact-time case spatial means by channel (rows, the water states side by side) and context (columns), each in its comparison style."""
+    """Plot case spatial means at one exact hour or phase by channel (rows, water states side by side) and context (columns) in comparison styles."""
     fields = _selected_fields(state_fields)
-    contexts = _labelled_record_series(records, allow_empty_contexts=True)
+    contexts, selected_times, time_text, phase_note = _snapshot_selection(
+        _labelled_record_series(records, allow_empty_contexts=True), physical_time=physical_time, phase=phase
+    )
     styles = _record_styles(contexts, styles)
     figure, raw_axes = plt.subplots(
         len(fields),
@@ -1626,7 +1656,8 @@ def plot_predicted_vs_reference_channels(
         for row, field in enumerate(fields):
             if not current_records:
                 axis = raw_axes[row, column]
-                axis.text(0.5, 0.5, "No case at this exact time", ha="center", va="center", transform=axis.transAxes)
+                empty = "No case at this exact time" if phase is None else "No reached case to pool"
+                axis.text(0.5, 0.5, empty, ha="center", va="center", transform=axis.transAxes)
                 if row == 0 and context:
                     figure_layout.set_panel_title(axis, context)
                 continue
@@ -1641,7 +1672,7 @@ def plot_predicted_vs_reference_channels(
             ) = _aggregate_snapshot_evidence(
                 current_records,
                 state_field=field,
-                physical_time=physical_time,
+                physical_times=selected_times[context],
             )
             finite_prediction = np.isfinite(prediction_display)
             # A wet-basis reference mean shares the prediction's valid cells, so it is NaN where no cell of the case is valid.
@@ -1680,8 +1711,8 @@ def plot_predicted_vs_reference_channels(
             if row == 0 and context:
                 figure_layout.set_panel_title(axis, context)
             axis.grid(alpha=0.25)
-    note = plot_layout.series_note(styles, f"{total_cases} case-context observations")
-    figure_layout.set_figure_title(figure, raw_axes, f"Prediction versus reference at t={physical_time:g} h", note=note)
+    note = plot_layout.series_note(styles, f"{total_cases} case-context observations", phase_note)
+    figure_layout.set_figure_title(figure, raw_axes, f"Prediction versus reference at {time_text}", note=note)
     _legend(figure, raw_axes)
     return figure
 

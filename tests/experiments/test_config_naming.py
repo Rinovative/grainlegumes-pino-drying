@@ -347,6 +347,7 @@ def test_worst_case_names_stay_within_one_path_component() -> None:
     assert transient.endswith("__lr-0p000532__a0smp-one-step-transition")
     b, a1 = _plan_children(b_scale=0.5, a1_scale=0.25)
     b_sampling = {"mode": "rollout_window", "window_stride": 32, "window_offset": 0}
+    b["temporal"]["sampling"].update(b_sampling)  # the pair key shows the values B trains with
     authored = {"training": {"b": {"sampling": b_sampling}}}
     pair = naming.pair_key(b, a1, authored)
     assert pair.startswith("b-a1__rollout-4__lr-b-0p5__lr-a1-0p25__bsmp-rollout-window__bws-32__bwo-0")
@@ -360,6 +361,7 @@ def test_worst_case_names_stay_within_one_path_component() -> None:
     # The limit case: a B curriculum of dozens of unequally spaced entries outgrows one path component of the pair folder.
     lengths = list(range(1, 41))
     long_curriculum = {"lengths": lengths, "milestone_fractions": [index / 41 for index in range(40)]}
+    b["training"]["curriculum"] = long_curriculum
     with pytest.raises(loader.ConfigError, match=r"pair key must not exceed 255 UTF-8 bytes.*got \d+ bytes"):
         naming.pair_key(b, a1, {"training": {"b": {"curriculum": long_curriculum}}})
 
@@ -431,6 +433,9 @@ def test_pair_key_adds_one_token_per_authored_b_a1_leaf_the_fixed_part_does_not_
             "a1": {"lr_scale": 0.5, "memory_batch": 16},
         },
     }
+    # The values are those B trains with, here the ones this file resolves to.
+    b["temporal"]["sampling"].update(authored["training"]["b"]["sampling"])
+    b["training"]["curriculum"] = authored["training"]["b"]["curriculum"]
 
     assert naming.pair_key(b, a1, authored) == ("b-a1__rollout-4__lr-0p5__bcur-3-6-at-0-0p25__bsmp-rollout-window__bws-16")
     with pytest.raises(loader.ConfigError, match=r"part of name token 'bcur' but not 'training\.b\.curriculum\.milestone_fractions'"):
@@ -458,6 +463,61 @@ def test_editing_a_b_leaf_of_a_plan_file_keeps_the_config_name_and_the_a0_folder
     assert common.paths.resolve_config_run_dir(first.a0) == common.paths.resolve_config_run_dir(second.a0)
     assert first.b["run"]["layout"]["pair"] == "b-a1__rollout-4__lr-1"
     assert second.b["run"]["layout"]["pair"] == "b-a1__rollout-4__lr-b-0p5__lr-a1-1"
+
+
+def _plan_file(root: Path, raw: dict[str, Any], b_leaves: dict[str, Any] | None = None) -> Path:
+    """Write ``raw`` as a plan file that sets the model, the learning rate and ``b_leaves`` over a base holding the rest."""
+    path = configs.write_config(root, raw)
+    if b_leaves is not None:
+        configs.write_yaml(path, {**loader.load_yaml(path), "training": {"b": b_leaves}})
+    return path
+
+
+def _train_plan(path: Path, **overrides: Any) -> plan_service.MatchedA1BPlan:
+    """Resolve a plan file with CLI overrides as ``train`` does."""
+    requested = loader.apply_training_overrides(loader.load_authored_config(path), **overrides)
+    return plan_service.resolve_matched_a1_b_plan(requested, source=naming.config_source_from_path(path))
+
+
+def test_the_pair_key_names_the_values_b_trains_with_when_a_cli_override_rewrites_authored_leaves(tmp_path: Path) -> None:
+    """--rollout-length rewrites the window stride and curriculum a plan file authors; the pair folder names what B trains with."""
+    raw = configs.transient_matched_config()
+    path = _plan_file(tmp_path, raw, {key: raw["training"]["b"][key] for key in ("sampling", "curriculum")})
+
+    assert _train_plan(path).b["run"]["layout"]["pair"] == "b-a1__rollout-4__lr-1__bcur-2-4__bsmp-rollout-window__bws-4__bwo-0"
+    assert _train_plan(path, rollout_length=2).b["run"]["layout"]["pair"] == "b-a1__rollout-2__lr-1__bcur-2__bsmp-rollout-window__bws-2__bwo-0"
+
+
+@pytest.mark.parametrize(
+    ("leaf", "value", "token"),
+    [
+        ("curriculum", {"milestone_fractions": [0.0, 0.25]}, "bcur-2-4-at-0-0p25"),
+        ("curriculum", {"lengths": [2], "milestone_fractions": [0.0]}, "bcur-2"),
+        ("sampling", {"window_stride": 2}, "bws-2"),
+        ("sampling", {"window_offset": 2}, "bwo-2"),
+    ],
+    ids=["curriculum-spacing", "curriculum-end", "window-stride", "window-offset"],
+)
+def test_an_inherited_b_value_the_rollout_does_not_imply_names_the_pair_so_an_override_never_shares_its_folder(
+    tmp_path: Path, leaf: str, value: dict[str, Any], token: str
+) -> None:
+    """A same-horizon --rollout-length rewrites an inherited curriculum or stride; the run without it names that value, so the folders differ."""
+    raw = configs.transient_matched_config()
+    raw["training"]["b"][leaf].update(value)  # in the base the plan file inherits from
+    path = _plan_file(tmp_path, raw)
+
+    inherited, overridden = _train_plan(path).b["run"]["layout"], _train_plan(path, rollout_length=4).b["run"]["layout"]
+    assert inherited["branch_id"] != overridden["branch_id"]
+    assert (inherited["pair"], overridden["pair"]) == (f"b-a1__rollout-4__lr-1__{token}", "b-a1__rollout-4__lr-1")
+
+
+def test_a_window_key_a_trajectory_plan_sets_but_its_override_drops_is_a_config_error_naming_it(tmp_path: Path) -> None:
+    """--rollout-length gives trajectory sampling only a rollout length; a window stride the file still sets is refused by its path."""
+    raw = configs.transient_matched_config(model_kind="rno")
+    path = _plan_file(tmp_path, raw, {"sampling": {"mode": "trajectory", "window_stride": 4}})
+
+    with pytest.raises(loader.ConfigError, match=r"training\.b\.sampling\.window_stride"):
+        _train_plan(path, rollout_length=2)
 
 
 def test_trial_leaf_formats_number_label_and_sorted_values() -> None:
@@ -510,6 +570,17 @@ def test_another_budget_k_or_schedule_is_another_run_name(change: dict[str, Any]
     assert naming.run_name({**_LAYOUT, **change}) != naming.run_name(_LAYOUT)
     with pytest.raises(ValueError, match="positive integer"):
         common.paths.seed_group_name({**_LAYOUT, "units_per_update": 0})
+
+
+def test_a_seed_group_beyond_the_component_limit_is_refused_where_it_becomes_a_directory() -> None:
+    """A saved revision fits as a label but not inside the seed-group directory, which saved-config validation refuses as a config error."""
+    saved = configs.resolve(configs.direct_config())
+    saved["run"]["revision"] = saved["run"]["layout"]["revision"] = "r" * 240
+
+    with pytest.raises(ValueError, match=r"seed group must not exceed 255 UTF-8 bytes.*got \d+ bytes"):
+        common.paths.resolve_config_run_dir(saved)
+    with pytest.raises(loader.ConfigError, match=r"seed group must not exceed 255 UTF-8 bytes"):
+        loader.validate_resolved_config(saved, verify_layout_identity=False)
 
 
 def test_resolved_layout_is_a_pure_function_of_config_source_and_revision(tmp_path: Path) -> None:

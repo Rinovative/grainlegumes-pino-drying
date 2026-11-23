@@ -1500,11 +1500,24 @@ def test_repeated_feed_leaves_the_success_decision_of_the_feeder_unchanged(
         ({"submission_intent": {"submission_index": 3}}, False),
         ({"node_job_intent": {"seat": 1}}, False),
         ({"reason_code": lifecycle.UNCLASSIFIED_SOLVER_REASON}, False),
+        ({"class": "validation", "reason_code": "negative_water_state"}, True),
+        ({"class": "validation", "reason_code": "CaseExecutionError"}, False),
+        ({"class": "solver", "reason_code": "negative_water_state"}, False),
     ],
-    ids=["eligible", "retryable", "older_dispatch", "submission_intent", "node_job_intent", "unclassified"],
+    ids=[
+        "eligible",
+        "retryable",
+        "older_dispatch",
+        "submission_intent",
+        "node_job_intent",
+        "unclassified",
+        "negative_water_state",
+        "other_validation",
+        "reason_of_another_class",
+    ],
 )
 def test_the_feeder_decides_only_the_latest_terminal_runtime_stop(monkeypatch: pytest.MonkeyPatch, change: dict[str, Any], recorded: bool) -> None:
-    """Only a non-retryable typed stop of the latest accounted dispatch is decided, and never while an intent is pending."""
+    """Only a non-retryable typed stop or negative water state of the latest accounted dispatch is decided, never while an intent is pending."""
     decisions: list[str] = []
     monkeypatch.setattr(lifecycle, "execution_batch", lambda _campaign, _reservation: SimpleNamespace(batch_id="batch"))
     monkeypatch.setattr(generation.campaign, "_record_failure_decision", lambda *_a, **kwargs: decisions.append(kwargs["reason_code"]))
@@ -1514,7 +1527,7 @@ def test_the_feeder_decides_only_the_latest_terminal_runtime_stop(monkeypatch: p
     ]
     manifest = {"submissions": dispatches, "submission_intent": change.get("submission_intent"), "node_job_intent": change.get("node_job_intent")}
     attempt = {
-        "class": "solver",
+        "class": change.get("class", "solver"),
         "retryable": change.get("retryable", False),
         "reason_code": change.get("reason_code", "stalled"),
         "detail": "stalled: 0.00 h of 1 h simulated after 900 s solving",
@@ -1524,4 +1537,4 @@ def test_the_feeder_decides_only_the_latest_terminal_runtime_stop(monkeypatch: p
     scheduler = {"active": {}, "accounted": {"7001-1": {}, "7001-2": {}}}
     campaign: Any = SimpleNamespace()  # only the stubbed execution batch reads it
     assert generation.campaign._reconcile_runtime_failure_decisions(manifest, campaign, records, scheduler, storage_root=None) is recorded
-    assert decisions == (["stalled"] if recorded else [])
+    assert decisions == ([change.get("reason_code", "stalled")] if recorded else [])

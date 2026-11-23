@@ -8,8 +8,10 @@ Responsibilities:
     bulk means on shared valid cells and unchanged normalized errors
   - Check the time windows of the mean and error over time: the windows, the last 24 h before each case's end, the
     difference and case-count rows, the target lines and the one figure legend
-  - Check the error over normalized time τ: equal bins no narrower than any case's step, cases aligned at τ = 1, and the
-    refusal of a case that does not start at t = 0 or holds no time after its origin
+  - Check the drying-phase views: every reached case at its nearest stored state (the origin included) at every phase point
+    of the error over time, the relative norms, the maps and the parity, with equal material weight; censored cases counted
+    and named with the effective time; target lines of the pooled cases only; a map note that stays off the maps; the phase
+    default of the pooled time views; and the refusal of a case without a time after its origin
   - Check series styles resolved once per comparison and looked up by record identity and summary provenance, one shade
     per run in every view also where only some runs have evidence, and the duration-ratio error bars with their refusal of
     ratios that are not positive and finite
@@ -714,7 +716,7 @@ def test_transient_registry_invokes_every_visible_entry(
             plt.close(result)
 
     sample = results["5-1. Sample GT vs Prediction"]
-    error_time = results["4-2. Error over physical time"]
+    error_time = results["4-2. Error over drying phase and hours"]
     assert isinstance(sample, analysis.ui.panel.ViewPanel)
     assert isinstance(error_time, analysis.ui.panel.ViewPanel)
     assert not any(isinstance(widget, widgets.Play) for widget in _widget_tree(sample.widget))
@@ -886,32 +888,37 @@ def test_a_break_even_passes_each_available_clock_so_the_unpaired_cases_are_coun
         evaluation.close()
 
 
-def test_only_the_error_over_time_view_offers_the_tau_switch_and_passes_it_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hours is the default, the switch reaches the error-over-time builder, and no other scoped view has it."""
+def test_the_pooled_time_views_default_to_the_drying_phase_and_pass_the_clock_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trajectory, error and relative-norm views default to the phase and pass the switch on; the target-magnitude view has none."""
     records = (sequence_record("autonomous_full", "full", case_id="low", offset=1.0),)
     evaluation = session.TransientEvaluationSession({"id": production_frame(records, artifact_root=str(tmp_path / "artifact"))})
     fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
     seen: list[dict[str, Any]] = []
 
-    def record_call(_series: dict[str, Any], **kwargs: Any) -> Figure:
-        seen.append(kwargs)
+    def record_call(series: dict[str, Any], **kwargs: Any) -> Figure:
+        frame = next(iter(series.values()))  # the relative norms pass curves, whose clock column names their time axis
+        seen.append({"time_axis": "phase" if "phase" in frame else "hours"} if isinstance(frame, pd.DataFrame) else kwargs)
         return plt.figure()
 
-    monkeypatch.setattr(analysis.evaluation.plots.transient, "plot_error_over_physical_time", record_call)
+    for name in ("plot_error_over_physical_time", "plot_state_trajectory_summary", "plot_relative_norms_over_time"):
+        monkeypatch.setattr(analysis.evaluation.plots.transient, name, record_call)
 
     def switch(plot_kind: str) -> widgets.ToggleButtons | None:
-        viewer = analysis.evaluation.panel._make_transient_scope_viewer(session=evaluation, fields=fields, plot_kind=plot_kind, comparison=False)
-        found = [item for item in _widget_tree(viewer.widget) if isinstance(item, widgets.ToggleButtons) and item.value == "hours"]
+        if plot_kind == "relative_norms":
+            viewer = analysis.evaluation.panel._transient_relative_norm_entry(evaluation)()
+        else:
+            viewer = analysis.evaluation.panel._make_transient_scope_viewer(session=evaluation, fields=fields, plot_kind=plot_kind, comparison=False)
+        found = [item for item in _widget_tree(viewer.widget) if isinstance(item, widgets.ToggleButtons) and item.value == "phase"]
         return found[0] if found else None
 
     try:
-        assert switch("trajectory") is None
         assert switch("target_magnitude") is None
-        control = switch("error_time")
-        assert control is not None
-        assert seen[-1]["time_axis"] == "hours"
-        control.value = "tau"
-        assert seen[-1]["time_axis"] == "tau"
+        for plot_kind in ("trajectory", "error_time", "relative_norms"):
+            control = switch(plot_kind)
+            assert control is not None
+            assert seen[-1]["time_axis"] == "phase"
+            control.value = "hours"
+            assert seen[-1]["time_axis"] == "hours"
     finally:
         plt.close("all")
         evaluation.close()
@@ -1730,72 +1737,144 @@ def test_error_over_time_line_is_the_root_of_the_material_case_mean_squared_erro
     plt.close(figure)
 
 
-def test_each_case_is_averaged_inside_a_tau_bin_before_the_cases_are_reduced() -> None:
-    """
-    In the two τ bins (0, 1/2] and (1/2, 1], each case's bin value is the mean of its own values there, drawn at the bin's upper edge.
+def _reached(record: SimpleNamespace, *, reached: bool = True) -> SimpleNamespace:
+    """Mark a record's reference as having reached its target (or, with ``reached`` False, as stopped without it)."""
+    record.target["reference_reached"] = reached
+    return record
 
-    A 4 h case stored at 1, 2 and 4 h after its origin gives 1.5 and 3, an 8 h case on an hourly grid (1, ..., 8) gives 2.5 and 6.5;
-    one non-finite value voids only its case's bin.
+
+def _sloped(record: SimpleNamespace, slope: float, *, material: str = "lentil", reached: bool = True) -> SimpleNamespace:
+    """Give a record an error growing from 0 at its origin by ``slope`` per stored hour in every cell, its material and completion."""
+    record.predicted_states = (record.reference_states + slope * record.physical_times[:, None, None, None]).astype(np.float32)
+    record.identity["material_family"] = material
+    return _reached(record, reached=reached)
+
+
+# The stored state each case of 3, 5, 9 and 11 states takes at the 20 phase points: the nearest, the origin included, ties earlier.
+_PHASE_STATES = {
+    3: np.repeat([0, 1, 2], [5, 10, 5]),
+    5: np.asarray([0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4]),
+    9: np.asarray([0, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4, 5, 5, 6, 6, 6, 7, 7, 8, 8]),
+    11: np.arange(1, 21) // 2,
+}
+
+
+def test_error_over_phase_pools_each_reached_case_at_its_nearest_state_with_equal_material_weight() -> None:
+    """
+    Lentil cases of 4 h, 8 h and a chickpea case of 20 h enter all 20 points; censored cases, origin-only too, are counted.
+
+    With a state scale of 2 the lentil errors are 2 k and the chickpea error k at stored state k, so the line is
+    sqrt(k_a² + k_b² + k_c² / 2): equal over the lentil cases, then over the materials (a plain case mean or another state
+    differs), 0 where every case resolves to its origin. The note states t_end in hours; an unknown clock is refused.
     """
     transient = analysis.evaluation.plots.transient
-    rows = ((np.asarray((0.25, 0.5, 1.0)), np.asarray((1.0, 2.0, 3.0))), (np.arange(1.0, 9.0) / 8.0, np.arange(1.0, 9.0)))
-    (short_tau, short), (long_tau, long) = transient._tau_binned(rows, 2)
-    np.testing.assert_array_equal(short_tau, [0.5, 1.0])
-    np.testing.assert_array_equal(long_tau, [0.5, 1.0])
-    np.testing.assert_array_equal(short, [1.5, 3.0])
-    np.testing.assert_array_equal(long, [2.5, 6.5])
-    ((_tau, voided),) = transient._tau_binned(((np.asarray((0.25, 0.5, 1.0)), np.asarray((np.nan, 2.0, 3.0))),), 2)
-    assert np.isnan(voided[0])
-    assert voided[1] == 3.0
-
-
-def test_error_over_tau_aligns_cases_of_different_length_at_one_with_every_case_in_every_bin() -> None:
-    """Cases of 118 h and 98 h on a 2 h grid end together at τ = 1; the bins are one 2 h step of the 98 h case wide, so n(τ) = 2 in all 49."""
-    transient = analysis.evaluation.plots.transient
-    series = {"ID": (_timed_record("long", 60), _timed_record("short", 50))}
-    scales = {"ID": scaling_state()}
-    figure = transient.plot_error_over_physical_time(series, scaling_states=scales, state_fields=("T",), styles=_STYLES, time_axis="tau")
-    error, count = figure.axes[0], figure.axes[-1]
-    tau = np.asarray(error.lines[0].get_xdata(), dtype=np.float64)
-    np.testing.assert_allclose(tau, np.arange(1.0, 50.0) / 49.0)
-    assert tau[-1] == 1.0
-    np.testing.assert_array_equal(count.lines[0].get_ydata(), 2.0)
-    assert (count.get_xlabel(), count.get_xlim(), count.get_ylabel()) == ("τ = t / t_stop [-]", (0.0, 1.0), "n(τ)")
+    records = (
+        _sloped(_timed_record("a", 3), 2.0),
+        _sloped(_timed_record("b", 5), 2.0),
+        _sloped(_timed_record("c", 11), 1.0, material="chickpea"),
+        _sloped(_timed_record("cut", 6), 50.0, reached=False),
+        _sloped(_timed_record("stub", 1), 50.0, reached=False),
+    )
+    arguments: dict[str, Any] = {"scaling_states": {"ID": scaling_state()}, "state_fields": ("T",), "styles": _STYLES}
+    figure = transient.plot_error_over_physical_time({"ID": records}, **arguments, time_axis="phase")
+    line, count = figure.axes[0].lines[0], figure.axes[-1]
+    np.testing.assert_allclose(np.asarray(line.get_xdata(), dtype=np.float64), analysis.ui.time.PHASE_GRID)
+    np.testing.assert_allclose(
+        np.asarray(line.get_ydata(), dtype=np.float64),
+        np.sqrt(_PHASE_STATES[3] ** 2 + _PHASE_STATES[5] ** 2 + _PHASE_STATES[11] ** 2 / 2),
+        atol=1e-12,
+    )
+    np.testing.assert_array_equal(count.lines[0].get_ydata(), 3)
+    assert (count.get_xlabel(), count.get_xlim(), count.get_ylabel()) == ("τ = t / t_end [-]", (0.0, 1.0), "n(τ)")
+    note = " ".join(" ".join(cast("Any", text).get_text() for text in figure.artists if hasattr(text, "get_text")).split())
+    assert "t_end 4-20 h, median 8 h; 3 reached, 2 censored not pooled" in note
     with pytest.raises(ValueError, match="time_axis"):
-        transient.plot_error_over_physical_time(
-            series, scaling_states={"ID": scaling_state()}, state_fields=("T",), styles=_STYLES, time_axis=cast("Any", "days")
-        )
+        transient.plot_error_over_physical_time({"ID": records}, **arguments, time_axis=cast("Any", "tau"))
 
 
-def test_error_over_tau_keeps_every_case_of_an_uneven_grid_and_refuses_a_case_that_does_not_start_at_zero() -> None:
+def test_relative_norms_over_phase_pool_each_reached_case_at_its_nearest_state_with_equal_material_weight(tmp_path: Path) -> None:
     """
-    A case stored at 0, 1, 2 and 4 h (widest τ step 1/2) and an hourly 8 h case share both τ bins; a case first stored at 4 h is refused.
+    Lentil cases of 2 h and 4 h and a chickpea case of 8 h enter all 20 phase points; a censored lentil case is only counted.
 
-    A late start would leave the case out of the early bins and silently shrink their cohort.
+    The relative L2 grows from 0 at the origin by 0.01 (lentil) and 0.005 (chickpea) per hour, so each point is the mean of the
+    lentil mean and the chickpea value at the stored states each case resolves. In hours the 8 h case stands alone after 4 h.
+    """
+    records = []
+    cases = (("a", "lentil", 3, 0.01), ("b", "lentil", 5, 0.01), ("c", "chickpea", 9, 0.005), ("cut", "lentil", 3, 1.0))
+    for case_id, material, length, rate in cases:
+        record = sequence_record("autonomous_full", "full", case_id=case_id, length=length)
+        record.reference_states = np.full_like(record.reference_states, 300.0)
+        records.append(_sloped(record, 300.0 * rate, material=material, reached=case_id != "cut"))
+    evaluation = session.TransientEvaluationSession({"id": production_frame(tuple(records), artifact_root=str(tmp_path / "artifact"))})
+    hours = evaluation.relative_norm_curve("id").query("metric_id == 'physical_relative_l2_T'")
+    assert list(hours.query("physical_time > 4")["cases"]) == [1] * 4
+    curve = evaluation.relative_norm_curve("id", time_axis="phase")
+    phase = curve.query("metric_id == 'physical_relative_l2_T'")
+    np.testing.assert_allclose(phase["phase"], analysis.ui.time.PHASE_GRID)
+    lentil = 0.01 * (_PHASE_STATES[3] + _PHASE_STATES[5]) / 2
+    np.testing.assert_allclose(phase["value"], (lentil + 0.005 * _PHASE_STATES[9]) / 2, atol=1e-12)
+    assert set(phase["cases"]) == set(phase["supported_cases"]) == {3}
+    assert curve.attrs["phase_label"] == "t_end 2-8 h, median 4 h; 3 reached, 1 censored not pooled"
+    figure = analysis.evaluation.plots.transient.plot_relative_norms_over_time({"id": curve}, styles=evaluation.series_styles())
+    assert figure.axes[0].get_xlabel() == "τ = t / t_end [-]"
+
+
+def test_aggregate_maps_and_parity_at_a_phase_take_each_reached_case_at_its_nearest_state_and_keep_the_note_off_the_maps() -> None:
+    """
+    Maps and parity at a phase take each reached case at its nearest stored state, and the phase note stays below the maps.
+
+    At τ = 0.5 a 4 h case gives its 2 h state (error 2 K) and a 20 h case its 10 h state (10 K): the mean map is 6 K and the
+    parity points lie 2 K and 10 K above the reference. At τ = 0.25 the ties take the 4 h case's origin (0 K) and the 20 h
+    case's 4 h state (4 K). A censored case of 100 K per hour is only counted; the note of three contexts stays below the maps.
     """
     transient = analysis.evaluation.plots.transient
-    uneven, hourly, late = _timed_record("uneven", 4), _timed_record("hourly", 9), _timed_record("late", 7)
-    uneven.physical_times, hourly.physical_times, late.physical_times = np.asarray((0.0, 1.0, 2.0, 4.0)), np.arange(9.0), np.arange(4.0, 11.0)
-    tau: dict[str, Any] = {"scaling_states": {"ID": scaling_state()}, "state_fields": ("T",), "styles": _STYLES, "time_axis": "tau"}
-    count = transient.plot_error_over_physical_time({"ID": (uneven, hourly)}, **tau).axes[-1].lines[0]
-    np.testing.assert_array_equal(count.get_xdata(), [0.5, 1.0])
-    np.testing.assert_array_equal(count.get_ydata(), [2, 2])
-    with pytest.raises(ValueError, match="t = 0"):
-        transient.plot_error_over_physical_time({"ID": (late, hourly)}, **tau)
+    records = (_sloped(_timed_record("short", 3), 1.0), _sloped(_timed_record("long", 11), 1.0))
+    records += (_sloped(_timed_record("cut", 6), 100.0, reached=False),)
+    for phase, mean, hours in ((0.5, 6.0, "2-10"), (0.25, 2.0, "0-4")):
+        figure = transient.plot_aggregate_error_maps({"ID": records}, state_fields=("T",), phase=phase, statistic="mean")
+        np.testing.assert_allclose(cast("Any", figure.axes[0].collections[0].get_array()), mean)
+        footer = figure.texts[-1].get_text()
+        assert f"τ = {phase:.2f}: stored t {hours} h" in footer
+        assert "2 reached, 1 censored not pooled" in footer
+    parity = transient.plot_predicted_vs_reference_channels({"ID": records}, state_fields=("T",), phase=0.5, styles=_STYLES)
+    offsets = np.asarray(parity.axes[0].collections[0].get_offsets())
+    np.testing.assert_allclose(offsets[:, 1] - offsets[:, 0], [2.0, 10.0])
+    wide = transient.plot_aggregate_error_maps(dict.fromkeys(("A", "B", "C"), records), state_fields=("T",), phase=0.5, statistic="mean")
+    wide.canvas.draw()
+    renderer = cast("Any", wide.canvas).get_renderer()
+    assert wide.texts[-1].get_window_extent(renderer).y1 < min(cast("Any", axis.get_tightbbox(renderer)).y0 for axis in wide.axes[:3])
+    with pytest.raises(ValueError, match="exactly one"):
+        transient.plot_aggregate_error_maps({"ID": records}, state_fields=("T",), physical_time=2.0, phase=0.5, statistic="mean")
+
+
+def test_the_trajectory_over_phase_draws_only_the_targets_of_the_pooled_cases() -> None:
+    """A censored case with its own target adds a target line in hours, none over the phase; with no pooled case, no target at all."""
+    transient = analysis.evaluation.plots.transient
+    censored = _reached(_timed_record("cut", 6, target=0.2), reached=False)
+    series = {"ID": (_reached(_timed_record("a", 3)), _reached(_timed_record("b", 11)), censored)}
+    for shown, time_axis, expected in (
+        (series, "hours", [12.0, 20.0]),
+        (series, "phase", [12.0]),
+        ({"ID": (censored,)}, "phase", []),
+    ):
+        figure = transient.plot_state_trajectory_summary(shown, state_fields=("w_gr",), styles=_STYLES, time_axis=cast("Any", time_axis))
+        levels = {float(np.asarray(line.get_ydata())[0]) for axis in figure.axes for line in axis.get_lines() if line.get_linestyle() == ":"}
+        assert sorted(levels) == pytest.approx(expected)
+        plt.close(figure)
 
 
 def test_error_over_time_refuses_a_record_without_a_time_after_its_origin_instead_of_dropping_it() -> None:
-    """A one-point record beside longer ones would silently leave the cohort, in hours and in τ alike."""
+    """A reached one-point record beside longer ones would silently leave the cohort: refused in hours, and over the phase too."""
     transient = analysis.evaluation.plots.transient
-    single = _timed_record("single", 1)
-    for time_axis in ("hours", "tau"):
-        with pytest.raises(ValueError, match="after its origin"):
+    single = _reached(_timed_record("single", 1))
+    for time_axis, refusal in (("hours", "after its origin"), ("phase", "no drying phase")):
+        with pytest.raises(ValueError, match=refusal):
             transient.plot_error_over_physical_time(
                 {"ID": (single, _timed_record("long", 20))},
                 scaling_states={"ID": scaling_state()},
                 state_fields=("T",),
                 styles=_STYLES,
-                time_axis=time_axis,
+                time_axis=cast("Any", time_axis),
             )
 
 
@@ -2591,7 +2670,7 @@ def test_a_partly_diverging_prediction_masks_only_its_cells_and_is_named_in_ever
     assert np.ma.count_masked(maps.axes[2].collections[0].get_array()) == 1
     plt.close(maps)
     _x, _y, mean_error, signed_mean, std_error, _reference_means, prediction_means = transient._aggregate_snapshot_evidence(
-        [record], state_field="T", physical_time=1.0
+        [record], state_field="T", physical_times=(1.0,)
     )
     assert np.isnan(mean_error[3, 3])
     assert np.isnan(signed_mean[3, 3])

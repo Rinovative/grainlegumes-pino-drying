@@ -2,6 +2,8 @@
 
 Responsibilities:
   - Check completed-source dispatch, exact-time trajectories, target outcomes, and spatial maps
+  - Check the aggregate state rows over the drying phase: reached cases only at their nearest stored states, censored ones
+    named, schedules kept in hours, and the phase offered only where every case carries completion evidence
 
 Design principles:
   - Physical support and steady compatibility survive display transformations
@@ -27,6 +29,7 @@ from matplotlib.colors import BoundaryNorm
 from matplotlib.figure import Figure
 
 from src import common, datasets, domain, generation
+from src.analysis.catalog import analysis_catalog_transient as catalog_transient
 from src.analysis.eda import dataframe as eda_dataframe
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda import eda_selection as selection
@@ -751,6 +754,67 @@ def test_dataset_styles_keep_material_colors_and_tell_batches_of_one_material_ap
     assert styles["D"].linestyle == styles["E"].linestyle == "-"
     assert styles["D"].color != styles["E"].color
     assert {styles["D"].color, styles["E"].color} <= set(transient_plots._ORDER_COLORS)
+
+
+def test_trajectory_summary_over_the_phase_pools_only_reached_cases_and_keeps_the_schedules_in_hours() -> None:
+    """
+    Each batch's reached 24 h case enters all 20 phase points of the state row; its 48 h censored case is counted in the note, not pooled.
+
+    Stored at 0, 1 and 24 h, the reached case gives its 1 h state up to τ = 0.5 and its 24 h state beyond. The schedule rows stay
+    on the clock with their own time label, as bands of the cases still running.
+    """
+    frames = catalog_transient._eda_datasets()
+    styles = transient_plots.batch_styles(dict.fromkeys(frames, "lentil"))
+    figure = transient_plots.plot_state_trajectory_summary(datasets=frames, max_cases=2, styles=styles, channels=("T",), time_axis="phase")
+    try:
+        (phase_axis,) = [axis for axis in figure.axes if axis.get_xlabel() == "τ = t / t_end [-]"]
+        grid = transient_plots.time_axis.PHASE_GRID
+        means = [line for line in phase_axis.get_lines() if np.array_equal(line.get_xdata(), grid)]
+        assert len(means) == len(frames)
+        for line, frame in zip(means, frames.values(), strict=True):
+            _times, case_means, *_extrema = capabilities.field_display_trajectory(frame, capabilities.case_row(frame, "case_0001"), "T")
+            np.testing.assert_allclose(np.asarray(line.get_ydata(), dtype=np.float64), case_means[np.repeat([1, 2], 10)])
+        counts = [line for axis in figure.axes if axis.get_ylabel() == "n(τ)" for line in axis.get_lines()]
+        assert counts
+        assert all(np.array_equal(line.get_ydata(), np.ones(grid.size)) for line in counts)
+        assert any(axis.get_xlabel().startswith("Time") for axis in figure.axes)  # the schedule rows keep hours
+        note = " ".join(" ".join(str(cast("Any", artist).get_text()) for artist in figure.artists if hasattr(artist, "get_text")).split())
+        assert "t_end 24-24 h, median 24 h; 1 reached, 1 censored not pooled" in note
+    finally:
+        plt.close(figure)
+
+
+@pytest.mark.parametrize("evidence", [True, False])
+def test_the_trajectory_viewer_offers_the_drying_phase_only_where_every_case_carries_completion_evidence(
+    evidence: bool, transient_frame: pd.DataFrame, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The trajectory viewer offers the drying phase only where every selected frame carries completion evidence.
+
+    With it the clock choice shows and the phase is drawn by default; beside a frame without it (a published Dataset) the
+    choice is hidden and the view draws hours, and the plot asked directly for the phase names that frame.
+    """
+    render_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(viewers.ui.viewers, "render_view", lambda *_args, **kwargs: render_calls.append(kwargs))
+    published = transient_frame.copy()
+    published["completion"] = None
+    frames = {"Generated": transient_frame, **({} if evidence else {"Published": published})}
+    catalog = _adaptive_catalog(tuple(frames.items()))
+    viewer = viewers.make_transient_case_view(
+        catalog=catalog,
+        selection_state=selection.GeneratedOutputSelectionState(catalog),
+        kind="trajectory",
+        export_state=None,
+        export_plot_name=None,
+        export_title=None,
+    ).widget
+    (clock,) = [widget for widget in _walk_widgets(viewer) if isinstance(widget, widgets.ToggleButtons) and widget.value == "phase"]
+    assert (clock.layout.display != "none") is evidence
+    assert render_calls[-1]["kwargs"]["time_axis"] == ("phase" if evidence else "hours")
+    if not evidence:
+        styles = transient_plots.batch_styles(dict.fromkeys(frames, "lentil"))
+        with pytest.raises(ValueError, match=r"\['Published'\] lack completion evidence"):
+            transient_plots.plot_state_trajectory_summary(datasets=frames, max_cases=1, styles=styles, channels=("T",), time_axis="phase")
 
 
 def test_trajectory_lines_keep_batch_colors_and_line_styles_with_n_t_on_every_row_and_one_outside_legend(transient_frame: pd.DataFrame) -> None:

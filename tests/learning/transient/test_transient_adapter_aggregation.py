@@ -32,7 +32,7 @@ from src.learning.transient import learning_transient_adapter as transient_adapt
 
 class _Metric:
     id = "metric"
-    space = "normalized"
+    space = "physical"
     requires_cases = True
 
     def reset(self) -> None:

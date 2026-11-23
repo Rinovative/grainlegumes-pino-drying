@@ -7,6 +7,8 @@ Responsibilities:
   - Check that only a derived admission cap follows a lowered rate, an explicit cap that holds back a replacement blocks,
     and a rerun compares effective caps
   - Check that the feeder decides runtime-stopped solves with their typed reason, only after their step ended, and writes cases.csv
+  - Check that a negative post-horizon water state of a fake transient case is recorded with its numbers through the real
+    worker, decided once after its step ended and replaced, while other conversion failures wait
 
 Design principles:
   - Failed candidates stay excluded while original design membership remains fixed
@@ -34,6 +36,7 @@ from src.generation import generation_campaign as campaign_runtime
 from src.generation import generation_campaign_lifecycle as lifecycle
 from src.generation import generation_campaign_status as status_formatting
 from src.generation import generation_controller as controller_service
+from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.publication import generation_publication_catalog as catalog
@@ -749,30 +752,31 @@ class _FeederCampaign:
 
     def decision(self, case_id: str) -> dict[str, Any] | None:
         """Return the recorded terminal decision of one lentil candidate, if any."""
-        records = lifecycle.candidate_records("steady_flow", self.campaign.source_name, storage_root=self.storage)
+        records = lifecycle.candidate_records(self.campaign.profile.id, self.campaign.source_name, storage_root=self.storage)
         return next(row["decision"] for row in records if row["reservation"]["case_id"] == case_id)
 
 
 _STALLED = "stalled: 0.00 h of 1 h simulated after 900 s solving"
 
 
-@pytest.fixture
-def feeder_campaign(
-    generation_config_factory: Any, fake_comsol: Path, world: FakeSlurm, tmp_path: Path, request: pytest.FixtureRequest
+def _feeder(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    world: FakeSlurm,
+    tmp_path: Path,
+    *,
+    simulation_profile: str = "steady_flow",
+    timeout: float = 1.0,
+    explicit: int | None = None,
 ) -> _FeederCampaign:
-    """Submit both originals of an s = 0.8 Source as tickets of one node job; the first failed, the second succeeded.
-
-    With one success the bound stays at or above 0.8 after three decisions (0.865) and falls below it after four (0.751).
-    Without an explicit cap (a test's ``param``) the cap is derived: the plan default 4 (two originals plus two tolerated failures).
-    """
-    explicit = getattr(request, "param", None)
+    """Submit both originals of an s = 0.8 Source as tickets of one node job; the second succeeded and its step ended."""
     config_path, _template = generation_config_factory(
-        simulation_profile="steady_flow",
+        simulation_profile=simulation_profile,
         executable=fake_comsol,
         natural_count=2,
         node_jobs=1,
         cores_per_node=2,
-        timeout=1.0,  # fake COMSOL's timeout mode outlasts it, so the runtime times the solve out
+        timeout=timeout,
         license_retry_enabled=False,  # its silent startup would otherwise read as license capacity
     )
     authored = {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "minimum_success_rate": 0.8}
@@ -783,8 +787,22 @@ def feeder_campaign(
     assert [(item["job_id"], item["ticket_seq"]) for item in first["submissions"]] == [("7001", 1), ("7001", 2)]
     successful_source_case(campaign.source_name, campaign.batches[0], 2, world.storage, tmp_path / "work")
     fed = _FeederCampaign(campaign, world.storage, tmp_path / "work", first["campaign_run_id"], world)
-    fed.end_step("case_0001", "FAILED", "1:0")
     fed.end_step("case_0002", "COMPLETED", "0:0")
+    return fed
+
+
+@pytest.fixture
+def feeder_campaign(
+    generation_config_factory: Any, fake_comsol: Path, world: FakeSlurm, tmp_path: Path, request: pytest.FixtureRequest
+) -> _FeederCampaign:
+    """Submit both originals of an s = 0.8 steady Source as tickets of one node job; the first failed, the second succeeded.
+
+    With one success the bound stays at or above 0.8 after three decisions (0.865) and falls below it after four (0.751).
+    Without an explicit cap (a test's ``param``) the cap is derived: the plan default 4 (two originals plus two tolerated failures).
+    The 1 s timeout lets fake COMSOL's timeout mode outlast it, so the runtime times the solve out.
+    """
+    fed = _feeder(generation_config_factory, fake_comsol, world, tmp_path, explicit=getattr(request, "param", None))
+    fed.end_step("case_0001", "FAILED", "1:0")
     return fed
 
 
@@ -966,13 +984,104 @@ def test_a_license_capacity_failure_without_protection_is_decided_like_a_solver_
     assert replaced["submissions"][-1]["case"]["case_id"] == "case_0003"
 
 
-def test_a_validation_failure_is_never_decided_by_the_feeder_and_stops_the_driver_with_fail_case(
-    feeder_campaign: _FeederCampaign, monkeypatch: pytest.MonkeyPatch
+def _conversion_fails(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Let the real runtime conversion wrapper receive ``error`` from the conversion of the fake COMSOL exports."""
+
+    def failing(*_args: Any, **_kwargs: Any) -> NoReturn:
+        raise error
+
+    monkeypatch.setattr(generation.publication.storage, "convert_exports_to_hdf5", failing)
+
+
+def _last_attempt(fed: _FeederCampaign, case_id: str) -> dict[str, Any]:
+    """Return the latest recorded candidate attempt of one lentil candidate."""
+    records = lifecycle.candidate_records(fed.campaign.profile.id, fed.campaign.source_name, storage_root=fed.storage)
+    return next(row["attempts"][-1] for row in records if row["reservation"]["case_id"] == case_id)
+
+
+_FAKE_POST_HORIZON_TIME = 172.2885558527809  # the fake COMSOL post_horizon mode's state after the 168 h horizon
+
+
+def test_a_negative_post_horizon_water_state_of_a_transient_case_is_decided_once_after_its_step_ended_and_replaced(
+    generation_config_factory: Any, fake_comsol: Path, world: FakeSlurm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Only runtime-stopped solves are decided automatically; an export failure keeps waiting for an explicit decision."""
+    """The real worker converts a fake transient export with a negative post-horizon water state and records the undershoot.
+
+    The feeder decides it only after the step's terminal accounting, without fail-case; a re-feed keeps the decision and
+    the one replacement.
+    """
+    fed = _feeder(generation_config_factory, fake_comsol, world, tmp_path, simulation_profile="transient_drying", timeout=5.0)
+    monkeypatch.setenv("FAKE_COMSOL_TRANSIENT_TIME_MODE", "post_horizon")
+    storage = generation.publication.storage
+    read_transient_fields = storage._transient_fields
+
+    def undershooting(*args: Any, **kwargs: Any) -> Any:
+        # Fake COMSOL writes non-negative water; one post-horizon value is lowered as the real conversion reads the export.
+        fields = read_transient_fields(*args, **kwargs)
+        assert fields[4] == _FAKE_POST_HORIZON_TIME
+        assert fields[5] is not None
+        fields[5][profiles.TRANSIENT_FIELD_NAMES.index("w_surf"), 0, 0] = -0.5
+        return fields
+
+    monkeypatch.setattr(storage, "_transient_fields", undershooting)
+    fed.run_step(monkeypatch, "case_0001")
+    attempt = _last_attempt(fed, "case_0001")
+    assert (attempt["stage"], attempt["class"], attempt["reason_code"], attempt["retryable"]) == (
+        "conversion",
+        "validation",
+        "negative_water_state",
+        False,
+    )
+    undershoot = attempt["evidence"]["negative_water_state"]
+    assert {key: undershoot[key] for key in ("stored_state_count", "post_horizon_state_checked")} == {
+        "stored_state_count": 169,
+        "post_horizon_state_checked": True,
+    }
+    assert {undershoot[key] for key in ("first_negative_time_h", "last_negative_time_h", "minimum_time_h")} == {_FAKE_POST_HORIZON_TIME}
+    assert undershoot["w_surf"] == {"unit": "kg/m^3", "minimum": -0.5, "negative_value_count": 1, "negative_state_count": 1}
+    assert (undershoot["w_int"]["negative_value_count"], undershoot["w_int"]["negative_state_count"]) == (0, 0)
+    assert (attempt["evidence"]["dispatch_key"], attempt["evidence"]["exception_type"]) == ("7001-1", "CaseExecutionError")
+    assert "169 stored states and the post-horizon state at t=172.289 h" in attempt["detail"]
+
+    campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)
+    assert fed.decision("case_0001") is None  # the step has no terminal accounting yet
+    fed.end_step("case_0001", "FAILED", "1:0")
+    campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)
+    decided = fed.decision("case_0001")
+    assert decided is not None
+    assert (decided["outcome"], decided["class"], decided["reason_code"]) == ("failed", "validation", "negative_water_state")
+    decision_path = common.paths.resolve_generation_case_decision_path(
+        next(
+            row["case_directory"]
+            for row in lifecycle.candidate_records(fed.campaign.profile.id, fed.campaign.source_name, storage_root=fed.storage)
+            if row["reservation"]["case_id"] == "case_0001"
+        )
+    )
+    decision_bytes = decision_path.read_bytes()
+    replaced = campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)
+    assert [item["case"]["case_id"] for item in replaced["submissions"]] == ["case_0001", "case_0002", "case_0003"]
+    refed = campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)
+    assert [item["case"]["case_id"] for item in refed["submissions"]] == ["case_0001", "case_0002", "case_0003"]
+    assert decision_path.read_bytes() == decision_bytes
+    status = campaign_runtime.campaign_status(fed.run_id, storage_root=fed.storage)
+    assert controller_service._unsettled_failure(fed.run_id, status) is None
+
+
+@pytest.mark.parametrize("stage", ["exports", "conversion"])
+def test_a_validation_failure_is_never_decided_by_the_feeder_and_stops_the_driver_with_fail_case(
+    feeder_campaign: _FeederCampaign, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Only runtime-stopped solves and negative water states are decided automatically; other export or conversion failures wait."""
     fed = feeder_campaign
-    error = generation.runtime.CaseExecutionError("Missing airflow.csv export.", work_directory=fed.work, failure_stage="exports")
-    fed.run_step(monkeypatch, "case_0001", error=error)
+    if stage == "exports":
+        error = generation.runtime.CaseExecutionError("Missing airflow.csv export.", work_directory=fed.work, failure_stage="exports")
+        fed.run_step(monkeypatch, "case_0001", error=error)
+    else:
+        _conversion_fails(monkeypatch, ValueError("Global diagnostic time must be strictly increasing."))
+        fed.run_step(monkeypatch, "case_0001")
+    attempt = _last_attempt(fed, "case_0001")
+    assert (attempt["stage"], attempt["class"], attempt["reason_code"]) == (stage, "validation", "CaseExecutionError")
+    assert "negative_water_state" not in attempt["evidence"]
     campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)
     assert fed.decision("case_0001") is None
     status = campaign_runtime.campaign_status(fed.run_id, storage_root=fed.storage)

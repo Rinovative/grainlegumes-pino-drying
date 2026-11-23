@@ -33,7 +33,9 @@ Notes:
     directories lose all write bits, and verification compares their modes
     with write bits masked.
   Snapshot store (storage_root/source_snapshots, --prune-snapshots):
-    an orphan has no storage reference, no tree, no job queued or run within 24 h, no change within 24 h and a valid snapshot.json.
+    an orphan has no storage reference, no tree, no job queued or run within 1 h, no change within 1 h and a valid snapshot.json.
+    The hour only bridges the file-system visibility delay and a launcher between freeze and submission; the reference, tree
+    and queue checks carry the protection.
 
 """
 
@@ -85,7 +87,8 @@ _SQUEUE_TIMEOUT_SECONDS = 60
 _SNAPSHOTS_DIRNAME = "source_snapshots"
 _SNAPSHOT_RECORD = "snapshot.json"
 _SNAPSHOT_RECORD_MAX_BYTES = 8 * 1024 * 1024
-_SNAPSHOT_QUIET_SECONDS = 86400.0  # nothing under a snapshot or the trees root may have changed this recently
+_SNAPSHOT_QUIET_SECONDS = 3600  # no job, and no change under a snapshot or the trees root, within this many seconds
+_SNAPSHOT_QUIET_TEXT = f"{_SNAPSHOT_QUIET_SECONDS // 3600} h"
 _REMOVAL_PREFIX = ".prune-"  # source_snapshots/.prune-<name>-<token>/ is a snapshot under removal
 _REFERENCE_SUFFIXES = (".json", ".jsonl", ".yaml", ".yml")  # storage records searched for a snapshot's name or fingerprint
 _REFERENCE_MAX_BYTES = 64 * 1024 * 1024
@@ -1015,9 +1018,14 @@ def prune_source_trees(
         if entry.is_symlink() or not entry.is_dir():
             continue
         if entry.name.startswith(_STAGING_PREFIX):
-            if active_job_ids is not None and entry.stat().st_mtime < cutoff:
-                _discard_directory(entry)
-                removed.append(entry.name)
+            if active_job_ids is None:
+                continue
+            # Under the tree's exclusive lock, which a prune holds while it discards its own quarantine of that tree.
+            tree_id = entry.name.removeprefix(_STAGING_PREFIX).rpartition("-")[0]
+            with _tree_lock(trees_root, tree_id, exclusive=True) if _TREE_ID_PATTERN.fullmatch(tree_id) else contextlib.nullcontext():
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:  # a concurrent prune may have removed it meanwhile
+                    _discard_directory(entry)
+                    removed.append(entry.name)
             continue
         if _TREE_ID_PATTERN.fullmatch(entry.name) is None:
             continue
@@ -1026,6 +1034,8 @@ def prune_source_trees(
             continue
         # Decide and delete under the exclusive tree lock, so a launcher that reuses or leases the tree meanwhile is seen.
         with _tree_lock(trees_root, entry.name, exclusive=True):
+            if not entry.is_dir():  # a concurrent prune removed it while this one waited for the lock
+                continue
             lease_directory = trees_root / _LEASES_DIRNAME / entry.name
             leases = sorted(lease_directory.iterdir()) if lease_directory.is_dir() else []
             in_use = any(lease.name in active_job_ids for lease in leases)
@@ -1033,31 +1043,42 @@ def prune_source_trees(
             if in_use or newest > cutoff:
                 kept.append(entry.name)
                 continue
-            _discard_directory(entry)
+            # Take the tree off its name first: a prune killed mid-removal leaves an old staging directory, which a later
+            # prune discards, never a partial tree under a name a launcher would find.
+            quarantine = trees_root / f"{_STAGING_PREFIX}{entry.name}-{secrets.token_hex(4)}"
+            entry.rename(quarantine)
+            _discard_directory(quarantine)
             shutil.rmtree(lease_directory, ignore_errors=True)
             removed.append(entry.name)
     return {"removed": removed, "kept": kept}
 
 
 def _slurm_output(command: Callable[[str], list[str]]) -> str | None:
-    """Return what a Slurm query for the current user prints, or None when it cannot run, fails or times out."""
+    """Return what a Slurm query for the current user prints, or None when it cannot run, fails or times out.
+
+    Inherited SQUEUE_*, SACCT_* and SLURM_* variables (except SLURM_CONF) are dropped: they set defaults such as a
+    partition or state filter that would hide jobs from the empty-queue and active-job checks.
+    """
+    environment = {key: value for key, value in os.environ.items() if key == "SLURM_CONF" or not key.startswith(("SQUEUE_", "SACCT_", "SLURM_"))}
     try:
-        result = subprocess.run(command(getpass.getuser()), check=True, capture_output=True, text=True, timeout=_SQUEUE_TIMEOUT_SECONDS)  # noqa: S603 -- fixed scheduler clients resolved from PATH
+        result = subprocess.run(  # noqa: S603 -- fixed scheduler clients resolved from PATH
+            command(getpass.getuser()), check=True, capture_output=True, text=True, timeout=_SQUEUE_TIMEOUT_SECONDS, env=environment
+        )
     except (OSError, subprocess.SubprocessError, KeyError):
         return None
     return result.stdout
 
 
 def _slurm_quiet_evidence() -> tuple[bool | None, bool | None]:
-    """Return whether the user's queue is empty in all states and whether sacct lists no job of the last 24 h."""
-    queue = _slurm_output(lambda user: ["squeue", "-h", "-t", "all", "-u", user])
-    recent = _slurm_output(lambda user: ["sacct", "-X", "-n", "-P", "-u", user, "-S", "now-24hours", "-o", "JobID"])
+    """Return whether the user's queue is empty in all states and whether sacct lists no job of the quiet window."""
+    queue = _slurm_output(lambda user: ["squeue", "-h", "--all", "-t", "all", "-u", user])
+    recent = _slurm_output(lambda user: ["sacct", "-X", "-n", "-P", "-u", user, "-S", f"now-{_SNAPSHOT_QUIET_SECONDS}", "-o", "JobID"])
     return (None if queue is None else not queue.strip()), (None if recent is None else not recent.strip())
 
 
 def _active_slurm_job_ids() -> set[str] | None:
     """Return the current user's queued or running job IDs, or None when the queue cannot be read."""
-    output = _slurm_output(lambda user: ["squeue", "-h", "-u", user, "-o", "%i"])
+    output = _slurm_output(lambda user: ["squeue", "-h", "--all", "-u", user, "-o", "%i"])
     if output is None:
         return None
     identifiers: set[str] = set()
@@ -1143,7 +1164,7 @@ def _trees_state(trees_root: Path, budget: _Budget) -> tuple[set[str], int]:
 
 
 def _require_quiet_scheduler(scheduler: Callable[[], tuple[bool | None, bool | None]]) -> None:
-    """Conditions c and c2: a busy queue or a job within 24 h stops routinely, an unanswered query blocks."""
+    """Conditions c and c2: a busy queue or a job within the quiet window stops routinely, an unanswered query blocks."""
     queue_empty, no_recent_job = scheduler()
     if queue_empty is None:
         _stop("squeue gave no answer")
@@ -1152,7 +1173,7 @@ def _require_quiet_scheduler(scheduler: Callable[[], tuple[bool | None, bool | N
     if no_recent_job is None:
         _stop("sacct gave no answer")
     if not no_recent_job:
-        _stop("Slurm jobs within the last 24 h", routine=True)
+        _stop(f"Slurm jobs within the last {_SNAPSHOT_QUIET_TEXT}", routine=True)
 
 
 def _referenced(storage_root: Path, needles: dict[str, tuple[bytes, bytes]], budget: _Budget) -> set[str]:
@@ -1226,7 +1247,7 @@ def _delete_orphans(
                 _require_quiet_scheduler(scheduler)
                 trees, newest = _trees_state(trees_root, budget)
                 if newest > cutoff_ns:
-                    _stop(f"{trees_root} changed within the last 24 h", routine=True)
+                    _stop(f"{trees_root} changed within the last {_SNAPSHOT_QUIET_TEXT}", routine=True)
                 if name in trees:
                     _invalid(f"a tree of this name exists in {trees_root}")
                 _snapshot_digest(snapshot, budget)
@@ -1265,7 +1286,7 @@ def prune_source_snapshots(
         Root of the source trees with their ``.locks``.
     scheduler : Callable[[], tuple[bool | None, bool | None]]
         Evidence of (c, c2): whether the queue is empty and whether no job ran
-        within 24 hours, each ``None`` when its query failed. Asked again before
+        within the quiet window, each ``None`` when its query failed. Asked again before
         every deletion.
     now : float
         Current time in seconds since the epoch.
@@ -1287,7 +1308,7 @@ def prune_source_snapshots(
     the tree, scheduler, recency and ``snapshot.json`` conditions and the scanned
     plan again. An entry replaced inside the snapshot between that check and the
     removal is removed with it: a window under the exclusive lock, on a quiet
-    cluster, after 24 hours without change. The folder is removed under a private
+    cluster, after the quiet window without change. The folder is removed under a private
     name ``.prune-<name>-<token>``; one left by a crash is reported as defective.
     Not covered: ``source_snapshots`` replaced by a symlink, or ``.locks`` by
     another directory, during a run; both need deliberate tampering.
@@ -1322,7 +1343,7 @@ def prune_source_snapshots(
         }
         if candidates:
             if newest > cutoff_ns:
-                _stop(f"{trees_root} changed within the last 24 h", routine=True)
+                _stop(f"{trees_root} changed within the last {_SNAPSHOT_QUIET_TEXT}", routine=True)
             _require_quiet_scheduler(scheduler)
             referenced = _referenced(storage_root, {name: (name.encode(), digest.encode()) for name, digest in candidates.items()}, budget)
             budget.spend()  # the deadline once more before the result is accepted

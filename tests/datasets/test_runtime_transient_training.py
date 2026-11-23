@@ -104,12 +104,26 @@ def test_partition_refuses_a_design_kind_its_material_role_cannot_hold_and_incom
 
 
 def test_train_subset_takes_the_first_train_cases_of_every_id_material() -> None:
-    """A Train subset is a per-material prefix in stored order; a size beyond any material's Train cases is refused."""
+    """A Train subset is a per-material prefix in stored order; a size beyond any material's Train cases is refused.
+
+    The whole Train role is admitted only with equal case counts per ID material; one lentil case fewer is refused,
+    while its subset of one case per material stays admitted.
+    """
     value = partition.build_fixed_partition(tuple(_CASES), material_by_case=_MATERIALS, design_kind_by_case=_KINDS, material_roles=_ROLES)
     assert partition.train_subset_cases(value, material_by_case=_MATERIALS, train_subset=None) == tuple(value["train"])
     assert partition.train_subset_cases(value, material_by_case=_MATERIALS, train_subset=1) == ("lentil_t0", "chickpea_t0")
     with pytest.raises(ValueError, match=r"data.train_subset 4 exceeds the Train cases of \['chickpea', 'lentil'\]"):
         partition.train_subset_cases(value, material_by_case=_MATERIALS, train_subset=4)
+    unequal = {**value, "train": [case_id for case_id in value["train"] if case_id != "lentil_t1"]}
+    with pytest.raises(ValueError, match=r"unequal case counts per ID material \{'chickpea': 2, 'lentil': 1\}"):
+        partition.train_subset_cases(unequal, material_by_case=_MATERIALS, train_subset=None)
+    assert partition.train_subset_cases(unequal, material_by_case=_MATERIALS, train_subset=1) == ("lentil_t0", "chickpea_t0")
+    # A declared ID material without any Train case counts as zero in both rules.
+    no_chickpea = {**value, "train": ["lentil_t0"]}
+    with pytest.raises(ValueError, match=r"\{'chickpea': 0, 'lentil': 1\}"):
+        partition.train_subset_cases(no_chickpea, material_by_case=_MATERIALS, train_subset=None)
+    with pytest.raises(ValueError, match=r"exceeds the Train cases of \['chickpea'\]"):
+        partition.train_subset_cases(no_chickpea, material_by_case=_MATERIALS, train_subset=1)
 
 
 def _dataset(*, mode: str) -> transient.TransientPhysicalDataset:

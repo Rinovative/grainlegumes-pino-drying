@@ -218,8 +218,9 @@ def test_a_single_stage_run_refuses_the_former_duration_key(build: Callable[[], 
         ({"kind": "reduce_on_plateau", "factor": 0.5, "patience": 3, "min_lr": 1.0e-5}, r"scheduler contains unknown key.*min_lr"),
         ({"kind": "reduce_on_plateau", "factor": 0.5}, r"scheduler kind 'reduce_on_plateau' takes exactly"),
         ({"kind": "cosine_annealing"}, r"Unknown scheduler kind"),
+        ({"kind": ["cosine"]}, r"Unknown scheduler kind"),
     ],
-    ids=["cosine-floor", "cosine-factor", "cosine-patience", "plateau-floor", "plateau-without-patience", "unknown"],
+    ids=["cosine-floor", "cosine-factor", "cosine-patience", "plateau-floor", "plateau-without-patience", "unknown", "list-kind"],
 )
 def test_the_scheduler_states_exactly_its_kind_keys_and_no_floor(scheduler: dict[str, Any], match: str) -> None:
     """The cosine takes only its kind, the plateau comparison kind exactly factor and patience, and neither a floor."""
@@ -287,6 +288,38 @@ def test_a_saved_config_without_a_base_owned_key_is_refused() -> None:
 
     with pytest.raises(experiments.config.loader.ConfigError, match=r"Config must state optimizer\.weight_decay;"):
         experiments.config.loader.validate_resolved_config(saved, verify_layout_identity=False)
+
+
+def test_a_saved_config_without_its_train_dataset_is_a_config_error() -> None:
+    """A saved config that lost data.train_dataset is refused by that path, not by a KeyError before the data keys are checked."""
+    saved = configs.resolve(configs.direct_config())
+    del saved["data"]["train_dataset"]
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"data\.train_dataset"):
+        experiments.config.loader.validate_resolved_config(saved, verify_layout_identity=False)
+
+
+def test_a_steady_config_refuses_a_transient_stage_schedule() -> None:
+    """A transient schedule would name a steady run after another budget than it trains; requested or saved, it is refused."""
+    raw = configs.direct_config()
+    raw["training"]["stage_schedule"] = {"mode": "matched_a1_b", "budget_unit": "supervised_transitions", "a0_budget_epochs": 5}
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"transient training key.*stage_schedule"):
+        configs.resolve(raw)
+
+    saved = configs.resolve(configs.direct_config())
+    saved["training"]["stage_schedule"] = {"mode": "stage_a_only", "budget_unit": "units", "budget_epochs": saved["training"]["budget_epochs"]}
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"transient training key.*stage_schedule"):
+        experiments.config.loader.validate_resolved_config(saved, verify_layout_identity=False)
+
+
+def test_a_steady_config_with_a_null_transient_training_key_resolves_saves_and_reloads(tmp_path: Path) -> None:
+    """A null transient key states nothing: the config the writer saves from it loads again."""
+    raw = configs.direct_config()
+    raw["training"]["teacher_handoff"] = None
+    path = tmp_path / "config.yaml"
+    experiments.config.loader.save_yaml(configs.resolve(raw), path)
+
+    experiments.config.loader.validate_resolved_config(experiments.config.loader.load_yaml(path))
 
 
 @pytest.mark.parametrize("value", [3, 0, True, 2.0])
@@ -446,6 +479,24 @@ def test_duplicate_metric_identifier_is_rejected() -> None:
     raw["evaluation"]["metrics"] = metrics
 
     with pytest.raises(ValueError, match="Duplicate evaluation metric id"):
+        configs.resolve(raw)
+
+
+def test_a_metric_id_is_bounded_by_the_longest_history_key_the_loop_builds_from_it() -> None:
+    """The longest admitted id fills the history's key bound with a component key; one character more fails at validation, not mid-training."""
+    component = learning.metrics.metrics.UNAVAILABLE_CASE_VALUES
+    longest = "m" * experiments.config.loader._MAX_METRIC_ID_LENGTH
+    learning.training.history._admit_scalars({f"id/{longest}/component/{component}": 1.0})
+    with pytest.raises(ValueError, match="bounded non-empty strings"):
+        learning.training.history._admit_scalars({f"id/{longest}m/component/{component}": 1.0})
+
+    raw = configs.direct_config()
+    metrics = configs.resolve(configs.direct_config())["evaluation"]["metrics"]
+    raw["evaluation"]["metrics"] = [{key: value for key, value in metric.items() if key != "direction"} for metric in metrics]
+    raw["evaluation"]["metrics"][1]["id"] = longest
+    configs.resolve(copy.deepcopy(raw))
+    raw["evaluation"]["metrics"][1]["id"] = f"{longest}m"
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"evaluation\.metrics\[1\]\.id"):
         configs.resolve(raw)
 
 

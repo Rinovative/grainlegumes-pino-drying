@@ -5,7 +5,7 @@ Responsibilities:
   - Compute the physical field statistics of one case: squared and absolute errors, reference and H1 energies
   - Reduce case statistics equally over the cases of a material and over the materials into per-field RMSE, MAE
     and relative norms, and into the one group objective of checkpoint selection, the scheduler, Optuna and ranking
-  - Accumulate these reductions over evaluation batches from explicit normalized or physical views
+  - Accumulate these reductions over evaluation batches from physical views
 
 Design principles:
   - One implementation serves training validation, artifacts and notebooks
@@ -15,7 +15,7 @@ Design principles:
   - Metric implementations never own or apply normalizers
 
 This module does NOT:
-  - Construct normalized or physical tensor views. Evaluation orchestration owns them
+  - Construct the physical tensor views. Evaluation orchestration owns them
   - Log or persist metric results. Callers own observer and storage side effects
 
 Notes:
@@ -53,6 +53,8 @@ RelativeNorm = Literal["l2", "h1"]
 RELATIVE_NORMS: Final[tuple[RelativeNorm, ...]] = ("l2", "h1")
 H1_LENGTH_SCALE_M: Final = 1.0
 H1_INTERIOR_CROP: Final = 2
+# Component key of a relative norm's unavailable case count, the longest component name a metric emits (the config loader bounds ids by it).
+UNAVAILABLE_CASE_VALUES: Final = "unavailable_case_values"
 CASE_STATISTICS: Final = ("count", "squared_error", "absolute_error", "reference_square", "h1_count", "h1_error", "h1_reference")
 _COUNT, _SQUARED, _ABSOLUTE, _REFERENCE, _H1_COUNT, _H1_ERROR, _H1_REFERENCE = range(len(CASE_STATISTICS))
 _NORM_COLUMNS: Final = {"l2": (_COUNT, _SQUARED, _REFERENCE), "h1": (_H1_COUNT, _H1_ERROR, _H1_REFERENCE)}
@@ -782,7 +784,8 @@ class ResolvedMetric:
     id, kind : str
         Stable config identifier and registered implementation kind.
     space : {"normalized", "physical"}
-        Tensor representation required by accumulation.
+        Tensor representation required by accumulation; a normalized RMSE or MAE accumulates physical
+        statistics and divides by its Train scale, the definition of :func:`field_metric_values`.
     fields : tuple[str, ...]
         Exact TaskSpec metric fields included in declared order.
     field_indices : tuple[int, ...]
@@ -796,7 +799,7 @@ class ResolvedMetric:
     groups : tuple[domain.tasks.spec.OutputGroupSpec, ...]
         Task-owned groups of a group metric or of a relative-norm summary.
     field_scales : tuple[float, ...]
-        Train state scales max(sigma, floor) aligned with ``fields`` for group metrics.
+        Train state scales max(sigma, floor) aligned with ``fields`` for group metrics and normalized field errors.
     reference_floors : tuple[float, ...]
         Reference-RMS floors aligned with ``fields`` for relative norms.
 
@@ -1023,16 +1026,18 @@ class FieldRMSEMetric(DatasetMetric):
     """Compute one field's RMSE: per-case mean squared error, equal over cases and materials, then the root."""
 
     def compute(self) -> float:
-        """Return the root of the material-case mean squared error."""
-        return math.sqrt(field_errors(self.statistics()).mse[self.fields[0]])
+        """Return the root of the material-case mean squared error, over the field's Train scale when it has one (normalized)."""
+        rmse = math.sqrt(field_errors(self.statistics()).mse[self.fields[0]])
+        return rmse / self.definition.field_scales[0] if self.definition.field_scales else rmse
 
 
 class FieldMAEMetric(DatasetMetric):
     """Compute one field's MAE: per-case mean absolute error, equal over cases and materials."""
 
     def compute(self) -> float:
-        """Return the material-case mean absolute error."""
-        return field_errors(self.statistics()).mae[self.fields[0]]
+        """Return the material-case mean absolute error, over the field's Train scale when it has one (normalized)."""
+        mae = field_errors(self.statistics()).mae[self.fields[0]]
+        return mae / self.definition.field_scales[0] if self.definition.field_scales else mae
 
 
 class RelativeNormMetric(DatasetMetric):
@@ -1065,7 +1070,7 @@ class RelativeNormMetric(DatasetMetric):
 
     def components(self) -> dict[str, float]:
         """Return the number of unavailable case values below the reference floors."""
-        return {"unavailable_case_values": float(sum(self._norms().unavailable.values()))}
+        return {UNAVAILABLE_CASE_VALUES: float(sum(self._norms().unavailable.values()))}
 
 
 class _CaseGroupMetric(DatasetMetric):
@@ -1285,7 +1290,9 @@ def build_evaluation_metrics(
         fields = _resolved_metric_fields(raw_metric["fields"], task_fields=task.metric_names, metric_id=metric_id)
         groups = resolve_metric_groups(task, kind=kind, fields=fields, metric_id=metric_id)
         grouped = kind in _GROUP_KINDS
-        if grouped and not resolved_scales:
+        # A normalized field error is the artifacts' one definition: physical statistics, the error over the physical Train scale.
+        rescaled = kind in {"rmse", "mae"} and space == "normalized"
+        if (grouped or rescaled) and not resolved_scales:
             msg = f"Metric {metric_id!r} requires the Train state scales."
             raise ValueError(msg)
         direction = str(raw_metric.get("direction", kind_spec.direction))
@@ -1296,14 +1303,14 @@ def build_evaluation_metrics(
         definition = ResolvedMetric(
             id=metric_id,
             kind=kind,
-            space=cast("MetricSpace", space),
+            space="physical" if rescaled else cast("MetricSpace", space),
             fields=fields,
             field_indices=tuple(task.metric_names.index(field) for field in fields),
             reduction="material_case_mean",
             direction=cast("MetricDirection", direction),
             unit=task.metric_field(fields[0]).unit if physical_unit else "1",
             groups=groups,
-            field_scales=tuple(resolved_scales[field] for field in fields) if grouped else (),
+            field_scales=tuple(resolved_scales[field] for field in fields) if grouped or rescaled else (),
             reference_floors=tuple(task.reference_floor(field) for field in fields) if kind in _RELATIVE_KINDS else (),
         )
         metric_class = _METRIC_CLASSES[kind]

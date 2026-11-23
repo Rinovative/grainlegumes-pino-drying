@@ -13,7 +13,9 @@ This module does NOT:
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import tempfile
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -31,6 +33,7 @@ from src import analysis, common, datasets
 from src.experiments import experiments_matched_budget as matched_budget
 from src.experiments import experiments_run as run_service
 from src.learning.training import learning_training_budget as stage_budget
+from src.learning.training import learning_training_history as training_history
 from src.learning.transient.learning_transient_handoff import HANDOFF_DIRECTORY
 
 if TYPE_CHECKING:
@@ -62,9 +65,20 @@ def _budget(unit: str, *, total: int, spent: int) -> dict[str, Any]:
     }
 
 
-def _finished(summary: dict[str, Any]) -> dict[str, Any]:
-    """Return B as validate_finished_run admits it: its summary and its admitted terminal budget."""
-    return {"summary": summary, "terminal_budget": stage_budget.StageBudget(**summary["terminal_budget"])}
+def _finished(summary: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    """
+    Return B as validate_finished_run admits it: its run directory, summary, admitted terminal budget and last checkpoint.
+
+    B's history in ``run_dir`` holds what its receipt reads: one validation at B's terminal spend after its one update,
+    none without one.
+    """
+    budget = stage_budget.StageBudget(**summary["terminal_budget"])
+    run_dir.mkdir(parents=True, exist_ok=True)
+    point, spent = float(budget.validated_point), float(budget.spent)
+    records = [{"validation/point": point, "budget/supervised_transitions": spent, "global_step": 1.0}] if budget.spent else []
+    training_history.history_path(run_dir).write_text(json.dumps({"validations": records}), encoding="utf-8")
+    last = {"update_work": [[budget.units, 1, budget.spent]]}
+    return {"run_dir": run_dir, "summary": summary, "terminal_budget": budget, "last_checkpoint": last}
 
 
 # The selected A0's handoff manifest: every B/A1 receipt of its lineage names these bytes' digest.
@@ -122,9 +136,9 @@ _FIRST_GROUP_DIVERGED_B = {
 
 def _matched_receipt(b_summary: dict[str, Any] = _COMPLETED_B, *, handoff: str = _A0_HANDOFF_SHA256) -> dict[str, Any]:
     """Build the supervised-transition receipt of one finished B under the selected A0 handoff."""
-    return matched_budget.build_b_receipt(
-        parent_identity_sha256="a" * 64, a0_handoff_sha256=handoff, b_config=_B_CONFIG, finished_b=_finished(deepcopy(b_summary))
-    )
+    with tempfile.TemporaryDirectory() as run_dir:
+        finished_b = _finished(deepcopy(b_summary), Path(run_dir))
+        return matched_budget.build_b_receipt(parent_identity_sha256="a" * 64, a0_handoff_sha256=handoff, b_config=_B_CONFIG, finished_b=finished_b)
 
 
 def _frame(arm: str, *, parent: str = "parent") -> pd.DataFrame:
@@ -363,7 +377,8 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_supervised_transitions(tm
                 "best_epoch": 3,
                 "best_checkpoint_sha256": "b" * 64,
                 "last_checkpoint_sha256": "d" * 64,
-            }
+            },
+            tmp_path / "b_history",
         ),
     )
     prepared = tuple(_prepared(tmp_path / arm, arm) for arm in ("a0", "a1", "b"))
@@ -523,7 +538,7 @@ def test_an_unavailable_arm_is_bound_to_its_own_run_and_to_the_selected_a0(monke
         parent_identity_sha256="a" * 64,
         a0_handoff_sha256=_A0_HANDOFF_SHA256,
         b_config=other_b,
-        finished_b=_finished(deepcopy(_FIRST_GROUP_DIVERGED_B)),
+        finished_b=_finished(deepcopy(_FIRST_GROUP_DIVERGED_B), tmp_path / "b_history"),
     )
     runs = {tmp_path / "a1": (_A1_CONFIG, _A1_WITHOUT_RESULT, copied), tmp_path / "b": (_B_CONFIG, _FIRST_GROUP_DIVERGED_B, copied)}
     a0 = (_prepared(tmp_path / "a0", "a0").loaded_run,)

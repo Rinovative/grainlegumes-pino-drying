@@ -74,8 +74,6 @@ def automatic_history_metric_definitions(
         objective_id=objective_id,
         physics_training_enabled=physics_training_enabled,
         physics_monitor_enabled=physics_monitor_enabled,
-        # Training and Optuna evaluate no held-out role, so their history has no OOD series and no OOD page.
-        ood_roles=(),
         cuda_enabled=cuda_enabled,
         optuna_trial=optuna_trial,
         rollout_curriculum=rollout_curriculum,

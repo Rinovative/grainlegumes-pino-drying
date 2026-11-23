@@ -12,10 +12,11 @@ Design principles:
   - The role of a steady frame comes from its explicit saved split role, never from names or paths
   - The objective of a cut is finalized by the artifact contract (equal weight per material, roots after the means), never by a row mean
   - A comparison cut keeps exactly the cases every model shares, so the compared frames stay case-matched
-  - A cut deep-copies the run-level attributes of its source frame and records the effective membership of its rows and the materials
-    of its choice in the selection provenance the comparison admission compares, so cuts holding the same cases are comparable and
-    cuts of different materials are separate datasets; the unchanged source provenance stays as ``attrs["source_artifact_provenance"]``
-  - A cut of a frame bound to a live session is bound once in that session, so redraws reuse its caches
+  - A cut takes its attrs from the session's one cut derivation: the run-level attributes of its source, the source provenance as
+    ``attrs["source_artifact_provenance"]``, and the membership, materials, aggregate and prediction validity of its own rows, so cuts
+    holding the same cases are comparable and cuts of different materials are separate datasets
+  - A cut of a frame bound to a live session is bound once in that session, so redraws reuse its caches; a cut of an unbound frame
+    stays unbound and binds only beside its source
 
 This module does NOT:
   - Load artifacts, admit runs, or decide which role the workflow refuses
@@ -26,7 +27,6 @@ This module does NOT:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
@@ -36,7 +36,6 @@ import numpy as np
 from src.analysis.artifacts import contracts
 from src.analysis.presentation import dataset_selection, display_labels
 
-from . import evaluation_dataframe as dataframe
 from . import evaluation_session
 
 if TYPE_CHECKING:
@@ -61,11 +60,6 @@ EVALUATION_GROUP_LABELS: Final[Mapping[str, str]] = MappingProxyType(
     {role: display_labels.evaluation_role_display_label(role) for role in dataset_selection.EVALUATION_GROUP_ORDER}
 )
 _STEADY_ROLE_BY_SPLIT: Final = {"eval": "id", "material_ood": "material_ood", "parameter_ood": "parameter_ood"}
-# The exact-grid admission cache of a frame lists the payloads of all its rows; a cut would fail it as changed membership.
-_GRID_CACHE_ATTR: Final = "_exact_comparison_grid_cache"
-# A cut is a new frame, so it must not inherit the live session reference of its source (a deepcopy of the session returns the
-# session itself): the source's live session binds it explicitly, and an unbound cut gets an ephemeral session like any direct caller.
-_UNSHARED_ATTRS: Final = frozenset({_GRID_CACHE_ATTR, evaluation_session.SESSION_ATTR, evaluation_session.SESSION_KEY_ATTR})
 _NO_REFUSED: Final[Mapping[str, str]] = MappingProxyType({})
 # A role refused as a whole has no known materials; its unavailable item carries this empty material.
 _WHOLE_ROLE: Final = ""
@@ -146,33 +140,14 @@ def _cases_by_material(frame: pd.DataFrame) -> dict[str, set[str]]:
     return cases
 
 
-def _cut(frame: pd.DataFrame, keep: Sequence[bool], *, materials: Iterable[str]) -> pd.DataFrame:
+def _cut(frame: pd.DataFrame, keep: Sequence[bool]) -> pd.DataFrame:
     """
-    Return the kept rows, the objective recomputed material-balanced on them, and their membership and materials as provenance.
+    Return the kept rows with the attrs of a cut, whose objective is recomputed material-balanced on them.
 
     A cut of a frame bound to a live session is bound once in that session, so every redraw returns the same frame and hits its caches.
     """
-    provenance = dataframe.require_complete_provenance(frame)
     subset = frame[np.asarray(keep, dtype=bool)].copy()
-    aggregate = contracts.aggregate_normalized_group_macro_rmse(
-        subset,
-        output_groups=provenance["evaluator"]["output_groups"],
-        train_scales=frame.attrs["train_scales"],
-        reference_floors=frame.attrs["reference_floors"],
-    )
-    attrs = {key: deepcopy(value) for key, value in frame.attrs.items() if key not in _UNSHARED_ATTRS}
-    selection = {
-        **attrs["artifact_provenance"]["selection"],
-        "effective_ordered_source_indices_sha256": contracts.ordered_indices_sha256(int(index) for index in subset["source_index"]),
-        "effective_case_count": len(subset),
-        "material_families": sorted(materials),
-    }
-    subset.attrs = {
-        **attrs,
-        "artifact_provenance": {**attrs["artifact_provenance"], "selection": selection},
-        "source_artifact_provenance": deepcopy(dict(provenance)),
-        dataframe.PRIMARY_OBJECTIVE_ID: dict(aggregate),
-    }
+    subset.attrs = evaluation_session.cut_attrs(frame, subset)
     session = evaluation_session.bound_session(frame)
     return subset if session is None else session.bind_cut(frame, subset)
 
@@ -285,16 +260,17 @@ def steady_frames(frames: Mapping[str, pd.DataFrame], choices: Iterable[dataset_
             message = f"No steady frame holds role {choice.group!r} for dataset choice {choice.label!r}."
             raise ValueError(message)
         frame = by_role[choice.group]
+        membership = contracts.artifact_case_membership(frame)
         materials = {item.material for item in choice.items}
-        missing = materials - _cases_by_material(frame).keys()
+        missing = materials - {material for _case_id, material in membership}
         if missing:
             message = f"Steady frame of role {choice.group!r} holds no cases of materials {sorted(missing)}."
             raise ValueError(message)
         if choice.label in drawn:
             message = f"Dataset choice label {choice.label!r} is not unique."
             raise ValueError(message)
-        keep = [material in materials for _case_id, material in contracts.artifact_case_membership(frame)]
-        drawn[choice.label] = _cut(frame, keep, materials=materials)
+        keep = [material in materials for _case_id, material in membership]
+        drawn[choice.label] = _cut(frame, keep)
     return DisplayFrames(drawn, {label: (label, model) for label in drawn})
 
 
@@ -368,7 +344,7 @@ def comparison_frames(frames_by_model: Mapping[str, pd.DataFrame], choice: datas
             message = f"Material {material!r} has no case shared by all models of role {choice.group!r}."
             raise ValueError(message)
     cuts = {
-        model: _cut(frames_by_model[model], [case_id in shared.get(material, ()) for case_id, material in rows], materials=shared)
+        model: _cut(frames_by_model[model], [case_id in shared.get(material, ()) for case_id, material in rows])
         for model, rows in memberships.items()
     }
     return DisplayFrames(cuts, {model: (choice.label, model) for model in cuts})
@@ -380,8 +356,18 @@ def transient_inventory(session: TransientEvaluationSession, *, refused: Mapping
 
     The role of a case is its declared evaluation-assignment role, else the role of its artifact.
     A role the workflow refused is one unavailable role-level item with its reason.
+
+    Raises
+    ------
+    ValueError
+        If a refused role also holds loaded cases.
+
     """
     pairs = {(_entry_role(entry), entry.material_family) for entry in session.case_inventory()}
+    loaded = sorted({role for role, _material in pairs}.intersection(refused))
+    if loaded:
+        message = f"Roles {loaded} are both refused and loaded."
+        raise ValueError(message)
     items = [_item(material, role) for role, material in sorted(pairs, key=lambda pair: (pair[1], pair[0]))]
     return _inventory(items, _refused_items(refused), poolable=False)
 

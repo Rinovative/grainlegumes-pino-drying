@@ -4,6 +4,7 @@ Responsibilities:
   - Execute safe one-node COMSOL commands and retain complete runtime evidence
   - Classify a solve the runtime stopped as stalled, timed_out, or solver_error, with a human detail of its progress
   - Collect explicit raw adapters and convert them to canonical case.h5
+  - Carry a typed conversion rejection (negative_water_state) with its numbers on the case failure
   - Publish non-authoritative case phases without changing solver outcomes
   - Publish cases, recover hash-bound Full-Retention HDF5, and admit terminal batches
 
@@ -170,7 +171,7 @@ _SHELL_SIGNAL_EXIT_BASE = 128  # a launcher shell reports a death by signal n as
 
 
 class CaseExecutionError(RuntimeError):
-    """Report one failed case with structured execution evidence and, when the runtime classified the stop itself, its reason."""
+    """Report one failed case with structured execution evidence and, when the runtime or the conversion classified it, its reason."""
 
     def __init__(
         self,
@@ -183,6 +184,8 @@ class CaseExecutionError(RuntimeError):
         missing_or_invalid_artifacts: tuple[str, ...] = (),
         failure_stage: str = "solver",
         runtime_reason: RuntimeFailureReason | None = None,
+        validation_reason: str | None = None,
+        validation_evidence: Mapping[str, Any] | None = None,
     ) -> None:
         """Initialize one structured case-execution failure."""
         super().__init__(message)
@@ -197,6 +200,9 @@ class CaseExecutionError(RuntimeError):
             raise ValueError(message)
         self.failure_stage = failure_stage
         self.runtime_reason = runtime_reason
+        # A typed conversion rejection (its reason code and JSON-ready numbers) that the campaign records and decides.
+        self.validation_reason = validation_reason
+        self.validation_evidence = None if validation_evidence is None else dict(validation_evidence)
 
 
 class CaseCleanupError(RuntimeError):
@@ -2010,6 +2016,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
             solver_metrics=solver_metrics,
         )
     except Exception as error:
+        rejection = error if isinstance(error, storage_service.NegativeWaterStateError) else None
         raise CaseExecutionError(
             str(error),
             work_directory=prepared.work_directory,
@@ -2017,6 +2024,8 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
             exit_code=exit_code,
             missing_or_invalid_artifacts=(str(error),),
             failure_stage="conversion",
+            validation_reason=None if rejection is None else rejection.reason_code,
+            validation_evidence=None if rejection is None else rejection.evidence,
         ) from error
     export_conversion_seconds = time.monotonic() - export_conversion_start
     source_export_bytes = sum(export.size_bytes for export in exports)

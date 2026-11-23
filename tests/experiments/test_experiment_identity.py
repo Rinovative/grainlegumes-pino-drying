@@ -166,6 +166,26 @@ def test_incomplete_child_navigation_does_not_admit_completed_evidence(tmp_path:
         run_service.validate_completed_run(run_dir)
 
 
+def test_incomplete_child_navigation_binds_the_parent_stage_identity(tmp_path: Path) -> None:
+    """An interrupted child whose saved config agrees with its own run identity but not with its parent's stage is refused."""
+    stages = _plan(tmp_path)
+    authored = configs.write_yaml(tmp_path / "plan.yaml", configs.transient_matched_config())
+    record = _record(stages, authored)
+    marker = identity.admit_fresh_transient_experiment_record(record, output_root=tmp_path)
+    run_dir = common.paths.resolve_config_run_dir(stages[1])
+    # Another curriculum keeps B's run name and layout, so only the scientific identity tells the configs apart.
+    changed = copy.deepcopy(stages[1])
+    changed["training"]["curriculum"]["milestone_fractions"] = [0.0, 0.25]
+    configs.write_yaml(run_dir / "config.yaml", changed)
+    common.serialization.atomic_write_json(
+        run_dir / "summary.json",
+        {"status": "interrupted", "run_identity": {"resolved_config_sha256": identity.resolved_config_digest(changed)}},
+    )
+
+    with pytest.raises(ValueError, match="immutable parent"):
+        identity.resolve_readonly_experiment_child(record, record["children"]["stage_b"], marker=marker, output_root=tmp_path)
+
+
 def test_another_k_is_another_experiment_with_its_own_identity_and_location(tmp_path: Path) -> None:
     """Units per update belong to the run identity and its name, so another k never continues or shares the first parent."""
     original_raw = configs.transient_matched_config()
@@ -257,13 +277,14 @@ def test_pairs_with_other_branch_settings_share_the_seed_group_a0(tmp_path: Path
 
 
 def test_same_pair_with_other_content_conflicts_at_the_parent_record(tmp_path: Path) -> None:
-    """One pair name binds one content: changed B settings under the same pair are refused, not renamed."""
+    """One pair name binds one content: B settings the key renders alike (three significant digits) under the same pair are refused, not renamed."""
     raw = configs.transient_matched_config()
+    raw["training"]["b"]["curriculum"]["milestone_fractions"] = [0.0, 0.25]
     first = _plan(tmp_path, raw)
     source = configs.write_yaml(tmp_path / "plan.yaml", raw)
     identity.admit_fresh_transient_experiment_record(_record(first, source), output_root=tmp_path)
     changed = copy.deepcopy(raw)
-    changed["training"]["b"]["curriculum"]["milestone_fractions"] = [0.0, 0.25]
+    changed["training"]["b"]["curriculum"]["milestone_fractions"] = [0.0, 0.2501]  # the pair key shows both as 0p25
 
     second = _plan(tmp_path, changed)
 

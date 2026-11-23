@@ -135,7 +135,7 @@ EDA_SECTIONS = (
             ),
             PlotPresentation(
                 "transient_state_trajectories",
-                "Reference physical trajectories",
+                "Reference trajectories over drying phase and hours",
                 frozenset({"transient_state", "physical_time"}),
             ),
             PlotPresentation(

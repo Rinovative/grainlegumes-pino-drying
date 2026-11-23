@@ -438,20 +438,24 @@ def _draw_map_plus_lines_03() -> object:
 
 
 def _draw_time_series_02() -> object:
-    """Draw the aggregated schedules and trajectories of two Source batches."""
-    return eda_plots.plot_state_trajectory_summary(datasets=_eda_datasets(), max_cases=2, styles=_eda_styles(), channels=("T", "phi"))
+    """Draw the aggregated schedules in hours and the reached cases' trajectories over the drying phase of two Source batches."""
+    return eda_plots.plot_state_trajectory_summary(
+        datasets=_eda_datasets(), max_cases=2, styles=_eda_styles(), channels=("T", "phi"), time_axis="phase"
+    )
 
 
 def _draw_time_series_04() -> object:
-    """Draw the mean reference and predicted trajectories of both runs."""
-    return plots.plot_state_trajectory_summary(_records(), state_fields=_FIELDS, styles=_session().series_styles())
+    """Draw the mean reference and predicted trajectories of both runs over the drying phase, the pooled views' default."""
+    return plots.plot_state_trajectory_summary(_records(), state_fields=_FIELDS, styles=_session().series_styles(), time_axis="phase")
 
 
 def _draw_time_series_05() -> object:
-    """Draw the error over physical time of both runs."""
+    """Draw the error of both runs over the drying phase, the pooled views' default."""
     evaluation = _session()
     scales = {name: evaluation.scaling_state(name) for name in evaluation.frame_names}
-    return plots.plot_error_over_physical_time(_records(), scaling_states=scales, state_fields=_FIELDS, styles=evaluation.series_styles())
+    return plots.plot_error_over_physical_time(
+        _records(), scaling_states=scales, state_fields=_FIELDS, styles=evaluation.series_styles(), time_axis="phase"
+    )
 
 
 def _draw_time_series_06() -> object:
@@ -564,7 +568,7 @@ ENTRIES: Final[tuple[CatalogPlot, ...]] = (
     CatalogPlot("map-plus-lines_03", "Transient snapshots with context", (f"{_EDA}.plot_state_snapshot_comparison",), _draw_map_plus_lines_03),
     CatalogPlot("time-series_02", "Dataset trajectories", (f"{_EDA}.plot_state_trajectory_summary",), _draw_time_series_02),
     CatalogPlot("time-series_04", "Reference and predicted trajectories", (f"{_EVALUATION}.plot_state_trajectory_summary",), _draw_time_series_04),
-    CatalogPlot("time-series_05", "Error over physical time", (f"{_EVALUATION}.plot_error_over_physical_time",), _draw_time_series_05),
+    CatalogPlot("time-series_05", "Error over drying phase", (f"{_EVALUATION}.plot_error_over_physical_time",), _draw_time_series_05),
     CatalogPlot("time-series_06", "Horizon error", (f"{_EVALUATION}.plot_horizon_error",), _draw_time_series_06),
     CatalogPlot(
         "time-series_07", "Training performance over compute", (f"{_EVALUATION}.plot_training_performance_vs_compute",), _draw_time_series_07

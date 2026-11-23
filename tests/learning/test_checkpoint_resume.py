@@ -2,7 +2,10 @@
 
 Responsibilities:
   - Check exact resumed state, the wall-time last-checkpoint cadence, checkpoint roles and payload
-    kinds, transactional restore, evaluation cadence, and objective selection
+    kinds, a global step equal to the committed updates, transactional restore, evaluation cadence,
+    and objective selection
+  - Check that checkpoint and history admit a resume only in the producing container, while reading
+    admits a native and a container checkpoint alike
 
 Design principles:
   - Synthetic deterministic training distinguishes best selection from last resume state
@@ -76,14 +79,14 @@ class _MappingDataset(Dataset[dict[str, torch.Tensor]]):
 
 class _DatasetMSE:
     """
-    Accumulate normalized MSE from global squared-error/count evidence.
+    Accumulate physical MSE from global squared-error/count evidence.
 
     The helper mirrors the evaluation metric protocol but omits field selection,
     units, and distributed state so checkpoint tests isolate lifecycle behavior.
     """
 
     id = "mse"
-    space = "normalized"
+    space = "physical"
 
     def reset(self) -> None:
         """Clear accumulated squared error and element count."""
@@ -98,7 +101,7 @@ class _DatasetMSE:
         space: str,
         batch_index: int,
     ) -> None:
-        """Accumulate one normalized batch using elementwise SSE and count."""
+        """Accumulate one physical batch using elementwise SSE and count."""
         del batch_index
         assert space == self.space
         difference = pred - target
@@ -147,7 +150,7 @@ class _ObjectiveStreamMetric(_DatasetMSE):
         space: str,
         batch_index: int,
     ) -> None:
-        """Validate normalized routing without accumulating batch values."""
+        """Validate physical routing without accumulating batch values."""
         del pred, target, batch_index
         assert space == self.space
 
@@ -668,6 +671,7 @@ def _history_loop(
         **binding,
         completed_epoch=0 if saved is None else learning.training.checkpoint.recorded_history_epochs(saved),
         validations=[] if saved is None else saved["objective_history"],
+        global_step=0 if saved is None else saved["global_step"],
     )
     experiments.run.seed_process(41, device=torch.device("cpu"))
     dataset = _MappingDataset()
@@ -1077,6 +1081,72 @@ def test_schema_or_identity_failure_precedes_runtime_mutation(tmp_path: Path, mi
 
 
 @pytest.mark.parametrize(
+    ("saved", "actual"),
+    [(None, "a" * 64), ("a" * 64, None), ("a" * 64, "b" * 64), ("a" * 64, "a" * 64)],
+    ids=("native-run-in-container", "container-run-natively", "another-container", "same-container"),
+)
+def test_resume_admits_only_the_container_its_run_was_produced_in(tmp_path: Path, saved: str | None, actual: str | None) -> None:
+    """
+    Checkpoint and history admit a resume only at the producing SIF digest, native only natively.
+
+    Reading a checkpoint admits a native and a container run alike, never two different containers.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _run(run_dir, epochs=2, seed=7)
+    payload = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    payload["identity"]["numerical_environment"]["sif_sha256"] = saved
+    expected = _identity()
+    expected["numerical_environment"]["sif_sha256"] = actual
+    binding: dict[str, Any] = {"task": "steady_flow", "run_name": "run"}
+    learning.training.history.make_epoch_state_callback(run_dir, **binding, checkpoint_identity=payload["identity"])(1, {"global_step": 1.0}, None)
+    model, optimizer, scheduler, loss, train_loader, _ = _components(99)
+    before = copy.deepcopy(model.state_dict())
+
+    def restore() -> None:
+        learning.training.checkpoint.restore_checkpoint(
+            payload,
+            expected_identity=expected,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            loss=loss,
+            train_loader=train_loader,
+            budget=_budget(2),
+        )
+
+    def reconcile() -> None:
+        learning.training.history.reconcile_history(
+            run_dir, **binding, checkpoint_identity=expected, completed_epoch=1, validations=[], global_step=1
+        )
+
+    read = learning.training.checkpoint.validate_checkpoint
+
+    def admit_resume() -> None:
+        """Validate the last checkpoint as a continuation source, as the run's resume admission does before restoring it."""
+        read(payload, expected_identity=expected, expected_role="last", payload_kind="full", scheduler_expected=True, require_best=False, resume=True)
+
+    def admit_reading() -> None:
+        read(payload, expected_identity=expected, expected_role="last", payload_kind="full", scheduler_expected=True, require_best=False)
+
+    if None in (saved, actual) or saved == actual:
+        # Inference and artifact reading admit a native and a container run alike.
+        admit_reading()
+    else:
+        with pytest.raises(ValueError, match="identity is incompatible"):
+            admit_reading()
+    if saved == actual:
+        admit_resume()
+        restore()
+        reconcile()
+        return
+    for admit in (admit_resume, restore, reconcile):
+        with pytest.raises(ValueError, match="identity"):
+            admit()
+    _assert_nested_equal(before, model.state_dict())
+
+
+@pytest.mark.parametrize(
     "value",
     [math.nan, math.inf],
     ids=("nan", "infinity"),
@@ -1216,7 +1286,7 @@ def test_late_restore_failure_rolls_back_every_runtime_state() -> None:
         payload_kind="full",
         identity=_identity("transactional"),
         completed_epoch=1,
-        global_step=1,
+        global_step=0,
         model=source_model,
         optimizer=source_optimizer,
         scheduler=source_scheduler,
@@ -1474,8 +1544,8 @@ def test_best_payload_kind_and_exact_key_set_fail_closed(tmp_path: Path) -> None
         objective_history=evaluation_best["objective_history"],
         train_loader=train_loader,
         runtime_device=torch.device("cpu"),
-        training_work=_NO_WORK,
-        update_work=[],
+        training_work=evaluation_best["training_work"],
+        update_work=evaluation_best["update_work"],
         budget=learning.training.budget.StageBudget(**evaluation_best["budget_state_dict"]),
     )
     missing = {key: value for key, value in evaluation_best.items() if key != "loss_state_dict"}
@@ -1498,6 +1568,8 @@ def test_best_payload_kind_and_exact_key_set_fail_closed(tmp_path: Path) -> None
         (full_best, "evaluation", "payload_kind mismatch: expected 'evaluation', got 'full'"),
         (missing, "evaluation", r"Missing keys: \['loss_state_dict'\]"),
         (extra, "evaluation", r"Unknown keys: \['optimizer_state_dict'\]"),
+        # An evaluation payload keeps the step and the committed work of its best: one optimizer step each.
+        ({**evaluation_best, "global_step": evaluation_best["global_step"] + 1}, "evaluation", "global_step must equal"),
     )
     for payload, kind, match in rejected:
         with pytest.raises(ValueError, match=match):
@@ -1522,7 +1594,7 @@ def test_full_payloads_bind_the_unit_sampler_state_and_refuse_loader_generator_p
     common: dict[str, Any] = {
         "identity": _identity(),
         "completed_epoch": 1,
-        "global_step": 4,
+        "global_step": 1,
         "model": model,
         "optimizer": optimizer,
         "scheduler": scheduler,
@@ -1559,6 +1631,9 @@ def test_full_payloads_bind_the_unit_sampler_state_and_refuse_loader_generator_p
         validate(legacy)
     with pytest.raises(ValueError, match="disagrees with its training_work"):
         validate({**partial, "update_work": [[3, 3, 3], [3, 3, 3]]})
+    # Its global step is its committed updates: a step of 100 over one committed update would place history at step 100.
+    with pytest.raises(ValueError, match="global_step must equal"):
+        validate({**partial, "global_step": 100})
     # A point's per-case bound evidence is required and holds finite hours only.
     entry = partial["objective_history"][0]
     missing = {key: value for key, value in entry.items() if key != "bound_violations"}

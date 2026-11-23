@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check regular/exact-stop time admission and one complete post-horizon exclusion
+  - Check that a negative stored water state fails the conversion with its recorded undershoot numbers
 
 Design principles:
   - Raw globals and final status must agree before canonical terminal projection
@@ -13,13 +14,16 @@ This module does NOT:
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
 
 from src import generation
 from src.generation.contracts import generation_contracts_profiles as profiles
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.mark.parametrize(
@@ -192,3 +196,130 @@ def test_post_horizon_state_requires_raw_global_field_and_final_status_consisten
             final_status,
             f_surf=0.4,
         )
+
+
+def _water_states(w_surf: list[list[float]], w_int: list[list[float]]) -> np.ndarray:
+    """Return stored transient states on a 1 x 2 grid with the given water values per state and constant T and phi."""
+    states = np.empty((len(w_surf), len(profiles.TRANSIENT_FIELD_NAMES), 1, 2))
+    states[:, profiles.TRANSIENT_FIELD_NAMES.index("T")] = 300.0
+    states[:, profiles.TRANSIENT_FIELD_NAMES.index("phi")] = 0.5
+    states[:, profiles.TRANSIENT_FIELD_NAMES.index("w_surf"), 0] = w_surf
+    states[:, profiles.TRANSIENT_FIELD_NAMES.index("w_int"), 0] = w_int
+    return states
+
+
+_INTERMEDIATE_NEGATIVE = (
+    np.asarray([0.0, 1.0, 2.0, 3.0]),
+    _water_states([[10.0, 10.0], [-0.5, 2.0], [-0.75, -0.1], [1.0, 1.0]], [[10.0, 10.0], [3.0, -0.25], [1.0, 1.0], [0.5, 1.0]]),
+    None,
+    None,
+    None,
+    None,
+)
+_FINAL_NEGATIVE = (
+    np.asarray([0.0, 1.0]),
+    _water_states([[10.0, 10.0], [5.0, 5.0]], [[10.0, 10.0], [5.0, 5.0]]),
+    1.5,
+    _water_states([[0.2, 0.3]], [[-0.01, 0.4]])[0],
+    None,
+    None,
+)
+_POST_HORIZON_NEGATIVE = (
+    np.asarray([0.0, 1.0, 2.0]),
+    _water_states([[10.0, 10.0], [5.0, 5.0], [1.0, 1.0]], [[10.0, 10.0], [5.0, 5.0], [1.0, 1.0]]),
+    None,
+    None,
+    2.25,
+    _water_states([[0.1, 0.3]], [[-0.3, 0.4]])[0],
+)
+_NON_NEGATIVE = (
+    np.asarray([0.0, 1.0]),
+    _water_states([[10.0, 10.0], [0.0, 5.0]], [[10.0, 10.0], [5.0, 0.0]]),
+    None,
+    None,
+    2.25,
+    _water_states([[0.0, 1.0]], [[1.0, 0.0]])[0],
+)
+
+
+@pytest.mark.parametrize(
+    ("transient", "expected"),
+    [
+        (
+            _INTERMEDIATE_NEGATIVE,
+            {
+                "stored_state_count": 4,
+                "first_negative_time_h": 1.0,
+                "last_negative_time_h": 2.0,
+                "minimum_time_h": 2.0,
+                "post_horizon_state_checked": False,
+                "w_surf": {"unit": "kg/m^3", "minimum": -0.75, "negative_value_count": 3, "negative_state_count": 2},
+                "w_int": {"unit": "kg/m^3", "minimum": -0.25, "negative_value_count": 1, "negative_state_count": 1},
+            },
+        ),
+        (
+            _FINAL_NEGATIVE,
+            {
+                "stored_state_count": 3,
+                "first_negative_time_h": 1.5,
+                "last_negative_time_h": 1.5,
+                "minimum_time_h": 1.5,
+                "post_horizon_state_checked": False,
+                "w_surf": {"unit": "kg/m^3", "minimum": 0.2, "negative_value_count": 0, "negative_state_count": 0},
+                "w_int": {"unit": "kg/m^3", "minimum": -0.01, "negative_value_count": 1, "negative_state_count": 1},
+            },
+        ),
+        (
+            _POST_HORIZON_NEGATIVE,
+            {
+                "stored_state_count": 3,
+                "first_negative_time_h": 2.25,
+                "last_negative_time_h": 2.25,
+                "minimum_time_h": 2.25,
+                "post_horizon_state_checked": True,
+                "w_surf": {"unit": "kg/m^3", "minimum": 0.1, "negative_value_count": 0, "negative_state_count": 0},
+                "w_int": {"unit": "kg/m^3", "minimum": -0.3, "negative_value_count": 1, "negative_state_count": 1},
+            },
+        ),
+        (_NON_NEGATIVE, None),
+    ],
+    ids=["intermediate_state", "exact_stop_state", "post_horizon_state", "non_negative"],
+)
+def test_conversion_rejects_any_negative_stored_water_state_with_its_numbers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, transient: tuple[Any, ...], expected: dict[str, Any] | None
+) -> None:
+    """A negative w_surf or w_int value in any stored or post-horizon state fails the conversion unclipped; non-negative states pass on."""
+    storage = generation.publication.storage
+    profile = SimpleNamespace(id=profiles.TRANSIENT_DRYING_PROFILE)
+    config = cast("Any", SimpleNamespace(profile=profile, scientific_values={"scientific_fixed_values": {}}))
+    scalar_values = np.full(len(profiles.scalar_input_fields(profiles.TRANSIENT_DRYING_PROFILE)), 0.4)
+    axes = (np.asarray([0.0, 1.0]), np.asarray([0.0]))
+    fields = [array for array in transient if isinstance(array, np.ndarray) and array.ndim > 1]
+    stored = [array.copy() for array in fields]
+
+    def passed(*_args: Any, **_kwargs: Any) -> Any:
+        message = "non-negative states reached the schedule adapter"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(storage, "_static_fields", lambda *_args: (*axes, np.ones((1, 1, 2))))
+    monkeypatch.setattr(storage, "_stationary_fixed_values", lambda *_args: np.zeros(0))
+    monkeypatch.setattr(storage.scalar_handoff_contract, "admit_case_scalar_handoff", lambda *_args: SimpleNamespace(values=scalar_values))
+    monkeypatch.setattr(storage, "_transient_fields", lambda *_args, **_kwargs: transient)
+    monkeypatch.setattr(storage, "_schedule_values", passed)
+
+    def convert() -> None:
+        storage.convert_exports_to_hdf5(config, {}, (), work_directory=tmp_path, runtime_directory=tmp_path, runtime_seconds=1.0)
+
+    if expected is None:
+        with pytest.raises(RuntimeError, match="reached the schedule adapter"):
+            convert()
+        return
+    with pytest.raises(storage.NegativeWaterStateError) as error:
+        convert()
+    assert (error.value.reason_code, error.value.evidence) == ("negative_water_state", expected)
+    assert str(expected["w_int"]["minimum"]) in str(error.value)
+    assert (f"{expected['stored_state_count']} stored states and the post-horizon state at t=2.25 h" in str(error.value)) is expected[
+        "post_horizon_state_checked"
+    ]
+    for array, original in zip(fields, stored, strict=True):
+        np.testing.assert_array_equal(array, original)  # never clipped
