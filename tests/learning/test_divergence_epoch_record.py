@@ -52,17 +52,16 @@ class _Cases(Dataset[dict[str, torch.Tensor]]):
 
 
 class _ConstantMSE:
-    """Report one constant normalized objective, so the first validation is eligible and the best."""
+    """Report one constant objective, so the first validation is eligible and the best."""
 
     id = "mse"
-    space = "normalized"
 
     def reset(self) -> None:
         """Hold no accumulated state."""
 
-    def update(self, pred: torch.Tensor, target: torch.Tensor, *, space: str, batch_index: int) -> None:
-        """Accept every normalized batch without accumulating."""
-        del pred, target, space, batch_index
+    def update(self, pred: torch.Tensor, target: torch.Tensor, *, batch_index: int) -> None:
+        """Accept every physical batch without accumulating."""
+        del pred, target, batch_index
 
     def compute(self) -> float:
         """Return the constant objective."""

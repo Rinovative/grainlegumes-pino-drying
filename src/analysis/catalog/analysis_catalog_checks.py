@@ -129,11 +129,7 @@ def _history(stage: str, *, start_epoch: int = 0, pipeline: str = "a0") -> disco
 
 
 def _draw_time_series_08() -> object:
-    histories: dict[str, discovery.StageHistory | discovery.UnavailableHistory] = {
-        "A0": _history("A0"),
-        "B": _history("B", start_epoch=2),
-        "old": discovery.UnavailableHistory(Path("old"), "no history"),
-    }
+    histories = {"A0": _history("A0"), "B": _history("B", start_epoch=2)}
     return training.plot_training_curves(histories)
 
 

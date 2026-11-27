@@ -2,7 +2,8 @@
 
 Responsibilities:
   - Compute Hann-windowed isotropic and x/y directional power spectra
-  - Show cumulative bandwidth with casewise uncertainty over ordered prefixes
+  - Show power and cumulative bandwidth with casewise uncertainty over ordered prefixes, each direction as a column pair of
+    one frequency axis, every cumulative panel on one range
   - Resolve both complementary position-dependent spectral orientations
   - Enforce per-field units, stored representations, and Cartesian grids
 
@@ -10,6 +11,9 @@ Design principles:
   - Frequencies use coordinate-derived units of inverse metres
   - Flow-position-resolved power is normalized within each row before case aggregation
   - Dataset comparisons never combine incompatible stored field representations
+  - Row headers name the displayed quantity without unit; power axes carry the squared unit, a dimensionless one as [-]
+  - A requested subset is validated and selected on the dataset keys; figure text then names the selected datasets by their
+    plotted labels (``eda_capabilities.plotted_labels``), while frames and styles stay keyed by the dataset key
 
 This module does NOT:
   - Load model-training datasets or infer undeclared task fields
@@ -18,6 +22,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import math
 import re
 from typing import TYPE_CHECKING, Any, Final, Literal
 
@@ -53,24 +58,26 @@ _POWER_FRACTION_FLOOR = 1e-12
 _CROSS_STREAM_ALONG_FLOW: Final[SpectralEvolutionOrientation] = "cross_stream_along_flow"
 _FLOW_ACROSS_CROSS_STREAM: Final[SpectralEvolutionOrientation] = "flow_across_cross_stream"
 _CASE_ID_PATTERN = re.compile(r"case_([0-9]{4,})")
-_DIMENSIONLESS_REPRESENTATION_LABELS = {
-    "dimensionless_log10_ratio_to_1_m2": "log10(k / 1 m²)",
-    "dimensionless_cross_component_ratio_to_geometric_mean": "kij / sqrt(kii kjj)",
-}
-_PHYSICAL_REPRESENTATION_LABELS = {
-    "absolute_physical_state": "physical values",
-    "identity": "physical values",
-    "identity_before_train_normalization": "physical values",
-    "derived_speed_magnitude": "derived magnitude |u|",
-}
-_PHYSICAL_VALUE_REPRESENTATIONS = frozenset(
+_SUPPORTED_REPRESENTATIONS = frozenset(
     {
         "absolute_physical_state",
         "identity",
         "identity_before_train_normalization",
         "derived_speed_magnitude",
+        "dimensionless_log10_ratio_to_1_m2",
+        "dimensionless_cross_component_ratio_to_geometric_mean",
     }
 )
+_K_X: Final = "$k_x$"  # the typeset spatial frequencies of the directional labels
+_K_Y: Final = "$k_y$"
+# The spectrum of every column pair (power, cumulative energy): its title and its frequency label, to which the unit is added.
+_DIRECTIONS: Final = {
+    "isotropic": ("Isotropic", "Spatial frequency k"),
+    "y": ("Flow direction y", f"Flow-direction spatial frequency {_K_Y}"),
+    "x": ("Cross-stream direction x", f"Cross-stream spatial frequency {_K_X}"),
+}
+_CUMULATIVE_FOCUS = 0.5  # cumulative axes whose every drawn value lies above this start just below the lowest one, not at 0
+_CUMULATIVE_STEP = 0.05  # the round step of a focused cumulative axis' lower limit
 
 
 def available_case_numbers(frame: pd.DataFrame) -> tuple[int, ...]:
@@ -185,13 +192,10 @@ def _select_datasets(
     return {name: datasets[name] for name in available if name in requested_set}
 
 
-def _case_count_text(datasets: dict[str, pd.DataFrame], *, max_cases: int) -> str:
-    """Report only actual displayed case counts; selection mechanics stay internal."""
-    counts = {label: min(max_cases, len(frame)) for label, frame in datasets.items()}
-    unique_counts = set(counts.values())
-    if len(unique_counts) == 1:
-        return f"{next(iter(unique_counts))} cases"
-    return ", ".join(f"{label}: {count} cases" for label, count in counts.items())
+def _case_count(selected_datasets: dict[str, pd.DataFrame], resolution: capabilities.ResolvedFieldSelection, max_cases: int) -> tuple[str, str]:
+    """Return a summary's title count and note of the bound, naming the datasets that draw by the labels its figure writes."""
+    plotted = capabilities.plotted_labels(selected_datasets)
+    return transient_plots.case_count_text(capabilities.contributing_frames(selected_datasets, resolution), max_cases, plotted=plotted)
 
 
 def _stored_state_scope_text(datasets: dict[str, pd.DataFrame]) -> str:
@@ -241,22 +245,6 @@ def _field_representation(frame: pd.DataFrame, field: str) -> str:
     return capabilities.field_representation(frame, field)
 
 
-def _stored_representation_label(frame: pd.DataFrame, field: str) -> str:
-    """Return one explicit human-readable stored-value representation."""
-    representation = _field_representation(frame, field)
-    labels = {**_DIMENSIONLESS_REPRESENTATION_LABELS, **_PHYSICAL_REPRESENTATION_LABELS}
-    try:
-        return labels[representation]
-    except KeyError as error:
-        msg = f"EDA field {field!r} has unsupported stored representation {representation!r}."
-        raise ValueError(msg) from error
-
-
-def _field_row_label(frame: pd.DataFrame, field: str) -> str:
-    """Return one unit-bearing row label; it names a dimensionless stored representation itself."""
-    return capabilities.field_quantity_label(frame, field, mathtext=True)
-
-
 def _finish_matrix(
     figure: Figure,
     axes: np.ndarray,
@@ -264,11 +252,18 @@ def _finish_matrix(
     *,
     title: str,
     row_headers: Sequence[str],
+    plotted: Mapping[str, str],
     legend_axes: Iterable[Axes] = (),
+    note: str = "",
 ) -> None:
-    """Write the row headers, the title with its availability note and the dataset legend collected from ``legend_axes``."""
+    """
+    Write the row headers (quantities without unit), the title with its ``note`` and availability note, and the dataset legend.
+
+    The legend is collected from ``legend_axes``; the availability note names the datasets as ``plotted`` writes them.
+    """
     figure_layout.set_row_headers(figure, axes, row_headers)
-    figure_layout.set_figure_title(figure, axes, title, note=capabilities.availability_note(resolution) or None)
+    notes = " ".join(part for part in (note, capabilities.availability_note(resolution, plotted=plotted)) if part)
+    figure_layout.set_figure_title(figure, axes, title, note=notes or None)
     handles, labels = figure_layout.legend_entries(legend_axes)
     if labels:
         wrapped = [display_labels.wrapped_dataset_display_label(label, width=transient_plots.LEGEND_WRAP_WIDTH) for label in labels]
@@ -282,14 +277,14 @@ def _hide_x_text(axis: Axes) -> None:
 
 
 def _spectral_power_ylabel(frame: pd.DataFrame, field: str) -> str:
-    """Label spectral power of the displayed values, whose mean-removed fluctuations carry the difference unit."""
+    """Label spectral power of the displayed values by the squared difference unit of their mean-removed fluctuations: Pa², (m/s)², or -."""
     representation = _field_representation(frame, field)
-    if representation in _DIMENSIONLESS_REPRESENTATION_LABELS:
-        return f"Mean spectral power [-]\nStored: {_stored_representation_label(frame, field)}"
-    if representation not in _PHYSICAL_VALUE_REPRESENTATIONS:
+    if representation not in _SUPPORTED_REPRESENTATIONS:
         msg = f"EDA field {field!r} has unsupported stored representation {representation!r}."
         raise ValueError(msg)
-    return f"Mean spectral power [({capabilities.field_display_unit(frame, field, quantity_kind='difference')})²]"
+    unit = capabilities.field_display_unit(frame, field, quantity_kind="difference")
+    squared = unit if unit == field_labels.display_unit("1") else f"{unit}²" if unit.isalpha() else f"({unit})²"
+    return f"Mean spectral power [{squared}]"
 
 
 def _spacing(row: pd.Series) -> tuple[float, float, str]:
@@ -509,13 +504,13 @@ def _orientation_labels(orientation: SpectralEvolutionOrientation, coordinate_un
     if orientation == _CROSS_STREAM_ALONG_FLOW:
         return (
             "Cross-stream spectral evolution along flow direction y",
-            f"Cross-stream spatial frequency k_x [1/{coordinate_unit}]",
+            f"Cross-stream spatial frequency {_K_X} [1/{coordinate_unit}]",
             f"Flow-direction position y [{coordinate_unit}]",
         )
     if orientation == _FLOW_ACROSS_CROSS_STREAM:
         return (
             "Flow-direction spectral evolution across cross-stream direction x",
-            f"Flow-direction spatial frequency k_y [1/{coordinate_unit}]",
+            f"Flow-direction spatial frequency {_K_Y} [1/{coordinate_unit}]",
             f"Cross-stream position x [{coordinate_unit}]",
         )
     msg = f"Unsupported spectral-evolution orientation: {orientation!r}."
@@ -566,55 +561,114 @@ def _set_log_frequency_axis(axis: Axes) -> None:
     axis.xaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=tuple(float(value) for value in np.arange(2, 10) * 0.1), numticks=12))
 
 
-def _isotropic_figure(
+def _direction_energy(
+    frame: pd.DataFrame, field: str, direction: str, *, max_cases: int, case_number: int | None
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Return one direction's frequencies, its power ``[case, frequency]`` (the ``max_cases`` prefix or one ``case_number``) and coordinate unit."""
+    if case_number is None:
+        radial_k, radial, x_k, x_energy, y_k, y_energy, _count, unit = _case_spectra(frame, field, max_cases=max_cases)
+    else:
+        radial_k, radial, x_k, x_energy, y_k, y_energy, unit = _row_spectra(frame, _case_row(frame, case_number), field)
+    k_values, energy = {"isotropic": (radial_k, radial), "x": (x_k, x_energy), "y": (y_k, y_energy)}[direction]
+    return k_values, np.atleast_2d(energy), unit
+
+
+def _draw_direction(
+    power_axis: Axes, cumulative_axis: Axes, k_values: np.ndarray, energy: np.ndarray, style: SeriesStyle, *, label: str
+) -> tuple[float, bool]:
+    """
+    Draw one dataset's power and cumulative energy of one direction: median with q10-q90 band over several cases, else the case.
+
+    Return the lowest drawn cumulative value and whether any positive non-DC power was drawn.
+    """
+    cumulative = _cumulative(energy)
+    if energy.shape[0] > 1:
+        _band(power_axis, k_values, energy, label=label, style=style)
+        lower, centre, upper = np.quantile(cumulative, (0.1, 0.5, 0.9), axis=0)
+        cumulative_axis.fill_between(k_values[1:], lower, upper, color=style.color, alpha=0.18)
+        power = np.median(energy, axis=0)
+    else:
+        power, centre = energy[0], cumulative[0]
+        lower = centre
+        valid = (k_values > 0.0) & (power > 0.0)
+        power_axis.plot(k_values[valid], power[valid], label=label, **_line(style))
+    cumulative_axis.plot(k_values[1:], centre, **_line(style, cumulative=True))
+    return float(lower.min()), bool(np.any((k_values > 0.0) & (power > 0.0)))
+
+
+def _set_cumulative_range(axes: Iterable[Axes], lowest: float) -> str:
+    """
+    Give every cumulative-energy axis one range, so rows compare: from 0, or just below ``lowest`` when every drawn value stays above one half.
+
+    A focused range keeps curves near 1 off the top tenth of their panel; the returned note names it (empty from 0).
+    """
+    lower = 0.0 if lowest < _CUMULATIVE_FOCUS else round((math.ceil(lowest / _CUMULATIVE_STEP) - 1) * _CUMULATIVE_STEP, 2)
+    for axis in axes:
+        axis.set_ylim(lower, 1.02)
+    return f"Cumulative energy axes start at {lower:g}, below every drawn value." if lower else ""
+
+
+def _spectra_figure(
     selected_datasets: dict[str, pd.DataFrame],
     resolution: capabilities.ResolvedFieldSelection,
     *,
+    directions: Sequence[str],
     title: str,
     styles: Mapping[str, SeriesStyle],
     max_cases: int,
     case_number: int | None = None,
+    note: str = "",
 ) -> Figure:
     """
-    Draw per field the isotropic power and cumulative energy of the selected datasets: the ``max_cases`` prefix or one ``case_number``.
+    Draw per field row and direction a column pair: the power and the cumulative energy of the ``max_cases`` prefix or one ``case_number``.
 
-    ``styles`` is resolved over every loaded dataset, so a dataset keeps its style whatever the selection.
+    Both panels of a pair share the direction's frequency axis over all rows, the power panels of a row share their y axis, and
+    every cumulative panel takes one range (``_set_cumulative_range``). ``styles`` is resolved over every loaded dataset.
     """
-    figure, axes = figure_layout.panel_figure(len(resolution.fields), 2, panel_in=_PANEL_IN)
-    row_headers: list[str] = []
-    for field_index, field in enumerate(resolution.fields):
+    plotted = capabilities.plotted_labels(selected_datasets)
+    figure, axes = figure_layout.panel_figure(len(resolution.fields), 2 * len(directions), panel_in=_PANEL_IN)
+    for column, direction in enumerate(directions):
+        for axis in axes[:, 2 * column : 2 * column + 2].flat[1:]:
+            axis.sharex(axes[0, 2 * column])
+        for row, axis in enumerate(axes[:, 2 * column] if column else ()):
+            axis.sharey(axes[row, 0])
+        figure_layout.set_panel_title(axes[0, 2 * column], f"{_DIRECTIONS[direction][0]} power")
+        figure_layout.set_panel_title(axes[0, 2 * column + 1], f"{_DIRECTIONS[direction][0]} cumulative energy")
+    lowest, row_headers = 1.0, []
+    for row, field in enumerate(resolution.fields):
         field_datasets = capabilities.compatible_frames(selected_datasets, resolution, field)
         reference_frame = next(iter(field_datasets.values()))
-        power_axis, cumulative_axis = axes[field_index]
-        coordinate_unit = "m"
-        for label, frame in field_datasets.items():
-            if case_number is None:
-                radial_k, radial, _x_k, _x_energy, _y_k, _y_energy, _count, coordinate_unit = _case_spectra(frame, field, max_cases=max_cases)
-                _band(power_axis, radial_k, radial, label=label, style=styles[label])
-                q10, median, q90 = np.quantile(_cumulative(radial), (0.1, 0.5, 0.9), axis=0)
-                cumulative_axis.plot(radial_k[1:], median, **_line(styles[label], cumulative=True))
-                cumulative_axis.fill_between(radial_k[1:], q10, q90, color=styles[label].color, alpha=0.18)
-            else:
-                radial_k, radial, _x_k, _x_energy, _y_k, _y_energy, coordinate_unit = _row_spectra(frame, _case_row(frame, case_number), field)
-                valid = (radial_k > 0.0) & (radial > 0.0)
-                power_axis.plot(radial_k[valid], radial[valid], label=label, **_line(styles[label]))
-                cumulative_axis.plot(radial_k[1:], _cumulative(radial[np.newaxis, :])[0], **_line(styles[label], cumulative=True))
-        _set_log_frequency_axis(power_axis)
-        figure_layout.set_log_scale(power_axis, "y")
-        _set_log_frequency_axis(cumulative_axis)
-        cumulative_axis.set_ylim(0.0, 1.02)
-        power_axis.set_ylabel(_spectral_power_ylabel(reference_frame, field))
-        cumulative_axis.set_ylabel("Cumulative energy [-]")
-        for axis in axes[field_index]:
-            axis.grid(alpha=0.25, which="both")
-            if field_index == len(resolution.fields) - 1:
-                axis.set_xlabel(f"Spatial frequency k [1/{coordinate_unit}]")
-            else:
-                _hide_x_text(axis)
-        row_headers.append(_field_row_label(reference_frame, field))
-    figure_layout.set_panel_title(axes[0, 0], "Isotropic power")
-    figure_layout.set_panel_title(axes[0, 1], "Cumulative energy")
-    _finish_matrix(figure, axes, resolution, title=title, row_headers=row_headers, legend_axes=axes[:, 0])
+        for column, direction in enumerate(directions):
+            power_axis, cumulative_axis = axes[row, 2 * column : 2 * column + 2]
+            coordinate_unit, positive = "m", False
+            for label, frame in field_datasets.items():
+                k_values, energy, coordinate_unit = _direction_energy(frame, field, direction, max_cases=max_cases, case_number=case_number)
+                low, drawn = _draw_direction(power_axis, cumulative_axis, k_values, energy, styles[label], label=plotted[label])
+                lowest, positive = min(lowest, low), positive or drawn
+            if not positive:
+                power_axis.text(0.5, 0.5, "No positive non-DC spectral power", transform=power_axis.transAxes, ha="center", va="center")
+            figure_layout.set_log_scale(power_axis, "y")
+            for axis in (power_axis, cumulative_axis):
+                _set_log_frequency_axis(axis)
+                axis.grid(alpha=0.25, which="both")
+                if row == len(resolution.fields) - 1:
+                    axis.set_xlabel(f"{_DIRECTIONS[direction][1]} [1/{coordinate_unit}]")
+                else:
+                    _hide_x_text(axis)
+        axes[row, 0].set_ylabel(_spectral_power_ylabel(reference_frame, field))
+        axes[row, 1].set_ylabel(f"Cumulative energy [{field_labels.display_unit('1')}]")
+        row_headers.append(capabilities.field_display_name(reference_frame, field, mathtext=True))
+    focus = _set_cumulative_range(axes[:, 1::2].flat, lowest)
+    _finish_matrix(
+        figure,
+        axes,
+        resolution,
+        title=title,
+        row_headers=row_headers,
+        plotted=plotted,
+        legend_axes=axes[:, 0],
+        note=" ".join(part for part in (note, focus) if part),
+    )
     return figure
 
 
@@ -668,13 +722,15 @@ def plot_isotropic_spectral_summary(
         max_cases=max_cases,
         channels=channels,
     )
-    case_text = _case_count_text(selected_datasets, max_cases=max_cases)
-    return _isotropic_figure(
+    count, note = _case_count(selected_datasets, resolution, max_cases)
+    return _spectra_figure(
         selected_datasets,
         resolution,
-        title=f"Isotropic spectra — {case_text}{_stored_state_scope_text(selected_datasets)}",
+        directions=("isotropic",),
+        title=f"Isotropic spectra — {count}{_stored_state_scope_text(selected_datasets)}",
         styles=styles,
         max_cases=max_cases,
+        note=note,
     )
 
 
@@ -693,127 +749,15 @@ def plot_isotropic_spectral_case(
         max_cases=1,
         channels=channels,
     )
-    return _isotropic_figure(
+    return _spectra_figure(
         selected_datasets,
         resolution,
+        directions=("isotropic",),
         title=f"Isotropic spectra — Case {case_number}{_stored_state_scope_text(selected_datasets)}",
         styles=styles,
         max_cases=1,
         case_number=case_number,
     )
-
-
-def _directional_axis(
-    axis: Axes,
-    *,
-    datasets: dict[str, pd.DataFrame],
-    styles: Mapping[str, SeriesStyle],
-    field: str,
-    direction: str,
-    max_cases: int,
-    case_number: int | None = None,
-    last_column: bool,
-) -> Axes:
-    """
-    Plot one physical directional spectrum and return its cumulative twin axis, whose entries join the shared legend.
-
-    The power y label belongs to the row (``label_rows_once``); only the last column writes the cumulative axis' label and ticks.
-    """
-    cumulative_axis = axis.twinx()
-    coordinate_unit = "m"
-    has_positive_power = False
-    for label, frame in datasets.items():
-        if case_number is None:
-            _radial_k, _radial, x_k, x_energy, y_k, y_energy, _count, coordinate_unit = _case_spectra(
-                frame,
-                field,
-                max_cases=max_cases,
-            )
-        else:
-            row = _case_row(frame, case_number)
-            _radial_k, _radial, x_k, x_values, y_k, y_values, coordinate_unit = _row_spectra(
-                frame,
-                row,
-                field,
-            )
-            x_energy = x_values[np.newaxis, :]
-            y_energy = y_values[np.newaxis, :]
-        if direction == "y":
-            k_values, energy = y_k, y_energy
-        elif direction == "x":
-            k_values, energy = x_k, x_energy
-        else:
-            message = f"Unsupported spectral direction: {direction!r}."
-            raise ValueError(message)
-        style = styles[label]
-        if case_number is None:
-            median_power = np.quantile(energy, 0.5, axis=0)
-            has_positive_power = has_positive_power or bool(np.any((k_values > 0.0) & (median_power > 0.0)))
-            _band(axis, k_values, energy, label=f"{label} power", style=style)
-        else:
-            power = energy[0]
-            valid = (k_values > 0.0) & (power > 0.0)
-            has_positive_power = has_positive_power or bool(np.any(valid))
-            axis.plot(k_values[valid], power[valid], label=f"{label} power", **_line(style))
-        cumulative = _cumulative(energy)
-        curve = np.quantile(cumulative, 0.5, axis=0) if case_number is None else cumulative[0]
-        cumulative_axis.plot(k_values[1:], curve, label=f"{label} cumulative", **_line(style, cumulative=True))
-    _set_log_frequency_axis(axis)
-    figure_layout.set_log_scale(axis, "y")
-    if direction == "y":
-        axis.set_xlabel(f"Flow-direction spatial frequency k_y [1/{coordinate_unit}]")
-    else:
-        axis.set_xlabel(f"Cross-stream spatial frequency k_x [1/{coordinate_unit}]")
-    cumulative_axis.set_ylim(0.0, 1.02)
-    cumulative_axis.set_ylabel("Cumulative energy [-]" if last_column else "", fontsize=figure_layout.LABEL_PT)
-    cumulative_axis.tick_params(labelright=last_column, labelsize=figure_layout.TICK_PT)
-    if not has_positive_power:
-        axis.text(0.5, 0.5, "No positive non-DC spectral power", transform=axis.transAxes, ha="center", va="center")
-    axis.grid(alpha=0.25, which="both")
-    return cumulative_axis
-
-
-def _directional_figure(
-    selected_datasets: dict[str, pd.DataFrame],
-    resolution: capabilities.ResolvedFieldSelection,
-    *,
-    title: str,
-    styles: Mapping[str, SeriesStyle],
-    max_cases: int,
-    case_number: int | None = None,
-) -> Figure:
-    """
-    Draw per field the flow-y and cross-stream-x spectra: the ``max_cases`` prefix or one ``case_number``.
-
-    The panels of a row share their power axis, which the first column labels. ``styles`` is resolved over every loaded dataset.
-    """
-    figure, axes = figure_layout.panel_figure(len(resolution.fields), 2, panel_in=_PANEL_IN, sharey="row")
-    legend_axes: list[Axes] = []  # each panel, then its cumulative twin: the order of the legend entries
-    row_headers: list[str] = []
-    for field_index, field in enumerate(resolution.fields):
-        field_datasets = capabilities.compatible_frames(selected_datasets, resolution, field)
-        for axis_index, direction in enumerate(("y", "x")):
-            axis = axes[field_index, axis_index]
-            cumulative_axis = _directional_axis(
-                axis,
-                datasets=field_datasets,
-                styles=styles,
-                field=field,
-                direction=direction,
-                max_cases=max_cases,
-                case_number=case_number,
-                last_column=axis_index == 1,
-            )
-            legend_axes += [axis, cumulative_axis]
-            if field_index < len(resolution.fields) - 1:
-                _hide_x_text(axis)
-        reference_frame = next(iter(field_datasets.values()))
-        figure_layout.label_rows_once(axes[field_index : field_index + 1], _spectral_power_ylabel(reference_frame, field))
-        row_headers.append(_field_row_label(reference_frame, field))
-    figure_layout.set_panel_title(axes[0, 0], "Flow direction y (k_y)")
-    figure_layout.set_panel_title(axes[0, 1], "Cross-stream direction x (k_x)")
-    _finish_matrix(figure, axes, resolution, title=title, row_headers=row_headers, legend_axes=legend_axes)
-    return figure
 
 
 def plot_directional_spectral_summary(
@@ -864,13 +808,15 @@ def plot_directional_spectral_summary(
         max_cases=max_cases,
         channels=channels,
     )
-    case_text = _case_count_text(selected_datasets, max_cases=max_cases)
-    return _directional_figure(
+    count, note = _case_count(selected_datasets, resolution, max_cases)
+    return _spectra_figure(
         selected_datasets,
         resolution,
-        title=f"Directional spectra — {case_text}{_stored_state_scope_text(selected_datasets)}",
+        directions=("y", "x"),
+        title=f"Directional spectra — {count}{_stored_state_scope_text(selected_datasets)}",
         styles=styles,
         max_cases=max_cases,
+        note=note,
     )
 
 
@@ -889,9 +835,10 @@ def plot_directional_spectral_case(
         max_cases=1,
         channels=channels,
     )
-    return _directional_figure(
+    return _spectra_figure(
         selected_datasets,
         resolution,
+        directions=("y", "x"),
         title=f"Directional spectra — Case {case_number}{_stored_state_scope_text(selected_datasets)}",
         styles=styles,
         max_cases=1,
@@ -906,17 +853,21 @@ def _evolution_figure(
     orientation: SpectralEvolutionOrientation,
     scope: str,
     evolution_map: Callable[[str, str], tuple[np.ndarray, np.ndarray, np.ndarray, str]],
+    note: str = "",
 ) -> Figure:
     """
     Draw per field and dataset one frequency/position map; ``evolution_map(label, field)`` returns frequency, position, fractions and unit.
 
-    Every colour bar carries its unit; the position label stands once per row and the frequency label once per column.
+    Every map has its colour bar; the bars of a row share quantity and unit, which the rightmost one names. The position label
+    stands once per row and the frequency label once per column; ``note`` joins the figure note.
     """
+    plotted = capabilities.plotted_labels(selected_datasets)
     figure, axes = figure_layout.panel_figure(len(resolution.fields), len(selected_datasets), panel_in=_PANEL_IN)
     plot_title, xlabel, ylabel = "Spectral evolution", "", ""
     row_headers: list[str] = []
     for field_index, field in enumerate(resolution.fields):
         field_datasets = capabilities.compatible_frames(selected_datasets, resolution, field)
+        colorbar = None
         for dataset_index, label in enumerate(selected_datasets):
             axis = axes[field_index, dataset_index]
             if label not in field_datasets:
@@ -939,14 +890,15 @@ def _evolution_figure(
             colorbar = figure.colorbar(image, ax=axis, **scale.colorbar_kwargs())
             decades = np.arange(0, np.log10(_POWER_FRACTION_FLOOR) - 1, -2, dtype=int)  # round steps 10^0, 10^-2, ... 10^-12
             colorbar.set_ticks((10.0**decades).tolist(), labels=[f"$10^{{{value}}}$" for value in decades])
-            colorbar.set_label(_COLORBAR_LABEL, size=figure_layout.LABEL_PT)
             colorbar.ax.tick_params(labelsize=figure_layout.TICK_PT)
-        row_headers.append(_field_row_label(next(iter(field_datasets.values())), field))
+        if colorbar is not None:
+            colorbar.set_label(_COLORBAR_LABEL, size=figure_layout.LABEL_PT)
+        row_headers.append(capabilities.field_display_name(next(iter(field_datasets.values())), field, mathtext=True))
     for column, label in enumerate(selected_datasets):  # title on the topmost and x text on the lowest available panel of each column
         shown_rows = [axis for axis in axes[:, column] if axis.axison]
         if shown_rows:
             figure_layout.set_panel_title(
-                shown_rows[0], display_labels.wrapped_dataset_display_label(label, width=_HEADER_WRAP_WIDTH, max_lines=_HEADER_MAX_LINES)
+                shown_rows[0], display_labels.wrapped_dataset_display_label(plotted[label], width=_HEADER_WRAP_WIDTH, max_lines=_HEADER_MAX_LINES)
             )
             shown_rows[-1].set_xlabel(xlabel)
             for axis in shown_rows[:-1]:
@@ -961,6 +913,8 @@ def _evolution_figure(
         resolution,
         title=f"{plot_title} — {scope}{_stored_state_scope_text(selected_datasets)}",
         row_headers=row_headers,
+        plotted=plotted,
+        note=note,
     )
     return figure
 
@@ -1018,7 +972,7 @@ def plot_vertical_spectral_evolution(
         max_cases=max_cases,
         channels=channels,
     )
-    case_text = _case_count_text(selected_datasets, max_cases=max_cases)
+    count, note = _case_count(selected_datasets, resolution, max_cases)
 
     def evolution_map(label: str, field: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
         frequency, position, fractions, _count, coordinate_unit = _spectral_evolution_map(
@@ -1033,8 +987,9 @@ def plot_vertical_spectral_evolution(
         selected_datasets,
         resolution,
         orientation=orientation,
-        scope=case_text,
+        scope=count,
         evolution_map=evolution_map,
+        note=note,
     )
 
 

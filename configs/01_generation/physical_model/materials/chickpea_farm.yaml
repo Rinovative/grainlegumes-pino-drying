@@ -1,0 +1,281 @@
+# Role: reference data of the physical model. Edit: only with new physical evidence or a deliberate model change.
+# Material-specific physical design in edit order: sampled values, density, Oswin, target, kinetics. Nominals/supports are parameterization choices, not universal constants.
+# Farm bulk of the thesis lot Kichererbsen, R: small desi-sized kernels with a very high fines share. Bed structure
+# (permeability, packing porosity, density) comes from that lot. The grain-substance blocks below the density record
+# are copied from chickpea.yaml: the fines are mostly the same plant material; their faster drying is not represented.
+schema_kind: generation_material
+material_family: chickpea_farm
+material_scope:
+  common_name: Chickpea, farm bulk
+  species: Cicer arietinum L.
+  market_class: small_desi_sized_farm_lot
+  product_form: whole_seed
+  coat_or_hull_state: intact
+  description: Farm bulk of small desi-sized chickpeas with a very high fines share (thesis lot Kichererbsen, R)
+# The permeability scale kappa_mean is in m^2. Natural support and transform define sampling; ood_supports are separate synthetic stress intervals.
+permeability:
+  nominal: 6.0e-09
+  support:
+    lower: 3.0e-09
+    upper: 1.2e-08
+  transform: log
+  distribution: uniform_in_log_space
+  ood_supports:
+  - lower: 1.15e-09
+    upper: 2.3e-09
+  - lower: 1.56e-08
+    upper: 3.1e-08
+  provenance:
+    evidence: project_baseline
+    source_refs:
+    - ba
+    method: Thesis farm bulk Kichererbsen, R (Tab. 13; three fills 120-230 mm in the 41.5 mm tube), apparent permeability
+      mu/(b + a*u) of the thesis Forchheimer fits at the nominal superficial velocity 0.14 m/s, geometric mean 6.1e-09 m^2
+      (fills 4.4-8.7e-09 m^2); no K_A correction. Support is the nominal times or divided by 2.
+    applicability:
+      packing: Only for packing bands in each complete density record; generated mean
+        eps must pass the material band.
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+      gap and width policy; permeability tails also satisfy fixed Kozeny-Carman guards.
+    verification: mathematically_reproduced
+# Granular-phase thermal values: k_gr is conductivity and cp_gr_dry is dry-solid specific heat. Natural and OOD supports are design ranges.
+thermal_properties:
+  k_gr:
+    nominal: 0.24
+    support:
+      lower: 0.18
+      upper: 0.32
+    transform: log
+    distribution: uniform_in_log_space
+    ood_supports:
+    - lower: 0.13
+      upper: 0.16
+    - lower: 0.36
+      upper: 0.45
+    provenance:
+      evidence: engineering_inversion
+      source_refs:
+      - oke_thesis_2021
+      - pulse_thermal_oke_baik_2022
+      method: Inversion of measured bed conductivities with the Maxwell-Eucken relation of the model. Oke (2021, Table 4.7) measures whole chickpea seeds at 12-18 % wb, 0.116-0.150 W/(m*K); with the bulk porosity 0.38-0.39 that Oke (2021, Table 4.2) reports for the same seeds, taken as an assumed proxy because the conductivity samples were prepared separately, this gives 0.19-0.26 W/(m*K). The ranges 0.160-0.227 W/(m*K) in the abstract of Oke and Baik (2022) are compressed flour values and are not used. The earlier value 0.30 was transferred from lentil and faba bean and lay above the only chickpea bed data.
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+  cp_gr_dry:
+    nominal: 1900.0
+    support:
+      lower: 1600.0
+      upper: 2200.0
+    transform: log
+    distribution: uniform_in_log_space
+    ood_supports:
+    - lower: 1200.0
+      upper: 1450.0
+    - lower: 2500.0
+      upper: 2900.0
+    provenance:
+      evidence: literature_transfer
+      source_refs:
+      - matouk_thermal
+      - oke_thesis_2021
+      method: Value unchanged, transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover. The Choi-Okos prediction for chickpea (Oke 2021, Table 4.6) gives 1.77 kJ/(kg*K) dry basis, inside the support; the DSC values of Oke on flour are implausibly low near 30 degC and are not used. The drying time depends only weakly on it (about 2 % for a change of 15 %).
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+# Initial moisture is dry basis (kg water/kg dry solids); amplitude controls field variation and field_support bounds generated values.
+initial_moisture:
+  mean_db:
+    nominal: 0.2345679012345679
+    support:
+      lower: 0.1904761904761905
+      upper: 0.28205128205128205
+    transform: linear
+    distribution: uniform
+    ood_supports:
+    - lower: 0.3
+      upper: 0.35
+    provenance:
+      evidence: engineering_estimate
+      source_refs:
+      - saskpulse_storage
+      - hatzendorf_chickpea_2025
+      method: Values and OOD range unchanged. Chickpea combining starts at about 18 % wb (SaskPulse 2025, section Seed Moisture Content at Harvest); a late Central European harvest reached 25-30 % wb for most varieties (Hatzendorf 2025), so the OOD range 23.1-25.9 % wb is realistic.
+      note: Natural material-dependent starting moisture in dry basis; range is an
+        explicit engineering envelope around project or product-compatible drying
+        evidence, not a market-target transfer.
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+  amplitude_db:
+    nominal: 0.02
+    support:
+      lower: 0.005
+      upper: 0.04
+    transform: linear
+    distribution: uniform
+    ood_supports:
+    - lower: 0.055
+      upper: 0.08
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+  field_support:
+    lower: 0.16606936416184973
+    upper: 0.32205128205128203
+    unit: kg/kg
+    provenance:
+      evidence: derived
+      source_refs:
+      - swiss_crops
+      method: X_db=X_wb/(1-X_wb); lower bound is the target 0.135/0.865 (swiss granum) plus the synthetic design margin margin_above_target_db 0.01, upper bound is the upper mean_db 0.22/0.78 plus the upper amplitude_db 0.04.
+      verification: mathematically_reproduced
+  margin_above_target_db: 0.01
+# Dimensionless support for generated bed-mean porosity; density calibration stores a compatible paired reference state.
+packing_porosity_mean_support:
+  lower: 0.58
+  upper: 0.66
+  unit: '1'
+  provenance:
+    evidence: project_baseline
+    source_refs:
+    - ba
+    method: Equal-mass relation of the thesis, eps = 1 - (h_clean/h_farm)*(1 - eps_clean), for 100 g in the
+      tube (h_clean 95 mm, eps_clean 0.464, h_farm 133.12 mm) gives 0.6175, assuming that fines and admixture have the
+      solid density of the kernels; with the measured bulk density and the farm kernels' density 1.53 g/cm^3 it is about
+      0.64. The thesis value 33.40 % mixes percent and fraction and is not used. The band covers the three fills (wet bulk
+      density 0.54-0.56 g/cm^3).
+    verification: mathematically_reproduced
+    applicability:
+      packing: Air fraction of the farm bulk including its fines matrix, not a kernel packing porosity; the
+        Kozeny-Carman coupling serves only as the local variation model.
+# Dry bulk-density calibration and paired bed porosity define the material reference used for packing/density consistency. OOD records are complete alternatives selected atomically.
+density_calibration:
+  record_id: chickpea_farm_density_calibration_v1
+  reference:
+    rho_bu_dry_ref: 480.0
+    eps_bed_ref: 0.62
+  rho_bu_dry_ref_support:
+    lower: 450.0
+    upper: 510.0
+    transform: log
+  ood_records:
+  - record_id: loose_low_density
+    rho_bu_dry_ref: 360.0
+    eps_bed_ref: 0.715
+    basis: same inferred dry particle density as reference; alternate complete packing
+      record
+  - record_id: dense_high_density
+    rho_bu_dry_ref: 600.0
+    eps_bed_ref: 0.525
+    basis: same inferred dry particle density as reference; alternate complete packing
+      record
+  selection_rule: complete_record_atomic
+  provenance:
+    evidence: project_baseline
+    source_refs:
+    - ba
+    method: Wet bulk density 0.553 g/cm^3 (mean of the three fills, Tab. 13) on a dry basis with an assumed
+      13 % wb, because the thesis does not report the sample moisture, gives 481 kg/m^3, paired with eps 0.62 of the same lot.
+    verification: mathematically_reproduced
+    applicability:
+      packing: Air fraction of the farm bulk including its fines matrix, not a kernel packing porosity; the
+        Kozeny-Carman coupling serves only as the local variation model.
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Complete loose and dense packing records derived at the fixed reference
+      inferred dry particle density.
+    verification: mathematically_reproduced
+# Coupled Oswin equilibrium-isotherm coefficients; preserve each material record and its stated units/evidence as one parameter set.
+oswin:
+  record_id: chickpea_production_oswin_v1
+  components:
+    A_osw: 11.21749504
+    B_osw: -0.06156313
+    C_osw: 0.49141999
+  units:
+    A_osw: '1'
+    B_osw: 1/K
+    C_osw: '1'
+  equation: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
+  temperature_variable: T_C=T_K-273.15 K; numerical coefficient B is per kelvin or
+    per degree Celsius increment
+  provenance:
+    evidence: literature_fit
+    source_refs:
+    - chickpea_oswin_source
+    method: 'Re-fit of 2402 reconstructed modified-Henderson source-surface points:
+      RMSE 0.10895 percentage points db, MRE 0.7516%, R2 0.99771. Statistics calculated
+      here.'
+    applicability:
+      moisture_basis: kg water/kg dry solids; source percent-db prefactor converted
+        by 0.01
+      evidence_scope: 15-35 degC, source desorption 8.9-16.9% db; fit evaluated over
+        RH 0.30-0.80
+# Single operational drying target on a wet basis; it is a material target, not an initial-moisture support.
+target_moisture:
+  target_moisture_wb: 0.135
+  provenance:
+    evidence: official_industry_target
+    source_refs:
+    - swiss_crops
+    method: swiss granum (2026-03-12) chapter 1.1 lists 13.5 % wb for chickpeas, lupins and lentils in one merged table cell; chapter 2.3 applies no weight deduction up to 13.5 % wb.
+    note: Acceptance moisture without weight deduction, used as the single operational drying target.
+# Surface/internal moisture-transfer prior: r_surf_0 is a rate, r_int_surf a rate ratio, f_surf a fraction; the loader derives the two OOD records from the nominals.
+two_compartment_kinetics:
+  record_id: chickpea_two_compartment_kinetics_v1
+  components:
+    r_surf_0:
+      nominal: 1.1e-04
+      support:
+        lower: 5.5e-05
+        upper: 1.98e-04
+      transform: log
+    r_int_surf:
+      nominal: 0.15
+      support:
+        lower: 0.10
+        upper: 0.3
+      transform: log
+    f_surf:
+      nominal: 0.45
+      support:
+        lower: 0.28
+        upper: 0.62
+      transform: logit
+  selection_rule: complete_record_atomic
+  provenance:
+    evidence: calibration_prior
+    source_refs:
+    - chickpea_drying
+    - bean_drying_afonso_correa_1999
+    method: No chickpea drying curve is available. r_surf_0 is taken from a Phaseolus analogue of the same Sauter diameter (fresh black bean, 35 degC, Afonso Junior and Correa 1999, Table 1; chickpea d32 5.38 mm against about 5.2 mm), matched at the moisture ratio of the target at the pilot air (35 degC, relative humidity 0.215), 1.04-1.18e-04. The abstract of Cavalcanti-Mata et al. (2020), thin layer at 40-80 degC with drying times of 72000 s to 39600 s, is only a plausibility check (it implies a rate of at least about 0.9e-04 only if the reported times end at a moisture ratio of 0.3 or below) because the full text and the end moisture were not available. The support 5.5e-05 to 1.98e-04 is the nominal value times 0.5 and 1.8 and reaches down to the value 5e-05 that a pure size scaling from lentil would give. The thin-layer time to the target at pilot air is 4.9 h. r_int_surf and f_surf are unchanged.
+    applicability:
+      evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
+        at known T, RH/omega, airflow and product state; T(t) if available
+      limitation: Transfer from a different genus (Phaseolus) with the same kernel size, not a chickpea curve; the testa differs (kabuli thinner, desi thicker) and no correction is applied. The rate prior is not fitted to experiments of this bed, and the drying times were not validated as real predictions.
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Complete slow and fast records follow the common nominal-multiplier kinetics
+      stress design equation.
+    verification: mathematically_reproduced

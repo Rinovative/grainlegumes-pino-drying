@@ -25,6 +25,7 @@ import pandas as pd
 from src.analysis.eda import eda_dataframe
 from src.analysis.eda.plots import eda_plot_case_statistics, eda_plot_spectral_analysis, eda_plot_transient
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
+from src.analysis.generation_inputs import generation_input_labels as labels
 from src.analysis.generation_inputs import generation_input_sources as sources
 from src.analysis.generation_inputs import generation_input_template_comparison as template
 from src.analysis.generation_inputs.plots import (
@@ -249,7 +250,7 @@ def _eda_frame() -> pd.DataFrame:
 def _eda_inputs() -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
     """Return one labelled Dataset frame and its series styles."""
     label = "Drying · Lentil · Synthetic"
-    return {label: _eda_frame()}, eda_plot_transient.batch_styles({label: "lentil"})
+    return {label: _eda_frame()}, eda_plot_transient.batch_styles({label: "lentil"}, {label: "id"})
 
 
 def _draw_map_grid_01() -> object:
@@ -293,7 +294,7 @@ def _draw_scatter_parity_01() -> object:
 
 def _draw_scatter_parity_09() -> object:
     comparison = template.compare_templates(_candidate_rows(), *_CAMPAIGNS, quantities=_DURATION)
-    return generation_input_plot_template.template_comparison(comparison)
+    return generation_input_plot_template.template_comparison(comparison, labels.campaign_display_labels(_candidate_rows(), _CAMPAIGNS))
 
 
 def _draw_spectral_01() -> object:

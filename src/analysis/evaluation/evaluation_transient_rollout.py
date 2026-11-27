@@ -580,7 +580,7 @@ def _admit_canonical_target_completion(
     )
 
 
-def _wet_fraction_series(
+def wet_fraction_series(
     states: np.ndarray,
     *,
     static: np.ndarray,
@@ -631,7 +631,7 @@ def _target_evidence(
     if not 0.0 < target_fraction_limit < 1.0:
         message = "target_fraction_limit must lie strictly inside (0, 1)."
         raise ValueError(message)
-    predicted_fraction = _wet_fraction_series(
+    predicted_fraction = wet_fraction_series(
         predicted,
         static=static,
         scalars=scalars,

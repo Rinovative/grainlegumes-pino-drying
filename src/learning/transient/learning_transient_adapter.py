@@ -267,16 +267,14 @@ class TransientTrainingAdapter:
                 t_n=batch.t_n,
                 model_kind=kind,
             )
-            one_step_normalized, one_step_physical = _teacher_forced_in_chunks(model, batch, self.tensorizer, model_kind=kind)
+            one_step_physical = _teacher_forced_in_chunks(model, batch, self.tensorizer, model_kind=kind)
         length = batch.rollout_length
-        # Completeness is the autonomous trajectory's alone; the one-step view is a diagnostic.
-        complete = rollout.physical_prediction.flatten(1).isfinite().all(1)
+        # Completeness is the autonomous trajectory's alone; the one-step view is a diagnostic. The standardized view of a
+        # finite physical rollout can still overflow, which leaves the case incomplete as well.
+        complete = encode_finite_cases(self.tensorizer.scaling, rollout.physical_prediction, reference=batch.next_state).flatten(1).isfinite().all(1)
         return training_adapter.AdapterEvaluationViews(
-            normalized_prediction=encode_finite_cases(self.tensorizer.scaling, rollout.physical_prediction, reference=batch.next_state),
-            normalized_target=self.tensorizer.scaling.encode_state(batch.next_state),
             physical_prediction=rollout.physical_prediction,
             physical_target=batch.next_state,
-            one_step_normalized_prediction=one_step_normalized,
             one_step_physical_prediction=one_step_physical,
             sample_count=batch.batch_size,
             processed_target_transitions=batch.batch_size * length,
@@ -424,10 +422,8 @@ _TEACHER_FORCED_CHUNK = 32
 _STATE_FIELDS = tuple(field.name for field in datasets.contracts.transient.TRANSIENT_STEP_CONTRACT.dynamic_state)
 
 
-def _teacher_forced_in_chunks(
-    model: nn.Module, batch: TransientBatch, tensorizer: TransientTensorizer, *, model_kind: str
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return normalized and physical one-step predictions of whole trajectories, carrying the RNO state."""
+def _teacher_forced_in_chunks(model: nn.Module, batch: TransientBatch, tensorizer: TransientTensorizer, *, model_kind: str) -> torch.Tensor:
+    """Return the physical one-step predictions of whole trajectories, carrying the RNO state."""
     hidden: object | None = None
     parts: list[TransientRollout] = []
     for start in range(0, batch.rollout_length, _TEACHER_FORCED_CHUNK):
@@ -444,7 +440,7 @@ def _teacher_forced_in_chunks(
         )
         hidden = part.captured_hidden.get(length)
         parts.append(part)
-    return torch.cat([part.normalized_prediction for part in parts], dim=1), torch.cat([part.physical_prediction for part in parts], dim=1)
+    return torch.cat([part.physical_prediction for part in parts], dim=1)
 
 
 def _bound_violations(prediction: torch.Tensor, times: torch.Tensor) -> dict[str, tuple[float | None, ...]]:

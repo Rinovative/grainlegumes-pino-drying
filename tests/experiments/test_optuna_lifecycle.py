@@ -6,7 +6,8 @@ Responsibilities:
     second invocation of a running study is refused before it opens the study
   - Check that a reopened study fails the trials a hard abort left running, refuses another device model or sampler, and
     runs only what is left of its allocation, its configured base first
-  - Check that one trial driver publishes the same terminal record, Optuna attribute and trial line for both tasks
+  - Check that one trial driver publishes the same terminal record, Optuna attribute and trial line for both tasks, and
+    advises an interrupted trial the reopen of its study, never a restart of the trial
   - Check that a diverged trial is pruned with the violated constraint TPE ranks last and an ineligible one without a value
   - Check that the study report counts every trial status, takes its best from completed trainings (a duplicate's stored
     value included), evaluates parameter importance on trained trials only and sums its invocations' seconds
@@ -14,7 +15,8 @@ Responsibilities:
     and that a trial whose evidence was lost keeps its best checkpoint
   - Check that a failed run preparation, a lost status attribute and a tracking finish failure keep one agreeing end state
   - Check that a finished trial frees its checkpoint files while its summary keeps the best digest
-  - Check that a trial repeating an existing experiment is reused or pruned without training
+  - Check that a trial repeating an existing experiment is reused or pruned without training, a completed owner's value
+    only once the completed-run admission accepts that owner
   - Check that a study records its Slurm source binding independently of its trials and is continued only in that tree
   - Check that a study records its root as the owner of the job's log links
 
@@ -1035,9 +1037,13 @@ def test_every_trial_outcome_publishes_one_terminal_record_for_both_tasks(
         assert len(persisted["epochs"]) == recorded_epochs
     if expected_status == "nonfinite_pruned":
         assert "non-finite value" in str(raised.value)
-    lines = _trial_lines(capsys)
+    printed = "\n".join(capsys.readouterr())
+    lines = [line for line in printed.splitlines() if line.startswith("trial ")]
     assert len(lines) == 1
     assert expected_status in lines[0]
+    # A trial is never resumed or replaced: an interrupted one is advised what its study's rerun does.
+    assert "restarts the run" not in printed
+    assert ("reopens the study" in printed) is (expected_status == "interrupted")
 
 
 @pytest.mark.parametrize("task", _TASKS)
@@ -1694,26 +1700,35 @@ def _duplicate_study(tmp_path: Path, *, epochs: int | None = None) -> optuna_run
     return replace(study, study={**study.study, "full_budget_epochs": epochs}, base_config=experiments.config.loader.finalize_run_layout(base))
 
 
-def test_duplicate_trial_of_a_completed_trial_reuses_its_value_without_training(tmp_path: Path) -> None:
-    """A sampler repeat of a completed trial with the same epochs completes from the stored value, untrained."""
+def _admit_owners(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Admit each completed owner by its summary alone, since these owners hold no artifacts; return the admitted run paths."""
+    admitted: list[Path] = []
+
+    def admit(run_dir: Path) -> dict[str, Any]:
+        admitted.append(Path(run_dir).resolve())
+        return {"summary": experiments.run.read_run_summary(run_dir)}
+
+    monkeypatch.setattr(experiments.run, "validate_completed_run", admit)
+    return admitted
+
+
+def test_duplicate_trial_of_a_completed_trial_reuses_its_value_without_training(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sampler repeat of an admitted completed trial with the same epochs completes from the stored value, untrained."""
     study = _duplicate_study(tmp_path)
     original = _publish_trial(study, 0, outcome="completed")
+    admitted = _admit_owners(monkeypatch)
     repeated = _Trial(number=1)
     config, _context = optuna_runtime._prepare_trial_config(study, repeated, sampler_seed=_SAMPLER_SEED)
     owner = original.relative_to(tmp_path / "outputs").as_posix()
 
     assert optuna_runtime._duplicate_trial_outcome(config, repeated) == (pytest.approx(0.5), owner)
+    assert admitted == [original.resolve()]
     assert repeated.attrs["duplicate_of"] == owner
     assert not optuna_runtime._trial_run_dir(config).exists()
 
 
-def test_run_trial_answers_a_repeated_trial_before_allocating_or_training(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The trial entry point returns a completed twin's value without allocating a run or contacting the device."""
-    study = _duplicate_study(tmp_path)
-    _publish_trial(study, 0, outcome="completed")
-    repeated = _Trial(number=1)
+def _refuse_training(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test as soon as a duplicate allocates a run, trains or resolves its device."""
 
     def fail(*_args: Any, **_kwargs: Any) -> None:
         pytest.fail("a duplicate trial must not allocate, train or resolve its device")
@@ -1722,16 +1737,45 @@ def test_run_trial_answers_a_repeated_trial_before_allocating_or_training(
     monkeypatch.setattr(optuna_runtime.experiments.run, "execute_prepared_run", fail)
     monkeypatch.setattr(optuna_runtime.learning.device, "resolve_device", fail)
 
+
+def test_run_trial_answers_a_repeated_trial_before_allocating_or_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The trial entry point returns a completed twin's value without allocating a run or contacting the device."""
+    study = _duplicate_study(tmp_path)
+    _publish_trial(study, 0, outcome="completed")
+    _admit_owners(monkeypatch)
+    repeated = _Trial(number=1)
+    _refuse_training(monkeypatch)
+
     assert optuna_runtime.run_trial(study, repeated, sampler_seed=_SAMPLER_SEED, admitted_device=_CPU_DEVICE) == pytest.approx(0.5)
     assert repeated.attrs["terminal_status"] == "duplicate"
     assert [line.split()[2] for line in _trial_lines(capsys)] == ["duplicate"]
 
 
+def test_a_repeat_of_a_completed_trial_its_admission_refuses_fails_untrained(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A completed owner that fails the completed-run admission (here: no split, normalizer or history) supplies no value."""
+    study = _duplicate_study(tmp_path)
+    _publish_trial(study, 0, outcome="completed")
+    repeated = _Trial(number=1)
+    config, _context = optuna_runtime._prepare_trial_config(study, _Trial(number=1), sampler_seed=_SAMPLER_SEED)
+    _refuse_training(monkeypatch)
+
+    with pytest.raises(experiments.run.RunLifecycleError, match="not loadable"):
+        optuna_runtime.run_trial(study, repeated, sampler_seed=_SAMPLER_SEED, admitted_device=_CPU_DEVICE)
+
+    assert repeated.attrs["terminal_status"] == "failed"
+    assert not optuna_runtime._trial_run_dir(config).exists()
+
+
 @pytest.mark.parametrize("owner_outcome", [None, "diverged"], ids=["unfinished-owner", "diverged-owner"])
-def test_duplicate_trial_that_cannot_reuse_its_owner_is_pruned_without_training(owner_outcome: str | None, tmp_path: Path) -> None:
+def test_duplicate_trial_that_cannot_reuse_its_owner_is_pruned_without_training(
+    owner_outcome: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A repeat of an unfinished or diverged trial is pruned as a duplicate, the latter as infeasible as its owner; nothing is allocated."""
     study = _duplicate_study(tmp_path)
     original = _publish_trial(study, 0, outcome=owner_outcome)
+    admitted = _admit_owners(monkeypatch)
     repeated = _Trial(number=1)
     config, _context = optuna_runtime._prepare_trial_config(study, _Trial(number=1), sampler_seed=_SAMPLER_SEED)
 
@@ -1741,6 +1785,8 @@ def test_duplicate_trial_that_cannot_reuse_its_owner_is_pruned_without_training(
     assert repeated.attrs["terminal_status"] == "duplicate_pruned"
     assert repeated.attrs["duplicate_of"] == original.relative_to(tmp_path / "outputs").as_posix()
     assert repeated.constraints == ({} if owner_outcome is None else {"diverged": 1.0})
+    # Only a completed owner (here the diverged one, which kept its best eligible point) passes the admission first.
+    assert admitted == ([] if owner_outcome is None else [original.resolve()])
     assert "work" not in repeated.attrs
     assert not optuna_runtime._trial_run_dir(config).exists()
 

@@ -4,8 +4,12 @@ Responsibilities:
   - Check the grid of time windows: column widths, row heights and the y axis shared along a row
   - Check the fixed-inch map geometry: margins, the width cap or none, and the sizes and places of the bands beside the maps
   - Check the slot colour bar's unit bracket and the labels a field-map scale's kind gives it: boundaries, signed band
-    centres, decades, a cyclic scale's wrap ends, a constant's value, a state's power of ten from the size of its values
-    and an error's from its step, a map's own arrows, and the thinning of its labels to the real bar height
+    centres, decades, a narrow geometric scale's boundaries distinct even for adjacent floats, a cyclic scale's wrap ends,
+    a constant's value, a state's power of ten from the size of its values and an error's from its step, a map's own
+    arrows, and the thinning of its labels, decades included, to the real bar height
+  - Check that a figure value keeps three significant digits, a negative one with the true minus sign, and zero reads 0
+  - Check that only a map grid's emptied bottom map hands its column's x labels on, to the nearest map drawn above it, with
+    its note moved inside the cell, while an ordinary subplot grid keeps its labels
 
 Design principles:
   - Geometry is read from drawn figures, never from layout fractions
@@ -17,7 +21,7 @@ This module does NOT:
 from __future__ import annotations
 
 from itertools import pairwise
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -27,6 +31,9 @@ from matplotlib.colors import BoundaryNorm
 from src.analysis.presentation import analysis_field_maps as field_maps
 from src.analysis.ui import analysis_ui_plot_layout as plot_layout
 from src.analysis.ui import analysis_ui_time as time_ui
+
+if TYPE_CHECKING:
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 
 def _slot_bar(domain: tuple[float, float], boundaries: Any, *, semantic: str = "linear_positive", **options: Any) -> tuple[Any, Any]:
@@ -157,6 +164,14 @@ def test_a_slot_bar_labels_its_boundaries_its_signed_band_centres_or_the_decades
     assert {len(text.partition(".")[2]) for text in texts} == {2}
     assert bar.ax.get_ylabel() == "T [10⁻⁹ K]"
     plt.close(figure)
+    # Over more than a decade but too few to label decades, every boundary keeps three significant digits of its own,
+    # not the four decimals the smallest one needs.
+    figure, bar = _slot_bar((1.0, 1.0), np.geomspace(4.52e-9, 1.4626e-7, 12), semantic="log_positive")
+    texts = [text for text in _texts(bar) if text]
+    assert (texts[0], texts[-1]) == ("0.0452", "1.46")
+    assert {len(text.replace(".", "").lstrip("0")) for text in texts} == {3}
+    assert bar.ax.get_ylabel() == "T [10⁻⁷ K]"
+    plt.close(figure)
 
 
 def test_a_tiny_signed_state_such_as_the_shear_permeability_is_labelled_in_the_power_of_ten_of_its_values() -> None:
@@ -248,6 +263,28 @@ def test_a_near_uniform_log_positive_bar_writes_enough_significant_digits_for_di
     assert len(set(shown)) == len(shown)
     assert bar.ax.get_ylabel() == "Kxx [10⁻¹⁰ m²]"
     plt.close(figure)
+
+
+def test_a_locked_geometric_bar_of_adjacent_float_boundaries_writes_each_boundary_distinctly_in_the_shared_power_of_ten() -> None:
+    """Twelve successive float64 values from 1.0002000200020002e-7: a float division by 10⁻⁷ would merge some of them."""
+    boundaries = [1.0002000200020002e-7]
+    for _ in range(11):
+        boundaries.append(float(np.nextafter(boundaries[-1], np.inf)))
+    figure, bar = _slot_bar((1.0, 1.0), np.array(boundaries), semantic="log_positive")
+    formatter = bar.ax.yaxis.get_major_formatter()
+    assert len({formatter(value) for value in boundaries}) == len(boundaries)
+    assert bar.ax.get_ylabel() == "T [10⁻⁷ K]"
+    plt.close(figure)
+
+
+def test_a_figure_value_keeps_three_significant_digits_a_negative_one_the_true_minus_sign_and_zero_reads_zero() -> None:
+    """Notes and tables write a value as a narrow geometric bar writes its boundaries: positionally, trailing zeros kept, 1125 as 1120."""
+    assert plot_layout.significant(0.04521) == "0.0452"
+    assert plot_layout.significant(-0.04521) == "\N{MINUS SIGN}0.0452"
+    assert plot_layout.significant(-1.234e-10, exponent=-10) == "\N{MINUS SIGN}1.23"
+    assert plot_layout.significant(9.996) == "10.0"
+    assert plot_layout.significant(1125.0) == "1120"
+    assert plot_layout.significant(0.0) == plot_layout.significant(-0.0) == "0"
 
 
 def test_maintained_state_bands_keep_distinct_labels_on_a_locked_bar() -> None:
@@ -351,6 +388,90 @@ def test_a_short_signed_bar_keeps_its_zero_label() -> None:
     figure, bar = _slot_bar((60.0, 1.0), signed, semantic="linear_signed")
     assert [text for text in _texts(bar) if text] == ["0.0"]
     plt.close(figure)
+
+
+def test_an_even_symmetric_tick_count_never_keeps_two_middle_labels_closer_than_the_thinning_step() -> None:
+    """Eight ticks symmetric about 0, 0.06 in apart, keep every third label: the middle pair, one gap apart, is dropped, both ends stay."""
+    ticks = np.arange(8) - 3.5
+    kept = sorted(plot_layout._labelled_ticks(ticks, np.full(7, 0.06)))
+    assert kept == [0, 7]
+    assert all(upper - lower >= 3 for lower, upper in pairwise(kept))
+    kept = sorted(plot_layout._labelled_ticks(np.arange(10) - 4.5, np.full(9, 0.1)))  # every second label from both ends
+    assert kept == [0, 2, 7, 9]
+    assert kept == [9 - index for index in reversed(kept)]
+
+
+def test_the_decade_labels_of_a_wide_geometric_bar_are_thinned_to_its_real_height() -> None:
+    """Six decades on a 0.42 in bar keep both end labels and fewer than six, none overlapping; a tall bar keeps all six."""
+    geometric = np.geomspace(1e-5, 1.0, 12)
+    figure, bar = _slot_bar((10.0, 1.0), geometric, semantic="log_positive")
+    texts = _texts(bar)
+    kept = [label for label in bar.ax.get_yticklabels() if label.get_text()]
+    assert texts[0]
+    assert texts[-1]
+    assert len(kept) < len(texts) == 6
+    extents = [label.get_window_extent() for label in kept]
+    assert all(lower.y1 <= upper.y0 for lower, upper in pairwise(extents))
+    plt.close(figure)
+    figure, bar = _slot_bar((1.0, 1.0), geometric, semantic="log_positive")
+    assert all(_texts(bar))
+    plt.close(figure)
+
+
+def test_an_empty_bottom_map_hands_its_x_labels_to_the_nearest_map_drawn_above_it() -> None:
+    """
+    In a 3 x 3 map grid the full left column keeps its x labels at the bottom, the middle column hands them past an emptied cell.
+
+    The right column draws no map above its emptied bottom cell, so its blank cells take nothing.
+    """
+    figure, axes, _slots = plot_layout.map_grid(plot_layout.plan_geometry(3, 3, (1.0, 1.0)), extent=(0.0, 1.0, 0.0, 1.0))
+    try:
+        for axis in (axes[1, 0], axes[2, 0], axes[0, 1]):
+            axis.pcolormesh(np.zeros((2, 2)))
+        for row, column in ((0, 0), (1, 1), (2, 1), (2, 2)):  # an upper cell holds no x labels to hand on
+            plot_layout.empty_cell(axes[row, column], "unavailable")
+        assert [axis.get_xlabel() for axis in axes.flat] == ["", "x [m]", "", "", "", "", "x [m]", "x [m]", "x [m]"]
+        assert [axis.xaxis.get_tick_params()["labelbottom"] for axis in axes[:2].flat] == [False, True, False, False, False, False]
+        assert axes[2, 0].xaxis.get_tick_params()["labelbottom"]
+    finally:
+        plt.close(figure)
+
+
+def test_emptying_the_middle_row_of_an_ordinary_subplot_grid_keeps_the_other_rows_labels() -> None:
+    """A plain three-row subplot grid is no map grid: its upper and lower subplots keep their x label and tick labels."""
+    figure, axes = plt.subplots(3, 1)
+    try:
+        for axis in axes:
+            axis.plot([0.0, 1.0], [0.0, 1.0])
+        axes[0].set_xlabel("Time [h]")
+        axes[2].set_xlabel("Time [h]")
+        before = [(axis.get_xlabel(), axis.xaxis.get_tick_params()["labelbottom"]) for axis in axes[[0, 2]]]
+        plot_layout.empty_cell(axes[1], "unavailable")
+        assert [(axis.get_xlabel(), axis.xaxis.get_tick_params()["labelbottom"]) for axis in axes[[0, 2]]] == before
+        assert not axes[1].axison
+    finally:
+        plt.close(figure)
+
+
+def test_an_empty_maps_note_moves_inside_its_cell_clear_of_its_text_and_the_x_labels_handed_above_it() -> None:
+    """The lower map of a two-row grid is non-finite: its mean line, written above it, stands inside its cell, overlapping no label."""
+    figure, axes, _slots = plot_layout.map_grid(plot_layout.plan_geometry(2, 1, (2.0, 1.0)), extent=(0.0, 2.0, 0.0, 1.0))
+    try:
+        axes[0, 0].pcolormesh(np.zeros((2, 2)))
+        plot_layout.add_map_note(axes[1, 0], "mean |e| n/a")
+        plot_layout.empty_cell(axes[1, 0], "Prediction non-finite in every cell")
+        figure.canvas.draw()
+        renderer = cast("FigureCanvasAgg", figure.canvas).get_renderer()
+        note, text = (item.get_window_extent(renderer) for item in axes[1, 0].texts)
+        cell = axes[1, 0].get_window_extent(renderer)
+        assert axes[0, 0].get_xlabel() == "x [m]"
+        assert cell.contains(note.x0, note.y0)
+        assert cell.contains(note.x1, note.y1)
+        moved = [axes[0, 0].xaxis.label, *(label for label in axes[0, 0].get_xticklabels() if label.get_text())]
+        assert not any(note.overlaps(label.get_window_extent(renderer)) for label in moved)
+        assert not note.overlaps(text)
+    finally:
+        plt.close(figure)
 
 
 def test_window_axes_are_one_column_per_window_with_a_y_axis_shared_along_each_row() -> None:

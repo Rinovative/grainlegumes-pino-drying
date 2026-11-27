@@ -1279,9 +1279,11 @@ class TransientSequenceArtifactStager:
         dataset_name: str,
         dataset_role: DatasetRole,
         resume_identity: Mapping[str, Any] | None = None,
+        resume_remedy: str = "rerun with --rebuild",
     ) -> None:
-        """Create an empty stage or reopen one with an exact resume descriptor."""
+        """Create an empty stage or reopen one with an exact resume descriptor; ``resume_remedy`` ends every refusal of a damaged stage."""
         artifact_root = Path(root).expanduser()
+        self._remedy = resume_remedy
         if artifact_root.is_symlink():
             message = f"Transient artifact staging root must not be symbolic: {artifact_root}"
             raise ValueError(message)
@@ -1341,20 +1343,20 @@ class TransientSequenceArtifactStager:
             message = f"Transient resume stage is already finalized: {self.root}"
             raise FileExistsError(message)
         if not descriptor_path.is_file() or descriptor_path.is_symlink():
-            message = f"Transient partial artifact is incompatible or corrupt; rerun with --rebuild: {self.root}"
+            message = f"Transient partial artifact is incompatible or corrupt; {self._remedy}: {self.root}"
             raise TransientSequenceArtifactError(message)
         try:
             descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            message = f"Transient partial artifact is corrupt; rerun with --rebuild: {self.root}"
+            message = f"Transient partial artifact is corrupt; {self._remedy}: {self.root}"
             raise TransientSequenceArtifactError(message) from error
         if descriptor != expected:
-            message = f"Transient partial artifact is incompatible; rerun with --rebuild: {self.root}"
+            message = f"Transient partial artifact is incompatible; {self._remedy}: {self.root}"
             raise TransientSequenceArtifactError(message)
         manifest_directory = self.root / self._CASE_MANIFEST_DIRECTORY
         npz_directory = self.root / "npz"
         if not manifest_directory.is_dir() or manifest_directory.is_symlink() or not npz_directory.is_dir() or npz_directory.is_symlink():
-            message = f"Transient partial artifact is corrupt; rerun with --rebuild: {self.root}"
+            message = f"Transient partial artifact is corrupt; {self._remedy}: {self.root}"
             raise TransientSequenceArtifactError(message)
         manifests = sorted(manifest_directory.glob("case-*.json"))
         for manifest_path in manifests:
@@ -1363,11 +1365,11 @@ class TransientSequenceArtifactStager:
         observed_payloads = set(npz_directory.glob("*.npz"))
         missing_payloads = expected_payloads.difference(observed_payloads)
         if missing_payloads:
-            message = f"Transient partial artifact payload inventory is corrupt; rerun with --rebuild: {self.root}"
+            message = f"Transient partial artifact payload inventory is corrupt; {self._remedy}: {self.root}"
             raise TransientSequenceArtifactError(message)
         for orphan in observed_payloads.difference(expected_payloads):
             if orphan.is_symlink() or not orphan.is_file():
-                message = f"Transient partial artifact contains an unsafe orphan payload; rerun with --rebuild: {orphan}"
+                message = f"Transient partial artifact contains an unsafe orphan payload; {self._remedy}: {orphan}"
                 raise TransientSequenceArtifactError(message)
             orphan.unlink()
 
@@ -1375,7 +1377,7 @@ class TransientSequenceArtifactStager:
         """Restore one strictly bound compact case manifest and payload digest."""
 
         def fail(detail: str) -> NoReturn:
-            message = f"Transient case resume {detail}; rerun with --rebuild: {manifest_path}"
+            message = f"Transient case resume {detail}; {self._remedy}: {manifest_path}"
             raise TransientSequenceArtifactError(message)
 
         if manifest_path.is_symlink() or not manifest_path.is_file():
@@ -1383,7 +1385,7 @@ class TransientSequenceArtifactStager:
         try:
             document = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            message = f"Transient case resume manifest is corrupt; rerun with --rebuild: {manifest_path}"
+            message = f"Transient case resume manifest is corrupt; {self._remedy}: {manifest_path}"
             raise TransientSequenceArtifactError(message) from error
         if not isinstance(document, dict) or set(document) != {
             "case_id",
@@ -1418,7 +1420,7 @@ class TransientSequenceArtifactStager:
         try:
             payload_path = _require_relative_payload(self.root, relative)
         except (FileNotFoundError, OSError, ValueError) as error:
-            message = f"Transient case resume payload is corrupt; rerun with --rebuild: {manifest_path}"
+            message = f"Transient case resume payload is corrupt; {self._remedy}: {manifest_path}"
             raise TransientSequenceArtifactError(message) from error
         if not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):
             fail("summary rows are corrupt")
@@ -1447,7 +1449,7 @@ class TransientSequenceArtifactStager:
             finally:
                 case_payload.close()
         except (OSError, TypeError, ValueError) as error:
-            message = f"Transient case resume payload semantics conflict; rerun with --rebuild: {manifest_path}"
+            message = f"Transient case resume payload semantics conflict; {self._remedy}: {manifest_path}"
             raise TransientSequenceArtifactError(message) from error
         evidence = _json_copy(
             document["resume_evidence"],

@@ -4,6 +4,10 @@ Responsibilities:
   - Read stored and derived field availability from authoritative frame metadata
   - Order the union of selected-dataset fields by shared scientific semantics
   - Identify the compatible dataset subset for each requested field
+  - Resolve the label a figure writes for each plotted dataset (``plotted_labels``): its bare label, its key with the package
+    alias only where bare labels meet; frames, styles, case ids and subsets stay keyed by the dataset key
+  - Leave the inlet boundary inputs (task role ``boundary``) out of the 2-D map views and name them in the availability note,
+    also where a request names them beside drawable fields
   - Extract direct or nested spatial values without fabricating missing data
   - Convert one case's field values, means and state trajectories to their displayed scale and label them
 
@@ -22,10 +26,11 @@ This module does NOT:
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 import numpy as np
 
@@ -39,6 +44,7 @@ if TYPE_CHECKING:
 
     import pandas as pd
 
+DISPLAY_LABEL_ATTRIBUTE: Final = "display_label"  # a frame's dataset label without its package alias, set where the workspace binds a view
 _SPATIAL_DIMENSIONS = 2
 _LOG10_RATIO = "dimensionless_log10_ratio_to_1_m2"
 _CROSS_RATIO = "dimensionless_cross_component_ratio_to_geometric_mean"
@@ -61,15 +67,19 @@ _SUPPORTED_VIEWS = frozenset(
         "state_trajectory",
     }
 )
+_MAP_VIEWS = frozenset({"spatial_map", "spectral", "state_snapshot"})
+# Inputs that hold values on the inlet row only: a 2-D map or spectrum of them is a hairline, so the map views leave them out.
+_BOUNDARY_FIELDS = frozenset(field.name for field in domain.tasks.registry.get_task("steady_flow").inputs if field.role == "boundary")
 
 
 @dataclass(frozen=True, slots=True)
 class ResolvedFieldSelection:
-    """Hold ordered fields and exact compatible/omitted dataset labels."""
+    """Hold ordered fields, exact compatible/omitted dataset labels and the inlet boundary inputs a map view leaves out."""
 
     fields: tuple[str, ...]
     datasets_by_field: Mapping[str, tuple[str, ...]]
     omitted_by_field: Mapping[str, tuple[str, ...]]
+    boundary_profiles: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Freeze defensive copies and require complete field mappings."""
@@ -116,12 +126,7 @@ def available_fields(
     if frame.empty:
         message = "EDA field discovery requires a non-empty frame."
         raise ValueError(message)
-    if is_transient_frame(frame):
-        fields = _transient_fields(frame, view=view)
-    elif view in {"state_snapshot", "state_trajectory"}:
-        fields = ()
-    else:
-        fields = _direct_fields(frame)
+    fields = tuple(field for field in _view_fields(frame, view) if view not in _MAP_VIEWS or field not in _BOUNDARY_FIELDS)
     if not fields:
         return ()
     metadata = {name: _field_presentation_metadata(frame, name) for name in fields}
@@ -182,13 +187,16 @@ def resolve_fields(
     if not union:
         message = "Selected datasets expose no fields for this EDA view."
         raise ValueError(message)
-    fields = _resolve_requested_fields(union, requested=requested, metadata=metadata)
+    stored = {field for frame in datasets.values() for field in _view_fields(frame, view)} if view in _MAP_VIEWS else set()
+    profiles = stored & _BOUNDARY_FIELDS
+    fields = _resolve_requested_fields(union, requested=requested, metadata=metadata, profiles=profiles)
     compatible = {field: tuple(label for label in labels if field in fields_by_dataset[label]) for field in fields}
     omitted = {field: tuple(label for label in labels if field not in fields_by_dataset[label]) for field in fields}
     return ResolvedFieldSelection(
         fields=fields,
         datasets_by_field=compatible,
         omitted_by_field=omitted,
+        boundary_profiles=tuple(sorted(profiles)),
     )
 
 
@@ -317,12 +325,35 @@ def compatible_frames(
     return {label: frame for label, frame in datasets.items() if label in compatible}
 
 
-def availability_note(resolution: ResolvedFieldSelection) -> str:
-    """Return one concise note for omitted dataset/field combinations."""
-    omitted = tuple(f"{field}: {', '.join(labels)}" for field in resolution.fields if (labels := resolution.omitted_by_field[field]))
-    if not omitted:
-        return ""
-    return "Unavailable dataset/field combinations omitted — " + "; ".join(omitted) + "."
+def contributing_frames(datasets: Mapping[str, pd.DataFrame], resolution: ResolvedFieldSelection) -> dict[str, pd.DataFrame]:
+    """Return the selected frames that provide at least one resolved field: the datasets a view draws and counts."""
+    providing = {label for field in resolution.fields for label in resolution.datasets_by_field[field]}
+    return {label: frame for label, frame in datasets.items() if label in providing}
+
+
+def plotted_labels(datasets: Mapping[str, pd.DataFrame]) -> dict[str, str]:
+    """
+    Return the label a figure writes for each of the ``datasets`` it plots: its frame's bare label, else its key where bare labels meet.
+
+    The keys stay the only keys of frames, styles, case ids and subsets; the returned labels serve figure text alone (titles,
+    legend entries, column headers, notes). Should two written labels still be equal, every dataset is written by its key.
+    """
+    bare = {label: str(frame.attrs.get(DISPLAY_LABEL_ATTRIBUTE, label)) for label, frame in datasets.items()}
+    counts = Counter(bare.values())
+    shown = {label: base if counts[base] == 1 else label for label, base in bare.items()}
+    return shown if len(set(shown.values())) == len(shown) else {label: label for label in datasets}
+
+
+def availability_note(resolution: ResolvedFieldSelection, *, plotted: Mapping[str, str]) -> str:
+    """Return one concise note for omitted dataset/field combinations, the datasets as ``plotted`` writes them, and the left-out inlet inputs."""
+    omitted = tuple(
+        f"{field}: {', '.join(plotted[label] for label in labels)}" for field in resolution.fields if (labels := resolution.omitted_by_field[field])
+    )
+    notes = ["Unavailable dataset/field combinations omitted — " + "; ".join(omitted) + "."] if omitted else []
+    if resolution.boundary_profiles:
+        profiles = ", ".join(field_labels.field_label(field, mathtext=True) for field in resolution.boundary_profiles)
+        notes.append(f"{profiles}: inlet boundary profile over x, not drawn as a 2-D field.")
+    return " ".join(notes)
 
 
 def field_unit(frame: pd.DataFrame, field: str) -> str:
@@ -421,16 +452,21 @@ def field_display_trajectory(frame: pd.DataFrame, row: pd.Series, field: str) ->
 
 
 def representation_display_name(field: str, representation: str, *, mathtext: bool = False, control: bool = False) -> str:
-    """Return a field's displayed quantity: log₁₀(κₓₓ / 1 m²) or κₓᵧ / √(κₓₓ κᵧᵧ) name a stored ratio representation, else the plain name."""
+    """
+    Return a field's displayed quantity: log₁₀(κₓₓ / 1 m²) or κₓᵧ / √(κₓₓ κᵧᵧ) name a stored ratio representation, else the plain name.
+
+    A mathtext ratio is one formula of the fields' symbols; a plot label style that shows names writes the name before it.
+    """
     name = moisture_display.display_name(field, mathtext=mathtext, control=control)
-    if representation == _LOG10_RATIO:
-        return rf"$\log_{{10}}({name.strip('$')}\,/\,1\,\mathrm{{m}}^2)$" if mathtext else f"log₁₀({name} / 1 m²)"
-    if representation != _CROSS_RATIO:
+    if representation not in _DIMENSIONLESS_REPRESENTATIONS:
         return name
-    xx, yy = (moisture_display.display_name(axis, mathtext=mathtext, control=control) for axis in ("Kxx", "Kyy"))
-    if mathtext:
-        return rf"${name.strip('$')}\,/\,\sqrt{{{xx.strip('$')}\,{yy.strip('$')}}}$"
-    return f"{name} / √({xx} {yy})"
+    if not mathtext:
+        xx, yy = (moisture_display.display_name(axis, control=control) for axis in ("Kxx", "Kyy"))
+        return f"log₁₀({name} / 1 m²)" if representation == _LOG10_RATIO else f"{name} / √({xx} {yy})"
+    symbol, xx, yy = (field_labels.field_label(key, mathtext=True, control=True).strip("$") for key in (field, "Kxx", "Kyy"))
+    formula = rf"\log_{{10}}({symbol}\,/\,1\,\mathrm{{m}}^2)" if representation == _LOG10_RATIO else rf"{symbol}\,/\,\sqrt{{{xx}\,{yy}}}"
+    named = not control and field_labels.label_style() != "symbol"
+    return f"{field_labels.field_display_metadata(field).name} ${formula}$" if named else f"${formula}$"
 
 
 def field_display_name(frame: pd.DataFrame, field: str, *, mathtext: bool = False, control: bool = False) -> str:
@@ -525,6 +561,13 @@ def _validate_view(view: str) -> None:
     if view not in _SUPPORTED_VIEWS:
         message = f"Unsupported EDA field view {view!r}."
         raise ValueError(message)
+
+
+def _view_fields(frame: pd.DataFrame, view: FieldView) -> tuple[str, ...]:
+    """Return one frame's declared fields for a plot family, the inlet boundary inputs included."""
+    if is_transient_frame(frame):
+        return _transient_fields(frame, view=view)
+    return () if view in {"state_snapshot", "state_trajectory"} else _direct_fields(frame)
 
 
 def _direct_fields(frame: pd.DataFrame) -> tuple[str, ...]:
@@ -665,8 +708,14 @@ def _resolve_requested_fields(
     *,
     requested: Sequence[str] | None,
     metadata: Mapping[str, channel_semantics.ChannelPresentationMetadata],
+    profiles: set[str],
 ) -> tuple[str, ...]:
-    """Validate and semantically order one optional explicit field selection."""
+    """
+    Validate and semantically order one optional explicit field selection.
+
+    Requested inlet ``profiles``, which the view leaves out and names in its note, leave the selection before validation; a
+    selection of them alone stays unavailable.
+    """
     if requested is None:
         return available
     if isinstance(requested, str):
@@ -676,6 +725,7 @@ def _resolve_requested_fields(
     if not selected or len(selected) != len(set(selected)) or any(not isinstance(field, str) or not field for field in selected):
         message = "EDA field selection must contain unique non-empty names."
         raise ValueError(message)
+    selected = tuple(field for field in selected if field not in profiles) or selected
     unknown = tuple(field for field in selected if field not in available)
     if unknown:
         message = f"Selected EDA fields are unavailable in every selected dataset: {unknown!r}."

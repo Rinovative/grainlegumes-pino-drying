@@ -4,7 +4,10 @@ Responsibilities:
   - Compare secondary relative L2 and H1 metrics without redefining the objective
   - Render global/local distributions and reference-versus-prediction field means
   - Plot p, u, v, and TaskSpec velocity-magnitude spatial error reductions as field rows by dataset columns on the shared fixed
-    map grid, every map on a round discrete scale locked over its row and every mean error map under one mean-error line
+    map grid, every map on a round discrete scale locked per row over the runs of its dataset, its rule and grouping in the scale
+    note, and every mean error map under one mean-error line
+  - Write the error bars of one unit in one figure, over field rows and datasets, in one power of ten (``error_bar_exponents``),
+    which the case maps of ``evaluation_plot_samples_outliers`` share
   - Relate field error to target magnitude and left/right boundary distance
 
 Design principles:
@@ -13,6 +16,8 @@ Design principles:
   - Complete and bounded-prefix reductions are reused through EvaluationSession
   - Local relative error normalizes each case field by its own reference RMS; cases below the field's floor are left
     out and their count is shown
+  - Case support and fit statistics (RMSE in the display unit, R² with four decimals) stand in a caption under their panel,
+    never over its data
   - Percentile clipping changes display scales only, never numerical summaries
 
 This module does NOT:
@@ -23,6 +28,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -54,8 +60,10 @@ _DEFAULT_CASE_LIMIT = 100
 _DISTRIBUTION_DEFAULT_CASE_LIMIT = 50
 _TARGET_MAGNITUDE_DEFAULT_CASE_LIMIT = 50
 _MINIMUM_KDE_SAMPLES = 2
+_PARITY_TICKS = 4  # at most this many tick intervals per parity axis, so long labels such as -0.0125 never collide
 _BAND_LABELS = ("0-5 %", "5-10 %", "10-20 %", "20-40 %", ">40 %")
 _UNAVAILABLE_CASE_NOTE = "Unavailable: a field reference below its floor, or a non-finite prediction"
+_POWER_REACH = 2  # an error bar takes its unit's finest power of ten only while its own tick step lies within this many powers of it
 
 
 def _finite(frame: pd.DataFrame, column: str, *, limit: int | None = None) -> np.ndarray:
@@ -130,7 +138,7 @@ def plot_global_error_metrics(*, datasets: dataset_cuts.DisplayFrames) -> Figure
     """Compare current secondary relative L2/H1: per dataset and norm one row of box plot, density and CDF, the models as series."""
     dataframe.validate_comparison(datasets)
     groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
-    title, count_headings = layout.dataset_title_context("Global error metrics", groups, {key: len(frame) for key, frame in datasets.items()})
+    title, count_headings = layout.dataset_title_context("Global error metrics", datasets, {key: len(frame) for key, frame in datasets.items()})
     metrics = (("Relative L2", "physical_relative_l2"), ("Relative H1", "physical_relative_h1"))
     unit = f"[{field_labels.display_unit('1')}]"
     figure, axes = figure_layout.panel_figure(len(groups) * len(metrics), 3)
@@ -170,7 +178,7 @@ def plot_global_error_metrics(*, datasets: dataset_cuts.DisplayFrames) -> Figure
                 _case_support_text(model if len(models) > 1 else name, values.size, len(datasets[key]))
                 for (model, key), values in zip(models.items(), populations.values(), strict=True)
             ]
-            cdf_axis.text(0.98, 0.02, "\n".join(support), transform=cdf_axis.transAxes, ha="right", va="bottom", fontsize=figure_layout.TICK_PT)
+            layout.add_caption(cdf_axis, support)
             if all(np.all(values > 0.0) for values in populations.values()):
                 figure_layout.set_log_scale(box_axis, "y")
                 figure_layout.set_log_scale(density_axis, "x")
@@ -196,7 +204,7 @@ def plot_predictive_error_distributions(
     with sessions.scoped_session(datasets) as active_session:
         summaries = {key: active_session.prefix_summary(frame, max_cases) for key, frame in datasets.items()}
     title, count_headings = layout.dataset_title_context(
-        "Predictive error distributions (lower is better)", groups, layout.effective_case_counts(datasets, max_cases=max_cases)
+        "Predictive error distributions (lower is better)", datasets, layout.effective_case_counts(datasets, max_cases=max_cases)
     )
     figure, axes = figure_layout.panel_figure(1 + len(fields), len(groups), panel_in=(4.2, 2.6), sharey="row")
     zero_relative_l2: set[int] = set()  # columns with an exact prediction, whose zero a log axis could not draw
@@ -222,18 +230,9 @@ def plot_predictive_error_distributions(
                     prefix = f"{model}: " if len(models) > 1 else ""
                     noun = "case" if local.unavailable_case_count == 1 else "cases"
                     below_floor[row].append(f"{prefix}{local.unavailable_case_count} {noun} below the reference floor, left out")
-        if support:
-            axes[0, column].text(0.02, 0.02, "\n".join(support), transform=axes[0, column].transAxes, fontsize=figure_layout.TICK_PT, va="bottom")
+        layout.add_caption(axes[0, column], support)
         for row, counts in enumerate(below_floor):
-            if counts:
-                axes[row + 1, column].text(
-                    0.02,
-                    0.02,
-                    "\n".join(counts),
-                    transform=axes[row + 1, column].transAxes,
-                    fontsize=figure_layout.TICK_PT,
-                    va="bottom",
-                )
+            layout.add_caption(axes[row + 1, column], counts)
         figure_layout.set_panel_title(axes[0, column], count_headings[dataset] or dataset)
     for column, axis in enumerate(axes[0]):  # a log axis labels a range inside one decade too, but draws no exact prediction
         if column not in zero_relative_l2:
@@ -269,7 +268,7 @@ def plot_mean_field_bias(
     with sessions.scoped_session(datasets) as active_session:
         summaries = {key: active_session.full_summary(frame, max_cases) for key, frame in datasets.items()}
     title, count_headings = layout.dataset_title_context(
-        "Reference vs prediction mean", groups, {key: summary.sample_count for key, summary in summaries.items()}
+        "Reference vs prediction mean", datasets, {key: summary.sample_count for key, summary in summaries.items()}
     )
     figure, axes = figure_layout.panel_figure(len(fields), len(groups))
     for column, (dataset, models) in enumerate(groups.items()):
@@ -285,30 +284,27 @@ def plot_mean_field_bias(
             high = max(float(max(np.max(reference), np.max(prediction))) for reference, prediction in means.values())
             if np.isclose(low, high):
                 high += np.finfo(float).eps
-            axis.plot((low, high), (low, high), "k--", linewidth=1, alpha=0.7)
-            for line, (model, key) in enumerate(models.items()):
+            axis.plot((low, high), (low, high), "k--", linewidth=1, alpha=0.7, gid=figure_layout.REFERENCE_GID)
+            unit = field_labels.display_unit(field.unit, field=field.key, quantity_kind="difference")
+            fits: list[str] = []
+            for model, key in models.items():
                 reference, prediction = means[model]
-                style = styles[key]
                 rmse = float(np.sqrt(np.mean((prediction - reference) ** 2)))
                 denominator = float(np.sum((reference - np.mean(reference)) ** 2))
                 r2 = 1.0 - float(np.sum((prediction - reference) ** 2)) / denominator if denominator > 0.0 else float("nan")
-                axis.scatter(reference, prediction, s=18, alpha=0.45, color=style.color, marker=style.marker or "o")
-                axis.text(
-                    0.03,
-                    0.97 - 0.08 * line,
-                    f"{model + ': ' if len(models) > 1 else ''}{field.metric_label('RMSE')} = {rmse:.3g}, R² = {r2:.3g}",
-                    transform=axis.transAxes,
-                    color=style.color,
-                    fontsize=figure_layout.TICK_PT,
-                    va="top",
-                )
+                axis.scatter(reference, prediction, s=18, alpha=0.45, color=styles[key].color, marker=styles[key].marker or "o")
+                fit = f"{field.metric_label('RMSE')} = {layout.significant(rmse)} {unit}, R² = {r2:.4f}"
+                fits.append(f"{model}: {fit}" if len(models) > 1 else fit)
             axis.set_xlabel(f"Reference mean [{field_labels.display_unit(field.unit, field=field.key)}]")
+            axis.locator_params(nbins=_PARITY_TICKS)
+            layout.add_caption(axis, fits, [styles[key].color for key in models.values()])
             axis.grid(alpha=0.3)
         figure_layout.set_panel_title(axes[0, column], count_headings[dataset] or dataset)
     for row, field in enumerate(fields):
         figure_layout.label_rows_once(axes[row : row + 1], f"Prediction mean [{field_labels.display_unit(field.unit, field=field.key)}]")
     figure_layout.set_row_headers(figure, axes, [field.matplotlib_label for field in fields])
-    layout.add_series_legend(figure, axes, datasets, groups, styles, name_roles=False)  # the panel title names the dataset and so its role
+    # Marker entries, as the models are points; the panel title names the dataset and so its role.
+    layout.add_series_legend(figure, axes, datasets, groups, styles, points=True, name_roles=False)
     figure_layout.set_figure_title(figure, axes, title, note=layout.series_note(styles))
     return figure
 
@@ -328,6 +324,43 @@ def _normalized_scale(datasets: Mapping[str, pd.DataFrame], field: presentation.
         return str(error)
 
 
+def dataset_scale_groups(datasets: Mapping[str, pd.DataFrame]) -> list[list[str]]:
+    """Return the keys of ``datasets`` grouped by dataset: the runs that share one colour scale per field; a bare mapping has a group per key."""
+    if not isinstance(datasets, dataset_cuts.DisplayFrames):
+        return [[key] for key in datasets]
+    return [list(models.values()) for models in series.panel_groups(datasets.labels).values()]
+
+
+def dataset_scale_note(*, signed: bool, compared: bool) -> str:
+    """Return the scale note's rule of the ends of error bars grouped by ``dataset_scale_groups``, with their grouping where ``compared``."""
+    bounds = "symmetric round bands over the 5th\N{EN DASH}95th percentile" if signed else "0 to the 95th percentile, covered by round bands"
+    return bounds + ("; one per field and dataset, shared by its runs" if compared else "")
+
+
+def error_bar_exponents(bars: Sequence[tuple[str, field_maps.FieldMapDefinition | None]]) -> list[int | None]:
+    """
+    Return per error bar of one figure, given by its unit and scale, the power of ten its labels and mean line are written in.
+
+    The bars of one unit share the finest power one of them needs for its own labels (``map_layout.error_format``), over field rows
+    and datasets alike, so a plain 0.001 m/s tick step beside a 0.0005 m/s one reads 10 beside 5 in 10⁻⁴ m/s. A bar whose tick step
+    lies more than ``_POWER_REACH`` powers above that one keeps its own (``None``) instead of long integers: 0.02 m/s beside 1e-12 m/s
+    is never 200000000000 in 10⁻¹³ m/s. A bar without a scale has no power (``None``). The boundaries stay the percentile rule's.
+    """
+    steps: list[float | None] = []
+    shared: dict[str, int] = {}
+    for unit, scale in bars:
+        ticks = None if scale is None else map_layout.error_ticks(scale.boundaries, signed=scale.semantic in field_maps.SIGNED_SEMANTICS)
+        step = None if ticks is None else map_layout.tick_step(ticks)
+        if step is not None:
+            own = map_layout.tick_format(step).exponent
+            shared[unit] = min(own, shared.get(unit, own))
+        steps.append(step)
+    return [
+        None if step is None or math.floor(math.log10(step) + 1e-9) - shared[unit] > _POWER_REACH else shared[unit]
+        for (unit, _scale), step in zip(bars, steps, strict=True)
+    ]
+
+
 def _map_figure(
     *,
     datasets: Mapping[str, pd.DataFrame],
@@ -344,9 +377,10 @@ def _map_figure(
     """
     Render one spatial statistic family: a row per display field, a column per dataset, one colour bar per map.
 
-    The columns follow the selection, so the figure grows with them (no width cap). Each row has one round scale locked over its
-    maps, with arrows only at the ends of the bars that have values beyond: a ``signed`` statistic is symmetric to the larger absolute
-    5th or 95th percentile, blue-white-red, any other runs from 0 to the 95th percentile. A ``normalized`` statistic is divided by the one
+    The columns follow the selection, so the figure grows with them (no width cap). Each row has, per dataset, one round scale locked
+    over the maps of the runs compared on it (``dataset_scale_groups``), with arrows only at the ends of the bars that have values
+    beyond: a ``signed`` statistic is symmetric to the larger absolute 5th or 95th percentile, blue-white-red, any other runs from 0
+    to the 95th percentile. A ``normalized`` statistic is divided by the one
     train-only reference scale the datasets share; a ``relative_percent`` one names the cases below the field's reference floor. With
     ``mean_line`` (the error maps, not the standard deviation) one line above each map gives its mean |e|, or "n/a" without a map.
     """
@@ -354,13 +388,11 @@ def _map_figure(
     fields = _display_fields(datasets)
     with sessions.scoped_session(datasets) as active_session:
         summaries = {id(frame): active_session.full_summary(frame, max_cases).require_spatial() for frame in datasets.values()}
-    # The columns of a comparison are the models of one dataset, which the title then names.
-    dataset_labels = {datasets.labels[key][0] for key in datasets} if isinstance(datasets, dataset_cuts.DisplayFrames) else set()
-    if len(dataset_labels) == 1 and (dataset_label := next(iter(dataset_labels))) not in datasets:
-        title = f"{title} · {dataset_label}"
     figure_title, count_headings = layout.aggregate_title_context(
-        title,
+        title + layout.dataset_suffix(datasets),
         {label: summaries[id(frame)].sample_count for label, frame in datasets.items()},
+        models=datasets.title_labels.values() if isinstance(datasets, dataset_cuts.DisplayFrames) else (),
+        eligible={label: len(frame) for label, frame in datasets.items()},  # a bounded prefix reads «first n of N cases»
     )
     extents = {summary.grid.extent for summary in summaries.values()}
     if len(extents) != 1:
@@ -378,7 +410,9 @@ def _map_figure(
     )
     colorbar_unit = "%" if relative_percent else "1" if normalized else None
     top_notes: list[str] = []
-    for row, field in enumerate(fields):
+    groups = dataset_scale_groups(datasets)
+    rows: list[tuple[str | None, dict[str, np.ndarray], dict[str, field_maps.FieldMapDefinition | None]]] = []
+    for field in fields:  # every scale first, so that the bars of one unit share one power of ten (``error_bar_exponents``)
         scale = _normalized_scale(datasets, field) if normalized else None
         reason = scale if isinstance(scale, str) else None
         divisor = scale.value if isinstance(scale, error_diagnostics.ReferenceScale) else 1.0
@@ -386,34 +420,47 @@ def _map_figure(
             label: _full_array(summaries[id(frame)], field, attribute) * (100.0 if relative_percent else 1.0) / divisor
             for label, frame in datasets.items()
         }
-        error_unit = field_labels.display_unit(colorbar_unit or field.unit, quantity_kind="difference")
-        unit = f"[{error_unit}]"
-        bar_label = f"{error_diagnostics.NORMALIZED_ERROR_SYMBOL} {unit}" if normalized else unit
-        # A relative mean map is all NaN when every case lies below the field's reference floor.
-        available = np.concatenate([values[np.isfinite(values)] for values in full.values()])
-        boundaries = field_maps.error_boundaries(available, signed=signed) if reason is None and available.size else None
-        definition = (
-            field_maps.build_field_map(
-                np.append(available, boundaries[[0, -1]]),  # the scale's own ends keep a uniform (all-zero) statistic from being a constant map
-                semantic=semantic,
-                field=field.key,
-                unit=colorbar_unit or field.unit,
-                display_transform=metric_label,
-                comparison_scope=scale.dataset_identity if isinstance(scale, error_diagnostics.ReferenceScale) else "selected Evaluation models",
-                locked_boundaries=boundaries,
-                bound_policy="rounded 5th to 95th percentile, symmetric" if signed else "0 to the rounded 95th percentile",
+        definitions: dict[str, field_maps.FieldMapDefinition | None] = {}
+        for group in groups:  # one scale per dataset, shared by the runs compared on it
+            # A relative mean map is all NaN when every case lies below the field's reference floor.
+            available = np.concatenate([full[key][np.isfinite(full[key])] for key in group])
+            boundaries = field_maps.error_boundaries(available, signed=signed) if reason is None and available.size else None
+            definition = (
+                field_maps.build_field_map(
+                    np.append(available, boundaries[[0, -1]]),  # the scale's own ends keep a uniform (all-zero) statistic from being a constant map
+                    semantic=semantic,
+                    field=field.key,
+                    unit=colorbar_unit or field.unit,
+                    display_transform=metric_label,
+                    comparison_scope=scale.dataset_identity if isinstance(scale, error_diagnostics.ReferenceScale) else "selected Evaluation models",
+                    locked_boundaries=boundaries,
+                    bound_policy="rounded 5th to 95th percentile, symmetric" if signed else "0 to the rounded 95th percentile",
+                )
+                if boundaries is not None
+                else None
             )
-            if boundaries is not None
-            else None
-        )
+            definitions.update(dict.fromkeys(group, definition))
+        rows.append((reason, full, definitions))
+    units = [field_labels.display_unit(colorbar_unit or field.unit, quantity_kind="difference") for field in fields]
+    powers = iter(error_bar_exponents([(unit, scales[label]) for unit, (_, _, scales) in zip(units, rows, strict=True) for label in datasets]))
+    for row, (field, error_unit, (reason, full, definitions)) in enumerate(zip(fields, units, rows, strict=True)):
+        bar_label = f"{error_diagnostics.NORMALIZED_ERROR_SYMBOL} [{error_unit}]" if normalized else f"[{error_unit}]"
         for column, (label, frame) in enumerate(datasets.items()):
+            power = next(powers)
             summary = summaries[id(frame)]
+            definition = definitions[label]
             values = full[label]
             finite = np.isfinite(values)
             below_floor = _relative_unavailable_cases(summary, field) if relative_percent else 0
-            note = f"{below_floor} of {summary.sample_count} cases below the reference floor, left out" if below_floor else ""
+            nonfinite = (summary.local_relative_nonfinite_cases or 0) if relative_percent else 0
+            left_out = [
+                f"{count} of {summary.sample_count} cases {why}, left out"
+                for count, why in ((below_floor, "below the reference floor"), (nonfinite, "non-finite"))
+                if count
+            ]
+            note = "; ".join(left_out)
             if mean_line:  # computed from the displayed map over all its finite cells, "n/a" for an unavailable map
-                exponent = 0 if definition is None else map_layout.error_format(definition.boundaries, signed=signed).exponent
+                exponent = 0 if definition is None else map_layout.error_format(definition.boundaries, signed=signed, exponent=power).exponent
                 shown = values if definition is not None else None
                 mean = layout.mean_error_text(shown, unit=None if normalized else error_unit, exponent=exponent)
                 note = f"{mean}; {note}" if note else mean
@@ -422,8 +469,8 @@ def _map_figure(
             elif note:
                 map_layout.add_map_note(axes[row, column], note)
             if definition is None or not finite.any():
-                lacking = "every case lies below the reference floor" if relative_percent else "no finite values"
-                map_layout.empty_cell(axes[row, column], f"Unavailable: {reason or lacking}")
+                lacking = "every case lies below the reference floor or is non-finite" if relative_percent else "no finite values"
+                map_layout.empty_cell(axes[row, column], f"Unavailable: {reason or '; '.join(left_out) or lacking}")
                 continue
             indices = display_grid.display_indices(values.shape, display_spatial_stride)
             x_grid, y_grid = summary.grid.coordinates
@@ -435,11 +482,11 @@ def _map_figure(
                 **definition.pcolormesh_kwargs(),
             )
             extend = field_maps.locked_extend(values[finite], definition.boundaries)
-            map_layout.add_field_map_colorbar(figure, image, slots[row, column], definition, label=bar_label, extend=extend)
+            map_layout.add_field_map_colorbar(figure, image, slots[row, column], definition, label=bar_label, extend=extend, exponent=power)
     map_layout.set_column_headers(axes, [count_headings[label] or label for label in datasets], top_notes)
     map_layout.set_row_labels(axes, [field.matplotlib_label for field in fields])
     map_layout.set_map_title(figure, figure_title)
-    layout.add_scale_note(figure, shared=False)
+    layout.add_scale_note(figure, shared=False, scale=dataset_scale_note(signed=signed, compared=len(datasets) > 1))
     return figure
 
 
@@ -524,7 +571,7 @@ def plot_error_vs_target_magnitude(
     with sessions.scoped_session(datasets) as active_session:
         summaries = {key: active_session.prefix_summary(frame, max_cases) for key, frame in datasets.items()}
     figure_title, count_headings = layout.dataset_title_context(
-        "Error vs reference magnitude", groups, {key: summary.case_count for key, summary in summaries.items()}
+        "Error vs reference magnitude", datasets, {key: summary.case_count for key, summary in summaries.items()}
     )
     figure, axes = figure_layout.panel_figure(len(fields), len(groups))
     for row, field in enumerate(fields):
@@ -582,7 +629,7 @@ def plot_boundary_error_decomposition(
         summaries = {key: active_session.prefix_summary(frame, max_cases) for key, frame in datasets.items()}
     figure_title, count_headings = layout.dataset_title_context(
         "Left/right boundary error ratio vs x-distance (interior reference: >40 %)",
-        groups,
+        datasets,
         {key: summary.case_count for key, summary in summaries.items()},
     )
     figure, axes = figure_layout.panel_figure(1, len(groups), sharey="row")

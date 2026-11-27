@@ -5,7 +5,9 @@ Responsibilities:
   - Check that the catalog reads the HDF5 input store, merges equivalent encodings of one case as duplicates, and refuses a
     corrupt duplicate
   - Check that campaign outcomes carry their sampled parameters into the failures-by-parameter figure
-  - Check that the A/B comparison maps stand on the common map grid with a lower band, and that summary numbers fit their cells
+  - Check that the A/B comparison maps stand on the common map grid with a lower band, and that summary numbers fit their
+    unfilled cells
+  - Check that a one-case dataset draws no schedule mean and that the schedule title writes the cases as its key does
 
 Design principles:
   - Selected dataset identity and exact support govern shared controls and aggregates
@@ -29,9 +31,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
-from matplotlib.colors import BoundaryNorm
+from matplotlib.colors import BoundaryNorm, to_rgba
 from matplotlib.figure import Figure
 from matplotlib.table import Cell
+from matplotlib.text import Text
 from support.generation_fixtures import lentil_generation_config, rewrite_input_store_equivalently
 
 from src import domain, generation
@@ -117,15 +120,12 @@ def test_dataset_contexts_preserve_separate_scientific_means(
         second.records[0],
         second,
     )
-    assert tuple(context.loc["campaign purpose"]) == (
-        "source_generation",
-        "source_generation",
+    assert tuple(context.loc["Campaign purpose"]) == (  # display names; identities and storage names stay exact
+        "Source Generation",
+        "Source Generation",
     )
-    assert tuple(context.loc["simulation profile"]) == (
-        "transient_drying",
-        "transient_drying",
-    )
-    assert tuple(context.loc["batch storage name"]) == (
+    assert all(str(value).startswith("Drying · Lentil · ") for value in context.loc["Dataset"])
+    assert tuple(context.loc["Batch storage name"]) == (
         source.batch_storage_name,
         second.batch_storage_name,
     )
@@ -376,6 +376,13 @@ def test_grouped_tables_expand_components_and_preserve_raw_values(
             "Drying",
         ]
         assert all("[" in label and label.endswith("]") for label in table.index.get_level_values(-1))
+    plots = generation_inputs.plots
+    for rendered in (
+        plots.overview.parameters(first, summary, second, summary),
+        plots.overview.field_summaries(first, summary, second, summary),
+        plots.boundaries.boundary_comparison_table(first, summary, second, summary),
+    ):  # a larger input value ranks nothing, so no cell of a four-value table is filled
+        assert "background-color" not in " ".join(item.value for item in _walk(rendered) if isinstance(item, widgets.HTML))
 
     drying_parameters = dict(generation_inputs.diagnostics.grouped_table_sections(parameter_table))["Drying"]
     component_labels = (
@@ -968,7 +975,11 @@ def test_summary_numbers_fit_their_cells_and_the_side_plot_legend_stands_inside_
     ],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No summary-table text, the widest numbers included, leaves its padded cell; the moisture relation plot carries its legend inside."""
+    """
+    No summary-table text, the widest numbers included, leaves its padded cell; the moisture relation plot carries its legend inside.
+
+    The value cells stay white: a figure table has no key that would give a row-wise shade a meaning.
+    """
     summary_table = generation_inputs.diagnostics.field_summary_comparison_table
 
     def widest(*args: Any, **kwargs: Any) -> pd.DataFrame:
@@ -994,10 +1005,12 @@ def test_summary_numbers_fit_their_cells_and_the_side_plot_legend_stands_inside_
             figure.canvas.draw()
             axis = next(axis for axis in figure.axes if axis.tables)
             texts = {cell.get_text().get_text() for cell in axis.tables[0].get_celld().values()}
-            assert {"1125", "-1.234e-10"} <= texts
-            for cell in axis.tables[0].get_celld().values():
+            assert {"1120", "\N{MINUS SIGN}1.23e\N{MINUS SIGN}10"} <= texts  # three significant digits; far below the row's power: compact
+            for (row, column), cell in axis.tables[0].get_celld().items():
                 room = (1.0 - 2.0 * Cell.PAD) * cell.get_width() * axis.get_window_extent().width  # the text's padding on both sides
                 assert cell.get_text().get_window_extent().width <= room
+                if row and column:
+                    assert cell.get_facecolor() == to_rgba("white")
         phases = set(generation_inputs.plots.moisture.RELATION_PHASE_COLORS)
         (side,) = (axis for axis in moisture.axes if (found := axis.get_legend()) and {text.get_text() for text in found.get_texts()} == phases)
         legend = side.get_legend()
@@ -1027,7 +1040,7 @@ def test_permeability_histograms_write_their_power_of_ten_into_the_unit_and_the_
     try:
         figure.canvas.draw()
         rows = len(generation_inputs.plots.permeability.TENSOR_FIELDS)
-        histograms = [axis for axis in figure.axes if axis.get_ylabel() == "Cell count"][:rows]
+        histograms = [axis for axis in figure.axes if axis.get_title().endswith("distribution")][:rows]
         assert len(histograms) == rows
         for axis in histograms:
             assert re.search(r"\[10[⁻⁰¹²³⁴⁵⁶⁷⁸⁹]+ m²\]$", axis.get_xlabel())
@@ -1097,6 +1110,30 @@ def test_schedule_plot_preserves_semantic_windows_and_common_mean(
         assert expected_early_minutes[-1] == 60.0
         assert 60.0 * startup_end_h in expected_early_minutes
         np.testing.assert_array_equal(first.schedule, source_schedule)
+    finally:
+        plt.close(figure)
+
+
+def test_schedule_plot_draws_no_mean_of_a_one_case_dataset_on_either_side(
+    profile_records: dict[
+        str,
+        tuple[
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+        ],
+    ],
+) -> None:
+    """Datasets A and B of one case each: only the two solid case curves per panel, no mean in the key, and a title writing the cases as it does."""
+    first, second = profile_records["transient_drying"]
+    mean_a = generation_inputs.diagnostics.build_dataset_diagnostics((first,))
+    mean_b = generation_inputs.diagnostics.build_dataset_diagnostics((second,))
+    figure = generation_inputs.plots.boundaries.schedule_comparison(first, mean_a, second, mean_b, same_dataset=False)
+    try:
+        assert all(len(axis.lines) == 2 and {line.get_linestyle() for line in axis.lines} == {"-"} for axis in figure.axes)
+        captions = [text.get_text() for legend in figure.legends for text in legend.get_texts()]
+        assert not any("Mean" in caption for caption in captions)
+        title = next(artist.get_text() for artist in figure.artists if isinstance(artist, Text))
+        assert all(caption.rpartition(" · ")[2] in title for caption in captions)  # «Case 41 (A)», as the key writes it
     finally:
         plt.close(figure)
 
@@ -1336,9 +1373,9 @@ def test_failures_by_parameter_places_terminal_candidates_by_material_and_typed_
     try:
         panels = [axis for axis in figure.axes if axis.get_title()]
         assert [axis.get_title() for axis in panels] == _PARAMETER_ORDER
-        assert [label.get_text() for label in panels[0].get_yticklabels()] == ["chickpea", "lentil"]
+        assert [label.get_text() for label in panels[0].get_yticklabels()] == ["Chickpea", "Lentil"]
         _assert_equal_panels_and_legend_column(figure)
-        assert sorted(text.get_text() for text in figure.legends[0].get_texts()) == ["stalled (n=1)", "successful (n=1)", "timed_out (n=1)"]
+        assert sorted(text.get_text() for text in figure.legends[0].get_texts()) == ["Stalled (n=1)", "Successful (n=1)", "Timed out (n=1)"]
         for panel in panels:  # the pending candidate is no terminal candidate; every panel draws the same three
             assert sum(len(np.asarray(collection.get_offsets())) for collection in panel.collections) == 3
     finally:
@@ -1424,7 +1461,7 @@ def test_outcome_parameter_distributions_draw_one_panel_per_parameter_with_one_s
         panels = [axis for axis in figure.axes if axis.get_visible()]
         assert [axis.get_title() for axis in panels] == _PARAMETER_ORDER
         _assert_equal_panels_and_legend_column(figure)
-        assert sorted(text.get_text() for text in figure.legends[0].get_texts()) == ["failed (n=2)", "pending (n=1)", "successful (n=1)"]
+        assert sorted(text.get_text() for text in figure.legends[0].get_texts()) == ["Failed (n=2)", "Pending (n=1)", "Successful (n=1)"]
         assert panels[0].get_ylabel()
         assert not panels[1].get_ylabel()
     finally:
@@ -1639,6 +1676,35 @@ def test_registered_views_build_in_panel_rows_and_publish_their_figures(
     assert rows["basic_spatial_inputs"] == 3
     assert rows["field_atlas"] == 2
     assert rows["dataset_cases_parameters"] == 1
+
+
+def test_transient_only_views_explain_steady_inputs_instead_of_failing(
+    dataset_catalog: generation_inputs.sources.GenerationInputDatasetCatalog,
+) -> None:
+    """A catalog with transient Datasets offers the transient-only views; on steady inputs they explain why they draw nothing."""
+    from src.analysis.generation_inputs import generation_input_panel as panel  # noqa: PLC0415
+
+    def first_key(profile_id: str) -> Any:
+        return next(generation_inputs.sources.dataset_key(dataset) for dataset in dataset_catalog.datasets if dataset.profile_id == profile_id)
+
+    resolution = generation_inputs.selection.resolve_generation_input_selection(dataset_catalog, preferred_dataset_key=first_key("transient_drying"))
+    state = generation_inputs.selection.GenerationInputSelectionState(dataset_catalog, initial_selection=resolution.selection)
+    factories = panel._view_factories(dataset_catalog, state)
+    keys = ("transient_schedules", "moisture_sorption")
+    exports: dict[str, dict[str, Any]] = {key: {"fig": None, "figures": (), "plot_name": key, "title": key} for key in keys}
+    try:
+        views = {key: factories[key](export_state=exports[key], export_plot_name=key, export_title=key) for key in keys}
+        assert all(isinstance(exports[key]["fig"], Figure) for key in keys)
+        state.select_dataset_a(first_key("steady_flow"))  # Dataset B follows onto A's profile
+        for key, view in views.items():
+            assert not view.failure.shown, key
+            # The figure of the transient selection is no longer the export target.
+            assert exports[key]["fig"] is None, key
+            assert exports[key]["figures"] == (), key
+            assert view.slot is not None
+            assert any("transient" in item.value for item in _walk(view.slot.widget) if isinstance(item, widgets.HTML)), key
+    finally:
+        plt.close("all")
 
 
 def test_campaign_outcomes_are_discovered_by_default(generation_config_factory: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

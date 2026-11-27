@@ -15,6 +15,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import shutil
 from pathlib import Path
@@ -45,7 +46,7 @@ _SELECTOR_KEYS = (
 def patch_dataset_producer_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide test-owned producer metadata; full source recovery has dedicated tests."""
     producer = build_synthetic_selection_provenance(dataset_name="integration", sample_ids=("case_1",))["producer_evidence"]
-    monkeypatch.setattr(datasets.packages.reproduction, "capture_producer_evidence", lambda **_kwargs: copy.deepcopy(producer))
+    monkeypatch.setattr(datasets.packages.reproduction, "held_producer_evidence", lambda **_kwargs: contextlib.nullcontext(copy.deepcopy(producer)))
     monkeypatch.setattr(datasets.packages.reproduction, "verify_current_producer", lambda *_args, **_kwargs: None)
 
 

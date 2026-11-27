@@ -88,6 +88,12 @@ def test_unique_labels_give_the_item_without_distinguishing_token_the_bare_base(
     assert labels == ("m", "m · rev-x")
 
 
+def test_unique_labels_separate_a_label_that_a_separated_group_meets_again() -> None:
+    labels = display_labels.unique_display_labels(["m", "m", "m · a"], [("a",), ("b",), ("c",)])
+    assert len(set(labels)) == len(labels)
+    assert labels[1] == "m · b"
+
+
 def test_unique_labels_grow_the_ellipsis_until_unique() -> None:
     first, second = "A" * 15 + "1" + "B" * 25, "A" * 15 + "2" + "B" * 25
     labels = display_labels.unique_display_labels(["m", "m"], [(first,), (second,)])

@@ -3,6 +3,14 @@
 Responsibilities:
   - Check steady maps, metrics, timing bindings, exact grids, and shared controls
   - Check that compared frames record one valid analysis producer within and across roles
+  - Check that titles name runs only by explicit short labels, none where a run was selected by its path alone
+  - Check that a pooled role is one frame per material, drawn as the equal-weight mean with each material as a marker, in the two views that pool
+  - Check that pooling refuses materials on different grids, names an undefined scoreboard ratio with its raw values, and never names the
+    pooled capacity point the artifact objective
+  - Check that a capacity drawn only by a material marker stays on the capacity axis and that point keys show the marker their
+    models are drawn with, a neutral circle beside a material key where a model's points carry several, and keep a model named
+    like a material apart from that material in the capacity and the Pareto key
+  - Check that only the ranked error columns of the steady tables are shaded
 
 Design principles:
   - Matched-case grid identity is checked independently of lazy view admission
@@ -15,8 +23,10 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
+import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -31,6 +41,8 @@ import pytest
 from matplotlib import colormaps
 from matplotlib.collections import LineCollection
 from matplotlib.colors import to_rgb
+from matplotlib.markers import MarkerStyle
+from matplotlib.text import Text
 from support.steady_evaluation import steady_frame
 
 from src import analysis, common, domain
@@ -50,6 +62,7 @@ if TYPE_CHECKING:
     from matplotlib.patches import Rectangle
 
 _CASE_COUNT = 2
+_MANY_MODELS = tuple(f"model {model}" for model in range(80))  # more lines than a 3 in panel holds even at the smallest font
 _ORIGIN_MAIN_STEADY_BASELINE_COMMIT = "bf8058aefaa960dc34ffac569a6f67b59de1bf5c"
 
 
@@ -64,6 +77,11 @@ def _ecdf_steps(line: Any) -> tuple[np.ndarray, np.ndarray]:
     assert values[0] == values[1]
     assert levels[0] < levels[1]
     return values[1:], levels[1:]
+
+
+def _medians(axis: Any) -> list[Any]:
+    """Return the lines of a spectral panel without the edges of its q10-q90 bands, the thin lines with open markers."""
+    return [line for line in axis.lines if line.get_markerfacecolor() != "none"]
 
 
 def _contexts_of(datasets: Mapping[str, pd.DataFrame], *, comparison: bool) -> list[Any]:
@@ -126,7 +144,7 @@ def _record_payload(frame: pd.DataFrame, path: Path) -> None:
 
 
 def test_steady_table_and_plots_show_an_unavailable_aggregate_by_its_support_counts(tmp_path: Path) -> None:
-    """Table cells, scoreboard ticks and the Pareto notice carry the counts; per-case statistics leave a non-finite case out."""
+    """Cells, scoreboard ticks and the Pareto notice carry the counts, both titles still name Model B; per-case statistics drop a non-finite case."""
     frame, _grid = steady_frame(tmp_path)
     peer = _steady_peer(frame)
     aggregate = peer.attrs[dataframe.PRIMARY_OBJECTIVE_ID]
@@ -146,11 +164,13 @@ def test_steady_table_and_plots_show_an_unavailable_aggregate_by_its_support_cou
     # Only model A has a bar per diagnostic; model B is named with its dataset and support counts in the note instead.
     assert len(scoreboard.axes[0].patches) == len(scoreboard.axes[0].get_xticklabels())
     assert any(f"Model B on ID: {text}" in entry for entry in _figure_texts(scoreboard))
+    assert _figure_texts(scoreboard)[0].endswith(" (Model A vs Model B)")  # a compared model without a bar stays named
     plt.close(scoreboard)
 
     pareto = plots.plot_accuracy_physics_pareto(datasets=models)
     assert [len(axis.collections) for axis in pareto.axes[:3]] == [1, 1, 1]
     assert any(text in note for note in _figure_texts(pareto))
+    assert _figure_texts(pareto)[0].endswith(" (Model A vs Model B)")
     for axis in pareto.axes[:3]:  # dimensionless units read [-], never [1]
         assert axis.get_xlabel() == "Normalized task error [-]"
         assert axis.get_ylabel().endswith("[-]")
@@ -167,6 +187,43 @@ def test_steady_table_and_plots_show_an_unavailable_aggregate_by_its_support_cou
     assert np.isnan(_numeric_array(heatmap.axes[1].images[0].get_array())[:, 0]).all()
     plt.close(heatmap)
     plt.close(sensitivity.plot_metadata_error_trends(datasets=models, max_cases=_CASE_COUNT, channels=("p",)))
+
+
+def _filled_cells(table: widgets.VBox) -> dict[str, int]:
+    """Return each column heading of a rendered table with its number of filled cells, which Styler lists as CSS selectors."""
+    rules, body = cast("widgets.HTML", table.children[1]).value.split("</style>")
+    headings = re.findall(r'class="col_heading level0 col(\d+)" >([^<]*)</th>', body)
+    return {heading: len(re.findall(rf"_row\d+_col{index}\b", rules)) for index, heading in headings}
+
+
+def _table_html(root: widgets.Widget) -> str:
+    """Return the HTML of every table in ``root``, also of tables grouped in rows."""
+    own = root.value if isinstance(root, widgets.HTML) else ""
+    return " ".join((own, *(_table_html(child) for child in getattr(root, "children", ()))))
+
+
+def test_only_the_ranked_error_columns_of_the_steady_tables_are_shaded(tmp_path: Path) -> None:
+    """
+    The global summary fills both models' cells of its error columns and none of its identity or count columns.
+
+    The work, model-family configuration and extreme-parameter tables rank nothing, so none of their cells is filled, although
+    the two models differ in their trainable parameters.
+    """
+    frame, _grid = steady_frame(tmp_path)
+    datasets = {"Model A": frame, "Model B": _steady_peer(frame)}
+    plots = analysis.evaluation.plots
+    heading = analysis.presentation.display_labels.table_heading
+    errors = ("normalized_group_macro_rmse", "normalized_rmse_u", "physical_relative_l2")
+    descriptive = ("trainable_parameters", "sample_count", "physical_relative_l2_unavailable_cases")
+
+    filled = _filled_cells(plots.run_summary.plot_run_summary_table(datasets=datasets))
+    assert {column: filled[heading(column)] for column in (*errors, *descriptive)} == {**dict.fromkeys(errors, 2), **dict.fromkeys(descriptive, 0)}
+    for table in (
+        plots.run_summary.plot_work_table(datasets=datasets),
+        plots.run_summary.plot_architecture_table(datasets=datasets),
+        plots.samples_outliers.plot_input_extremes_table(datasets=datasets),
+    ):
+        assert "background-color" not in _table_html(table)
 
 
 def test_steady_comparison_checks_every_matched_case_grid_after_lazy_panel_admission(tmp_path: Path) -> None:
@@ -451,26 +508,26 @@ def test_the_steady_sample_overview_draws_every_learned_field_on_round_discrete_
     ]
     # Only the three error maps carry text: one mean |e| line each, over the drawn finite error, in the unit of their bar.
     assert not [text for axis in maps[:, :2].flat for text in axis.texts if text.get_gid() != "channel-row-label"]
+    significant = analysis.evaluation.plots.layout.significant
     for row in range(3):
         (mean_line,) = (text.get_text() for text in maps[row, 2].texts if text.get_gid() != "channel-row-label")
         drawn = np.ma.filled(maps[row, 2].collections[0].get_array().astype(float), np.nan)
-        assert mean_line == f"mean |e| = {np.nanmean(np.abs(drawn)):.3g} {slots[row, 2].get_ylabel().strip('[]')}"
+        assert mean_line == f"mean |e| = {significant(float(np.nanmean(np.abs(drawn))))} {slots[row, 2].get_ylabel().strip('[]')}"
     (note,) = (text.get_text() for text in figure.texts if text.get_text() != figure.get_suptitle())
-    assert note == "Colour scales: 5th\N{EN DASH}95th percentile; prediction uses the reference scale; arrows mark values outside"
-    # No title carries a metric, whether or not the case has a relative L2.
-    assert figure.get_suptitle() == "Lentil · ID · case_0001"
+    assert (
+        note
+        == "Colour scales: 5th\N{EN DASH}95th percentile, covered by round bands; prediction uses the reference scale; arrows mark values outside"
+    )
+    # No title carries a metric, whether or not the case has a relative L2; the case is named by its display case number.
+    assert figure.get_suptitle() == "Lentil, ID — Case 1"
     plt.close(figure)
     second = plot(datasets={"lentil, ID": frame}, row_position=1)
-    assert second.get_suptitle() == "Lentil · ID · case_0002"
+    assert second.get_suptitle() == "Lentil, ID — Case 2"
     plt.close(second)
 
-    named = plot(datasets={"uno_m64x64_h32_l7__fd": frame}, row_position=0)
-    assert named.get_suptitle() == "Lentil · ID · FNO · case_0001"
+    named = plot(datasets={"uno_m64x64_h32_l7__fd": frame}, row_position=0)  # a bare mapping's key, such as a run name, is no model label
+    assert named.get_suptitle() == "Lentil, ID — Case 1"
     plt.close(named)
-    frame.attrs["artifact_provenance"]["model"].update(kind="uno", physics_enabled=True)
-    physics = plot(datasets={"uno_m64x64_h32_l7__fd": frame}, row_position=0)
-    assert physics.get_suptitle() == "Lentil · ID · PI-U-NO · case_0001"
-    plt.close(physics)
 
     normalized = plot(datasets={"lentil, ID": frame}, row_position=0, error_mode=error_diagnostics.NORMALIZED_ABSOLUTE_ERROR)
     assert normalized.axes[2].get_title().startswith("Absolute error / train std")
@@ -539,20 +596,39 @@ def test_comparison_error_maps_name_their_dataset_in_the_title(tmp_path: Path) -
     plt.close(single)
 
 
+def test_aggregate_titles_name_one_model_or_two_by_their_short_labels_and_more_none(tmp_path: Path) -> None:
+    """One model ends the title as its label, two as «A vs B», three none (the legend names them); an unlabelled model gives none."""
+    layout = analysis.evaluation.plots.layout
+    counts = {"A": 4, "B": 4, "C": 4}
+    for models, named in ((("A",), "(A)"), (("A", "B"), "(A vs B)"), (("A", "B", "C"), None), (("",), None)):
+        title, _headings = layout.aggregate_title_context("Title", counts, models=models)
+        assert title.endswith(named) if named else "(" not in title, models
+    labels = {"A · lentil": ("lentil, ID", "A"), "B · lentil": ("lentil, ID", "B"), "A · pea": ("lentil, OOD", "A"), "B · pea": ("lentil, OOD", "B")}
+    displayed = dataset_cuts.DisplayFrames(dict.fromkeys(labels, pd.DataFrame()), labels)
+    title, _headings = layout.dataset_title_context("Title", displayed, dict.fromkeys(labels, 3))
+    assert title.endswith("(A vs B)")  # the models of every dataset panel, each once
+    frame, _grid = steady_frame(tmp_path)
+    figure = analysis.evaluation.plots.error_behavior.plot_global_error_metrics(
+        datasets=_displayed({"A": frame, "B": _steady_peer(frame)}, dataset="lentil, ID")
+    )
+    assert any(text.endswith("(A vs B)") for text in _figure_texts(figure))
+    plt.close(figure)
+
+
 def test_the_permeability_overlay_labels_its_signed_error_bar_at_band_centres_with_fixed_decimals(tmp_path: Path) -> None:
     """The overlay's signed-error bar ticks at the band centres (a labelled 0) with one decimal, like the overview's."""
     frame, _grid = steady_frame(tmp_path)
     figure = analysis.evaluation.plots.samples_outliers.plot_permeability_error_overlay(datasets={"lentil, ID": frame}, row_position=0, channel="p")
     figure.canvas.draw()
-    levels = _levels(figure.axes[5])  # the error map: second row, third column
-    np.testing.assert_allclose(figure.axes[-1].get_yticks(), (levels[:-1] + levels[1:]) / 2.0)
-    labels = [text.get_text() for text in figure.axes[-1].get_yticklabels()]
+    levels = _levels(figure.axes[2])  # the error map: first row, third column; its bar is the third slot after the six maps
+    np.testing.assert_allclose(figure.axes[8].get_yticks(), (levels[:-1] + levels[1:]) / 2.0)
+    labels = [text.get_text() for text in figure.axes[8].get_yticklabels()]
     assert "0.0" in labels or "0.00" in labels
     # Labels thinned for a short bar are blank; the fixed-decimal rule covers the shown ones.
     assert len({len(text.partition(".")[2]) for text in labels if text}) == 1
     # Its bars can show arrows, so one note line under the title says what they mean and which scales run over a percentile range.
     (note,) = (text.get_text() for text in figure.texts if text.get_text().startswith("Colour scales:"))
-    assert note.endswith("arrows mark values outside")
+    assert "; arrows mark values outside; red line: " in note  # the line goes on to name the one red error contour drawn here
     assert "permeability over its full range" in note
     plt.close(figure)
 
@@ -647,8 +723,9 @@ def test_the_permeability_overlay_titles_follow_the_label_style_and_its_red_cont
         analysis.presentation.field_labels.set_label_style("symbol")
     # The headers are bold, which rewrites a mathtext symbol inside its span; the symbols stay recognisable.
     assert [(r"\kappa_{" + suffix + "}") in title for suffix, title in zip(("xx", "xy", "yx", "yy"), titles["symbol"], strict=True)] == [True] * 4
-    assert [title.startswith("log10(") and title.endswith(" / 1 m²)") for title in titles["symbol"]] == [True, False, False, True]
-    assert titles["name"] == ["log10(Permeability xx / 1 m²)", "Permeability xy", "Permeability yx", "log10(Permeability yy / 1 m²)"]
+    log10 = r"$\mathbf{\log_{10}}$("  # typeset like the spectral transfer label, set bold with the header
+    assert [title.startswith(log10) and title.endswith(" / 1 m²)") for title in titles["symbol"]] == [True, False, False, True]
+    assert titles["name"] == [f"{log10}Permeability xx / 1 m²)", "Permeability xy", "Permeability yx", f"{log10}Permeability yy / 1 m²)"]
 
 
 def test_a_mean_error_map_without_finite_values_names_the_reference_floor_only_in_the_relative_mode(
@@ -665,7 +742,8 @@ def test_a_mean_error_map_without_finite_values_names_the_reference_floor_only_i
         texts[mode] = {text.get_text() for axis in figure.axes for text in axis.texts if "Unavailable" in text.get_text()}
         plt.close(figure)
     assert texts[error_diagnostics.SIGNED_ERROR] == {"Unavailable: no finite values"}
-    assert texts["Relative [%]"] == {"Unavailable: every case lies below the reference floor"}
+    assert texts["Relative [%]"]
+    assert all("reference floor" in text for text in texts["Relative [%]"])  # the cases it leaves out, or the generic reason
     figure = behavior.plot_mean_error_maps(datasets={"Steady fixture": frame}, max_cases=_CASE_COUNT)
     lines = [text.get_text() for axis in figure.axes for text in axis.texts if text.get_text().startswith("mean ")]
     assert lines
@@ -692,7 +770,8 @@ def test_the_mean_error_maps_put_the_datasets_in_columns_and_grow_with_the_selec
     for map_axis, bar in zip(maps.flat, bars.flat, strict=True):
         (line,) = (text.get_text() for text in map_axis.texts if text.get_text().startswith("mean "))
         drawn = np.ma.filled(map_axis.collections[0].get_array().astype(float), np.nan)  # the fixture grid is drawn unsampled
-        assert line == f"mean |e| = {np.nanmean(np.abs(drawn)):.3g} {bar.get_ylabel().strip('[]')}"
+        mean = analysis.evaluation.plots.layout.significant(float(np.nanmean(np.abs(drawn))))
+        assert line == f"mean |e| = {mean} {bar.get_ylabel().strip('[]')}"
     plt.close(one)
     plt.close(two)
     deviation = analysis.evaluation.plots.error_behavior.plot_std_error_maps(datasets={"Model A": frame}, max_cases=_CASE_COUNT)
@@ -790,7 +869,12 @@ def test_the_physical_consistency_figures_draw_a_row_per_dataset_and_the_models_
 
 
 def test_the_pressure_boundary_summary_puts_the_dimensionless_medians_and_the_pascal_error_on_two_panels(tmp_path: Path) -> None:
-    """[-] medians (inlet, outlet, boundary) and the drop error in Pa never share an axis; each model keeps its series colour in both."""
+    """
+    [-] medians (inlet, outlet, boundary) and the drop error in Pa never share an axis; each model keeps its series colour in both.
+
+    The medians are points, never bars, whose length on a log axis would suggest a baseline; the legend names the models by
+    marker entries, and the row headers name each dataset and so its role.
+    """
     shown = _two_models_on_two_datasets(tmp_path)
     physical = analysis.evaluation.plots.physical_consistency
     table = physical.build_pressure_boundary_summary(shown)
@@ -800,14 +884,17 @@ def test_the_pressure_boundary_summary_puts_the_dimensionless_medians_and_the_pa
     for row, dataset in enumerate(("ID", "OOD")):
         keys = [f"{model} · {dataset}" for model in ("A", "B")]
         dimensionless, pascal = figure.axes[2 * row : 2 * row + 2]
-        assert (len(dimensionless.patches), len(pascal.patches)) == (3 * 2, 2)
+        assert not dimensionless.patches
+        assert not pascal.patches
         assert dimensionless.get_ylabel().endswith("[-]")
         assert pascal.get_ylabel().endswith("[Pa]")
-        bars, pascal_bars = cast("list[Rectangle]", dimensionless.patches), cast("list[Rectangle]", pascal.patches)
-        np.testing.assert_allclose([patch.get_height() for patch in bars], table.loc[keys].iloc[:, :3].to_numpy().reshape(-1))
-        np.testing.assert_allclose([patch.get_height() for patch in pascal_bars], table.loc[keys].iloc[:, 3].to_numpy())
-        assert [patch.get_facecolor()[:3] for patch in pascal.patches] == [to_rgb(styles[key].color) for key in keys]
-    assert {legend.get_title().get_text() for legend in figure.legends} == {"Model", "Role"}
+        assert all(line.get_linestyle() == "None" and line.get_marker() == "o" for line in (*dimensionless.lines, *pascal.lines))
+        np.testing.assert_allclose([_numeric_array(line.get_ydata()) for line in dimensionless.lines], table.loc[keys].iloc[:, :3].to_numpy())
+        np.testing.assert_allclose([_numeric_array(line.get_ydata()) for line in pascal.lines], table.loc[keys].iloc[:, 3:].to_numpy())
+        assert [to_rgb(line.get_color()) for line in pascal.lines] == [to_rgb(styles[key].color) for key in keys]
+    (legend,) = figure.legends
+    assert legend.get_title().get_text() == "Model"
+    assert all(cast("Any", handle).get_marker() == "o" for handle in legend.legend_handles)
     plt.close(figure)
 
 
@@ -818,13 +905,15 @@ def test_the_spectral_figures_draw_all_channels_in_one_colour_each_with_a_panel_
     spectral = analysis.evaluation.plots.spectral_fidelity
     demand = spectral.plot_spectral_demand_prediction_error(datasets=shown, max_cases=_CASE_COUNT)
     assert len(demand.axes) == 2 * 2 * 2  # spectrum and error row per model, a column per dataset
-    channel_colours = [line.get_color() for line in demand.axes[0].lines[::2]]
+    channel_colours = [line.get_color() for line in _medians(demand.axes[0])[::2]]
     assert len(set(channel_colours)) == len(fields) > 1  # every channel, each its own colour
     for axis in (*demand.axes[0:2], *demand.axes[4:6]):  # spectrum panels: reference (dashed) and prediction (solid) of every channel
-        assert [line.get_color() for line in axis.lines] == [colour for colour in channel_colours for _curve in range(2)]
-        assert [line.get_linestyle() for line in axis.lines[:2]] == ["--", "-"]
+        assert [line.get_color() for line in _medians(axis)] == [colour for colour in channel_colours for _curve in range(2)]
+        assert [line.get_linestyle() for line in _medians(axis)[:2]] == ["--", "-"]
     for axis in (*demand.axes[2:4], *demand.axes[6:8]):  # error panels
-        assert [line.get_color() for line in axis.lines] == channel_colours
+        assert [line.get_color() for line in _medians(axis)] == channel_colours
+    for axis in demand.axes:  # a band edge has its curve's colour, like every line of the panel
+        assert {line.get_color() for line in axis.lines} == set(channel_colours)
     labels = [axis.get_ylabel() for axis in demand.axes]
     assert [bool(label) for label in labels] == [True, False, True, False] * 2  # once per row
     assert all(label.endswith("[-]") for label in labels if label)  # normalised spectra: no unit mixes on one axis
@@ -833,7 +922,7 @@ def test_the_spectral_figures_draw_all_channels_in_one_colour_each_with_a_panel_
     plt.close(demand)
     transfer = spectral.plot_spectral_transfer_ratio(datasets=shown, max_cases=_CASE_COUNT)
     assert len(transfer.axes) == 2 * 2 * 2  # transfer and support row per model
-    assert [line.get_color() for line in transfer.axes[0].lines[: len(fields)]] == channel_colours
+    assert [line.get_color() for line in _medians(transfer.axes[0])[: len(fields)]] == channel_colours
     assert [bool(axis.get_ylabel()) for axis in transfer.axes[:4]] == [True, False, True, False]
     plt.close(transfer)
 
@@ -877,7 +966,7 @@ def test_the_pressure_boundary_medians_leave_a_non_finite_case_out_and_name_a_mo
     assert table.loc["Model A", inlet] == pytest.approx(frame["pressure_inlet_mse"].iloc[1])
     assert pd.isna(table.loc["Model B", inlet])
     figure = physical.plot_pressure_boundary_summary(datasets=datasets)
-    assert np.isfinite(cast("Rectangle", figure.axes[0].patches[0]).get_height())
+    assert np.isfinite(_numeric_array(figure.axes[0].lines[0].get_ydata())[0])
     assert figure.axes[0].get_yscale() == "log"  # the finite medians are positive; the missing one no longer switches the scale off
     assert any("unavailable" in text.get_text() for text in figure.axes[0].texts)
     plt.close(figure)
@@ -922,14 +1011,29 @@ def test_the_overview_can_show_the_velocity_magnitude_with_streamlines_in_place_
     plt.close(figure)
 
 
-def test_the_sample_title_model_name_fails_on_an_untyped_physics_flag_like_the_run_summary(tmp_path: Path) -> None:
-    """A non-bool physics_enabled is no silent non-PI model: the title helper reads provenance through the run summary's validation."""
+def test_the_case_titles_end_with_the_short_labels_of_the_compared_models(tmp_path: Path) -> None:
+    """One compared model ends the sample and kappa titles as its label, two the p/U title as «A vs B», more none; a bare mapping names none."""
     frame, _grid = steady_frame(tmp_path)
     samples = analysis.evaluation.plots.samples_outliers
-    assert samples._model_display_name(frame)
-    frame.attrs["artifact_provenance"]["model"]["physics_enabled"] = "yes"
-    with pytest.raises(TypeError, match=r"boolean model\.physics_enabled"):
-        samples._model_display_name(frame)
+    shown = dataset_cuts.DisplayFrames({"lentil, ID": frame}, {"lentil, ID": ("lentil, ID", "FNO · B · seed 9")})
+    for plot in (samples.plot_sample_prediction_overview, samples.plot_permeability_error_overlay):
+        figure = plot(datasets=shown, row_position=0)
+        assert figure.get_suptitle().endswith(" (FNO · B · seed 9)"), plot.__name__
+        plt.close(figure)
+        bare = plot(datasets={"lentil, ID": frame}, row_position=0)
+        assert "(" not in bare.get_suptitle(), plot.__name__
+        plt.close(bare)
+    models = _displayed({"FNO · B · seed 9": frame, "U-NO · B · seed 9": _steady_peer(frame), "RNO · B · seed 9": _steady_peer(frame)}, dataset="ID")
+    for compared, suffix in (
+        (("FNO · B · seed 9", "U-NO · B · seed 9"), " (FNO · B · seed 9 vs U-NO · B · seed 9)"),
+        (("U-NO · B · seed 9",), " (U-NO · B · seed 9)"),
+    ):
+        figure = samples.plot_pressure_velocity_comparison(datasets=models, models=compared)
+        assert figure.get_suptitle() == f"Pressure and velocity comparison · Lentil, ID — Case 1{suffix}"
+        plt.close(figure)
+    three = samples.plot_pressure_velocity_comparison(datasets=models)
+    assert three.get_suptitle() == "Pressure and velocity comparison · Lentil, ID — Case 1"  # the column headers name the three models
+    plt.close(three)
 
 
 def test_the_mean_error_maps_show_the_signed_mean_on_a_symmetric_blue_white_red_scale_by_default(tmp_path: Path) -> None:
@@ -1012,15 +1116,17 @@ def test_the_steady_break_even_entry_costs_each_run_and_names_a_run_without_trai
     frames["Run B"].attrs[dataframe.COMPLETED_RUN_SUMMARY_ATTR]["run_name"] = "steady-other"
     frames["Run A"].attrs[dataframe.COMPLETED_RUN_SUMMARY_ATTR].update(model_kind="fno", elapsed_seconds=3600.0, training_units={"train_cases": 10})
 
-    figure = _break_even_entry(frames, comparison=True)()
+    figure, _details = _break_even_entry(frames, comparison=True)()
     try:
-        assert [axis.get_title() for axis in figure.axes if axis.lines] == ["Run A"]
+        assert [axis.get_title() for axis in figure.axes if axis.lines] == [""]  # one panel: the figure title and key name its run
+        assert any("Run A" in artist.get_text() for artist in figure.findobj(lambda artist: hasattr(artist, "get_text")))
         assert "Run B" in figure.get_supxlabel()
         # The costs use the clocks and the paired cases of the speed-up view: its solver sums over its one paired case.
         speedup = analysis.evaluation.plots.run_summary.build_runtime_table({"Run A": frames["Run A"]}).iloc[0]
-        solver, surrogate = speedup["solver_speedup Σ comsol_solver_s"], speedup["solver_speedup Σ surrogate forward [s]"]
+        assert (speedup["solver_speedup Σ comsol_solver_s"], speedup["solver_speedup Σ surrogate forward [s]"]) == (4.0, 0.1)
         paired, unpaired = speedup["solver_speedup paired cases"], speedup["solver_speedup unavailable cases"]
-        expected = f"t_c = {solver:.3g} s, t_s = {surrogate:.3g} s per case over {paired} paired cases ({unpaired} unpaired)"
+        # Three significant digits with their trailing zeros, written out independently of the formatter.
+        expected = rf"$t_\mathrm{{c}}$ = 4.00 s, $t_\mathrm{{s}}$ = 0.100 s per case over {paired} paired cases ({unpaired} unpaired)"
         assert expected in "\n".join(_figure_texts(figure))
     finally:
         plt.close("all")
@@ -1135,7 +1241,7 @@ def test_a_role_switch_passes_only_the_models_of_the_drawn_role(tmp_path: Path, 
 
 
 def test_the_pressure_velocity_view_offers_its_models_as_runs_and_draws_inside_the_figure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The runs disclosure names «k von n gewählt» with the first two selected; the selection reaches the plot as ``models``."""
+    """The runs disclosure names «k of n selected» with the first two selected; the selection reaches the plot as ``models``."""
     frame, _x_grid = steady_frame(tmp_path)
     models = {label: frame.copy(deep=True) for label in ("A", "B", "C")}
     for copied in models.values():
@@ -1150,7 +1256,7 @@ def test_the_pressure_velocity_view_offers_its_models_as_runs_and_draws_inside_t
     view = analysis.ui.notebook._invoke_dropdown_entry(factory, export_state=None, export_plot_name="pv", export_title="pv")
 
     summaries = [str(getattr(item, "summary", "")) for item in _widget_tree(view.widget)]
-    assert "Läufe: 2 von 3 gewählt" in summaries
+    assert "Runs: 2 of 3 selected" in summaries
     assert drawn[-1]["models"] == ("A", "B")
     assert not {"model_1", "model_2"} & set(drawn[-1])
     figure = analysis.evaluation.plots.samples_outliers.plot_pressure_velocity_comparison(datasets=models, models=("A", "B", "C"))
@@ -1163,11 +1269,17 @@ def test_the_pressure_velocity_view_offers_its_models_as_runs_and_draws_inside_t
     plt.close(figure)
 
 
-def test_the_pooling_switch_is_enabled_only_in_a_view_whose_reduction_is_material_balanced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The summary table pools; every other view of the panel shows the switch disabled with the reason."""
+@pytest.mark.parametrize(
+    ("comparison", "pooling"), [(False, set()), (True, {"Global comparison summary", "Exact trainable parameters vs performance"})]
+)
+def test_the_pooling_switch_is_enabled_only_in_the_views_that_weight_every_material_equally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, comparison: bool, pooling: set[str]
+) -> None:
+    """A comparison pools in its scoreboard and capacity view, a single-model panel has neither; every other view disables the switch."""
     frame, _x_grid = steady_frame(tmp_path)
+    models = {"A": frame, "B": _steady_peer(frame)} if comparison else {"Steady fixture": frame}
     monkeypatch.setattr(analysis.ui.viewers, "render_view", lambda *_args, **_kwargs: True)
-    registry = panel._build_sections(_scope({"Steady fixture": frame}, comparison=False), comparison=False)
+    registry = panel._build_sections(_scope(models, comparison=comparison), comparison=comparison)
     enabled: dict[str, bool] = {}
     for entries, _section_title in registry.values():
         for title, factory, _stem in entries:
@@ -1176,8 +1288,260 @@ def test_the_pooling_switch_is_enabled_only_in_a_view_whose_reduction_is_materia
                 (toggle,) = [item for item in _widget_tree(view.widget) if getattr(item, "description", None) == analysis.ui.selectors.POOL_LABEL]
                 enabled[title] = not toggle.disabled
                 assert toggle.disabled == (toggle.tooltip == dataset_cuts.POOL_DISABLED_REASON)
-    assert {title for title, on in enabled.items() if on} == {"Summary table"}
+    assert "Summary table" in enabled
+    assert {title for title, on in enabled.items() if on} == pooling
     assert len(enabled) > 5
+
+
+def _pooled_frames(tmp_path: Path) -> tuple[dataset_cuts.DisplayFrames, float]:
+    """Return what models A and B draw for the pooled ID role of lentil (first case) and chickpea (second), and the role's whole objective."""
+    frame, _x_grid = steady_frame(tmp_path)
+    frame.loc[1, "material_family"] = "chickpea"
+    scope = _scope({"A": frame, "B": _steady_peer(frame)}, comparison=True)
+    choices = selection.resolve_choices(scope.inventory, [item.key for item in scope.inventory.items], pooled=True)
+    return scope.frames(choices), frame.attrs[dataframe.PRIMARY_OBJECTIVE_ID]["value"]
+
+
+def test_a_pooled_role_draws_one_frame_per_model_and_material_and_never_one_of_appended_rows(tmp_path: Path) -> None:
+    """In a comparison and for one model alike: every frame holds one material, all under the one pooled dataset label."""
+    frame, _x_grid = steady_frame(tmp_path)
+    frame.loc[1, "material_family"] = "chickpea"
+    for models in ({"A": frame, "B": _steady_peer(frame)}, {"Steady fixture": frame}):
+        scope = _scope(models, comparison=len(models) > 1)
+
+        drawn = scope.frames(selection.resolve_choices(scope.inventory, [item.key for item in scope.inventory.items], pooled=True))
+
+        assert len(drawn) == 2 * len(models)
+        assert [set(cut["material_family"]) for cut in drawn.values()] == [{"chickpea"}, {"lentil"}] * len(models)
+        assert {dataset for dataset, _model in drawn.labels.values()} == {"ID, all materials"}
+        grouped = analysis.evaluation.plots.series.panel_series(drawn.labels)
+        assert [len(keys) for by_model in grouped.values() for keys in by_model.values()] == [2] * len(models)
+
+
+def test_capacity_shows_the_mean_of_the_material_objectives_with_each_material_as_a_marker(tmp_path: Path) -> None:
+    """A model's point is the unweighted mean of its materials' objectives, not the objective of the pooled rows; the materials stay as markers."""
+    drawn, whole_role = _pooled_frames(tmp_path)
+    objective = {key: frame.attrs[dataframe.PRIMARY_OBJECTIVE_ID]["value"] for key, frame in drawn.items()}
+    assert objective["A · Chickpea, ID"] != pytest.approx(objective["A · Lentil, ID"])
+
+    figure = analysis.evaluation.plots.sensitivity_capacity.plot_capacity_accuracy(datasets=drawn, max_cases=_CASE_COUNT)
+
+    points = [_numeric_array(collection.get_offsets())[0] for collection in figure.axes[0].collections]
+    assert len(points) == 6  # per model its pooled point, then chickpea and lentil
+    for first, (model, trainable) in zip((0, 3), (("A", 8.0), ("B", 16.0)), strict=True):
+        chickpea, lentil = objective[f"{model} · Chickpea, ID"], objective[f"{model} · Lentil, ID"]
+        expected = np.asarray([(trainable, (chickpea + lentil) / 2), (trainable, chickpea), (trainable, lentil)])
+        np.testing.assert_allclose(points[first : first + 3], expected)
+        assert points[first][1] != pytest.approx(whole_role)  # the objective of the rows appended is another number
+    texts = _figure_texts(figure)
+    assert {"Chickpea", "Lentil"} <= set(texts)
+    assert any(text.startswith("Pooled series") for text in texts)
+    plt.close(figure)
+
+
+def test_the_scoreboard_pools_the_materials_as_the_mean_ratio_to_the_best_with_the_materials_as_markers(tmp_path: Path) -> None:
+    """Every bar is the mean of its model's two material markers on the same ratio scale, whose best is the best pooled value."""
+    drawn, _whole_role = _pooled_frames(tmp_path)
+    for key, factor in (("B · Chickpea, ID", 3.0), ("B · Lentil, ID", 2.0)):  # make model B worse by a different factor per material
+        aggregate = drawn[key].attrs[dataframe.PRIMARY_OBJECTIVE_ID]
+        aggregate["value"] *= factor
+        for statistics in aggregate["group_statistics"].values():
+            statistics["normalized_rmse"] *= factor
+    raw = {key: frame.attrs[dataframe.PRIMARY_OBJECTIVE_ID]["value"] for key, frame in drawn.items()}
+    pooled = {model: (raw[f"{model} · Chickpea, ID"] + raw[f"{model} · Lentil, ID"]) / 2 for model in ("A", "B")}
+
+    figure = analysis.evaluation.plots.run_summary.plot_relative_comparison_scoreboard(datasets=drawn)
+
+    axis = figure.axes[0]
+    columns = len(axis.get_xticklabels())
+    bars = [cast("Rectangle", patch) for patch in axis.patches]
+    heights = [bar.get_height() for bar in bars]
+    assert len(heights) == 2 * columns  # one bar per model and diagnostic, none per material
+    assert heights[0] == pytest.approx(1.0)  # task macro: model A is the best pooled value
+    assert heights[columns] == pytest.approx(pooled["B"] / pooled["A"])
+    markers = [_numeric_array(collection.get_offsets()) for collection in axis.collections]
+    assert len(markers) == 4  # model A then B, chickpea then lentil
+    np.testing.assert_allclose([markers[0][0][1], markers[1][0][1]], [raw["A · Chickpea, ID"] / pooled["A"], raw["A · Lentil, ID"] / pooled["A"]])
+    for column in range(columns):  # a bar is the mean of its model's two markers
+        for model, first in (("A", 0), ("B", 2)):
+            bar = bars[(0 if model == "A" else columns) + column]
+            assert bar.get_height() == pytest.approx(np.mean([markers[first][column][1], markers[first + 1][column][1]]))
+            assert markers[first][column][0] == pytest.approx(bar.get_x() + bar.get_width() / 2)
+    plt.close(figure)
+
+
+def _shift_case_grid(frame: pd.DataFrame, position: int, path: Path) -> None:
+    """Move the case at ``position`` onto another grid: its payload, coordinates shifted, is written to ``path`` and bound by digest."""
+    with np.load(Path(str(frame.iloc[position]["npz_path"])), allow_pickle=False) as payload:
+        arrays = {name: payload[name] for name in payload.files}
+    arrays["coordinates"] = arrays["coordinates"].copy()
+    arrays["coordinates"][0] += 0.02
+    np.savez_compressed(path, **arrays)
+    _record_payload(frame, path)
+    frame.loc[frame.index[position], "npz_path"] = str(path)
+
+
+def test_pooling_refuses_materials_whose_cases_lie_on_different_grids(tmp_path: Path) -> None:
+    """Each material passes the grid admission alone and draws separately, but pooled materials must share one grid: both views refuse."""
+    frame, _x_grid = steady_frame(tmp_path)
+    frame.loc[1, "material_family"] = "chickpea"
+    _shift_case_grid(frame, 1, tmp_path / "chickpea_case.npz")
+    scope = _scope({"A": frame, "B": _steady_peer(frame)}, comparison=True)
+    keys = [item.key for item in scope.inventory.items]
+    plots = analysis.evaluation.plots
+
+    separate = scope.frames(selection.resolve_choices(scope.inventory, keys, pooled=False))
+    plt.close(plots.sensitivity_capacity.plot_capacity_accuracy(datasets=separate, max_cases=_CASE_COUNT))
+
+    pooled = scope.frames(selection.resolve_choices(scope.inventory, keys, pooled=True))
+    for plot in (plots.run_summary.plot_relative_comparison_scoreboard, plots.sensitivity_capacity.plot_capacity_accuracy):
+        with pytest.raises(dataframe.ComparisonCompatibilityError, match=r"\['chickpea', 'lentil'\].*mixes incompatible grids"):
+            plot(datasets=pooled)
+
+
+def _set_diagnostics(frame: pd.DataFrame, value: float | None) -> None:
+    """Give the task macro and every group of ``frame``'s aggregate the value ``value``, or make the aggregate unavailable for ``None``."""
+    aggregate = frame.attrs[dataframe.PRIMARY_OBJECTIVE_ID]
+    if value is None:
+        aggregate.update(
+            available=False, value=None, field_metrics=None, relative_unavailable_cases=None, group_statistics=None, finite_value_count=0
+        )
+        aggregate["nonfinite_value_count"] = aggregate["required_value_count"]
+        return
+    aggregate["value"] = value
+    for statistics in aggregate["group_statistics"].values():
+        statistics["normalized_rmse"] = value
+
+
+@pytest.mark.parametrize(
+    ("values", "best", "listed"),
+    [
+        ({"A": (0.0, 0.0), "B": (1.0, 3.0)}, "zero", "B (Chickpea) 1, B (Lentil) 3"),
+        ({"A": (1.0, None), "B": (None, 3.0)}, "unavailable", "A (Chickpea) 1, B (Lentil) 3"),
+    ],
+    ids=["zero-best", "no-best"],
+)
+def test_an_undefined_scoreboard_ratio_is_named_with_the_finite_material_values_as_raw_values(
+    tmp_path: Path, values: Mapping[str, tuple[float | None, float | None]], best: str, listed: str
+) -> None:
+    """A best pooled value of zero or none leaves a finite material value without a ratio: the note says why and lists it as a raw value."""
+    drawn, _whole_role = _pooled_frames(tmp_path)
+    for model, by_material in values.items():
+        for material, value in zip(("Chickpea", "Lentil"), by_material, strict=True):
+            _set_diagnostics(drawn[f"{model} · {material}, ID"], value)
+
+    figure = analysis.evaluation.plots.run_summary.plot_relative_comparison_scoreboard(datasets=drawn)
+
+    axis = figure.axes[0]
+    columns = [label.get_text() for label in axis.get_xticklabels()]
+    text = " ".join(_figure_texts(figure))
+    for column in columns:
+        assert f"Ratio undefined for {column} on ID, all materials (displayed best is {best}); raw values: {listed}" in text
+    # A zero best still ranks the exact zeros, model A's, at 1; without any best no bar is drawn.
+    assert [cast("Rectangle", patch).get_height() for patch in axis.patches] == ([1.0] * len(columns) if best == "zero" else [])
+    plt.close(figure)
+
+
+def test_capacity_names_a_pooled_point_the_mean_per_material_error_never_the_artifact_objective(tmp_path: Path) -> None:
+    """A pooled point is no artifact objective: title and axis name the mean per-material error; separate materials keep their names."""
+    drawn, _whole_role = _pooled_frames(tmp_path)
+    separate = dataset_cuts.DisplayFrames(drawn, {key: (key.split(" · ")[1], model) for key, (_dataset, model) in drawn.labels.items()})
+    plots = analysis.evaluation.plots.sensitivity_capacity
+
+    pooled_figure = plots.plot_capacity_accuracy(datasets=drawn, max_cases=_CASE_COUNT)
+    separate_figure = plots.plot_capacity_accuracy(datasets=separate, max_cases=_CASE_COUNT)
+
+    pooled_texts = [*_figure_texts(pooled_figure), pooled_figure.axes[0].get_ylabel()]
+    assert pooled_texts[0].startswith("Capacity versus mean per-material normalized group macro RMSE")
+    assert pooled_texts[-1].startswith("Mean per-material normalized group macro RMSE")
+    assert not [text for text in pooled_texts if re.search("authoritative|aggregate|objective", text, flags=re.IGNORECASE)]
+    assert _figure_texts(separate_figure)[0].startswith("Capacity versus authoritative aggregate accuracy")
+    assert separate_figure.axes[0].get_ylabel().startswith("Normalized group macro RMSE")
+    plt.close(pooled_figure)
+    plt.close(separate_figure)
+
+
+def test_a_capacity_drawn_only_by_a_material_marker_stays_inside_the_axis(tmp_path: Path) -> None:
+    """
+    Model B (24 parameters) has no chickpea objective, so only its lentil marker is drawn; that capacity sets the axis as a pooled point does.
+
+    Model A's pooled point stands alone at 8, so a range padded around 8 alone would cut B's marker off.
+    """
+    drawn, _whole_role = _pooled_frames(tmp_path)
+    channels = domain.tasks.steady_flow.STEADY_FLOW.output_names
+    nonfinite = validity_contract.build_field_prediction_validity(np.full((len(channels), 1, 1), np.nan), channels=channels)
+    drawn["B · Chickpea, ID"]["prediction_validity"] = json.dumps(nonfinite)
+    for key in ("B · Chickpea, ID", "B · Lentil, ID"):
+        drawn[key].attrs["artifact_provenance"]["model"]["parameter_counts"] = {"total": 24, "trainable": 24}
+
+    figure = analysis.evaluation.plots.sensitivity_capacity.plot_capacity_accuracy(datasets=drawn, max_cases=_CASE_COUNT)
+
+    (axis,) = figure.axes
+    capacities = [float(_numeric_array(collection.get_offsets())[0, 0]) for collection in axis.collections]
+    assert capacities == [8.0, 8.0, 8.0, 24.0]  # A's pooled point and its two materials, then B's lentil marker alone
+    low, high = axis.get_xlim()
+    assert all(low < capacity < high for capacity in capacities)
+    plt.close(figure)
+
+
+def test_point_keys_show_the_marker_their_models_are_drawn_with(tmp_path: Path) -> None:
+    """
+    Runs on two materials draw each model's points with its material marker; a model is named «Chickpea» like a material.
+
+    The run behind «Chickpea» is named «C» on lentil, so every point «Chickpea» names carries the chickpea square. In the capacity
+    and the Pareto key it keeps that square in its own colour beside the material group's neutral «Chickpea» square, and «B», whose
+    points carry two markers, is a neutral circle. The pressure summary keys a model by the marker of its first series: chickpea
+    (the material OOD role) is the first dataset, so «Chickpea» and «B» are squares.
+    """
+    frame, _x_grid = steady_frame(tmp_path)
+    peer = _steady_peer(frame)
+    frames: dict[str, pd.DataFrame] = {}
+    labels: dict[str, tuple[str, str]] = {}
+    for dataset, role, material, models in (
+        ("chickpea, Material OOD", "material_ood", "chickpea", ("Chickpea", "B")),
+        ("lentil, ID", "eval", "lentil", ("C", "B")),
+    ):
+        for model in models:
+            source = peer if model == "B" else frame
+            shown = source.copy(deep=True)
+            shown.attrs = copy.deepcopy(source.attrs)
+            shown.attrs["dataset_role"] = role
+            shown.attrs["artifact_provenance"]["split_role"] = role
+            shown.attrs["artifact_provenance"]["selection"]["material_families"] = [material]
+            frames[f"{model} · {dataset}"], labels[f"{model} · {dataset}"] = shown, (dataset, model)
+    materials = dataset_cuts.DisplayFrames(frames, labels)
+    styles = analysis.evaluation.plots.series.series_styles(materials)
+    squares = [styles[f"{model} · chickpea, Material OOD"].marker for model in ("Chickpea", "B")]
+    assert squares == ["s", "s"]
+    plots = analysis.evaluation.plots
+
+    capacity = plots.sensitivity_capacity.plot_capacity_accuracy(datasets=materials, max_cases=_CASE_COUNT)
+    pareto = plots.run_summary.plot_accuracy_physics_pareto(datasets=materials)
+    pressure = plots.physical_consistency.plot_pressure_boundary_summary(datasets=materials)
+
+    square = MarkerStyle("s")
+    drawn_square = square.get_path().transformed(square.get_transform())
+    np.testing.assert_allclose(_numeric_array(capacity.axes[0].collections[0].get_paths()[0].vertices), _numeric_array(drawn_square.vertices))
+    for figure in (capacity, pareto):
+        keys = {legend.get_title().get_text(): list(zip(legend.get_texts(), legend.legend_handles, strict=True)) for legend in figure.legends}
+        assert {group: [(text.get_text(), cast("Any", handle).get_marker()) for text, handle in entries] for group, entries in keys.items()} == {
+            "Model": [("Chickpea", "s"), ("B", "o"), ("C", "o")],
+            "Material": [("Chickpea", "s"), ("Lentil", "o")],
+        }
+        model, material = (cast("Any", keys[group][0][1]) for group in ("Model", "Material"))
+        colour = to_rgb(styles["Chickpea · chickpea, Material OOD"].color)
+        assert to_rgb(model.get_markeredgecolor()) == colour != to_rgb(material.get_markeredgecolor())
+    # B draws chickpea squares and lentil circles, so its key is a neutral circle and a material key tells the shapes apart.
+    pressure_keys = {
+        legend.get_title().get_text(): [
+            (text.get_text(), cast("Any", handle).get_marker()) for text, handle in zip(legend.get_texts(), legend.legend_handles, strict=True)
+        ]
+        for legend in pressure.legends
+    }
+    assert pressure_keys == {"Model": [("Chickpea", "s"), ("B", "o"), ("C", "o")], "Material": [("Chickpea", "s"), ("Lentil", "o")]}
+    assert [line.get_marker() for axis in pressure.axes[:2] for line in axis.lines] == ["s"] * 4  # the chickpea row
+    for figure in (capacity, pareto, pressure):
+        plt.close(figure)
 
 
 def test_a_comparison_draws_every_selected_dataset_with_models_as_series_and_single_model_views_one(
@@ -1196,7 +1560,7 @@ def test_a_comparison_draws_every_selected_dataset_with_models_as_series_and_sin
     panel._dataset_view(scope, plot_func=lambda **_kwargs: None, selection_state=None, export={})
     panel._dataset_view(scope, plot_func=lambda **_kwargs: None, selection_state=None, export={}, single_model=True)
 
-    assert set(drawn[0]) == {f"{model} · {label}" for model in ("A", "B") for label in ("lentil, ID", "lentil, Material OOD")}
+    assert set(drawn[0]) == {f"{model} · {label}" for model in ("A", "B") for label in ("Lentil, ID", "Lentil, Material OOD")}
     for key, (dataset_label, model_label) in drawn[0].labels.items():
         assert key == f"{model_label} · {dataset_label}"
     assert len(drawn[1]) == 1
@@ -1211,26 +1575,6 @@ def _two_role_comparison_scope(tmp_path: Path, models: tuple[str, ...] = ("A", "
         panel.EvaluationContext(key="material_ood", label="Material OOD", datasets=_model_copies(frame, models, role="material_ood")),
     ]
     return panel._SteadyScope(contexts, comparison=True, refused_roles={})
-
-
-def test_every_map_view_of_a_comparison_draws_one_dataset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Map views keep one dataset in a comparison, whatever the number of compared models."""
-    scope = _two_role_comparison_scope(tmp_path)
-    seen: dict[str, set[str]] = {}
-    original = analysis.ui.viewers.case_count_view
-
-    def recording(*args: Any, **kwargs: Any) -> Any:
-        seen.setdefault(kwargs["export_plot_name"], set()).update(dataset_label for dataset_label, _model in kwargs["datasets"].labels.values())
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(analysis.ui.viewers, "case_count_view", recording)
-    registry = panel._build_sections(scope, comparison=True)
-    maps = {"Mean error maps", "Std error maps", "Spatial residuals", "Darcy–Brinkman operator residual"}  # noqa: RUF001
-    entries = [(title, factory) for entries, _title in registry.values() for title, factory, _stem in entries if title in maps]
-    assert {title for title, _factory in entries} == maps
-    for title, factory in entries:
-        analysis.ui.notebook._invoke_dropdown_entry(factory, export_state=None, export_plot_name=title, export_title=title)
-    assert {title: len(labels) for title, labels in seen.items()} == dict.fromkeys(maps, 1)
 
 
 def test_a_dataset_and_model_label_pair_that_collides_in_the_comparison_key_is_refused(tmp_path: Path) -> None:
@@ -1257,7 +1601,7 @@ def test_a_comparison_draws_one_dataset_and_lists_a_refused_role_as_unavailable(
     assert all(len(cut) == _CASE_COUNT for cut in drawn[0].values())
     assert [model_label for _dataset, model_label in drawn[0].labels.values()] == ["A", "B"]
     texts = [str(getattr(item, "description", None) or getattr(item, "value", "")) for item in _widget_tree(view.widget)]
-    assert "<b>Nicht verfügbar</b>" in texts
+    assert "<b>Unavailable</b>" in texts
     unavailable = [item for item in _widget_tree(view.widget) if "disagreeing membership in B" in str(getattr(item, "description", ""))]
     assert unavailable
     assert all(item.disabled for item in unavailable)
@@ -1445,8 +1789,14 @@ def test_steady_line_bar_and_distribution_views_draw_datasets_as_panels_and_mode
     plt.close(scoreboard)
 
     heatmap = plots.sensitivity_capacity.plot_metadata_error_heatmap(datasets=shown, max_cases=_CASE_COUNT)
-    assert [len(axis.images) for axis in heatmap.axes[:4]] == [1] * 4  # datasets underneath, a column per model
-    assert [axis.get_title() for axis in heatmap.axes[:4]] == ["A", "B", "A", "B"]
+    assert [len(axis.images) for axis in heatmap.axes[:4]] == [1] * 4  # a column per dataset, a row per run
+    assert [axis.get_title() for axis in heatmap.axes[:4]] == ["ID", "OOD", "", ""]  # the datasets head the top row
+    # Each run heads its own row, on the row's first panel.
+    assert [[text.get_text() for text in axis.texts if text.get_text() in {"A", "B"}] for axis in heatmap.axes[:4]] == [["A"], [], ["B"], []]
+    heatmap.canvas.draw()
+    panels = [axis.get_position() for axis in heatmap.axes[:4]]
+    bar = heatmap.axes[-1].get_position()
+    assert (bar.y0, bar.y1) == pytest.approx((min(box.y0 for box in panels), max(box.y1 for box in panels)))  # one bar spans the block
     plt.close(heatmap)
 
 
@@ -1667,13 +2017,13 @@ def test_steady_physical_spectral_and_sensitivity_values(tmp_path: Path) -> None
     plt.close(pressure)
 
     demand = plots.spectral_fidelity.plot_spectral_demand_prediction_error(datasets=_displayed(datasets), max_cases=_CASE_COUNT)
-    reference_power = _numeric_array(demand.axes[0].lines[0].get_ydata())
-    prediction_power = _numeric_array(demand.axes[0].lines[1].get_ydata())
-    error_power = _numeric_array(demand.axes[1].lines[0].get_ydata())
+    reference_power = _numeric_array(_medians(demand.axes[0])[0].get_ydata())
+    prediction_power = _numeric_array(_medians(demand.axes[0])[1].get_ydata())
+    error_power = _numeric_array(_medians(demand.axes[1])[0].get_ydata())
     # The fixture's prediction is 4 x the reference and its error equals the reference, so the unit-sum spectra coincide.
     np.testing.assert_allclose(prediction_power, reference_power)
     np.testing.assert_allclose(error_power, reference_power)
-    assert demand.axes[0].get_ylabel().endswith("(normalised) [-]")
+    assert demand.axes[0].get_ylabel() == "Normalized spectral power [-]"
     plt.close(demand)
 
     transfer = plots.spectral_fidelity.plot_spectral_transfer_ratio(
@@ -1767,6 +2117,20 @@ def test_full_summary_leaves_a_nonfinite_case_out_of_the_local_relative_maps_who
         assert magnitude.local_relative_unavailable_cases == alone.magnitudes[group].local_relative_unavailable_cases
 
 
+def test_the_local_relative_maps_name_the_nonfinite_case_they_leave_out(tmp_path: Path) -> None:
+    """The relative mean maps say that the NONFINITE case is left out; the signed maps, which keep its finite cells, say nothing."""
+    mixed = _nonfinite_frame(tmp_path / "mixed", (1,))
+    behavior = analysis.evaluation.plots.error_behavior
+    notes = {}
+    for mode in (error_diagnostics.SIGNED_ERROR, "Relative [%]"):
+        figure = behavior.plot_mean_error_maps(datasets={"mixed": mixed}, max_cases=_CASE_COUNT, error_mode=mode)
+        notes[mode] = [text.get_text() for text in figure.findobj(Text) if "non-finite, left out" in text.get_text()]
+        plt.close(figure)
+    assert notes[error_diagnostics.SIGNED_ERROR] == []
+    assert notes["Relative [%]"]
+    assert all(f"1 of {_CASE_COUNT} cases non-finite, left out" in note for note in notes["Relative [%]"])
+
+
 def test_prefix_plots_show_an_empty_prefix_instead_of_failing(tmp_path: Path) -> None:
     """Every prefix consumer states `unavailable` when no prefix case is finite, and the curated spectral entry still renders the rest."""
     plots = analysis.evaluation.plots
@@ -1796,6 +2160,56 @@ def test_prefix_plots_show_an_empty_prefix_instead_of_failing(tmp_path: Path) ->
     plt.close(figure)
 
 
+def test_a_compared_model_without_a_finite_case_stays_in_the_title_and_its_panels_say_so(tmp_path: Path) -> None:
+    """Model B has no finite prefix case: the distributions still end with «(A vs B)», and B's panels name it as unavailable."""
+    frames = {"A": _nonfinite_frame(tmp_path / "a", ()), "B": _steady_peer(_nonfinite_frame(tmp_path / "b", (0, 1)))}
+    figure = analysis.evaluation.plots.error_behavior.plot_predictive_error_distributions(datasets=_displayed(frames, dataset="ID"))
+    texts = _figure_texts(figure)
+    assert texts[0].endswith(" (A vs B)")
+    assert any(f"B: unavailable (0 finite of {_CASE_COUNT} prefix cases)" in text for text in texts)
+    plt.close(figure)
+
+
+@pytest.mark.parametrize(
+    ("models", "cut", "save"),
+    [
+        (_MANY_MODELS[:8], False, False),
+        (("x" * 300,), False, False),
+        (_MANY_MODELS, True, False),
+        (_MANY_MODELS, True, True),
+    ],
+    ids=["wrapped", "unbroken-word", "cut-at-smallest-font", "saved-tight"],
+)
+def test_the_empty_prefix_lines_render_inside_their_panel(models: tuple[str, ...], cut: bool, save: bool) -> None:
+    """
+    Models without a finite prefix case: drawn, or saved with a tight box, the text lies inside the panel.
+
+    Every line is shown, broken at words and a word wider than the panel at characters, unless even the smallest font cannot hold
+    the rows: the rows that fit then end in one row «… k more».
+    """
+    layout = analysis.evaluation.plots.layout
+    figure, axis = plt.subplots(figsize=(4.0, 3.0))
+    for model in models:
+        layout.mark_empty_prefix(axis, case_count=_CASE_COUNT, model=model)
+    if save:
+        figure.savefig(io.BytesIO(), bbox_inches="tight")
+    else:
+        figure.canvas.draw()
+    panel = axis.get_window_extent()
+    (text,) = axis.texts
+    extent = text.get_window_extent()
+    assert (panel.x0 <= extent.x0, extent.x1 <= panel.x1, panel.y0 <= extent.y0, extent.y1 <= panel.y1) == (True,) * 4
+    *shown, last = text.get_text().splitlines()
+    if cut:
+        count = re.fullmatch("\N{HORIZONTAL ELLIPSIS} ([0-9]+) more", last)
+        assert count is not None
+        assert shown[0].startswith("model 0:")
+        assert len(shown) + int(count.group(1)) >= len(models)
+    else:
+        assert "".join(text.get_text().split()) == "".join(f"{model}:{layout.empty_prefix_text(_CASE_COUNT)}".replace(" ", "") for model in models)
+    plt.close(figure)
+
+
 def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> None:
     """Protect exact selected cases, Kappa evidence, rankings, and paired fields."""
     frame, x_grid = steady_frame(tmp_path)
@@ -1815,7 +2229,7 @@ def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> No
         selection_index=0,
         channel="p",
     )
-    assert linked_outlier.get_suptitle() == "Lentil · ID · case_0002 · $p$ outlier field view"
+    assert linked_outlier.get_suptitle() == "$p$ outlier field view · Lentil, ID — Case 2"
     plt.close(linked_outlier)
 
     linked_extreme = plots.plot_linked_input_extreme_cases(
@@ -1823,15 +2237,15 @@ def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> No
         selection_index=0,
         parameter="parameters_bed.structure.coarse_len_rel",
     )
-    assert linked_extreme.get_suptitle() == "Lentil · ID · case_0001 · Input extreme: Coarse correlation length minimum"
+    assert linked_extreme.get_suptitle() == "Input extreme: Coarse correlation length minimum · Lentil, ID — Case 1"
     plt.close(linked_extreme)
 
     models = {"Model A": frame, "Model B": peer}
     comparison = plots.plot_pressure_velocity_comparison(datasets=models, row_position=0)
-    assert comparison.get_suptitle() == "Pressure and velocity comparison — Case 1"
-    # Rows p and |u|, columns the ground truth then every model, each header once above its column and every map with its own bar.
+    assert comparison.get_suptitle() == "Pressure and velocity comparison · Lentil, ID — Case 1"
+    # Rows p and |u|, columns the reference then every model, each header once above its column and every map with its own bar.
     maps, bars = (np.asarray(axes, dtype=object).reshape(2, 3) for axes in (comparison.axes[:6], comparison.axes[6:]))
-    assert [axis.get_title() for axis in maps[0]] == ["GT", "Model A", "Model B"]
+    assert [axis.get_title() for axis in maps[0]] == ["Reference", "Model A", "Model B"]
     assert not any(axis.get_title() for axis in maps[1])
     assert [bar.get_ylabel() for bar in bars.flat] == ["[Pa]"] * 3 + ["[m/s]"] * 3
     labels = [text.get_text() for axis in maps[:, 0] for text in axis.texts if text.get_gid() == "channel-row-label"]
@@ -1839,7 +2253,7 @@ def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> No
     assert r"|\mathbf{u}|" in labels[1]
     plt.close(comparison)
     chosen = plots.plot_pressure_velocity_comparison(datasets=models, row_position=0, models=("Model B",), scale_mode="Shared (GT)")
-    assert [axis.get_title() for axis in chosen.axes[:4] if axis.get_title()] == ["GT", "Model B"]
+    assert [axis.get_title() for axis in chosen.axes[:4] if axis.get_title()] == ["Reference", "Model B"]
     assert len(chosen.axes) == 8
     plt.close(chosen)
     with pytest.raises(ValueError, match="distinct displayed models"):
@@ -1972,7 +2386,7 @@ def test_steady_case_and_channel_controls_share_one_state_owner(
     first, first_case, first_channel = make_view()
     assert first_case.value == _CASE_COUNT
     assert first_channel.value == "p"
-    assert first.status.text == ""
+    assert first.status.text == "generation case 2"  # the navigator names the opened case's generation case ID
     second, second_case, second_channel = make_view()
 
     first_case.value = 1
@@ -2085,6 +2499,44 @@ def test_steady_single_run_with_several_roles_admits_one_case_inventory(tmp_path
     result.close()
 
 
+def test_a_workflow_comparison_with_a_run_selected_by_its_path_names_no_model_in_its_titles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two labelled runs end the title as «A vs B»; with one run selected by its path alone the title names none, its legend the alias."""
+    frame = _role_frame(tmp_path / "frame", (1, 2))
+    runs = {(tmp_path / name).resolve(): artifact for name, artifact in (("first", frame), ("second-alias", _steady_peer(frame)))}
+    prepared = {
+        run_dir: analysis.artifacts.service.PreparedRunArtifacts(
+            loaded_run=artifact_loader.LoadedRunArtifacts(
+                task="steady_flow", run_name=run_dir.name, run_dir=run_dir, id_artifact=_loaded_artifact(artifact, run_dir / "analysis" / "id")
+            ),
+            role_actions={"id": "reused"},
+        )
+        for run_dir, artifact in runs.items()
+    }
+    monkeypatch.setattr(analysis.artifacts.service, "load_prepared_run_artifacts", lambda path, **_kwargs: prepared[path])
+    plot = analysis.evaluation.plots.error_behavior.plot_global_error_metrics
+    figures: list[Any] = []
+
+    def captured(**kwargs: Any) -> Any:
+        figures.append(plot(**kwargs))
+        return figures[-1]
+
+    monkeypatch.setattr(analysis.evaluation.plots.error_behavior, "plot_global_error_metrics", captured)
+    workflow = analysis.evaluation.workflow
+    for labels in (("A", "B"), ("A", None)):
+        result = workflow.prepare_evaluation_workflow(
+            tuple(workflow.EvaluationRunSelection(run_dir, label=label) for run_dir, label in zip(runs, labels, strict=True)),
+            (workflow.EvaluationContextSpec("id", "ID", "id"),),
+            sections=("global_error",),
+        )
+        panel._LAZY_PANELS[result.panel].open()
+        result.close()
+    named, unnamed = (_figure_texts(figure) for figure in figures)  # the first text is the figure title
+    assert named[0].endswith("(A vs B)")
+    assert not unnamed[0].endswith(")")  # neither «(A vs second-alias)» nor «(A)»
+    assert any("second-alias" in text for text in unnamed[1:])  # the legend still names the run by its alias
+    plt.close("all")
+
+
 def test_steady_comparison_intersects_the_cases_within_each_role(tmp_path: Path) -> None:
     """Keep only the cases every run has in a role, role after role, and refuse a role without any."""
     id_frame = _role_frame(tmp_path / "id", (1, 2))
@@ -2127,17 +2579,17 @@ def test_the_dataset_choice_of_one_view_reaches_the_others_through_the_selection
         return panel._dataset_view(scope, plot_func=lambda **_kwargs: None, selection_state=shared, export={})  # type: ignore[arg-type]
 
     first, second = make_view(), make_view()
-    assert drawn == [("lentil, ID", "lentil, Material OOD")] * 2
+    assert drawn == [("Lentil, ID", "Lentil, Material OOD")] * 2
 
-    ood = next(item for item in _widget_tree(first.widget) if getattr(item, "description", None) == "lentil, Material OOD")
+    ood = next(item for item in _widget_tree(first.widget) if getattr(item, "description", None) == "Lentil, Material OOD")
     ood.value = False
     assert shared.selection.datasets == (("lentil", "id"),)
-    assert drawn[-1] == ("lentil, ID",)
+    assert drawn[-1] == ("Lentil, ID",)
 
     second.deactivate()
     second.activate()
-    assert drawn[-1] == ("lentil, ID",)
-    assert [item.value for item in _widget_tree(second.widget) if getattr(item, "description", None) == "lentil, Material OOD"] == [False]
+    assert drawn[-1] == ("Lentil, ID",)
+    assert [item.value for item in _widget_tree(second.widget) if getattr(item, "description", None) == "Lentil, Material OOD"] == [False]
     assert shared.selection.datasets == (("lentil", "id"),)
 
 
@@ -2162,7 +2614,7 @@ def test_a_case_count_viewer_rebuilt_for_other_datasets_resumes_the_count_it_sho
     ((first_resume, first),) = built
     assert first_resume is None
     first.rows[0].children[0].children[0].value = 1
-    ood = next(item for item in _widget_tree(view.widget) if getattr(item, "description", None) == "lentil, Material OOD")
+    ood = next(item for item in _widget_tree(view.widget) if getattr(item, "description", None) == "Lentil, Material OOD")
     ood.value = False
 
     assert [resume for resume, _viewer in built] == [None, 1]
@@ -2193,7 +2645,7 @@ def test_a_view_hidden_from_inside_its_own_plot_publishes_nothing_and_draws_agai
     shown = _record_shows(monkeypatch)
     view = panel._dataset_view(scope, plot_func=plot, selection_state=None, export={}, count=count)
     assert "drawn" in _taken(shown)
-    ood = next(item for item in _widget_tree(view.widget) if getattr(item, "description", None) == "lentil, Material OOD")
+    ood = next(item for item in _widget_tree(view.widget) if getattr(item, "description", None) == "Lentil, Material OOD")
     hide.append(view)
     ood.value = False
     assert "drawn" not in _taken(shown)
@@ -2203,7 +2655,7 @@ def test_a_view_hidden_from_inside_its_own_plot_publishes_nothing_and_draws_agai
 
 
 def _two_role_scope(tmp_path: Path) -> Any:
-    """Return the single-model scope of an ID and a material-OOD frame: two datasets (lentil, ID and lentil, Material OOD)."""
+    """Return the single-model scope of an ID and a material-OOD frame: two datasets (Lentil, ID and Lentil, Material OOD)."""
     return panel._SteadyScope(
         [
             panel.EvaluationContext(key="id", label="ID", datasets={"ID": _role_frame(tmp_path / "id", (1, 2))}),
@@ -2226,7 +2678,7 @@ def test_an_explicitly_empty_dataset_selection_is_shared_as_a_choice_not_as_none
         return panel._dataset_view(scope, plot_func=lambda **_kwargs: None, selection_state=shared, export={})  # type: ignore[arg-type]
 
     def boxes(view: Any) -> list[Any]:
-        return [item for item in _widget_tree(view.widget) if getattr(item, "description", None) in {"lentil, ID", "lentil, Material OOD"}]
+        return [item for item in _widget_tree(view.widget) if getattr(item, "description", None) in {"Lentil, ID", "Lentil, Material OOD"}]
 
     first, second = make_view(), make_view()
     assert shared.selection.datasets is None

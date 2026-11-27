@@ -3,7 +3,9 @@
 Responsibilities:
   - Check admitted map support, tensor fields, cyclic orientation labelled at its wrap ends, state bands, and selector reuse
   - Check the 2 x 3 field order and that the atlas draws equal maps with bars as tall as their maps on the shared grid
-  - Check that axis and colour-bar units and quantity names come from one display rule and one name table
+  - Check that axis and colour-bar units and quantity names come from one display rule and one name table, the axial
+    direction's in degrees included, and that the notes name only the inputs of the case's task
+  - Check that the figure title names the case by the caption of its Dataset, as the comparison figures do
 
 Design principles:
   - Display sampling preserves full-grid scales and endpoints
@@ -12,6 +14,7 @@ This module does NOT:
   - Generate permeability fields or fabricate maps for constant quantities
 """
 
+import re
 from dataclasses import replace
 from types import MappingProxyType
 from unittest.mock import patch
@@ -26,6 +29,7 @@ from src.analysis.generation_inputs import generation_input_selection as selecti
 from src.analysis.generation_inputs import generation_input_sources as sources
 from src.analysis.generation_inputs.plots import generation_input_plot_atlas as atlas_plots
 from src.analysis.generation_inputs.plots import generation_input_plot_layout as layout
+from src.analysis.presentation import analysis_display_labels as display_labels
 from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
 from src.analysis.presentation.analysis_field_maps import FieldMapSemantic
@@ -53,6 +57,26 @@ def test_atlas_keeps_true_support_and_exact_tensor_fields(profile_records: Profi
     plt.close(second)
 
 
+def test_atlas_title_names_the_case_as_the_comparison_figures_do(profile_records: ProfileRecords) -> None:
+    """With its Dataset the title reads material, role and a capitalised case number, like the comparison captions; without, just the case."""
+    first, second = profile_records["steady_flow"]
+    dataset = diagnostics.build_dataset_diagnostics((first, second))
+    atlas = atlas_plots.prepare_field_atlas(first)
+    named = atlas_plots.field_atlas(atlas, ("Kxx",), dataset=dataset)
+    bare = atlas_plots.field_atlas(atlas, ("Kxx",))
+    assert named is not None
+    assert bare is not None
+    try:
+        caption = layout.case_caption(first, dataset)
+        assert named.get_suptitle() == f"Generated fields — {caption}"
+        assert caption.endswith(f"Case {first.case.case_index}")
+        assert caption.startswith(f"{display_labels.material_display_label(dataset.material_family)} · ")
+        assert bare.get_suptitle() == f"Generated fields — Case {first.case.case_index}"
+    finally:
+        plt.close(named)
+        plt.close(bare)
+
+
 def test_atlas_orders_fields_as_a_two_by_three_grid_and_draws_equal_maps_with_unit_bars(profile_records: ProfileRecords) -> None:
     """The six main fields lead in grid order; every map has the planned size and a bar as tall as itself; the empty cells close the grid."""
     record = profile_records["transient_drying"][0]
@@ -68,8 +92,10 @@ def test_atlas_orders_fields_as_a_two_by_three_grid_and_draws_equal_maps_with_un
         width, height = figure.get_size_inches()
         assert figure.get_layout_engine() is None
         assert all(axis.get_title() for axis in maps[:4])
-        assert [axis.get_visible() for axis in maps] == [True] * 4 + [False] * 2
+        assert [axis.axison for axis in maps] == [True] * 4 + [False] * 2  # the empty cells are drawn without frame or ticks
         assert maps[1].get_xlabel() == maps[2].get_xlabel() == "x [m]"
+        assert maps[1].xaxis.get_tick_params()["labelbottom"]
+        assert maps[2].xaxis.get_tick_params()["labelbottom"]
         assert maps[1].xaxis.label.get_fontsize() == maps[2].xaxis.label.get_fontsize() == figure_layout.LABEL_PT
         assert str(record.case.case_index) in figure.get_suptitle()
         sizes = np.array([(axis.get_position().width * width, axis.get_position().height * height) for axis in maps[:4]])
@@ -93,7 +119,7 @@ def test_axis_and_colour_bar_units_share_one_display_rule_and_every_quantity_is_
     assert layout.quantity_axis_label("eps_bed").endswith(" [-]")
     assert layout.quantity_axis_label("Kxx").endswith(" [m²]")
     assert layout.quantity_label("X_0_db_field") == field_labels.field_label("X_0_db_field", mathtext=True)
-    assert layout.quantity_label("K_anisotropy") == diagnostics.field_name("K_anisotropy")
+    assert layout.quantity_label("K_anisotropy") == field_labels.field_label("K_anisotropy", mathtext=True)
 
 
 def test_constant_density_and_isotropic_direction_are_not_fabricated_maps(profile_records: ProfileRecords) -> None:
@@ -128,7 +154,19 @@ def test_axial_orientation_wraps_on_one_fixed_cyclic_scale(profile_records: Prof
     slot = figure.axes[1]  # the map's colour-bar slot follows the one map
     np.testing.assert_allclose(slot.get_yticks(), scale.boundaries)  # labelled at both wrap ends, never at the band centres
     assert [label.get_text() for label in slot.get_yticklabels()][-1] == "90"
+    assert slot.get_ylabel() == "[°]"
+    assert atlas.labels["K_orientation"] == layout.quantity_label("K_orientation")
+    assert any("±" in note for note in atlas.notes)  # the near-uniform direction names how closely its cells follow their axis
     plt.close(figure)
+
+
+def test_atlas_notes_name_only_the_inputs_of_its_task(profile_records: ProfileRecords) -> None:
+    """A steady case notes its inlet pressure profile, a transient one its schedules as well; no note shows a raw identifier."""
+    steady = atlas_plots.prepare_field_atlas(profile_records["steady_flow"][0]).notes
+    transient = atlas_plots.prepare_field_atlas(profile_records["transient_drying"][0]).notes
+    assert not any("schedule" in note for note in steady)
+    assert any("schedule" in note for note in transient)
+    assert not any(re.search(r"\bz(_bg)?\b", note) for note in (*steady, *transient))
 
 
 def test_state_fields_get_round_state_bands_so_a_near_uniform_one_is_widened(profile_records: ProfileRecords) -> None:

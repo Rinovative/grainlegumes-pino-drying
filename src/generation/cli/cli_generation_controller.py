@@ -4,6 +4,7 @@ Responsibilities:
   - Parse the public Generation command and admit the shared source, committed or not
   - Submit a run from the login node as its own driver job and run the controller inside that job
   - Dispatch lifecycle commands to the controller and native host boundary
+  - Run field-test commands through the host boundary, submitting node jobs only from a frozen source tree
   - Render run results with their process exit status
 
 Design principles:
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 _INTERRUPTED_EXIT_CODE = 130
+_FIELD_TEST_MODULE = "src.generation.cli.cli_field_test"
+_FIELD_TEST_ACTIONS = ("plan", "submit", "resume", "status", "cancel")
 
 
 def _fail(message: str, *, exit_code: int = 1) -> NoReturn:
@@ -102,6 +105,10 @@ def _parser() -> argparse.ArgumentParser:
         "--minimum-success-rate", type=float, required=True, help="new rate s with 0 < s <= 1; it can only be lowered (the current value is a no-op)"
     )
     amend.add_argument("--reason", required=True, help="why the rate is lowered after the original design was frozen")
+    field_test = subcommands.add_parser("field-test", help="plan, submit, resume, inspect, or cancel one per-parameter field test")
+    field_test.add_argument("action", choices=_FIELD_TEST_ACTIONS)
+    field_test.add_argument("test_dir", type=Path, help="STORAGE_ROOT/04_field_tests/TASK/TEST_ID")
+    field_test.add_argument("options", nargs=argparse.REMAINDER, help="options of src.generation.cli.cli_field_test, such as --dry-run")
     inputs = subcommands.add_parser("inputs", help="generate selected canonical campaign inputs")
     inputs.add_argument("config")
     inputs.add_argument("options", nargs=argparse.REMAINDER)
@@ -140,6 +147,23 @@ def _run_inputs(repository: Path, config: str, options: list[str]) -> int:
         scheduled=True,
         partition="standard",
     )
+    print(output, end="" if output.endswith("\n") else "\n")
+    return 0
+
+
+def _run_field_test(repository: Path, args: argparse.Namespace) -> int:
+    """Run one field-test command; submit and resume freeze the source and run from the frozen tree, like a campaign run."""
+    layout = host_service.HostLayout.resolve(repository)
+    directory = Path(args.test_dir).expanduser().resolve()
+    task, test_id = directory.parent.name, directory.name
+    if directory != common.paths.resolve_field_test_dir(task, test_id, storage_root=layout.storage).resolve():
+        _fail(f"Field-test directory must be STORAGE_ROOT/{common.paths.FIELD_TESTS_AREA_NAME}/TASK/TEST_ID: {directory}", exit_code=2)
+    # Node tickets name the executing tree, so only a submission that starts node jobs freezes the source.
+    executes = args.action in {"submit", "resume"} and "--dry-run" not in args.options
+    admission = host_service.admit_source(layout, freeze=executes)
+    print(_source_line(admission), file=sys.stderr)
+    host = host_service.GenerationHost(layout, admission)
+    output = host.call(args.action, task, test_id, *args.options, "--storage-root", str(layout.storage), scheduled=False, module=_FIELD_TEST_MODULE)
     print(output, end="" if output.endswith("\n") else "\n")
     return 0
 
@@ -235,8 +259,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     repository = Path.cwd()
     try:
-        if args.command == "inputs":
-            return _run_inputs(repository, args.config, args.options)
+        if args.command in {"inputs", "field-test"}:
+            return _run_inputs(repository, args.config, args.options) if args.command == "inputs" else _run_field_test(repository, args)
         driver: host_service.LauncherJob | None = None
         if args.command == "run":
             if args.max_admission_cases is not None and args.max_admission_cases < 1:

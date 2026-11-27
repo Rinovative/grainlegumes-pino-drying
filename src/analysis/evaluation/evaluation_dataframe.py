@@ -7,6 +7,7 @@ Responsibilities:
   - Admit per-case prediction validity: NaN metrics only for non-finite predictions
   - Flatten source metadata without colliding with authoritative columns
   - Validate task, objective, units, formulas, role, membership and recorded analysis producer before plots
+  - Hold the material cuts of a pooled series to one exact grid, as the cases of one artifact are
 
 Design principles:
   - DataFrames carry validated provenance in attrs
@@ -27,19 +28,24 @@ import json
 from collections.abc import Mapping
 from numbers import Integral, Real
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 
 from src.analysis.artifacts import contracts
 from src.analysis.presentation import analysis_display_grid as display_grid
+from src.analysis.presentation import analysis_display_labels as display_labels
 
 from . import evaluation_case as cases
 from . import evaluation_prediction_validity as validity_contract
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
 COMPLETED_RUN_CONFIG_ATTR = "completed_run_config"
 COMPLETED_RUN_SUMMARY_ATTR = "completed_run_summary"
+_STORED_ROLES = frozenset({"eval", "material_ood", "parameter_ood"})  # the split roles a steady artifact saves
 PRIMARY_OBJECTIVE_ID = "normalized_group_macro_rmse"
 PRIMARY_OBJECTIVE_DEFINITION = {
     "id": PRIMARY_OBJECTIVE_ID,
@@ -719,13 +725,13 @@ def reference_floor(frame: pd.DataFrame, component_fields: tuple[str, ...]) -> f
 
 def dataset_role(frame: pd.DataFrame) -> str:
     """
-    Return ``ID``, ``Material OOD`` or ``Parameter OOD`` from the explicit saved split role.
+    Return the shared display label of the explicit saved split role (``ID``, ``Material OOD``, ``Parameter OOD``).
 
-    Unknown roles are disclosed as ``unspecified`` rather than inferred from a
+    Any other or missing role is disclosed as ``unspecified`` rather than inferred from a
     dataset or run name.
     """
-    labels = {"eval": "ID", "material_ood": "Material OOD", "parameter_ood": "Parameter OOD"}
-    return labels.get(str(frame.attrs.get("dataset_role")), "unspecified")
+    role = frame.attrs.get("dataset_role")
+    return display_labels.evaluation_role_display_label(role) if isinstance(role, str) and role in _STORED_ROLES else "unspecified"
 
 
 def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dict[str, Any]:
@@ -957,6 +963,33 @@ def validate_comparison(
                     except ValueError as error:
                         msg = f"Models {reference_name!r} and {name!r} have incompatible grid for case {member}: {error}"
                         raise ComparisonCompatibilityError(msg) from error
+
+
+def validate_pooled_grids(datasets: Mapping[str, pd.DataFrame], pools: Iterable[Sequence[str]]) -> None:
+    """
+    Reject a pooled series whose material cuts do not all lie on one exact grid.
+
+    ``pools`` lists the keys of each pooled series: one cut per material of one model's role. Each cut passes
+    ``validate_comparison`` alone, so the cases of all cuts of a series are held to one grid together, as the cases of one
+    artifact are.
+
+    Raises
+    ------
+    ComparisonCompatibilityError
+        If the cases of one pooled series lie on incompatible grids; the message names its materials.
+
+    """
+    for keys in pools:
+        admitted = [_exact_comparison_grids(datasets[key]) for key in keys]
+        try:
+            _require_one_artifact_grid(
+                tuple(member for members, _grids in admitted for member in members),
+                tuple(grid for _members, grids in admitted for grid in grids),
+            )
+        except ComparisonCompatibilityError as error:
+            materials = [material for key in keys for material in require_complete_provenance(datasets[key])["selection"]["material_families"]]
+            msg = f"Pooled materials {materials} lie on incompatible grids; show them separately. {error}"
+            raise ComparisonCompatibilityError(msg) from error
 
 
 def numeric_metadata_columns(frame: pd.DataFrame) -> tuple[str, ...]:

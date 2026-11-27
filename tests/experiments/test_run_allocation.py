@@ -3,9 +3,30 @@
 Responsibilities:
   - Check collision refusal, writer leases, atomic status, runtime sessions, and resume admission
   - Check that steady and transient inference refuse a run while a writer holds its lease
-  - Check admission of a start that names an existing run: continue, report complete, or reject
+  - Check admission of a start that names an existing run: continue, report finished, or reject; a finished run, also an
+    unsuccessful one, is reported through the finished-run admission and exits 2 without an eligible checkpoint
   - Check that a run recorded by other training code is neither reported complete, extended nor resumed
-  - Check that a started run, but no Optuna trial, records its folder as a job log owner
+  - Check that a resume or rerun refused by its admission, history, device or another directory's identity binding
+    creates no lock file or binding, and that an unsuccessful run is admitted against its summary's records and identity
+  - Check that the train command reports a continuation refused by another directory's identity binding as a rejected admission,
+    and another refused continuation, a damaged saved config or summary, an irregular writer lock marker or a completed run's
+    malformed identity entry included, in one line without a traceback or a rerun
+  - Check that an environment failure before a continuation's attempt, Slurm provenance read before the run's state included,
+    prints its rerun in a matching allocation without a traceback, as does an I/O error inspecting an existing run or binding
+    a completed run's identity, and that a completed run's rerun reports it complete only once nothing can end it
+  - Check that an attempt the job's environment ends after its start, by a failed checkpoint write or by host memory
+    exhausted while its best decodes, ends interrupted with its reason and continuing rerun, and no traceback
+  - Check that a run that ended before its first checkpoint, staged checkpoint leftovers included, is replaced by its
+    start command and trained to its end with its identity bound to the leaf, while an entry outside its layout, a
+    symbolic link in its layout or config, other science or training code, a malformed status or another writer keeps
+    its refusal and every file, and ``--resume`` refuses such a leaf naming its start command before its source binding
+  - Check that an interrupted run is promised a restart only when its start replaces its leaf, and that a replacement
+    the job's environment ends midway reports that the leaf may be partly replaced
+  - Check that a fresh run, but no Optuna trial and no resume refused before its attempt, records its folder as a job
+    log owner, and that a continuation ended before its attempt names its reason and a rerun only after its environment
+  - Check that a continuation whose pinned Dataset content lacks a key, never claimed as a malformed manifest, or whose
+    Dataset folder or manifest is a symbolic link, is refused naming it, never rerun, and that an absent manifest ends it
+    with the rerun, also before a later Dataset that is a symbolic link
 
 Design principles:
   - Scientific config stays immutable while permitted duration extensions are explicit
@@ -16,7 +37,10 @@ This module does NOT:
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import errno
+import functools
 import json
 import multiprocessing as mp
 import queue
@@ -30,9 +54,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 import pytest
+import torch
 from support import configs, run_state
+from torch.utils.data import DataLoader, TensorDataset
 
-from src import common, experiments, learning
+from src import common, datasets, experiments, learning
+from src.experiments import experiments_run_source_binding as source_binding
+from src.experiments.cli import cli_train
 from src.experiments.config import experiments_config_loader as config_loader
 from src.experiments.config import experiments_config_naming as config_naming
 
@@ -282,14 +310,11 @@ def test_active_writer_blocks_resume_admission(
     lock_path.unlink()
     missing_target = tmp_path / "missing-writer-marker.lock"
     lock_path.symlink_to(missing_target)
-    report = experiments.run.inspect_existing_run_admission(
-        run_dir,
-        config,
-        config_path=config_path,
-    )
+    # A marker that is no regular file is the run's stored state, which no rerun repairs: the run cannot continue.
+    report = experiments.run.inspect_existing_run_admission(run_dir, config, config_path=config_path)
     assert report["active_lock"] is None
     assert report["resume_compatibility"] == "incompatible"
-    assert "Active writer state could not be verified" in report["reason"]
+    assert "no regular file" in report["reason"]
     assert lock_path.readlink() == missing_target
     assert not missing_target.exists()
 
@@ -362,8 +387,13 @@ def test_existing_target_that_cannot_continue_rejects_before_runtime_setup(
 def test_training_code_drift_refuses_reuse_and_resume_before_any_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A run recorded by older training code is neither reported complete nor resumed; nothing is written."""
+    """
+    A run recorded by older training code is neither reported complete nor resumed; nothing is written.
+
+    The refused resume is an expected outcome, so the train command reports it in one line without a traceback.
+    """
     output_root = tmp_path / "outputs"
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
     config_path = _synthetic_config_path(tmp_path)
@@ -385,80 +415,669 @@ def test_training_code_drift_refuses_reuse_and_resume_before_any_write(
         run_state_summary, {**json.loads(run_state_summary.read_text(encoding="utf-8")), "status": "interrupted", "completed_epoch": 1}
     )
     before[run_state_summary.relative_to(run_dir)] = run_state_summary.read_bytes()
-    with pytest.raises(ValueError, match=changed):
+    with pytest.raises(experiments.run.ContinuationRefusedError, match=changed):
         experiments.run.run_experiment(saved_config, resume=run_dir)
+    capsys.readouterr()
+    assert cli_train.main(["--resume", str(run_dir)]) == 1
+    stderr = capsys.readouterr().err
+    assert "training_steady_flow implementation changed" in stderr
+    assert "Traceback" not in stderr
 
     assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
 
 
-def test_prepared_resume_refuses_training_code_drift_before_any_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The public prepared-run executor resumes only a run recorded by the running training code; nothing is written."""
+@pytest.mark.parametrize("damage", ["config", "summary", "lock_marker"])
+def test_a_continuation_refused_by_a_damaged_state_file_prints_its_refusal_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], damage: str
+) -> None:
+    """
+    A saved config that is no YAML, a summary that is no text or a writer lock marker that is no regular file refuses it.
+
+    Each is the run's persisted state, which a rerun in another allocation meets again: ``--resume`` prints the refusal's own
+    sanitized line, and a start that names the run the existing-run rejection, both without a traceback or a rerun; the run
+    stays byte-identical.
+    """
     output_root = tmp_path / "outputs"
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
-    with monkeypatch.context() as drift:
-        run_state.drift_training_code(drift, "steady_flow")
-        stale = _resolved_admission_config(output_root)
-    run_dir = common.paths.resolve_config_run_dir(stale, output_root=output_root)
-    run_state.write_lightweight_run_state(run_dir, stale, status="interrupted", completed_epoch=1)
-    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("stale code must not train"))
+    config_path = _synthetic_config_path(tmp_path)
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+    run_state.write_lightweight_run_state(run_dir, config, status="interrupted", completed_epoch=1)
+    if damage == "config":
+        common.paths.resolve_run_config_path(run_dir).write_text("run: [unclosed\n", encoding="utf-8")
+    elif damage == "summary":
+        common.paths.resolve_run_summary_path(run_dir).write_bytes(b"\xff\xfe")
+    else:
+        lock_path = common.paths.resolve_run_lock_path(run_dir)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.symlink_to(tmp_path / "missing-writer-marker.lock")
+    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("a refused run must not train"))
     before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
+    capsys.readouterr()
 
-    with pytest.raises(ValueError, match=r"training_steady_flow implementation changed"):
-        experiments.run.execute_prepared_run(
-            stale,
-            run_dir=run_dir,
-            resume_from=common.paths.resolve_last_checkpoint_file(run_dir),
-            device_resolution=experiments.run.learning.device.resolve_device("cpu"),
-        )
+    assert cli_train.main(["--resume", str(run_dir)]) == 1
+    refused = capsys.readouterr().err
+    monkeypatch.setattr(experiments.run, "run_experiment", functools.partial(experiments.run.run_experiment, output_root=output_root))
+    assert cli_train.main([str(config_path)]) == 1
+    rejected = capsys.readouterr().err
 
+    assert refused.startswith("Run continuation refused: The continuation was refused before its attempt started")
+    assert rejected.startswith("Run admission rejected: The existing run at")
+    assert "Traceback" not in refused + rejected
+    assert "matching allocation" not in refused + rejected
     assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
 
 
-@pytest.mark.parametrize("end", ["completed", "diverged"])
+@pytest.mark.parametrize("environment", ["active_writer", "slurm_provenance"])
+def test_an_environment_failure_before_a_continuation_started_prints_the_rerun_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], environment: str
+) -> None:
+    """
+    Another writer, or Slurm provenance that is no worker evidence, fails the job's environment before any attempt reported.
+
+    The command names the failure and the rerun in a matching allocation in two lines without a traceback, and the run
+    stays byte-identical. The provenance is read before any check of the run's state, so it is the reported end although
+    that state, a failed run, refuses the continuation as well.
+    """
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+    status = "failed" if environment == "slurm_provenance" else "interrupted"
+    run_state.write_lightweight_run_state(run_dir, config, status=status, completed_epoch=1)
+    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("an unadmitted run must not train"))
+    before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
+    capsys.readouterr()
+
+    if environment == "slurm_provenance":
+        monkeypatch.setenv("ML_SLURM_PROVENANCE", "not json")
+        assert cli_train.main(["--resume", str(run_dir)]) == 1
+    else:
+        with experiments.run.run_writer_lease(run_dir):
+            assert cli_train.main(["--resume", str(run_dir)]) == 1
+
+    reason, step = capsys.readouterr().err.splitlines()
+    assert reason.startswith("Run not started: RunLifecycleError: ")
+    assert ("must contain valid JSON" if environment == "slurm_provenance" else "active writer lease") in reason
+    assert step == "  next: rerun the same command in a matching allocation, the run is unchanged"
+    assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
+
+
+class _ScaledMSELoss(torch.nn.MSELoss):
+    """A training loss that accepts the run's Train scaling, as every training loss of the run does."""
+
+    def set_scaling(self, _scaling: object) -> None:
+        """Accept the scaling the attempt hands over."""
+
+
+def _stub_attempt_runtime(monkeypatch: pytest.MonkeyPatch, *, train_loop: Callable[..., Any], evaluate_selected: Callable[..., Any]) -> None:
+    """Replace a fresh single run's data, model, loss, metrics, training loop and selected evaluation; its lifecycle and report stay real."""
+    scaling = SimpleNamespace(physical_state=SimpleNamespace(scale=torch.ones(1)), to=lambda _device: None)
+    sampler = datasets.runtime.units.UnitSampler(unit_kind="case", cases=(0,), keys=None, units_per_update=1, memory_batch=1, seed=0)
+    train = DataLoader(TensorDataset(torch.zeros(1)), batch_sampler=sampler)
+    loaders = {"train": train, "eval": [0], "scaling": scaling, "scaling_artifact": {}, "split_indices": {}}
+    run_learning = experiments.run.learning
+
+    def create_dataloaders(*_args: Any, split_persist_callback: Callable[[dict[str, Any]], None] | None = None, **_kwargs: Any) -> dict[str, Any]:
+        if split_persist_callback is not None:
+            split_persist_callback({})  # a fresh run publishes its membership
+        return loaders
+
+    for target, name, stub in (
+        (experiments.run, "_grid_spacing", lambda *_args: (0.003, 0.003)),
+        (config_loader, "create_dataloaders_from_config", create_dataloaders),
+        (run_learning.models.factory, "build_model", lambda *_args, **_kwargs: torch.nn.Linear(1, 1)),
+        (run_learning.losses.factory, "build_training_loss", lambda *_args, **_kwargs: _ScaledMSELoss()),
+        (run_learning.metrics.metrics, "build_evaluation_metrics", lambda *_args, **_kwargs: {}),
+        (run_learning.training.optim, "build_scheduler", lambda *_args, **_kwargs: None),
+        (run_learning.training.checkpoint, "build_checkpoint_identity", lambda *_args, **_kwargs: {"effective_config_digest": "a" * 64}),
+        (experiments.run.tracking, "build_monitor_membership", lambda *_args: None),
+        (run_learning.training.loop, "train_loop", train_loop),
+        (run_learning.training.loop, "evaluate_selected_checkpoint", evaluate_selected),
+    ):
+        monkeypatch.setattr(target, name, stub)
+
+
+@pytest.mark.parametrize("end", ["checkpoint_write", "best_decode_memory"])
+def test_an_attempt_the_jobs_environment_interrupted_reports_its_rerun_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], end: str
+) -> None:
+    """
+    A started attempt that the job's environment ends after its last checkpoint ends interrupted, reported by the run alone.
+
+    The run's own checkpoint write failing, or host memory exhausted while the selected best decodes after the terminal
+    last (a ``MemoryError``), ends it so. The run's report names the reason and the rerun that continues from the intact
+    last checkpoint, and the command adds no traceback.
+    """
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config_path = _synthetic_config_path(tmp_path)
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+
+    def trained(**kwargs: Any) -> dict[str, Any]:
+        (kwargs["save_dir"] / "last_checkpoint.pt").touch()  # the last checkpoint of the attempt's first event
+        if end == "checkpoint_write":
+            # The next publication fails in the training loop, which annotates its phase.
+            with learning.training.loop._training_phase("last_checkpoint", 1):
+                raise OSError(errno.ENOSPC, "No space left on device")
+        objective = config_loader.get_resolved_objective(config)
+        best = str(kwargs["save_dir"] / "best_checkpoint.pt")
+        return {"status": "completed", "best_epoch": 1, "best_metric": 0.1, "objective": objective, "best_checkpoint_path": best}
+
+    def exhausted(**_kwargs: Any) -> dict[str, Any]:
+        message = "DefaultCPUAllocator: can't allocate memory"
+        raise MemoryError(message)
+
+    _stub_attempt_runtime(monkeypatch, train_loop=trained, evaluate_selected=exhausted)
+    monkeypatch.setattr(experiments.run, "run_experiment", functools.partial(experiments.run.run_experiment, output_root=output_root))
+    capsys.readouterr()
+    assert cli_train.main([str(config_path)]) == 1
+
+    stderr = capsys.readouterr().err
+    stop = next(line for line in stderr.splitlines() if line.startswith("interrupted "))
+    step = next(line for line in stderr.splitlines() if line.startswith("  next: "))
+    reason = "OSError: [Errno 28] No space left on device" if end == "checkpoint_write" else "MemoryError: DefaultCPUAllocator"
+    assert stop.startswith(f"interrupted {config['run']['name']} ")
+    assert reason in stop
+    assert step.startswith("  next: rerun the same command to continue from the last checkpoint")
+    assert "Traceback" not in stderr
+    assert experiments.run.read_run_summary(run_dir)["status"] == "interrupted"
+
+
+@pytest.mark.parametrize("stale", ["interrupted", "running"])
+def test_a_run_that_ended_before_its_first_checkpoint_is_replaced_by_its_start_and_trains_to_its_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], stale: str
+) -> None:
+    """
+    An attempt interrupted after a history record but before its first checkpoint committed no work: ``train CONFIG`` replaces it.
+
+    Its first checkpoint publication was cut off before its renames, which leaves a staged checkpoint and a writer's
+    temporary of another, no committed work. Its report advises the rerun that restarts it. The rerun, also of a summary
+    a killed job left ``running``, names the replacement and starts the leaf afresh: the old history record, the staged
+    leftovers and the attempt are gone, and the identity stays bound to the leaf.
+    """
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config_path = _synthetic_config_path(tmp_path)
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+    history = learning.training.history.history_path(run_dir)
+    leftovers = [run_dir / ".best_checkpoint.pt.staged", run_dir / "..last_checkpoint.pt.staged.k1ll3d.tmp"]
+
+    def interrupted(**kwargs: Any) -> dict[str, Any]:
+        kwargs["epoch_state_callback"](1, {"global_step": 1.0, "train/loss_total": 0.5}, None)
+        for leftover in leftovers:
+            leftover.touch()
+        raise KeyboardInterrupt
+
+    def trained(**kwargs: Any) -> dict[str, Any]:
+        assert not history.exists()  # the earlier attempt's record is gone
+        assert not any(leftover.exists() for leftover in leftovers)
+        kwargs["epoch_state_callback"](1, {"global_step": 2.0, "train/loss_total": 0.25}, None)
+        for name in ("best_checkpoint.pt", "last_checkpoint.pt"):
+            (kwargs["save_dir"] / name).touch()
+        budget = {"unit": "units", "units": 1, "total": 1, "train_seconds": 0.0, "skipped_points": []}
+        outcome = {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None}
+        return {
+            "status": "completed", "best_epoch": 1, "best_metric": 0.1, "objective": config_loader.get_resolved_objective(config),
+            "best_checkpoint_path": str(kwargs["save_dir"] / "best_checkpoint.pt"), "completed_epoch": 1, "global_step": 2,
+            "training_work": {}, "terminal_epoch": 1, "training_outcome": outcome, "budget": budget,
+        }  # fmt: skip
+
+    selected = {"selected_epoch": 1, "selected_metrics": {}, "terminal_metrics": {}}
+    _stub_attempt_runtime(monkeypatch, train_loop=interrupted, evaluate_selected=lambda **_kwargs: selected)
+    monkeypatch.setattr(experiments.run, "run_experiment", functools.partial(experiments.run.run_experiment, output_root=output_root))
+    assert cli_train.main([str(config_path)]) == 130
+    assert "  next: rerun the same command, which restarts the run: no checkpoint saved yet" in capsys.readouterr().err
+    assert len(json.loads(history.read_text(encoding="utf-8"))["epochs"]) == 1
+    summary = common.paths.resolve_run_summary_path(run_dir)
+    common.serialization.atomic_write_json(summary, {**json.loads(summary.read_text(encoding="utf-8")), "status": stale})
+    binding = common.paths.resolve_identity_registry_entry(output_root, config_loader.allocation_digest(config))
+    bound = binding.read_bytes()
+    entry = experiments.registry.lookup(config)
+    assert entry is not None
+    assert entry.target == run_dir.resolve()
+
+    monkeypatch.setattr(learning.training.loop, "train_loop", trained)
+    assert cli_train.main([str(config_path)]) == 0
+
+    assert f"run replaced: previous_status {stale}  run_dir " in capsys.readouterr().out
+    replaced = experiments.run.read_run_summary(run_dir)
+    assert [entry["status"] for entry in replaced["status_history"]] == ["initializing", "running", "completed"]
+    assert len(replaced["runtime_sessions"]) == 1
+    assert [record["global_step"] for record in json.loads(history.read_text(encoding="utf-8"))["epochs"]] == [2.0]
+    assert binding.read_bytes() == bound
+
+
+def _leaf_without_a_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, Any], Path]:
+    """Return the request, its resolved config and its interrupted leaf that holds every run file but a checkpoint."""
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config_path = _synthetic_config_path(tmp_path)
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+    run_state.write_lightweight_run_state(run_dir, config, status="interrupted", completed_epoch=0, include_best=False)
+    common.paths.resolve_last_checkpoint_file(run_dir).unlink()
+    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("a refused run must not train"))
+    monkeypatch.setattr(experiments.run, "run_experiment", functools.partial(experiments.run.run_experiment, output_root=output_root))
+    return config_path, config, run_dir
+
+
+_REFUSED = "Run continuation refused: The continuation was refused before its attempt started"
+_CONFLICT = "Run admission rejected: Scientific identity conflict"
+
+
+@pytest.mark.parametrize(
+    ("refusal", "expected", "reason"),
+    [
+        ("unknown_entry", _REFUSED, "'notes.txt', which is no file of its run"),
+        ("handoff_manifest_of_a_steady_run", _REFUSED, "'teacher_handoff_manifest.json', which is no file of its run"),
+        ("symlinked_layout", _REFUSED, "is no real folder"),
+        ("symlinked_config", _REFUSED, "config.yaml is no regular file"),
+        ("other_science", _CONFLICT, "--revision"),
+        ("training_drift", _CONFLICT, "--revision"),
+        ("malformed_status", "Run admission rejected: The existing run at", "Run summary has no valid lifecycle status"),
+        ("active_writer", "Run admission rejected: An active writer lease already owns this run", "Wait until it finishes"),
+    ],
+)
+def test_a_leaf_without_a_checkpoint_that_its_start_cannot_replace_keeps_its_refusal_and_every_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], refusal: str, expected: str, reason: str
+) -> None:
+    """
+    A leaf its start cannot replace keeps its refusal, and nothing below the test root changes, so no lock file or binding exists.
+
+    The leaf's state refuses an entry outside the run's layout, a teacher-handoff manifest in a steady run included, and
+    a layout folder or config that is a symbolic link, before anything is read through it, each in its refusal's line.
+    Other science, also another training digest, keeps the ``--revision`` advice, a status that is no string the
+    existing-run rejection and an active writer the advice to wait; none is advised a rerun in a matching allocation.
+    """
+    config_path, _config, run_dir = _leaf_without_a_checkpoint(tmp_path, monkeypatch)
+    if refusal == "unknown_entry":
+        (run_dir / "notes.txt").write_text("kept by hand", encoding="utf-8")
+    elif refusal == "handoff_manifest_of_a_steady_run":
+        (run_dir / "teacher_handoff_manifest.json").write_text("{}", encoding="utf-8")  # only a transient handoff writes it
+    elif refusal == "symlinked_layout":
+        # The leaf's config folder is an alias of another folder below the output root.
+        run_dir.parent.symlink_to(run_dir.parent.rename(tmp_path / "outputs" / "elsewhere"), target_is_directory=True)
+    elif refusal == "symlinked_config":
+        saved = common.paths.resolve_run_config_path(run_dir)
+        saved.symlink_to(saved.rename(tmp_path / "saved-config.yaml"))
+    elif refusal == "other_science":
+        raw = configs.direct_config()
+        raw["optimizer"]["lr"] = float(raw["optimizer"]["lr"]) * 1.0001  # the same three-digit name token
+        config_path = configs.write_config(tmp_path, raw, canonical_root=tmp_path)
+        assert common.paths.resolve_config_run_dir(configs.resolve(raw, output_root=tmp_path / "outputs")) == run_dir
+    elif refusal == "training_drift":
+        with monkeypatch.context() as drift:
+            run_state.drift_training_code(drift, "steady_flow")
+            stale = _resolved_admission_config(tmp_path / "outputs")
+        config_loader.save_yaml(stale, common.paths.resolve_run_config_path(run_dir))
+    elif refusal == "malformed_status":
+        summary = common.paths.resolve_run_summary_path(run_dir)
+        common.serialization.atomic_write_json(summary, {**json.loads(summary.read_text(encoding="utf-8")), "status": []})
+    before = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    capsys.readouterr()
+
+    with experiments.run.run_writer_lease(run_dir) if refusal == "active_writer" else contextlib.nullcontext():
+        assert cli_train.main([str(config_path)]) == 1
+        after = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+
+    stderr = capsys.readouterr().err
+    assert stderr.startswith(expected)
+    assert reason in stderr
+    assert "Traceback" not in stderr
+    assert "matching allocation" not in stderr
+    lock = common.paths.resolve_run_lock_path(run_dir).relative_to(tmp_path)
+    assert {path: payload for path, payload in after.items() if path != lock} == before
+
+
+@pytest.mark.parametrize("drifted", [False, True])
+def test_a_resume_of_a_leaf_without_a_checkpoint_is_refused_naming_its_start_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], drifted: bool
+) -> None:
+    """
+    ``--resume`` continues only from a last checkpoint: a leaf its start replaces is refused, naming that start, and stays unchanged.
+
+    That reason precedes the source binding, so a leaf another source tree binds is not advised a continuation through
+    Slurm, where ``--resume`` could not continue it either. After a training-code change no start replaces the leaf, so
+    the refusal names the drift and its ``--revision`` remedy instead.
+    """
+    _config_path, _config, run_dir = _leaf_without_a_checkpoint(tmp_path, monkeypatch)
+    if drifted:
+        with monkeypatch.context() as drift:
+            run_state.drift_training_code(drift, "steady_flow")
+            stale = _resolved_admission_config(tmp_path / "outputs")
+        config_loader.save_yaml(stale, common.paths.resolve_run_config_path(run_dir))
+
+    def bound_to_another_tree(_leaves: Any) -> None:
+        msg = f"Run {run_dir} is bound to another source tree; continue it through scripts/slurm_ml.sh."
+        raise experiments.run.SourceBindingError(msg)
+
+    monkeypatch.setattr(source_binding, "admit_continuation", bound_to_another_tree)
+    before = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    capsys.readouterr()
+
+    assert cli_train.main(["--resume", str(run_dir)]) == 1
+
+    stderr = capsys.readouterr().err
+    assert stderr.startswith("Run continuation refused: The continuation was refused before its attempt started")
+    assert ("ended before its first checkpoint" in stderr) is not drifted
+    assert ("its start command (train CONFIG, or its plan for a matched stage) replaces it" in stderr) is not drifted
+    assert ("--revision" in stderr) is drifted
+    assert "matching allocation" not in stderr
+    assert "slurm_ml.sh" not in stderr
+    assert {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()} == before
+
+
+def test_an_interrupted_run_without_a_checkpoint_is_promised_a_restart_only_when_its_start_replaces_its_leaf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    The advice of an attempt interrupted before its first checkpoint follows the replacement admission of its published state.
+
+    A file outside the run's layout keeps the start from replacing the leaf, so the report promises no restart, and the
+    rerun it advises refuses the leaf naming that file.
+    """
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config_path = _synthetic_config_path(tmp_path)
+
+    def interrupted(**kwargs: Any) -> dict[str, Any]:
+        (kwargs["save_dir"] / "notes.txt").write_text("kept by hand", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    _stub_attempt_runtime(monkeypatch, train_loop=interrupted, evaluate_selected=lambda **_kwargs: {})
+    monkeypatch.setattr(experiments.run, "run_experiment", functools.partial(experiments.run.run_experiment, output_root=output_root))
+    assert cli_train.main([str(config_path)]) == 130
+    step = next(line for line in capsys.readouterr().err.splitlines() if line.startswith("  next: "))
+    assert "which restarts the run:" not in step
+    assert "restarts the run only if its leaf admits that, otherwise names why" in step
+
+    assert cli_train.main([str(config_path)]) == 1
+    assert "'notes.txt', which is no file of its run" in capsys.readouterr().err
+
+
+def test_a_replacement_the_jobs_environment_ends_midway_reports_a_leaf_that_may_be_partly_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    An I/O error after the replacement removed the earlier attempt's files, before its fresh summary, leaves the leaf partly replaced.
+
+    The command says so, without a traceback, and advises the rerun, which replaces the leaf that is still replaceable.
+    """
+    config_path, config, run_dir = _leaf_without_a_checkpoint(tmp_path, monkeypatch)
+    transition = experiments.run._transition_run_status_locked
+
+    def unwritable_fresh_summary(*args: Any, anew: bool = False, **kwargs: Any) -> dict[str, Any]:
+        if anew:
+            raise OSError(errno.EIO, "Input/output error")
+        return transition(*args, **kwargs)
+
+    monkeypatch.setattr(experiments.run, "_transition_run_status_locked", unwritable_fresh_summary)
+    capsys.readouterr()
+    assert cli_train.main([str(config_path)]) == 1
+
+    assert capsys.readouterr().err.splitlines() == [
+        "Run not started: OSError: [Errno 5] Input/output error",
+        "  next: rerun the same command in a matching allocation, which replaces the run; its leaf may be partly replaced already",
+    ]
+    assert not common.paths.resolve_split_indices_path(run_dir).exists()
+    assert experiments.run.read_run_summary(run_dir)["status"] == "interrupted"
+    assert experiments.run._replaceable_leaf(run_dir, config, matched_receipt=None) is not None
+
+
+def test_an_io_error_inspecting_an_existing_run_is_the_jobs_environment_at_its_start_and_in_its_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    An I/O error while an existing run is inspected is the job's environment, never a reason the run cannot continue.
+
+    A start that names the run prints the failure and the rerun in a matching allocation without a traceback, a matched
+    stage's read-only recovery check offers that rerun, and the run stays byte-identical.
+    """
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config_path = _synthetic_config_path(tmp_path)
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+    run_state.write_lightweight_run_state(run_dir, config, status="interrupted", completed_epoch=1)
+    before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
+
+    def unreadable(*_args: Any, **_kwargs: Any) -> None:
+        message = "Input/output error"
+        raise OSError(errno.EIO, message)
+
+    monkeypatch.setattr(experiments.run, "read_run_summary", unreadable)
+    monkeypatch.setattr(experiments.run, "run_experiment", functools.partial(experiments.run.run_experiment, output_root=output_root))
+    capsys.readouterr()
+    assert cli_train.main([str(config_path)]) == 1
+    assert capsys.readouterr().err.splitlines() == [
+        "Run not started: OSError: [Errno 5] Input/output error",
+        "  next: rerun the same command in a matching allocation, the run is unchanged",
+    ]
+    recovery, reason = experiments.run._matched_failed_stage_recovery(run_dir, config, prerequisites=lambda _finished: None)
+    assert recovery == "environment"
+    assert "OSError: [Errno 5] Input/output error" in reason
+    assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
+
+
+@pytest.mark.parametrize("end", ["completed", "diverged", "no_eligible_checkpoint"])
 def test_rerunning_a_finished_run_returns_its_saved_outcome_without_training(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     end: str,
 ) -> None:
-    """A finished run reports its saved end status, a divergence included; no run state is written or trained, only its binding repaired."""
+    """
+    A finished run reports its saved end status, a divergence or no eligible checkpoint included; nothing is written or trained.
+
+    Only its binding is repaired, and the command exits 2 for a run without an eligible checkpoint, as when it just ended so.
+    The saved outcome is read through the finished-run admission of a matched leaf, stubbed here because the lightweight run
+    holds no checkpoints or history (the steady lifecycle test admits a real one). An unsuccessful run that committed no
+    optimizer group has no last checkpoint, which no finished run needs.
+    """
     output_root = tmp_path / "outputs"
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
     config_path = _synthetic_config_path(tmp_path)
     config = _resolved_admission_config(output_root)
     run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
-    run_state.write_lightweight_run_state(run_dir, config, status="completed", completed_epoch=config["training"]["budget_epochs"])
+    status = "unsuccessful" if end == "no_eligible_checkpoint" else "completed"
+    epochs = config["training"]["budget_epochs"]
+    run_state.write_lightweight_run_state(run_dir, config, status=status, completed_epoch=epochs, include_best=status == "completed")
+    if status == "unsuccessful":
+        common.paths.resolve_last_checkpoint_file(run_dir).unlink()
+    best = {"best_epoch": 1, "best_metric": 0.25} if status == "completed" else {"best_epoch": None, "best_metric": None}
     divergence = "loss is non-finite" if end == "diverged" else None
-    training_outcome = {"status": end, "budget_progress": 0.5 if divergence else 1.0, "eligible_points": 1, "divergence": divergence}
+    eligible = int(status == "completed")
+    training_outcome = {"status": end, "budget_progress": 0.5 if divergence else 1.0, "eligible_points": eligible, "divergence": divergence}
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
-        {
-            "status": "completed",
-            "completed_epoch": config["training"]["budget_epochs"],
-            "best_epoch": 1,
-            "best_metric": 0.25,
-            "training_outcome": training_outcome,
-        },
+        {"status": status, "completed_epoch": epochs, **best, "training_outcome": training_outcome},
     )
     before = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    admitted: list[Path] = []
+
+    def admit(path: Path) -> dict[str, Any]:
+        admitted.append(path.resolve())
+        return {"summary": experiments.run.read_run_summary(path)}
 
     def execute(*_args: Any, **_kwargs: Any) -> None:
         pytest.fail("a complete run must not train again")
 
+    monkeypatch.setattr(experiments.run, "validate_finished_run", admit)
     monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", execute)
 
     outcome = experiments.run.run_experiment(config_path, output_root=output_root)
 
+    assert admitted == [run_dir.resolve()]
     assert outcome["already_complete"] is True
     assert "already_complete" in capsys.readouterr().out
     assert outcome["run_dir"] == run_dir.resolve()
-    assert outcome["result"] == {"status": end, "training_outcome": training_outcome, "best_epoch": 1, "best_metric": 0.25}
+    assert outcome["result"] == {"status": end, "training_outcome": training_outcome, **best}
     registry_state = output_root.relative_to(tmp_path) / ".state" / "identities"
     after = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
     assert {path: payload for path, payload in after.items() if not path.is_relative_to(registry_state)} == before
     entry = experiments.registry.lookup(config)
     assert entry is not None
     assert entry.target == run_dir.resolve()
+    monkeypatch.setattr(experiments.run, "run_experiment", functools.partial(experiments.run.run_experiment, output_root=output_root))
+    assert cli_train.main([str(config_path)]) == (2 if status == "unsuccessful" else 0)
+    assert ("unsuccessful: no eligible checkpoint" in capsys.readouterr().out) is (status == "unsuccessful")
+
+
+@pytest.mark.parametrize("status", ["completed", "unsuccessful", "interrupted"])
+def test_a_rerun_refused_by_its_admission_changes_nothing_and_binds_no_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    """
+    A rerun refused by its admission, the finished-run one or the resume one, is neither reported finished nor resumed.
+
+    The lightweight run holds no valid checkpoint, split or history, so both refusals come before the identity binding is
+    repaired and before the writer lease creates its lock file: nothing below the test root changes.
+    """
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config_path = _synthetic_config_path(tmp_path)
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+    run_state.write_lightweight_run_state(run_dir, config, status=status, completed_epoch=1)
+    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("a refused run must not train"))
+    before = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+
+    with pytest.raises(experiments.run.RunLifecycleError):
+        experiments.run.run_experiment(config_path, output_root=output_root)
+
+    assert {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()} == before
+    assert experiments.registry.lookup(config) is None
+
+
+def test_a_completed_rerun_refused_by_its_device_leaves_a_stale_binding_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    A completed run is admitted before any device setup, but its stale identity binding is repaired only after the device admission.
+
+    The rerun reports the run complete only once nothing can end it any more, so a device it cannot use prints no such line.
+    """
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config_path = _synthetic_config_path(tmp_path)
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+    run_state.write_lightweight_run_state(run_dir, config, status="completed", completed_epoch=config["training"]["budget_epochs"])
+    outcome = {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None}
+    summary = {**experiments.run.read_run_summary(run_dir), "best_epoch": 1, "best_metric": 0.25, "training_outcome": outcome}
+    common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(run_dir), summary)
+    # The binding names a directory that no longer exists.
+    gone = output_root / "gone"
+    gone.mkdir()
+    experiments.registry.ensure_bound(config, gone)
+    gone.rmdir()
+    monkeypatch.setattr(experiments.run, "validate_completed_run", lambda path: {"summary": experiments.run.read_run_summary(path)})
+
+    def unusable(*_args: Any, **_kwargs: Any) -> None:
+        msg = "CUDA is not usable"
+        raise learning.device.DeviceResolutionError(msg)
+
+    monkeypatch.setattr(experiments.run.learning.device, "resolve_device", unusable)
+    before = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    capsys.readouterr()
+
+    with pytest.raises(learning.device.DeviceResolutionError):
+        experiments.run.run_experiment(config_path, output_root=output_root)
+
+    assert "already_complete" not in capsys.readouterr().out
+    assert {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()} == before
+
+
+@pytest.mark.parametrize("binding", ["malformed_entry", "io_error"])
+def test_a_completed_rerun_whose_identity_binding_fails_ends_by_its_cause_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], binding: str
+) -> None:
+    """
+    A completed run's rerun repairs its identity binding last: a malformed entry is stored state, an I/O error the job's environment.
+
+    The malformed entry refuses the rerun in one line without a rerun, which would be refused again; an I/O error prints the
+    rerun in a matching allocation. Neither prints a traceback or reports the run complete, and nothing below the test root
+    changes but the registry's persistent lock anchor, lease infrastructure.
+    """
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config_path = _synthetic_config_path(tmp_path)
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+    run_state.write_lightweight_run_state(run_dir, config, status="completed", completed_epoch=config["training"]["budget_epochs"])
+    outcome = {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None}
+    summary = {**experiments.run.read_run_summary(run_dir), "best_epoch": 1, "best_metric": 0.25, "training_outcome": outcome}
+    common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(run_dir), summary)
+    monkeypatch.setattr(experiments.run, "validate_completed_run", lambda path: {"summary": experiments.run.read_run_summary(path)})
+    if binding == "malformed_entry":
+        entry = common.paths.resolve_identity_registry_entry(output_root, config_loader.allocation_digest(config))
+        entry.parent.mkdir(parents=True)
+        entry.write_text("not json", encoding="utf-8")
+    else:
+
+        def unreadable(*_args: Any, **_kwargs: Any) -> None:
+            message = "Input/output error"
+            raise OSError(errno.EIO, message)
+
+        monkeypatch.setattr(experiments.registry, "ensure_bound", unreadable)
+    monkeypatch.setattr(experiments.run, "run_experiment", functools.partial(experiments.run.run_experiment, output_root=output_root))
+    locks = output_root / ".state" / "identities" / "locks"
+    before = {item: item.read_bytes() for item in tmp_path.rglob("*") if item.is_file() and not item.is_relative_to(locks)}
+    capsys.readouterr()
+
+    assert cli_train.main([str(config_path)]) == 1
+    printed = capsys.readouterr()
+    if binding == "malformed_entry":
+        assert printed.err.startswith("Run continuation refused: The continuation was refused before its attempt started")
+        assert "RuntimeError: Identity registry entry is not valid JSON" in printed.err
+        assert "Traceback" not in printed.err
+        assert "matching allocation" not in printed.err
+    else:
+        assert printed.err.splitlines() == [
+            "Run not started: OSError: [Errno 5] Input/output error",
+            "  next: rerun the same command in a matching allocation, the run is unchanged",
+        ]
+    assert "already_complete" not in printed.out
+    assert {item: item.read_bytes() for item in tmp_path.rglob("*") if item.is_file() and not item.is_relative_to(locks)} == before
+
+
+def test_an_in_place_continuation_of_an_identity_another_run_owns_is_refused_before_the_writer_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    A start that would continue an interrupted run whose identity another directory owns is refused read-only, without a lock file.
+
+    It is a refused continuation caused by the identical experiment, which the train command reports as a rejected admission,
+    as for a fresh start, never as a training traceback.
+    """
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config_path = _synthetic_config_path(tmp_path)
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+    run_state.write_lightweight_run_state(run_dir, config, status="interrupted", completed_epoch=1)
+    owner = output_root / "owner"
+    owner.mkdir()
+    experiments.registry.ensure_bound(config, owner)
+    # The lightweight run holds no restorable checkpoint, so its read-only resume admission admits it here.
+    admitted = (config, config, {}, {}, common.paths.resolve_last_checkpoint_file(run_dir))
+    monkeypatch.setattr(experiments.run, "_admit_resolved_resume", lambda *_args, **_kwargs: admitted)
+    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("a refused run must not train"))
+    before = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+
+    with pytest.raises(experiments.run.ContinuationRefusedError) as refused:
+        experiments.run.run_experiment(config_path, output_root=output_root)
+    assert isinstance(refused.value.__cause__, experiments.registry.IdenticalExperimentError)
+    # The command, under the same output root.
+    monkeypatch.setattr(experiments.run, "run_experiment", functools.partial(experiments.run.run_experiment, output_root=output_root))
+    capsys.readouterr()
+    assert cli_train.main([str(config_path)]) == 1
+    stderr = capsys.readouterr().err
+    assert "Run admission rejected: The identical experiment already exists at" in stderr
+    assert "Traceback" not in stderr
+
+    assert {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()} == before
 
 
 def test_initialization_failure_never_looks_loadable(
@@ -605,6 +1224,98 @@ def test_runtime_sessions_append_requested_and_resolved_facts_without_rewriting_
     assert (summary["elapsed_seconds"], summary["attempted_train_seconds"], summary["duration_coverage"]) == (None, None, "unknown_attempts")
 
 
+@pytest.mark.parametrize(
+    ("case", "refusal"),
+    [
+        ("stage_without_group", None),
+        ("stage_without_group_with_a_record", "history"),
+        ("stage_without_group_or_its_identity", "checkpoint identity"),
+        ("stage_without_group_with_another_identity", "checkpoint identity"),
+        ("stage_without_group_with_a_malformed_environment", "checkpoint identity is invalid"),
+        ("stage_without_group_with_another_image", "runtime session"),
+        ("stage_without_group_with_another_cuda_build", "runtime session"),
+        ("stage_without_group_with_another_package_version", None),
+        ("trial_with_groups", None),
+        ("trial_history_beyond_its_step", "terminal global step"),
+    ],
+)
+def test_an_unsuccessful_steady_run_without_a_checkpoint_holds_the_records_its_summary_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, refusal: str | None
+) -> None:
+    """
+    An unsuccessful run without a last checkpoint is admitted against its summary's terminal epoch and step and its validated points.
+
+    A stage that committed no optimizer group wrote no record, as a transient one: a record it holds is refused, and so is a
+    summary without its producer identity or with another one, also without any record. An Optuna trial writes no last
+    checkpoint, also after committed groups: its history holds their validation and epoch records, bound to the producer
+    identity its summary records, whose numerical environment (a container on CUDA) is not the reader's; a final record
+    beyond the summary's global step is refused. Without a record, only the runtime session of the attempt that ended the
+    run binds that environment: a malformed value is refused, and so is an image or a CUDA build other than the session's;
+    a package version is recorded once, in the identity alone, so another one is admitted.
+    """
+    trial = case.startswith("trial")
+    if trial:
+        source = config_naming.ConfigSource("steady_flow", common.paths.OPTUNA_FAMILY, "study")
+        config = config_loader.resolve_config(configs.direct_config(), source=source, output_root=tmp_path)
+    else:
+        config = configs.resolve(configs.direct_config(), output_root=tmp_path)
+    run_dir = common.paths.resolve_config_run_dir(config)
+    run_state.write_lightweight_run_state(run_dir, config, status="unsuccessful", completed_epoch=0, include_best=False)
+    common.paths.resolve_last_checkpoint_file(run_dir).unlink()
+    rebuilt = run_state.producer_identity()
+    producer = {**rebuilt["numerical_environment"], "sif_sha256": "f" * 64, "torch_cuda_build": "12.1"}
+    recorded = {**rebuilt, "numerical_environment": producer}
+    # The attempt that ended the run records its Slurm job's image and, on CUDA, PyTorch's CUDA build.
+    session = {"device_type": "cuda", "cuda_build_version": "12.1", "slurm": {"sif_sha256": "f" * 64}}
+    monkeypatch.setattr(experiments.run, "_saved_run_identity", lambda *_args, **_kwargs: ({}, None, rebuilt))
+    total = learning.training.budget.passes_budget(int(config["training"]["budget_epochs"]), 4)
+    budget = learning.training.budget.StageBudget(unit="units", total=total)
+    if trial:
+        budget.record_group(units=total // 2, supervised_transitions=total // 2, train_seconds=0.5)
+        point = budget.record_validation()
+    outcome = {"status": "diverged", "budget_progress": budget.progress, "eligible_points": 0, "divergence": "loss is non-finite"}
+    summary = {
+        **experiments.run.read_run_summary(run_dir),
+        **experiments.run._terminal_budget_evidence(budget.state_dict()),
+        "training_units": {"full_set_units": 4},
+        "training_outcome": outcome,
+        "completed_epoch": int(trial),
+        "global_step": 2 * int(trial),
+        "best_epoch": None,
+        "last_checkpoint_sha256": None,
+        "checkpoint_identity": recorded,
+        "runtime_sessions": [session],
+    }
+    environment_change = {
+        "stage_without_group_with_a_malformed_environment": {"numpy": ["2.0.0"]},
+        "stage_without_group_with_another_image": {"sif_sha256": "0" * 64},
+        "stage_without_group_with_another_cuda_build": {"torch_cuda_build": "11.8"},
+        "stage_without_group_with_another_package_version": {"numpy": "0.0.1"},
+    }.get(case)
+    if case == "stage_without_group_or_its_identity":
+        del summary["checkpoint_identity"]
+    elif case == "stage_without_group_with_another_identity":
+        summary["checkpoint_identity"] = {**recorded, "effective_config_digest": "0" * 64}
+    elif environment_change is not None:
+        summary["checkpoint_identity"] = {**recorded, "numerical_environment": {**producer, **environment_change}}
+    common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(run_dir), summary)
+    write = learning.training.history.make_epoch_state_callback(
+        run_dir, task="steady_flow", run_name=str(config["run"]["name"]), checkpoint_identity=recorded
+    )
+    if trial:
+        # The validation at the reached point inside epoch 1, then that epoch's end at the trial's terminal step (one later beyond it).
+        write(1, None, {"global_step": 1.0, "validation/point": float(point), "validation/eligible": 0.0})
+        write(1, {"global_step": 3.0 if case == "trial_history_beyond_its_step" else 2.0, "train/loss_total": 0.5}, None)
+    elif case == "stage_without_group_with_a_record":
+        write(1, {"global_step": 1.0, "train/loss_total": 0.5}, None)
+
+    if refusal is None:
+        assert experiments.run.validate_finished_run(run_dir)["terminal_budget"].spent == budget.spent
+    else:
+        with pytest.raises(experiments.run.RunLifecycleError, match=refusal):
+            experiments.run.validate_finished_run(run_dir)
+
+
 @pytest.mark.parametrize("earlier", ["no_history", "no_sessions_under_an_earlier_contract", "contract_without_history", "malformed_attempt"])
 def test_resume_refuses_a_summary_that_records_its_attempts_in_an_earlier_schema(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, earlier: str
@@ -640,13 +1351,14 @@ def test_resume_refuses_a_summary_that_records_its_attempts_in_an_earlier_schema
     assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
 
 
-def test_resume_admission_refuses_a_contradictory_history_before_its_attempt_changes_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resume_admission_refuses_a_contradictory_history_before_any_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     The resume admission validates the history read-only against the last checkpoint it admits as continuation source.
 
-    A history whose counted epoch ends at the last's step admits the attempt. One that ends after it is refused under the
-    writer lease before the attempt publishes the run as running: the run, its summary and runtime sessions included,
-    stays byte-identical. The last is loaded as continuation source, the best only to be read.
+    A history whose counted epoch ends at the last's step admits the attempt, after one admission before the writer lease
+    and one under it. A history that ends after it is refused before the writer lease, so its lock file is not created,
+    and the run, its summary and runtime sessions included, stays byte-identical. The last is loaded as continuation
+    source, the best only to be read.
     """
     config = configs.resolve(configs.direct_config(), output_root=tmp_path)
     run_dir = common.paths.resolve_config_run_dir(config)
@@ -666,6 +1378,7 @@ def test_resume_admission_refuses_a_contradictory_history_before_its_attempt_cha
 
     monkeypatch.setattr(experiments.run, "_read_saved_data_artifacts", lambda *_args: (SimpleNamespace(as_payload=dict), {}))
     monkeypatch.setattr(experiments.run, "_validate_saved_data_contract", lambda *_args: None)
+    monkeypatch.setattr(config_loader, "admit_pinned_datasets", lambda *_args: None)  # the synthetic config publishes no Dataset
     monkeypatch.setattr(learning.training.checkpoint, "build_checkpoint_identity", lambda *_args, **_kwargs: identity)
     monkeypatch.setattr(learning.training.checkpoint, "load_checkpoint", load)
     monkeypatch.setattr(learning.training.checkpoint, "recorded_history_epochs", lambda _payload: 1)
@@ -680,12 +1393,16 @@ def test_resume_admission_refuses_a_contradictory_history_before_its_attempt_cha
 
     record_epoch_end(1.0)
     resume()
-    assert (len(attempts), loads) == (1, [("last", True), ("best", False)])
+    assert (len(attempts), loads) == (1, [("last", True), ("best", False)] * 2)
+    lock = experiments.run._run_writer_lock_path(run_dir)
+    # The admitted resume created the lock file; the refused one must not create it again.
+    lock.unlink()
     record_epoch_end(2.0)
     before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
-    with pytest.raises(ValueError, match="global step"):
+    with pytest.raises(experiments.run.ContinuationRefusedError, match="global step"):
         resume()
     assert len(attempts) == 1
+    assert not lock.exists()
     assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
 
 
@@ -1039,6 +1756,8 @@ def test_saved_effective_resume_service_preserves_exact_science_and_refuses_over
     config = configs.resolve(configs.direct_config(), output_root=tmp_path)
     run_dir = common.paths.resolve_config_run_dir(config)
     source = configs.write_yaml(run_dir / "config.yaml", config)
+    # The saved status is admitted before the delegated admission, so the run must be one that continues.
+    common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(run_dir), {"status": "interrupted"})
     if renamed:
         moved = tmp_path / "renamed_direct_bundle"
         run_dir.rename(moved)
@@ -1060,11 +1779,13 @@ def test_saved_effective_resume_service_preserves_exact_science_and_refuses_over
     assert requested["data"] == config["data"]
     assert requested["run"]["layout"] == config["run"]["layout"]
     assert source.read_bytes() == original
-    with pytest.raises(ValueError, match="cannot override scientific"):
+    # An override contradicts the saved run, which refuses it like any other change of its saved science.
+    refused = experiments.run.ContinuationRefusedError
+    with pytest.raises(refused, match="cannot override scientific"):
         experiments.run.run_experiment(source, resume=run_dir, train_dataset="different")
-    with pytest.raises(ValueError, match="cannot override scientific"):
+    with pytest.raises(refused, match="cannot override scientific"):
         experiments.run.run_experiment(source, resume=run_dir, seed=19)
-    with pytest.raises(ValueError, match="cannot override scientific"):
+    with pytest.raises(refused, match="cannot override scientific"):
         experiments.run.run_experiment(source, resume=run_dir, epochs=int(config["training"]["budget_epochs"]) + 1)
 
 
@@ -1133,7 +1854,7 @@ def test_optuna_trial_directory_is_not_resumed(tmp_path: Path, monkeypatch: pyte
 
     monkeypatch.setattr(experiments.run, "_run_resolved_experiment", execute)
 
-    with pytest.raises(experiments.run.RunLifecycleError, match="trials are not resumed"):
+    with pytest.raises(experiments.run.ContinuationRefusedError, match="trials are not resumed"):
         experiments.run.run_experiment(source, resume=run_dir)
 
 
@@ -1169,11 +1890,16 @@ def test_job_log_owner_is_recorded_only_inside_a_job_and_a_failed_write_only_war
     common.paths.record_job_log_owner(owner)  # neither the failed write nor its failed warning may reach the job
 
 
-@pytest.mark.parametrize(("start", "recorded"), [("resume", 2), ("trial", 0)])
-def test_a_run_records_its_folder_as_job_log_owner_even_when_its_device_check_fails_but_a_trial_does_not(
+@pytest.mark.parametrize(("start", "recorded"), [("fresh", 1), ("refused_resume", 0), ("trial", 0)])
+def test_a_fresh_run_records_its_folder_as_job_log_owner_even_when_its_device_check_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, start: str, recorded: int
 ) -> None:
-    """Fresh and resumed executions each record their run folder before any check can fail them; a trial belongs to its study."""
+    """
+    A fresh execution records its run folder before any check can fail it; a trial's logs belong to its study.
+
+    A resume records it only when its attempt starts, so one refused before, here by its device check, names no owner and
+    no job log is linked into the run it left unchanged (the steady lifecycle test starts one).
+    """
     owners_file = tmp_path / "owners"
     monkeypatch.setenv("JOB_LOG_OWNERS_FILE", str(owners_file))
     config = _minimal_config(tmp_path / "outputs")
@@ -1188,9 +1914,131 @@ def test_a_run_records_its_folder_as_job_log_owner_even_when_its_device_check_fa
 
     monkeypatch.setattr(experiments.run, "validate_deterministic_model_device_policy", interrupt)
     resolution = experiments.run.learning.device.resolve_device("cpu")
-    for resume_from in (None, run_dir / "last_checkpoint.pt")[: 2 if start == "resume" else 1]:
-        with pytest.raises(KeyboardInterrupt):
-            experiments.run.execute_prepared_run(config, run_dir=run_dir, resume_from=resume_from, device_resolution=resolution)
+
+    def execute() -> None:
+        if start != "refused_resume":
+            experiments.run.execute_prepared_run(config, run_dir=run_dir, device_resolution=resolution)
+            return
+        with experiments.run.run_writer_lease(run_dir):
+            experiments.run._execute_prepared_run_locked(
+                config,
+                run_dir=run_dir,
+                persisted_config=config,
+                saved_split_indices={},
+                resume_from=common.paths.resolve_last_checkpoint_file(run_dir),
+                device_resolution=resolution,
+            )
+
+    with pytest.raises(KeyboardInterrupt):
+        execute()
 
     lines = owners_file.read_text(encoding="utf-8").splitlines() if owners_file.exists() else []
     assert lines == [str(run_dir.resolve())] * recorded
+    # A started attempt ends interrupted; the refused resume leaves the run's status as it was.
+    assert experiments.run.read_run_summary(run_dir)["status"] == ("initializing" if start == "refused_resume" else "interrupted")
+
+
+@pytest.mark.parametrize("end", ["state_refusal", "environment_failure"])
+def test_an_unstarted_continuation_names_its_reason_and_a_rerun_only_after_an_environment_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], end: str
+) -> None:
+    """
+    A continuation that ends before its attempt started leaves the run unchanged and names its reason.
+
+    A refusal by the run's persisted state advises no rerun, which is refused again. The device check is the job's
+    environment, so its failure, here a ``ValueError``, keeps its type and is advised the rerun in a matching allocation.
+    """
+    config = _minimal_config(tmp_path / "outputs")
+    run_dir = experiments.run.prepare_fresh_run(config)
+    reason = "the persisted state or the environment fails the continuation"
+    error_type = experiments.run.ContinuationRefusedError if end == "state_refusal" else ValueError
+
+    def fail(*_args: Any, **_kwargs: Any) -> None:
+        # The device check is the attempt's first; a check of the run's state raises the typed refusal itself.
+        raise error_type(reason)
+
+    monkeypatch.setattr(experiments.run, "validate_deterministic_model_device_policy", fail)
+    before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
+    with pytest.raises(error_type, match=reason), experiments.run.run_writer_lease(run_dir):
+        experiments.run._execute_prepared_run_locked(
+            config,
+            run_dir=run_dir,
+            persisted_config=config,
+            saved_split_indices={},
+            resume_from=common.paths.resolve_last_checkpoint_file(run_dir),
+            device_resolution=experiments.run.learning.device.resolve_device("cpu"),
+        )
+
+    assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
+    stop, *details = capsys.readouterr().err.splitlines()
+    assert stop.startswith(f"{'refused' if end == 'state_refusal' else 'FAILED'} {config['run']['name']} ")
+    assert reason in stop
+    assert "unchanged" in details[-1]
+    assert ("rerun" in details[-1]) is (end == "environment_failure")
+
+
+@pytest.mark.parametrize("dataset", ["content_key", "linked_folder", "linked_manifest", "absent_manifest", "absent_before_a_linked_one"])
+def test_a_continuation_is_refused_by_its_malformed_or_unsafe_pinned_dataset_and_ended_by_an_absent_one(
+    transient_package: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], dataset: str
+) -> None:
+    """
+    Malformed or unsafe content of a continuation's pinned Datasets refuses it as that input; an absent path is the job's environment.
+
+    A key the loaders' Dataset code misses, as in a payload, is malformed Dataset content, named by its error and the
+    Dataset folders, never claimed as a malformed manifest, which only the resume admission's manifest check reports. A
+    Dataset folder or manifest that exists but is a symbolic link, which the manifest reader refuses, is refused naming
+    it. Neither is a failed read, so no rerun heals it: the continuation is refused before its attempt started and advised
+    no rerun. An absent manifest, as behind a mount the job cannot reach, keeps its error and is advised the rerun, also
+    when a later pinned Dataset is a symbolic link: the readers stop at the first path they cannot use. Neither changes
+    the run.
+    """
+    root, dataset_id = transient_package["root"], transient_package["train_dataset"]
+    monkeypatch.setenv("STORAGE_ROOT", str(root))
+    dataset_dir = common.paths.resolve_dataset_dir("transient_drying", dataset_id, dataset_root=common.paths.get_datasets_root(storage_root=root))
+    manifest_path = dataset_dir / common.paths.DATASET_MANIFEST_FILENAME
+    named = {
+        "content_key": f"Dataset content is malformed: KeyError: 'cases', in {dataset_dir}.",
+        "linked_folder": str(dataset_dir),
+        "linked_manifest": str(manifest_path),
+    }.get(dataset)
+    material_ood: list[str] = []
+    if dataset.startswith("absent_"):
+        manifest_path.unlink()
+    if dataset == "absent_before_a_linked_one":
+        linked = dataset_dir.with_name("linked_material_ood")
+        linked.symlink_to(dataset_dir, target_is_directory=True)
+        material_ood.append(linked.name)
+    elif dataset.startswith("linked_"):
+        unsafe = dataset_dir if dataset == "linked_folder" else manifest_path
+        moved = unsafe.with_name(f"{unsafe.name}.moved")
+        unsafe.rename(moved)
+        unsafe.symlink_to(moved)
+    raw = configs.transient_stage_a_only_config()
+    raw["data"].update({"train_dataset": dataset_id, "material_ood_datasets": material_ood})
+    config = configs.resolve(raw, output_root=tmp_path / "outputs")
+    run_dir = experiments.run.prepare_fresh_run(config)
+
+    def loaders(*_args: Any, **_kwargs: Any) -> None:
+        # The training loaders read each manifest through its reader, then the Dataset's payload, which here lacks a key.
+        experiments.run.datasets.packages.load_package_manifest("transient_drying", dataset_id, storage_root=root)
+        key = "cases"
+        raise KeyError(key)
+
+    monkeypatch.setattr(config_loader, "create_dataloaders_from_config", loaders)
+    before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
+    ending = experiments.run.ContinuationRefusedError if named is not None else FileNotFoundError
+    with pytest.raises(ending) as ended, experiments.run.run_writer_lease(run_dir):
+        experiments.run._execute_prepared_run_locked(
+            config,
+            run_dir=run_dir,
+            persisted_config=config,
+            saved_split_indices={},
+            resume_from=common.paths.resolve_last_checkpoint_file(run_dir),
+            device_resolution=experiments.run.learning.device.resolve_device("cpu"),
+        )
+
+    if named is not None:
+        assert named in str(ended.value)
+        assert (dataset != "content_key") or ("manifest" not in str(ended.value))
+    assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
+    assert ("rerun" in capsys.readouterr().err) is (named is None)

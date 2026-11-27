@@ -3,7 +3,7 @@
 Responsibilities:
   - Map canonical field keys to robust plain-text and Matplotlib symbols and to names, from one table
   - Own the label style (symbol, name, or name and symbol) and compose field and metric labels in it at call time
-  - Normalize dimensionless units and unit exponents for scientific presentation
+  - Normalize dimensionless units, unit exponents and the products of compound units for scientific presentation
   - Own the display conversions by unit and quantity: absolute Kelvin to Celsius, and the named relative-humidity and
     wet-basis fractions to percent with their differences in percentage points
   - Provide one human-readable fallback for undeclared formula symbols
@@ -56,6 +56,10 @@ _FIELD_DISPLAY: Final = {
     "Kxy": FieldDisplayMetadata("κₓᵧ", r"$\kappa_{xy}$", "Permeability xy"),
     "Kyx": FieldDisplayMetadata("κᵧₓ", r"$\kappa_{yx}$", "Permeability yx"),
     "Kyy": FieldDisplayMetadata("κᵧᵧ", r"$\kappa_{yy}$", "Permeability yy"),
+    "K_min": FieldDisplayMetadata("κ_min", r"$\kappa_{\mathrm{min}}$", "Minimum principal permeability"),
+    "K_max": FieldDisplayMetadata("κ_max", r"$\kappa_{\mathrm{max}}$", "Maximum principal permeability"),
+    "K_anisotropy": FieldDisplayMetadata("κ_max/κ_min", r"$\kappa_{\mathrm{max}}/\kappa_{\mathrm{min}}$", "Anisotropy ratio"),
+    "K_orientation": FieldDisplayMetadata("θ_κ", r"$\theta_{\kappa}$", "Major permeability direction"),
     "eps_bed": FieldDisplayMetadata("ε", r"$\varepsilon$", "Bed porosity"),
     "p_in_bc": FieldDisplayMetadata("p_in,bc", r"$p_{\mathrm{in,bc}}$", "Inlet pressure boundary"),
     "p": FieldDisplayMetadata("p", r"$p$", "Pressure"),
@@ -78,9 +82,19 @@ _FIELD_DISPLAY: Final = {
     "w_gr": FieldDisplayMetadata(
         "w_gr", r"$w_{\mathrm{gr}}$", "Grain water content", FieldDisplayMetadata("X_wb", r"$X_{\mathrm{wb}}$", "Grain moisture")
     ),
+    "w_gr0": FieldDisplayMetadata("w_gr,0", r"$w_{\mathrm{gr},0}$", "Initial water content"),
     "T_in_bc": FieldDisplayMetadata("T_in,bc", r"$T_{\mathrm{in,bc}}$", "Inlet temperature"),
     "omega_in_bc": FieldDisplayMetadata("ω_in,bc", r"$\omega_{\mathrm{in,bc}}$", "Inlet humidity ratio"),
     "T_amb": FieldDisplayMetadata("T_amb", r"$T_{\mathrm{amb}}$", "Ambient temperature"),
+    # Case-global scalar material conditioning, with the symbols of docs/02_physical_model.md.
+    "r_surf_0": FieldDisplayMetadata("r_surf,0", r"$r_{\mathrm{surf},0}$", "Surface drying rate"),
+    "r_int_surf": FieldDisplayMetadata("r_int/r_surf", r"$r_{\mathrm{int}}/r_{\mathrm{surf}}$", "Interior-to-surface rate ratio"),
+    "f_surf": FieldDisplayMetadata("f_s", r"$f_{\mathrm{s}}$", "Surface water fraction"),
+    "A_osw": FieldDisplayMetadata("A", r"$A$", "Oswin coefficient A"),
+    "B_osw": FieldDisplayMetadata("B", r"$B$", "Oswin coefficient B"),
+    "C_osw": FieldDisplayMetadata("C", r"$C$", "Oswin exponent C"),
+    "k_gr": FieldDisplayMetadata("k_gr", r"$k_{\mathrm{gr}}$", "Grain thermal conductivity"),
+    "cp_gr_dry": FieldDisplayMetadata("c_p,gr,dry", r"$c_{p,\mathrm{gr,dry}}$", "Dry grain heat capacity"),
 }
 
 
@@ -190,7 +204,7 @@ def display_unit(
         return "°C"
     if unit == "1":
         return "-"
-    return _UNIT_EXPONENT.sub(lambda match: match.group(1).translate(_SUPERSCRIPTS), unit)
+    return _UNIT_EXPONENT.sub(lambda match: match.group(1).translate(_SUPERSCRIPTS), unit).replace("*", "·")  # ``W/(m*K)`` reads ``W/(m·K)``
 
 
 def display_values(

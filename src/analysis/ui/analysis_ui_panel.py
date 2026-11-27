@@ -7,7 +7,7 @@ Responsibilities:
   - Open a popover body directly below its own header's row, over the rows below, without moving the plot (F2)
   - Keep hidden views idle and coalesce the redraw requests of a batch of control changes into one (rules 4 and 12)
   - Number the render requests of a view so only the newest publishes, and bind a nested view to its host's render (rule 3)
-  - Draw cheap views at once and expensive views on «Berechnen», keeping the last results in kernel memory (rule 2)
+  - Draw cheap views at once and expensive views on «Compute», keeping the last results in kernel memory (rule 2)
   - Build tab sets whose headers are equally wide and fit the longest title
 
 Design principles:
@@ -23,7 +23,7 @@ This module does NOT:
 
 Notes:
   On-demand views:
-    - A view is marked expensive, and then waits for «Berechnen», when its measured render time is above about 2 s.
+    - A view is marked expensive, and then waits for «Compute», when its measured render time is above about 2 s.
 
 """
 
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from types import ModuleType
 
 VIEW_CACHE_ENTRIES: Final = 8
-CACHE_NOTE: Final = "aus dem Cache"
+CACHE_NOTE: Final = "from the cache"
 _DISCLOSURE_ALLOWANCE_CH: Final = 2
 _TAB_CLASS_PREFIX: Final = "glp-tabw-"
 
@@ -214,7 +214,7 @@ def control_rows(rows: Sequence[widgets.Widget]) -> widgets.VBox:
 
 
 def popover_overlay(
-    content: widgets.Widget, rows: Sequence[widgets.Widget], popovers: Sequence[tuple[widgets.ToggleButton, widgets.DOMWidget]]
+    content: widgets.Box, rows: Sequence[widgets.Widget], popovers: Sequence[tuple[widgets.ToggleButton, widgets.DOMWidget]]
 ) -> widgets.GridBox:
     """
     Return ``content`` and the popover bodies in one grid cell, each body directly below its header's row (F2).
@@ -404,7 +404,7 @@ class ViewCache:
 
 
 def compute_button() -> widgets.Button:
-    """Return the «Berechnen» button of an expensive view."""
+    """Return the «Compute» button of an expensive view."""
     return controls.action_button(controls.COMPUTE_LABEL, kind="compute")
 
 
@@ -415,11 +415,11 @@ def _viewers() -> ModuleType:
 
 class OnDemandView:
     """
-    The plot of one view: a cheap view draws on every refresh, an expensive one only on «Berechnen» (rule 2).
+    The plot of one view: a cheap view draws on every refresh, an expensive one only on «Compute» (rule 2).
 
     ``draw(key)`` returns the figure for the hashable control state ``selection()``. An expensive view keeps its last
-    ``VIEW_CACHE_ENTRIES`` results in a ``ViewCache`` and shows a cached selection at once with the note «aus dem Cache».
-    The panel is built before the view, so the «Berechnen» ``button`` is made with ``compute_button()``, placed in one of
+    ``VIEW_CACHE_ENTRIES`` results in a ``ViewCache`` and shows a cached selection at once with the note «from the cache».
+    The panel is built before the view, so the «Compute» ``button`` is made with ``compute_button()``, placed in one of
     the panel's rows, and passed here; it is shown only for an expensive view.
     """
 
@@ -440,7 +440,7 @@ class OnDemandView:
             message = "An on-demand view needs a panel with a plot slot."
             raise ValueError(message)
         if expensive and button is None:
-            message = "An expensive view needs its «Berechnen» button placed in one of the panel's rows."
+            message = "An expensive view needs its «Compute» button placed in one of the panel's rows."
             raise ValueError(message)
         self.panel = panel
         self.expensive = expensive
@@ -454,7 +454,7 @@ class OnDemandView:
         self._guard = controls.BusyGuard([self.button], panel.status)
 
     def refresh(self) -> None:
-        """Follow a control change: draw a cheap view, show a cached result, or wait for «Berechnen»."""
+        """Follow a control change: draw a cheap view, show a cached result, or wait for «Compute»."""
         self.panel.request(self._refresh_now)
 
     def compute(self) -> None:
@@ -469,9 +469,9 @@ class OnDemandView:
             elapsed = time.perf_counter() - started
             self.cache.put(key, result)
             _viewers().render_view(self.panel, lambda: result, **self._export)
-            return f"Berechnet in {elapsed:.1f} s; für diese Auswahl gespeichert ({len(self.cache)} von {self.cache.entries} Einträgen)."
+            return f"Computed in {elapsed:.1f} s; kept for this selection ({len(self.cache)} of {self.cache.entries} entries)."
 
-        self._guard.run(run, busy_text="Berechne …", on_error=lambda error: _viewers().fail_view(self.panel, error, **self._export))
+        self._guard.run(run, busy_text="Computing …", on_error=lambda error: _viewers().fail_view(self.panel, error, **self._export))
 
     def _refresh_now(self) -> None:
         key = self._selection()
@@ -480,13 +480,13 @@ class OnDemandView:
         elif key in self.cache:
             self.panel.status.set(self._show_cached(key))
         else:
-            message = f"Diese Auswahl ist noch nicht berechnet: «{controls.COMPUTE_LABEL}» drücken."
+            message = f"This selection is not computed yet: press «{controls.COMPUTE_LABEL}»."
             _viewers().clear_view(self.panel, message, **self._export)
 
     def _show_cached(self, key: Hashable) -> str:
         result = self.cache.get(key)
         _viewers().render_view(self.panel, lambda: result, **self._export)
-        return f"Ansicht {CACHE_NOTE} ({len(self.cache)} von {self.cache.entries} Einträgen)."
+        return f"View {CACHE_NOTE} ({len(self.cache)} of {self.cache.entries} entries)."
 
 
 def tab_width_ch(titles: Sequence[str]) -> int:

@@ -3,12 +3,13 @@
 Responsibilities:
   - Compare initial moisture and equilibrium-RH maps as A/B/B-minus-A rows
   - Retain separate A/B distributions with dataset-mean markers
-  - Compare inlet startup RH with case and empirical bed-equilibrium summaries
+  - Compare inlet startup RH with case and empirical bed-equilibrium summaries on one relative-humidity axis, its phase
+    key inside its panel
 
 Design principles:
   - Equilibrium RH comes only from the canonical per-case inverse-Oswin result
   - Dataset reference values average per-case nonlinear diagnostics
-  - Moisture and humidity remain separate physical quantities
+  - Moisture and humidity remain separate physical quantities; the inlet and the bed share the relative-humidity axis
 
 This module does NOT:
   - Render single-case alternatives, copy sorption equations, or resample fields
@@ -25,6 +26,8 @@ import numpy as np
 from matplotlib.lines import Line2D
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
+from src.analysis.presentation import analysis_field_labels as field_labels
+from src.analysis.ui import analysis_ui_figure_layout as figure_layout
 
 from . import generation_input_plot_layout as layout
 from . import generation_input_plot_spatial as spatial
@@ -39,16 +42,18 @@ if TYPE_CHECKING:
     from src.analysis.presentation import analysis_display_grid as display_grid
 
 RELATION_MARKER_SIZE: Final = 38.0
-RELATION_RANGE_LINE_WIDTH: Final = 6.0
+RELATION_RANGE_LINE_WIDTH: Final = 1.5
+RELATION_RANGE_CAP_SIZE: Final = 5.0
+RELATION_LABEL_PAD_PT: Final = 8.0  # the relative-humidity label clear of its tick labels
 RELATION_PHASE_COLORS: Final = MappingProxyType(
     {
-        "Bed median (q05-q95 range)": "tab:purple",
+        "Bed median (q05\N{EN DASH}q95)": "tab:purple",
         "Inlet start": "tab:green",
         "Inlet startup end": "tab:red",
     }
 )
 RELATION_PHASE_MARKERS: Final = (
-    ("Bed median (q05-q95 range)", "o"),
+    ("Bed median (q05\N{EN DASH}q95)", "o"),
     ("Inlet start", "^"),
     ("Inlet startup end", "v"),
 )
@@ -164,34 +169,28 @@ def _draw_inlet_bed_comparison(
             _mean_relationship(mean_b),
         )
     positions = np.arange(len(values), dtype=np.float64)
+    bed_color, start_color, end_color = RELATION_PHASE_COLORS.values()
     for position, value in zip(
         positions,
         values,
         strict=True,
     ):
         q05, median, q95, inlet_start, inlet_end = value
-        axis.vlines(
+        # Opaque with end caps: a bed's q05-q95 spread is a few percent of the axis, which a faint bar hid behind the median marker.
+        axis.errorbar(
             position,
-            q05,
-            q95,
-            color=RELATION_PHASE_COLORS["Bed median (q05-q95 range)"],
-            linewidth=RELATION_RANGE_LINE_WIDTH,
-            alpha=0.28,
+            median,
+            yerr=np.array(((median - q05,), (q95 - median,))),
+            fmt="none",
+            ecolor=bed_color,
+            elinewidth=RELATION_RANGE_LINE_WIDTH,
+            capsize=RELATION_RANGE_CAP_SIZE,
+            zorder=2,
         )
         for offset, phase_value, marker, phase_color in (
-            (
-                0.0,
-                median,
-                "o",
-                RELATION_PHASE_COLORS["Bed median (q05-q95 range)"],
-            ),
-            (-0.07, inlet_start, "^", RELATION_PHASE_COLORS["Inlet start"]),
-            (
-                0.07,
-                inlet_end,
-                "v",
-                RELATION_PHASE_COLORS["Inlet startup end"],
-            ),
+            (0.0, median, "o", bed_color),
+            (-0.07, inlet_start, "^", start_color),
+            (0.07, inlet_end, "v", end_color),
         ):
             axis.scatter(
                 position + offset,
@@ -218,11 +217,19 @@ def _draw_inlet_bed_comparison(
         for label, marker in RELATION_PHASE_MARKERS
     )
     axis.set_xticks(positions, labels)
+    # One axis for the inlet and the bed: it is labelled as relative humidity, not as either of them.
     axis.set_ylabel(
-        layout.quantity_axis_label("phi_eq"),
+        field_labels.field_label_with_unit("phi", diagnostics.FIELD_UNITS["phi_eq"], mathtext=True),
         fontsize=layout.FIGURE_LAYOUT.label_size,
+        labelpad=RELATION_LABEL_PAD_PT,
     )
     axis.set_title("Inlet vs bed-equilibrium RH", fontsize=layout.FIGURE_LAYOUT.axis_title_size)
     axis.tick_params(labelsize=layout.FIGURE_LAYOUT.tick_size)
     axis.grid(axis="y", alpha=0.22)
-    axis.legend(handles=phase_handles, loc="best", fontsize=layout.FIGURE_LAYOUT.legend_size)
+    figure = axis.get_figure(root=True)
+    if figure is None:
+        msg = "The inlet-bed comparison needs an axis on a figure."
+        raise RuntimeError(msg)
+    panel = np.empty((1, 1), dtype=object)
+    panel[0, 0] = axis
+    figure_layout.add_legend(figure, panel, phase_handles, [label for label, _marker in RELATION_PHASE_MARKERS])  # the panel's own key stays inside

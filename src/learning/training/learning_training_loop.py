@@ -7,6 +7,7 @@ Responsibilities:
     restore and after every committed group
   - Consume the resolved semantic objective for plateau-schedule and best-metric updates
   - Manage checkpoints, histories, and reproducibility state
+  - Annotate a failure with its lifecycle phase and declare the phases that write the attempt's own history and checkpoints
   - Run one update path for both tasks: per update group, weight each unit's loss by its case weight,
     accumulate the memory microbatches, average over the group's units, then step once
   - Measure every group on the one optimisation clock and commit its units, supervised transitions and seconds to the
@@ -68,6 +69,9 @@ EpochStateCallback = Callable[[int, dict[str, float] | None, dict[str, float] | 
 NONFINITE_CASES_KEY = "nonfinite_cases"
 # An epoch's last group holds the units left over, and its loss is their mean (see train_update_groups).
 LAST_GROUP_RULE: Final = "epoch_remainder_mean_over_its_units"
+# The phases that write the attempt's own history and checkpoint files, each replaced atomically, so the last checkpoint
+# before a failed write stays intact.
+PERSISTENCE_PHASES: Final = frozenset({"epoch_state", "best_checkpoint", "last_checkpoint"})
 
 
 @dataclass(slots=True)
@@ -739,7 +743,7 @@ def eval_one_epoch(
     Raises
     ------
     ValueError
-        If metric IDs, spaces (every metric accumulates physical tensors), or tensor views are inconsistent.
+        If metric IDs or tensor views are inconsistent.
 
     Notes
     -----
@@ -776,7 +780,6 @@ def eval_one_epoch(
                 metric.update(
                     pred_physical,
                     batch["y"],
-                    space="physical",
                     batch_index=batch_index,
                     **({"cases": cases} if getattr(metric, "requires_cases", False) else {}),
                 )
@@ -880,22 +883,14 @@ def _eval_adapter_one_epoch(
             cases = _case_membership(raw_batch, key="metadata", metrics=eval_metrics.values())
             views = adapter.evaluation_step(model, adapter.prepare_batch(raw_batch, device=device, training=False))
             _collect_bound_cases(bound_cases, bound_channels, views.bound_violations, raw_batch, cases)
-            # The standardized view of a finite physical rollout can still overflow; either view makes the case non-finite.
-            nonfinite_cases += int((~(views.case_complete & views.normalized_prediction.flatten(1).isfinite().all(1))).sum().item())
+            nonfinite_cases += int((~views.case_complete).sum().item())
             # The one-step guardrail is a diagnostic: a non-finite one-step value only leaves it without a value.
             one_step_finite = one_step_finite and bool(views.one_step_physical_prediction.isfinite().all().item())
             if nonfinite_cases:
                 # An incomplete validation reports no metric value, so the remaining batches are only counted.
                 continue
-            source_views = (
-                views.normalized_prediction,
-                views.normalized_target,
-                views.physical_prediction,
-                views.physical_target,
-                views.one_step_normalized_prediction,
-                views.one_step_physical_prediction,
-            )
-            reference = views.normalized_target
+            source_views = (views.physical_prediction, views.physical_target, views.one_step_physical_prediction)
+            reference = views.physical_target
             if (
                 not isinstance(reference, torch.Tensor)
                 or reference.ndim != _TRANSIENT_VIEW_RANK
@@ -905,7 +900,7 @@ def _eval_adapter_one_epoch(
                 raise ValueError(msg)
             pred, target = views.physical_prediction.flatten(0, 1), views.physical_target.flatten(0, 1)
             for metric_id, metric in eval_metrics.items():
-                kwargs: dict[str, Any] = {"space": "physical", "batch_index": batch_index}
+                kwargs: dict[str, Any] = {"batch_index": batch_index}
                 if cases is not None and getattr(metric, "requires_cases", False):
                     kwargs["cases"] = cases.repeat(reference.shape[1])
                 mask = views.valid_mask
@@ -1237,7 +1232,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     best_path = common.paths.resolve_best_checkpoint_file(run_dir)
     last_path = common.paths.resolve_last_checkpoint_file(run_dir)
     # Admission gives the run one writer, so staged files of an earlier crashed publication are ours to drop.
-    checkpoints.discard_staged_checkpoints(best_path, last_path)
+    with _training_phase("last_checkpoint", start_epoch_index):
+        checkpoints.discard_staged_checkpoints(best_path, last_path)
     trial_run = experiments.run.is_trial_config(config)
     session_started = time.perf_counter()
     last_published_at = time.monotonic()

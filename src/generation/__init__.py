@@ -7,6 +7,7 @@ Provides:
 - controller: service-backed workflow execution and continuation
 - cases: deterministic case planning and construction services
 - contracts: immutable scientific vocabularies and registries
+- field_tests: per-parameter field-test rosters, records, steps, and dispatch outside every Source
 - publication: canonical storage and terminal-evidence publication
 - readiness: unresolved campaign launch-gate inspection
 - run: immutable campaign run plans
@@ -19,7 +20,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from . import cases, contracts, publication, runtime, validation
+    from . import cases, contracts, field_tests, publication, runtime, validation
     from . import generation_campaign as campaign
     from . import generation_campaign_lifecycle as lifecycle
     from . import generation_controller as controller
@@ -32,6 +33,7 @@ _MODULES = {
     "controller": "generation_controller",
     "cases": "cases",
     "contracts": "contracts",
+    "field_tests": "field_tests",
     "publication": "publication",
     "readiness": "generation_readiness",
     "run": "generation_run",
@@ -43,6 +45,7 @@ __all__ = [
     "cases",
     "contracts",
     "controller",
+    "field_tests",
     "lifecycle",
     "publication",
     "readiness",

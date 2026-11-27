@@ -89,3 +89,30 @@ def test_transient_model_comparison_checks_every_case_grid_identity() -> None:
         evaluation.require_common_comparison_grids()
     evaluation._frames = MappingProxyType({"A": (frame("same"), None), "B": (frame("same"), None)})
     evaluation.require_common_comparison_grids()
+
+
+def test_transient_model_comparison_pairs_only_the_frames_of_one_dataset_role() -> None:
+    """A run's ID and material-OOD frames hold different cases by design; frames of one role must share cases."""
+
+    def frame(role: str, *cases: str) -> pd.DataFrame:
+        result = pd.DataFrame()
+        result.attrs["artifact_kind"] = "transient_sequence"
+        result.attrs["transient_scaling_state"] = {}
+        result.attrs["transient_unavailable_horizons"] = ()
+        result.attrs["transient_sequence_records"] = tuple(
+            SimpleNamespace(dataset_role=role, case_id=case, identity={"spatial_representation": {"grid_identity_sha256": "grid"}}) for case in cases
+        )
+        return result
+
+    frames = {
+        "A ID": frame("id", "case-1", "case-2"),
+        "A OOD": frame("material_ood", "case-9"),
+        "B ID": frame("id", "case-1", "case-2"),
+        "B OOD": frame("material_ood", "case-9"),
+    }
+    evaluation = object.__new__(transient_session.TransientEvaluationSession)
+    evaluation._frames = MappingProxyType({name: (value, None) for name, value in frames.items()})
+    evaluation.require_common_comparison_grids()
+    evaluation._frames = MappingProxyType({**evaluation._frames, "B ID": (frame("id", "case-1"), None)})
+    with pytest.raises(ValueError, match="'A ID' and 'B ID' have different exact case memberships"):
+        evaluation.require_common_comparison_grids()

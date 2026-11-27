@@ -1,13 +1,14 @@
 """Render unified boundary tables and transient schedule comparisons.
 
 Responsibilities:
-  - Present boundary scalars as Case A, Mean A, Case B, and Mean B
+  - Present boundary scalars as Case A, Mean A, Case B, and Mean B, unshaded: a larger value ranks nothing
   - Plot primitive and derived boundary quantities over operation and the first hour
   - Derive RH after display-time interpolation and average per-case curves
   - Report unavailable pointwise means when dataset supports differ
 
 Design principles:
-  - Cases are solid and dataset means are dashed with consistent A/B colors
+  - Cases are solid and dataset means are dashed in the colour of their case, keyed by the case captions; a one-case
+    dataset draws no mean
   - Temperature and humidity ratio remain the only persisted schedule channels
   - Display interpolation never mutates or adds persisted schedule support
 
@@ -57,8 +58,6 @@ def boundary_comparison_table(
         diagnostics.grouped_table_sections(table),
         title=(f"Boundary conditions — Mean A n = {mean_a.case_count}; Mean B n = {mean_b.case_count}"),
         columns=2,
-        shade_constant=True,
-        row_local=True,
     )
 
 
@@ -143,7 +142,8 @@ def schedule_comparison(
 
     Temperature and humidity ratio are interpolated piecewise-linearly at every
     display time. Relative humidity is then derived per case. Dataset RH means
-    average those per-case nonlinear curves.
+    average those per-case nonlinear curves. The mean of a one-case dataset is
+    that case's own curve, so it is neither drawn nor keyed.
     """
     first_schedule = diagnostics.transient_evidence(first)[0]
     second_schedule = diagnostics.transient_evidence(second)[0]
@@ -154,16 +154,21 @@ def schedule_comparison(
         (2, "omega_in_bc", "kg/kg"),
         (3, "phi_in_bc", "1"),
     )
+    schedule_mean_a = mean_a.schedule_mean if mean_a.case_count > 1 else None
+    schedule_mean_b = mean_b.schedule_mean if not same_dataset and mean_b.case_count > 1 else None
+
+    color_a, color_b = layout.case_colors(mean_a, mean_b)
+    caption_a, caption_b = layout.case_caption(first, mean_a, "A"), layout.case_caption(second, mean_b, "B")
 
     supports = [
         first_schedule[(first_schedule[:, 0] >= 0.0) & (first_schedule[:, 0] <= _EARLY_OPERATION_END_H), 0],
         second_schedule[(second_schedule[:, 0] >= 0.0) & (second_schedule[:, 0] <= _EARLY_OPERATION_END_H), 0],
     ]
-    if mean_a.schedule_mean is not None:
-        mean_times = mean_a.schedule_mean[:, 0]
+    if schedule_mean_a is not None:
+        mean_times = schedule_mean_a[:, 0]
         supports.append(mean_times[(mean_times >= 0.0) & (mean_times <= _EARLY_OPERATION_END_H)])
-    if not same_dataset and mean_b.schedule_mean is not None:
-        mean_times = mean_b.schedule_mean[:, 0]
+    if schedule_mean_b is not None:
+        mean_times = schedule_mean_b[:, 0]
         supports.append(mean_times[(mean_times >= 0.0) & (mean_times <= _EARLY_OPERATION_END_H)])
     early_operation_ticks = _early_operation_ticks(*supports)
 
@@ -184,11 +189,11 @@ def schedule_comparison(
         second_values = diagnostics.case_boundary_schedule(second, second_times)
         mean_a_values = (
             None
-            if mean_a.schedule_mean is None
+            if schedule_mean_a is None
             else diagnostics.dataset_boundary_schedule(
                 mean_a,
                 _display_times(
-                    mean_a.schedule_mean,
+                    schedule_mean_a,
                     startup_enabled=startup_enabled,
                     startup_duration_h=startup_duration_h,
                     early_operation=early_operation,
@@ -197,11 +202,11 @@ def schedule_comparison(
         )
         mean_b_values = (
             None
-            if same_dataset or mean_b.schedule_mean is None
+            if schedule_mean_b is None
             else diagnostics.dataset_boundary_schedule(
                 mean_b,
                 _display_times(
-                    mean_b.schedule_mean,
+                    schedule_mean_b,
                     startup_enabled=startup_enabled,
                     startup_duration_h=startup_duration_h,
                     early_operation=early_operation,
@@ -217,9 +222,9 @@ def schedule_comparison(
                 name=name,
                 unit=unit,
                 early_operation=early_operation,
-                color=layout.DATASET_A_COLOR,
+                color=color_a,
                 linestyle="-",
-                label=f"Case {first.case.case_index} (A)",
+                label=caption_a,
             )
             if mean_a_values is not None:
                 mean_label = f"Dataset mean, n = {mean_a.case_count}" if same_dataset else f"Mean A, n = {mean_a.case_count}"
@@ -230,7 +235,7 @@ def schedule_comparison(
                     name=name,
                     unit=unit,
                     early_operation=early_operation,
-                    color=(layout.DATASET_MEAN_COLOR if same_dataset else layout.DATASET_A_COLOR),
+                    color=(layout.DATASET_MEAN_COLOR if same_dataset else color_a),
                     linestyle="--",
                     label=mean_label,
                 )
@@ -241,9 +246,9 @@ def schedule_comparison(
                 name=name,
                 unit=unit,
                 early_operation=early_operation,
-                color=layout.DATASET_B_COLOR,
+                color=color_b,
                 linestyle="-",
-                label=f"Case {second.case.case_index} (B)",
+                label=caption_b,
             )
             if mean_b_values is not None:
                 _plot_schedule(
@@ -253,7 +258,7 @@ def schedule_comparison(
                     name=name,
                     unit=unit,
                     early_operation=early_operation,
-                    color=layout.DATASET_B_COLOR,
+                    color=color_b,
                     linestyle="--",
                     label=f"Mean B, n = {mean_b.case_count}",
                 )
@@ -287,7 +292,7 @@ def schedule_comparison(
     figure_layout.set_figure_title(
         figure,
         axes,
-        f"Transient schedules — Case {first.case.case_index} (A) vs Case {second.case.case_index} (B)",
+        f"Transient schedules — Case {first.case.case_index} (A) vs Case {second.case.case_index} (B)",  # the key names material and regime
         note=" ".join(unavailable) or None,
     )
     handles, legend_labels = axes[0][0].get_legend_handles_labels()

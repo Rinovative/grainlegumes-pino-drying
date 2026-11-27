@@ -5,15 +5,20 @@ Responsibilities:
   - Draw one structured-grid field on its shared discrete scale
   - Centralize independent, locked, and signed physical scales: log-positive principal permeabilities, signed Kxy, and
     round state bands for every other field
+  - Own the caption and colours of Case A and Case B in every comparison figure, and the caption of a single case
+  - Word the note of a map whose colours hide its values: a one-signed difference, a compressed or a near-uniform axial range,
+    its values written with the shared three significant digits
 
 Design principles:
   - Map geometry, headers and colour bars belong to the shared fixed-inch map grid; this module only fills it
   - Presentation helpers never clip displayed scientific values; fields reach maps only through the shared display
     conversion (relative humidity in %), and labelled in the active label style with one unit rule for axes and colour bars
+  - A case is named by its Dataset's material and sampling regime; cases of two registered materials take their material
+    colours, two cases of one material the A/B colours
 
 This module does NOT:
   - Load generation inputs, derive fields, or select cases
-  - Plan map grids, label colour bars, or import evaluation internals
+  - Plan map grids, label colour bars, change scale boundaries, or import evaluation internals
 """
 
 from __future__ import annotations
@@ -26,8 +31,10 @@ import numpy as np
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
 from src.analysis.presentation import analysis_display_grid as display_grid
+from src.analysis.presentation import analysis_display_labels as display_labels
 from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
+from src.analysis.presentation import analysis_visual_semantics as visual_semantics
 from src.analysis.ui import analysis_ui_plot_layout as shared_layout
 
 if TYPE_CHECKING:
@@ -37,6 +44,8 @@ if TYPE_CHECKING:
     from matplotlib.collections import QuadMesh
     from matplotlib.figure import Figure
     from matplotlib.gridspec import GridSpec
+
+    from src.analysis.generation_inputs import generation_input_sources as sources
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +86,61 @@ FIGURE_LAYOUT: Final = GenerationInputFigureLayout()
 DATASET_A_COLOR: Final = "tab:blue"
 DATASET_B_COLOR: Final = "tab:orange"
 DATASET_MEAN_COLOR: Final = "0.30"
+_MIDDLE_CELLS: Final = (0.05, 0.95)  # the quantiles that bound the middle 90 % of a map's cells
+_COMPRESSED_SHARE: Final = 1.0 / 3.0  # middle cells within less than this share of a scale's span: the note names their range
+_AXIAL_SPAN_DEG: Final = 180.0
+
+
+def case_caption(
+    record: diagnostics.GenerationInputDiagnostics, dataset: diagnostics.DatasetDiagnostics | sources.GenerationInputDataset, role: str | None = None
+) -> str:
+    """Return the caption of a case of ``dataset``: material, sampling regime and case number, and the A/B ``role`` of a comparison."""
+    material = display_labels.material_display_label(dataset.material_family)
+    caption = f"{material} · {display_labels.regime_display_label(dataset.sampling_regime)} · Case {record.case.case_index}"
+    return caption if role is None else f"{caption} ({role})"
+
+
+def case_colors(mean_a: diagnostics.DatasetDiagnostics, mean_b: diagnostics.DatasetDiagnostics) -> tuple[str, str]:
+    """
+    Return the colours of Case A and Case B, which their dataset means share.
+
+    Two registered materials are the series dimension and take their fixed material colours; two cases of one material,
+    or of a material without a registered colour, take the A/B colours.
+    """
+    materials = (mean_a.material_family, mean_b.material_family)
+    if materials[0] != materials[1] and all(material in visual_semantics.MATERIAL_COLORS for material in materials):
+        return visual_semantics.material_color(materials[0]), visual_semantics.material_color(materials[1])
+    return DATASET_A_COLOR, DATASET_B_COLOR
+
+
+def one_sign_note(difference: np.ndarray, scale: field_maps.FieldMapDefinition, unit: str, *, exponent: int | None = None) -> str:
+    """
+    Return the range of a B-minus-A map whose cells share one sign, which its symmetric scale fills on one side only; else ``""``.
+
+    The range is written in the power of ten of the bar's labels, given the map row's ``exponent`` as the bar is.
+    """
+    low, high = float(np.min(difference)), float(np.max(difference))
+    if low < 0.0 < high or low == high:
+        return ""
+    exponent = shared_layout.error_format(np.asarray(scale.boundaries), signed=True, exponent=exponent).exponent
+    shown = " to ".join(shared_layout.significant(value, exponent=exponent) for value in (low, high))
+    return f"All cells {'≥' if low >= 0.0 else '≤'} 0: {shown} {shared_layout.label_with_exponent(unit, exponent)}"
+
+
+def compressed_note(values: np.ndarray, scale: field_maps.FieldMapDefinition) -> str:
+    """Return the range of the middle 90 % of a map's cells when they fill less than a third of its scale, else ``""``."""
+    low, high = (float(value) for value in np.quantile(values, _MIDDLE_CELLS))
+    span = float(scale.boundaries[-1] - scale.boundaries[0])
+    return f"90 % of cells: {shared_layout.significant(low)} to {shared_layout.significant(high)}" if high - low < _COMPRESSED_SHARE * span else ""
+
+
+def axial_note(degrees: np.ndarray) -> str:
+    """Return how closely the cells of an axial direction map (modulo 180°) follow their mean axis, when within a third of the scale."""
+    doubled = np.deg2rad(2.0 * degrees)  # axial angles average as doubled angles, so -89° and 89° meet
+    centre = float(np.rad2deg(np.arctan2(np.mean(np.sin(doubled)), np.mean(np.cos(doubled))))) / 2.0
+    reach = float(np.quantile(np.abs((degrees - centre + _AXIAL_SPAN_DEG / 2.0) % _AXIAL_SPAN_DEG - _AXIAL_SPAN_DEG / 2.0), 0.9))
+    compressed = 2.0 * reach < _COMPRESSED_SHARE * _AXIAL_SPAN_DEG
+    return f"90 % of cells within ±{reach:.0f}° of {centre:.0f}°".replace("-", "\N{MINUS SIGN}") if compressed else ""
 
 
 def figure_grid(

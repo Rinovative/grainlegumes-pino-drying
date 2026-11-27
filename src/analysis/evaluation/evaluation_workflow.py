@@ -1,13 +1,15 @@
 """Prepare portable evaluation sessions and panels from concise run selections.
 
 Responsibilities:
-  - Normalize explicit current run paths and optional presentation labels
+  - Normalize explicit current run paths and optional presentation labels; runs labelled alike are told apart by their
+    first separating run name, directory leaf or path
   - Load the selected roles read-only; a missing or incompatible role is refused with its exact artifact command
   - Admit each requested role on its own and report every refused role with its reason
   - Compose session-owned role contexts for single-run or comparison panels
   - Admit a matched B or A1 without an eligible checkpoint into the A0/A1/B comparison from its finished run
   - Return concise lifecycle, checkpoint, artifact, and device reporting
   - Give the transient panel a lazy loader of each loaded stage's training history, read only when its view opens
+  - Give the transient panel each run's explicit label by frame name, which ends its case titles
 
 Design principles:
   - Notebook cells expose choices while reusable orchestration remains in source
@@ -47,7 +49,7 @@ if TYPE_CHECKING:
     from src.analysis.artifacts.analysis_artifact_service import PreparedRunArtifacts
     from src.analysis.evaluation.evaluation_artifact_loader import LoadedEvaluationArtifact, LoadedRunArtifacts
     from src.analysis.evaluation.evaluation_panel import EvaluationContext
-    from src.analysis.evaluation.evaluation_run_discovery import StageHistory, UnavailableHistory
+    from src.analysis.evaluation.evaluation_run_discovery import StageHistory
     from src.analysis.evaluation.evaluation_selection import EvaluationProtocol, EvaluationSelectionState
     from src.analysis.evaluation.evaluation_session import EvaluationSession
     from src.analysis.evaluation.evaluation_transient_comparison import LineageComparison
@@ -212,6 +214,11 @@ def _display_label(
 ) -> str:
     """Return the presentation label: the selection label or the run's storage alias."""
     return selection.label.strip() if selection.label is not None else loaded.storage_alias
+
+
+def _frame_name(display_label: str, role: str) -> str:
+    """Return the shown name of one run's transient session frame of one role (``FNO · B · seed 9 · Material OOD``): its one builder."""
+    return f"{display_label} · {analysis.presentation.display_labels.evaluation_role_display_label(role)}"
 
 
 def _required_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
@@ -530,7 +537,7 @@ def _transient_performance_frame(
     for loaded, display_label in zip(loaded_runs, display_labels, strict=True):
         evidence = _transient_arm_evidence(loaded)
         # A row without records (a rolling horizon the material never reaches) has no error to set against compute.
-        selected = summaries.loc[(summaries["frame"] == f"{display_label} ID") & (summaries["contributing_record_count"] > 0)].copy()
+        selected = summaries.loc[(summaries["frame"] == _frame_name(display_label, "id")) & (summaries["contributing_record_count"] > 0)].copy()
         if selected.empty:
             msg = f"Transient comparison lacks ID summaries for {display_label!r}."
             raise RuntimeError(msg)
@@ -576,7 +583,7 @@ def _lazy_transient_performance(
 
 def _lazy_transient_histories(
     *, loaded_runs: Sequence[LoadedRunArtifacts], display_labels: Sequence[str]
-) -> Callable[[], Mapping[str, StageHistory | UnavailableHistory]]:
+) -> Callable[[], Mapping[str, StageHistory]]:
     """
     Return a loader of every loaded stage's training history by display label, which opens no run before it is called.
 
@@ -585,7 +592,7 @@ def _lazy_transient_histories(
     whose history is missing or refused fails the run's admission with ``RunLifecycleError``; the loader lets that through.
     """
 
-    def load() -> Mapping[str, StageHistory | UnavailableHistory]:
+    def load() -> Mapping[str, StageHistory]:
         return {
             label: analysis.evaluation.run_discovery.stage_history(loaded.run_dir, expected_checkpoint_sha256=loaded.selected_checkpoint_sha256)
             for label, loaded in zip(display_labels, loaded_runs, strict=True)
@@ -637,7 +644,7 @@ def _transient_selection_case_ids(
         return tuple(entry.case_id for entry in session.partitioned_case_inventory())
     selected: list[str] = []
     for role in roles:
-        frame_names = tuple(f"{label} {role.upper()}" for label in display_labels)
+        frame_names = tuple(_frame_name(label, role) for label in display_labels)
         shared = set(session.case_ids(frame_names[0]))
         for frame_name in frame_names[1:]:
             shared.intersection_update(session.case_ids(frame_name))
@@ -768,10 +775,16 @@ def prepare_evaluation_workflow(
         raise ValueError(msg)
     specs = _normalized_context_specs(context_specs, artifact_roles=roles)
 
-    display_labels = tuple(_display_label(selection, loaded) for (selection, _path), loaded in zip(normalized_selections, loaded_runs, strict=True))
+    # Runs shown alike (one label, or one directory leaf) keep their own frames: the first separating run fact tells them apart.
+    display_labels = analysis.presentation.display_labels.unique_display_labels(
+        tuple(_display_label(selection, loaded) for (selection, _path), loaded in zip(normalized_selections, loaded_runs, strict=True)),
+        tuple((loaded.scientific_run_name, loaded.storage_alias, str(loaded.run_dir)) for loaded in loaded_runs),
+    )
     if len(display_labels) != len(set(display_labels)):
         msg = "Evaluation presentation labels must be unique."
         raise ValueError(msg)
+    # A run selected by its path alone is labelled by its storage alias, which steady titles never name.
+    unnamed_models = {label for (selection, _path), label in zip(normalized_selections, display_labels, strict=True) if selection.label is None}
     artifacts: dict[tuple[Path, ArtifactSelectionRole], LoadedEvaluationArtifact] = {
         (loaded.run_dir, role): _selected_artifact(loaded, role) for loaded in loaded_runs for role in roles
     }
@@ -794,7 +807,7 @@ def prepare_evaluation_workflow(
     if task == "transient_drying":
         session = analysis.evaluation.transient_session.TransientEvaluationSession(
             {
-                f"{display_label} {role.upper()}": artifacts[(loaded.run_dir, role)].frame
+                _frame_name(display_label, role): artifacts[(loaded.run_dir, role)].frame
                 for display_label, loaded in zip(display_labels, loaded_runs, strict=True)
                 for role in roles
             }
@@ -864,6 +877,12 @@ def prepare_evaluation_workflow(
                 evaluation_compute_device=evaluation_compute_device,
                 widths=widths,
                 refused_roles=refused,
+                # Titles name a run by the label its caller gave (the workspace's short label), never by a storage alias.
+                frame_runs={
+                    _frame_name(label, role): analysis.evaluation.panel.FrameRun(label, named=selection.label is not None)
+                    for (selection, _path), label in zip(normalized_selections, display_labels, strict=True)
+                    for role in roles
+                },
             )
         elif len(loaded_runs) == 1:
             if selection_state is not None:
@@ -874,6 +893,7 @@ def prepare_evaluation_workflow(
                 sections=sections,
                 selection_state=selection_state,
                 widths=widths,
+                unnamed_models=unnamed_models,
             )
         else:
             if selection_state is not None:
@@ -885,6 +905,7 @@ def prepare_evaluation_workflow(
                 selection_state=selection_state,
                 widths=widths,
                 refused_roles=refused,
+                unnamed_models=unnamed_models,
             )
         report = tuple(
             _report_row(prepared, artifact_roles=roles, display_label=display_label)

@@ -6,6 +6,8 @@ Responsibilities:
   - Preserve exact persisted supports and evaluate display-only boundary curves
   - Provide Celsius- and percent-aware A/B comparisons and empirical dataset summaries: relative humidity in % RH,
     wet-basis targets in % w.b., their startup changes in pp
+  - Caption Datasets by task, material and sampling regime, and give the case context of prepared inputs in display
+    names with its input directory relative to the storage root the inputs were discovered from
 
 Design principles:
   - Generation, profile, and domain owners define every scientific semantic
@@ -31,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 from src import domain
+from src.analysis.presentation import analysis_display_labels as display_labels
 from src.analysis.presentation import analysis_field_labels as field_labels
 from src.generation.cases import generation_cases_admission as admission
 from src.generation.cases import generation_cases_schedule as schedule_service
@@ -41,6 +44,7 @@ from . import generation_input_table_schema as table_schema
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
 
 SCALAR_NAMES: Final = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
 COMMON_DERIVED_FIELD_NAMES: Final = ("K_min", "K_max", "K_anisotropy")
@@ -56,10 +60,6 @@ _UNDECLARED_NAMES: Final = MappingProxyType(
     {
         "x": "Horizontal coordinate",
         "y": "Vertical coordinate",
-        "K_min": "Minimum principal permeability",
-        "K_max": "Maximum principal permeability",
-        "K_anisotropy": "Anisotropy ratio",
-        "w_gr0": "Initial water content",
     }
 )
 FIELD_UNITS: Final = MappingProxyType(
@@ -303,9 +303,15 @@ def field_summary_specs(record: GenerationInputDiagnostics) -> tuple[tuple[str, 
     )
 
 
-def case_display_label(record: GenerationInputDiagnostics) -> str:
-    """Return one short case label independent of persisted directory names."""
-    return f"Case {record.case.case_index}"
+def dataset_caption(dataset: DatasetDiagnostics) -> str:
+    """Return the display caption of one Dataset: its task, material and sampling regime."""
+    return " · ".join(
+        (
+            labels.profile_display_label(dataset.profile_id),
+            display_labels.material_display_label(dataset.material_family),
+            display_labels.regime_display_label(dataset.sampling_regime),
+        )
+    )
 
 
 def _immutable(value: Any) -> np.ndarray:
@@ -1038,52 +1044,44 @@ def case_context_table(
     mean_a: DatasetDiagnostics,
     second: GenerationInputDiagnostics,
     mean_b: DatasetDiagnostics,
+    *,
+    storage_root: Path | None = None,
 ) -> pd.DataFrame:
-    """Return compact side-by-side dataset, case, identity, and provenance evidence."""
+    """
+    Return compact side-by-side dataset, case, identity, and provenance evidence of the prepared inputs.
+
+    Rows and dataset values carry display names; identities, hashes and storage names stay exact. The input directory is
+    written relative to ``storage_root``, the root the inputs were discovered from, so no personal absolute path is shown;
+    inputs assembled without storage keep their recorded directory. Inputs say nothing about execution, so no execution
+    status is claimed.
+    """
     if first.profile_id != second.profile_id:
         msg_0 = "Case context comparison requires one simulation profile."
         raise ValueError(msg_0)
     values = {
-        "dataset": (
-            f"{mean_a.material_family.replace('_', ' ').title()} · {mean_a.sampling_regime}",
-            f"{mean_b.material_family.replace('_', ' ').title()} · {mean_b.sampling_regime}",
+        "Dataset": (dataset_caption(mean_a), dataset_caption(mean_b)),
+        "Campaign purpose": (
+            display_labels.humanize_identifier(mean_a.campaign_purpose),
+            display_labels.humanize_identifier(mean_b.campaign_purpose),
         ),
-        "material": (mean_a.material_family, mean_b.material_family),
-        "regime": (mean_a.sampling_regime, mean_b.sampling_regime),
-        "campaign purpose": (
-            mean_a.campaign_purpose,
-            mean_b.campaign_purpose,
-        ),
-        "simulation profile": (
-            mean_a.profile_id,
-            mean_b.profile_id,
-        ),
-        "profile label": (
-            labels.profile_display_label(mean_a.profile_id),
-            labels.profile_display_label(mean_b.profile_id),
-        ),
-        "status": (
-            "input only; not executed",
-            "input only; not executed",
-        ),
-        "case number": (first.case.case_index, second.case.case_index),
-        "dataset case count": (mean_a.case_count, mean_b.case_count),
-        "canonical batch": (mean_a.batch_id, mean_b.batch_id),
-        "batch storage name": (
+        "Case number": (first.case.case_index, second.case.case_index),
+        "Dataset case count": (mean_a.case_count, mean_b.case_count),
+        "Canonical batch": (mean_a.batch_id, mean_b.batch_id),
+        "Batch storage name": (
             mean_a.batch_storage_name,
             mean_b.batch_storage_name,
         ),
-        "batch identity": (mean_a.batch_identity, mean_b.batch_identity),
-        "case input identity": (
+        "Batch identity": (mean_a.batch_identity, mean_b.batch_identity),
+        "Case input identity": (
             first.case.payload["case_input_id"],
             second.case.payload["case_input_id"],
         ),
-        "simulation case identity": (
+        "Simulation case identity": (
             first.case.payload["simulation_case_id"],
             second.case.payload["simulation_case_id"],
         ),
-        "input-generation source": (first.case.source_id, second.case.source_id),
-        "git commit": (
+        "Input-generation source": (first.case.source_id, second.case.source_id),
+        "Git commit": (
             first.case.payload["git_commit"],
             second.case.payload["git_commit"],
         ),
@@ -1091,9 +1089,9 @@ def case_context_table(
             ", ".join(first.case.payload["input_files"]),
             ", ".join(second.case.payload["input_files"]),
         ),
-        "persistent directory": (
-            str(first.case.directory),
-            str(second.case.directory),
+        "Input directory (from storage root)": tuple(
+            (record.case.directory if storage_root is None else record.case.directory.resolve().relative_to(storage_root.resolve())).as_posix()
+            for record in (first, second)
         ),
     }
     return pd.DataFrame(

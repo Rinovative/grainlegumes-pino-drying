@@ -3,7 +3,9 @@
 Responsibilities:
   - Discover persisted experiments once and retain the normalized catalog
   - Offer the runs as one open selector grouped by architecture: one run (single, closes after the pick) or several compatible (comparison)
-  - Label every run once over the catalog (``FNO · B · seed 9``) for the selector header, the legends and the details
+  - Label every run once over the catalog (``FNO · B · seed 9``) for the run selector, the single-run panel and the details, which
+    alone name the full run; a comparison's panel and details, of a failed load too, name its runs by labels unique over the
+    compared runs with each saved training setting they differ in, one schema for all
   - Load validated artifacts read-only only for artifact-ready selections
   - Present lifecycle, provenance, compatibility, and recovery status without tracebacks, as one summary line with details on demand
   - Delegate task-aware scientific panels to maintained Evaluation sessions
@@ -110,25 +112,35 @@ def _role_label(role: str) -> str:
     return analysis.presentation.display_labels.evaluation_role_display_label(role)
 
 
-def _run_labels(runs: Sequence[run_discovery.EvaluationRunDiscovery]) -> tuple[str, ...]:
-    """
-    Return one short label per run, unique across ``runs`` (``FNO · B · seed 9``, ``PI-U-NO · seed 9``); the selector lists the full names.
+def _training_facets(runs: Sequence[run_discovery.EvaluationRunDiscovery]) -> tuple[str, ...]:
+    """Return each run's saved B/A1 pair tokens that not every run with a pair shares (``rollout-16``); empty where all agree or none is set."""
+    tokens = [() if run.pair_label is None else tuple(run.pair_label.split("__")) for run in runs]
+    shared = set.intersection(*(set(item) for item in tokens if item)) if any(tokens) else set()
+    return tuple(" ".join(token for token in item if token not in shared) for item in tokens)
 
-    When no facet separates some runs, every label takes its full run name instead, and its directory where even that repeats.
+
+def _run_labels(runs: Sequence[run_discovery.EvaluationRunDiscovery], *, compared: bool = False) -> tuple[str, ...]:
+    """
+    Return one short label per run, unique across ``runs`` (``FNO · B · seed 9``, ``PI-U-NO · seed 9``); the details name the full run.
+
+    Runs of one label take their first separating saved facet in compact form, else a short digest of their directory, which
+    always separates, so a label never carries a full run name or path. The run name comes before the Dataset: two A0 of one
+    configuration on different Datasets differ in a run name token (``ep-100``) where their Dataset aliases differ at length.
+    ``compared`` runs also show each saved training setting they differ in (``_training_facets``), though their labels differ.
     """
     families = {spec.family: spec.label for spec in analysis.presentation.visual_semantics.ARCHITECTURES}
     bases = []
-    for run in runs:
+    for run, training in zip(runs, _training_facets(runs) if compared else ("",) * len(runs), strict=True):
         # The display name of the model family; a run whose family does not resolve keeps its architecture descriptor.
         model = families.get(run.model_family or "") or run.model_label
         stage = [] if run.stage is None else [run.stage]  # discovery normalizes the stage (A0, B, A1)
-        bases.append(" · ".join([model, *stage, f"seed {run.seed}" if run.seed is not None else "seed unavailable"]))
-    facets = tuple((run.pair_label, run.config_label, run.dataset_id, run.run_name, str(run.run_dir)) for run in runs)
-    try:
-        return analysis.presentation.display_labels.unique_display_labels(bases, facets)
-    except ValueError:  # The workspace must still open: name the runs by their full names.
-        named = [f"{base} · {run.run_name}" for base, run in zip(bases, runs, strict=True)]
-        return tuple(f"{name} · {run.run_dir}" if named.count(name) > 1 else name for name, run in zip(named, runs, strict=True))
+        seed = f"seed {run.seed}" if run.seed is not None else "seed unavailable"
+        bases.append(" · ".join([model, *stage, seed, *([training] if training else [])]))
+    digests = (common.serialization.canonical_json_sha256(str(run.run_dir)) for run in runs)
+    facets = tuple(
+        (run.pair_label, run.config_label, run.run_name, run.dataset_id, str(run.run_dir), digest) for run, digest in zip(runs, digests, strict=True)
+    )
+    return analysis.presentation.display_labels.unique_display_labels(bases, facets)
 
 
 def _artifact_state_label(
@@ -210,16 +222,16 @@ class _EvaluationWorkspaceController:
         )
         self._workflow: workflow.PreparedEvaluationWorkflow | None = None
         self.detail_slot = ui.panel.PlotSlot()
-        # One label per run over the whole catalog, so a run reads the same in the selector header, the legends and the details.
+        # One label per run over the whole catalog, so a run reads the same in the selector, the legends and the details; only the
+        # details name the full run.
         self._labels = dict(zip((run.run_dir for run in catalog.runs), _run_labels(catalog.runs), strict=True))
         by_name: dict[tuple[str, str | None, str | None], str] = {(run.task, run.dataset_id, run.run_name): str(run.run_dir) for run in catalog.runs}
         options = [
             ui.selectors.RunOption(
-                name=run.run_name,
+                name=self._labels[run.run_dir],
                 family=run.model_family,
                 key=str(run.run_dir),
                 issue="; ".join(run.metadata_issues) or None,
-                label=self._labels[run.run_dir],
                 parent=by_name.get((run.task, run.dataset_id, run.a0_run_name)),  # a B or A1 run stands below its A0 when that is listed
             )
             for run in catalog.runs
@@ -396,7 +408,7 @@ class _EvaluationWorkspaceController:
                 continue
             lacking = [self._labels[run.run_dir] for run in runs if (artifact := _artifact_for_role(run, role)) is None or artifact.state != "ready"]
             if len(lacking) < len(runs):
-                refused[role] = f"nicht bereit in {', '.join(lacking)}" if lacking else "andere Datensatzbindung je Lauf"
+                refused[role] = f"not ready in {', '.join(lacking)}" if lacking else "different dataset binding per run"
         return refused
 
     def _status_html(
@@ -614,7 +626,7 @@ class _EvaluationWorkspaceController:
         if issues:
             items = "".join(f"<li>{escape(issue)}</li>" for issue in dict.fromkeys(issues))
             note = "All discovered runs remain visible; incompatible artifacts are capability-gated."
-            html = f"<h3>Compatible selected runs</h3><ul>{items}</ul><p>{note}</p>"
+            html = f"<h3>Compatible selected runs</h3><ul>{items}</ul><p>{note}</p>{self._run_names(selected)}"
             self._publish(lambda: _Outcome(None, issues[0], "warning", html))
             return
         shared = {role for _label, role in bindings.values()}
@@ -624,11 +636,19 @@ class _EvaluationWorkspaceController:
         self._publish(lambda: self._load_comparison(selected, roles))
 
     def _load_comparison(self, selected: tuple[run_discovery.EvaluationRunDiscovery, ...], roles: tuple[ArtifactRole, ...]) -> _Outcome:
-        """Prepare the comparison of the selected runs over ``roles``, or say why none is prepared; the caller publishes the outcome."""
+        """
+        Prepare the comparison of the selected runs over ``roles``, or say why none is prepared; the caller publishes the outcome.
+
+        The panel and the details, of a failure too, name the compared runs by labels unique over them (``_run_labels`` of the
+        selection): a facet the catalog needs only against a run outside the comparison is shown for none of them, a training
+        setting the compared runs differ in for each, so every compared run follows one label schema.
+        """
+        labels = _run_labels(selected, compared=True)
+        compared = dict(zip((run.run_dir for run in selected), labels, strict=True))
         try:
             prepared = workflow.prepare_model_comparison_evaluation_workspace(
                 tuple(run.run_dir for run in selected),
-                labels=tuple(self._labels[run.run_dir] for run in selected),
+                labels=labels,
                 expected_task=selected[0].task,
                 artifact_roles=roles,
                 sections="all",
@@ -639,20 +659,22 @@ class _EvaluationWorkspaceController:
             )
         except Exception as error:  # noqa: BLE001 -- bounded notebook status
             detail = f"{type(error).__name__}: {error}"
-            return _Outcome(None, f"Compatibility warning ({detail})", "error", f"<h3>Compatibility warning</h3><p>{escape(detail)}</p>")
+            html = f"<h3>Compatibility warning</h3><p>{escape(detail)}</p>{self._run_names(selected, compared)}"
+            return _Outcome(None, f"Compatibility warning ({detail})", "error", html)
         try:
-            return self._comparison_outcome(selected, roles, prepared)
+            return self._comparison_outcome(selected, roles, prepared, compared)
         except BaseException:
             _dispose_workflow(prepared)  # nothing publishes it: its session must not stay open
             raise
 
-    @staticmethod
     def _comparison_outcome(
+        self,
         selected: tuple[run_discovery.EvaluationRunDiscovery, ...],
         roles: tuple[ArtifactRole, ...],
         prepared: workflow.PreparedEvaluationWorkflow,
+        compared: Mapping[Path, str],
     ) -> _Outcome:
-        """Return the outcome of one prepared comparison: its summary and the roles it admitted and refused."""
+        """Return the outcome of one prepared comparison: its summary, each run's label (``compared``) with its full name, and the roles."""
         admitted = [role for role in roles if role not in prepared.refused_roles]
         refused = "".join(f"<li>{escape(_role_label(role))}: {escape(reason)}</li>" for role, reason in prepared.refused_roles.items())
         names = escape(", ".join(_role_label(role) for role in admitted))
@@ -660,9 +682,16 @@ class _EvaluationWorkspaceController:
             prepared,
             f"{len(selected)} runs compared on {len(admitted)} of {len(_ARTIFACT_ROLES)} dataset roles.",
             "normal",
-            f"<h3>Compatible selected runs</h3><p>{len(selected)} artifacts admitted for {names} using exact persisted metadata.</p>"
+            f"<h3>Compatible selected runs</h3>{self._run_names(selected, compared)}"
+            f"<p>{len(selected)} artifacts admitted for {names} using exact persisted metadata.</p>"
             + (f"<p>Not available:</p><ul>{refused}</ul>" if refused else ""),
         )
+
+    def _run_names(self, selected: Sequence[run_discovery.EvaluationRunDiscovery], labels: Mapping[Path, str] | None = None) -> str:
+        """Return the list of each selected run's short label (of ``labels``, else the catalog's) with its full name; none for no run."""
+        shown = self._labels if labels is None else labels
+        runs = "".join(f"<li>{escape(shown[run.run_dir])}: {escape(run.run_name)}</li>" for run in selected)
+        return f"<ul>{runs}</ul>" if runs else ""
 
 
 def _summary(

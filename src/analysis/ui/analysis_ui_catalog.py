@@ -70,7 +70,7 @@ _GROUP_LABELS: Final = {
 def _item(material: str, role: str) -> presentation.dataset_selection.DatasetItem:
     """Return one synthetic (material, role) dataset item."""
     return presentation.dataset_selection.DatasetItem(
-        key=(material, role), material=material, group=role, label=presentation.dataset_selection.dataset_label(material, _GROUP_LABELS[role])
+        key=(material, role), material=material, group=role, label=presentation.dataset_selection.dataset_label(material, role)
     )
 
 
@@ -79,9 +79,9 @@ INVENTORY: Final = presentation.dataset_selection.DatasetInventory(
     group_order=presentation.dataset_selection.EVALUATION_GROUP_ORDER,
     group_labels=_GROUP_LABELS,
     poolable=True,
-    unavailable=[(_item("field_pea", "parameter_ood"), "keine gemeinsamen Fälle in uno_m64x64_h32_l7")],
+    unavailable=[(_item("field_pea", "parameter_ood"), "no common cases in uno_m64x64_h32_l7")],
 )
-POOL_REASON: Final = "Zusammenfassen in dieser Ansicht nicht materialausgeglichen"
+POOL_REASON: Final = "Pooling is not material-balanced in this view"
 CASE_IDS: Final = (3, 7, 12, 40)
 CASE_LABELS: Final = {
     3: "lentil · case 3 · ε 0.38 · p_in 120 Pa",
@@ -137,7 +137,7 @@ def _channels() -> widgets.Widget:
     status = controls.StatusLine()
 
     def report() -> None:
-        status.set(f"Gewählt: {', '.join(checks.selected) or 'keine'}")
+        status.set(f"Selected: {', '.join(checks.selected) or 'none'}")
 
     checks.observe(report)
     return panel.ViewPanel([panel.row(checks.widget)], status=status).widget
@@ -324,11 +324,11 @@ _ENTRIES: Final = (
     CatalogEntry("status", "Status line", _status),
     CatalogEntry("failure", "Failure display", _failure),
     CatalogEntry("runs-multiple", "Runs, several", _runs_multiple),
-    CatalogEntry("run-single", "Run, one (with «Metadaten fehlen»)", _run_single),
+    CatalogEntry("run-single", "Run, one (with «Missing metadata»)", _run_single),
     CatalogEntry("datasets-multiple", "Datasets, several, pooling switch enabled", _datasets_multiple),
     CatalogEntry("datasets-pool-disabled", "Datasets, pooling switch disabled with its reason", _datasets_pool_disabled),
-    CatalogEntry("dataset-single", "Dataset, one (with «Nicht verfügbar»)", _dataset_single),
-    CatalogEntry("on-demand", "Expensive view with «Berechnen»", _on_demand),
+    CatalogEntry("dataset-single", "Dataset, one (with «Unavailable»)", _dataset_single),
+    CatalogEntry("on-demand", "Expensive view with «Compute»", _on_demand),
     CatalogEntry("tabs", "Tabs, one width per notebook", _tabs),
     CatalogEntry("lazy-panel", "Lazy panel with a persistent control row", _lazy_panel, ("datasets-pool-disabled", "tabs", "actions")),
     CatalogEntry("view-panel", "View panel: three rows, popover under row 2", _view_panel, ("runs-multiple", "case-navigator")),

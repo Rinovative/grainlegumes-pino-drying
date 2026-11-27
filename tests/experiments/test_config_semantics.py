@@ -3,6 +3,7 @@
 Responsibilities:
   - Check explicit request resolution, scientific identity, resume compatibility, and invalid
     semantics
+  - Check that a config file that is no YAML is a config error naming its file
 
 Design principles:
   - Runtime/reporting changes stay distinct from scientific changes
@@ -320,6 +321,17 @@ def test_a_steady_config_with_a_null_transient_training_key_resolves_saves_and_r
     experiments.config.loader.save_yaml(configs.resolve(raw), path)
 
     experiments.config.loader.validate_resolved_config(experiments.config.loader.load_yaml(path))
+
+
+def test_a_config_file_that_is_no_yaml_is_a_config_error_naming_the_file(tmp_path: Path) -> None:
+    """A file that is no YAML is a contract error, a ``ValueError`` like every other config defect, naming its file and parser cause."""
+    path = tmp_path / "config.yaml"
+    path.write_text("run: [unclosed\n", encoding="utf-8")
+
+    with pytest.raises(experiments.config.loader.ConfigError) as refused:
+        experiments.config.loader.load_yaml(path)
+    assert str(path) in str(refused.value)
+    assert isinstance(refused.value.__cause__, yaml.YAMLError)
 
 
 @pytest.mark.parametrize("value", [3, 0, True, 2.0])

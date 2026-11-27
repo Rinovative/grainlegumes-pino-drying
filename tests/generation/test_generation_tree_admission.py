@@ -294,19 +294,19 @@ def test_dataset_producer_evidence_reuses_the_admitted_snapshot_inside_a_tree(fr
     _use_tree(monkeypatch, frozen_project, receipt)
     before = sorted(path.name for path in frozen_project.snapshots.iterdir())
 
-    evidence = reproduction.capture_producer_evidence()
-    assert evidence["source_snapshot"] == {
-        "relative_path": f"source_snapshots/{receipt['tree_id']}/snapshot.json",
-        "sha256": receipt["snapshot_sha256"],
-        "git_commit": receipt["git_commit"],
-        "source_fingerprint_sha256": receipt["source_fingerprint_sha256"],
-    }
+    with reproduction.held_producer_evidence() as evidence:
+        assert evidence["source_snapshot"] == {
+            "relative_path": f"source_snapshots/{receipt['tree_id']}/snapshot.json",
+            "sha256": receipt["snapshot_sha256"],
+            "git_commit": receipt["git_commit"],
+            "source_fingerprint_sha256": receipt["source_fingerprint_sha256"],
+        }
     assert sorted(path.name for path in frozen_project.snapshots.iterdir()) == before
     reproduction.verify_current_producer(evidence)
 
     tampered(Path(receipt["tree_path"]), "src/module.py")
-    with pytest.raises(source_service.SourceAdmissionError, match="failed verification"):
-        reproduction.capture_producer_evidence()
+    with pytest.raises(source_service.SourceAdmissionError, match="failed verification"), reproduction.held_producer_evidence():
+        pass
     with pytest.raises(ValueError, match="does not match the snapshot"):
         reproduction.verify_current_producer(evidence)
 

@@ -1350,7 +1350,7 @@ class EvaluationSession:
         self._closed = False
         self._bindings: dict[int, _Binding] = {}
         self._canonical_frames: dict[tuple[str, str], pd.DataFrame] = {}
-        # Dataset cuts of bound frames, apart from the canonical frames: a pooled cut has the membership of its source.
+        # Dataset cuts of bound frames, apart from the canonical frames: a cut holding every case of its source has the membership of its source.
         self._cuts: dict[ArtifactKey, pd.DataFrame] = {}
         self._case_cache: OrderedDict[tuple[ArtifactKey, int], _CacheEntry] = OrderedDict()
         self._aggregate_cache: OrderedDict[tuple[Any, ...], _CacheEntry] = OrderedDict()

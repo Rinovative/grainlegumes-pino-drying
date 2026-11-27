@@ -2,6 +2,8 @@
 
 Responsibilities:
   - Check transient dispatch, exact role membership, wrapper closure, and A0/A1/B lineage
+  - Check that a case title of the built panel ends with the label its run was selected with
+  - Check the summary table's dataset-first order, the outlier ranking and table of finite errors, and the compared runs' labels
 
 Design principles:
   - Comparisons require paired scientific identities and immutable B budget evidence
@@ -27,7 +29,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib.text import Text
 from support.synthetic_task import synthetic_split_payload
+from support.transient_evaluation import production_frame, sequence_frame, sequence_record
 
 from src import analysis, common, datasets
 from src.experiments import experiments_matched_budget as matched_budget
@@ -49,6 +53,11 @@ def _split(arm: str, *, material_ood: tuple[tuple[str, tuple[str, ...]], ...] = 
         rollout = {"mode": "trajectory", "rollout_length": 2}
         split["extension"]["sampling"] = datasets.contracts.transient.TransientSamplingSpec.from_mapping(rollout).as_dict()
     return split
+
+
+def _arm_transitions(figure: Any) -> list[float]:
+    """Return the committed transitions of every arm's point in the first panel of a matched-budget figure, in drawing order."""
+    return [float(offset[0]) for collection in figure.axes[0].collections for offset in np.asarray(collection.get_offsets())]
 
 
 def _budget(unit: str, *, total: int, spent: int) -> dict[str, Any]:
@@ -318,7 +327,7 @@ def test_workflow_filters_absent_ood_roles_and_validates_exact_three_arm_lineage
     assert dataset_calls == []
     assert tuple(context.key for context in workflow.contexts) == ("id",)
     assert all(row["artifact_roles"] == ["id"] for row in workflow.report)
-    assert set(observed_frames) == {"A0 ID", "A1 ID", "B ID"}
+    assert set(observed_frames) == {"A0 · ID", "A1 · ID", "B · ID"}
     assert workflow.transient_lineage is not None
     assert workflow.transient_lineage.primary_comparison == "B_vs_A1"
     assert workflow.transient_lineage.separate_comparison == "B_vs_A0"
@@ -330,11 +339,9 @@ def test_workflow_filters_absent_ood_roles_and_validates_exact_three_arm_lineage
     assert workflow.transient_performance is performance
     assert len(dataset_calls) == 1
     figure = analysis.evaluation.plots.transient.plot_training_performance_vs_compute(performance, lineage=workflow.transient_lineage)
-    assert len(figure.axes[0].lines) == 1
-    np.testing.assert_allclose(
-        np.asarray(figure.axes[0].lines[0].get_xdata(), dtype=np.float64),
-        np.asarray([0.0, 10.0, 10.0], dtype=np.float64),
-    )
+    np.testing.assert_allclose(_arm_transitions(figure), [0.0, 10.0, 10.0])
+    # A0 joins each later arm; A1 and B at the same budget stay unjoined
+    assert [np.asarray(line.get_xdata(), dtype=np.float64).tolist() for line in figure.axes[0].lines] == [[0.0, 10.0], [0.0, 10.0]]
     plt.close(figure)
     workflow.close()
     assert len(observed_sessions) == 1
@@ -405,7 +412,7 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_supervised_transitions(tm
 
     rows = pd.DataFrame.from_records(
         {
-            "frame": f"{label} ID",
+            "frame": f"{label} · ID",
             "material_family": "lentil",
             "mode": mode,
             "requested_horizon": horizon,
@@ -428,8 +435,7 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_supervised_transitions(tm
     assert set(performance["comparison_arm"]) == {"A0", "A1", "B"}
     assert set(performance["mode"]) == {"autonomous_full"}
     figure = analysis.evaluation.plots.transient.plot_training_performance_vs_compute(performance, lineage=lineage)
-    transitions = np.asarray(figure.axes[0].lines[0].get_xdata())
-    np.testing.assert_allclose(transitions, [0.0, 13.0, 12.0])
+    np.testing.assert_allclose(_arm_transitions(figure), [0.0, 13.0, 12.0])  # A0, A1, B at their own committed transitions
     assert "supervised transitions" in figure.axes[0].get_xlabel()
     plt.close(figure)
 
@@ -506,7 +512,7 @@ def test_both_matched_arms_without_an_eligible_checkpoint_enter_the_comparison_a
     rows = pd.DataFrame.from_records(
         [
             {
-                "frame": "A0 ID",
+                "frame": "A0 · ID",
                 "material_family": "lentil",
                 "mode": "autonomous_full",
                 "requested_horizon": "full",
@@ -524,9 +530,9 @@ def test_both_matched_arms_without_an_eligible_checkpoint_enter_the_comparison_a
     )
     assert performance is not None
     figure = analysis.evaluation.plots.transient.plot_training_performance_vs_compute(performance, lineage=lineage)
-    title = figure.axes[0].get_title()
-    assert "B: diverged" in title
-    assert "A1: no_eligible_checkpoint" in title
+    note = " ".join(" ".join(text.get_text().split()) for text in figure.artists if isinstance(text, Text))  # the figure title and its note
+    assert "B: Diverged at" in note
+    assert "A1: No eligible checkpoint at 100 % of its budget, 0 eligible points, no result" in note
     plt.close(figure)
 
 
@@ -573,6 +579,43 @@ def test_the_workflow_admits_an_unsuccessful_selection_only_into_the_comparison(
     assert {row["display_label"] for row in workflow.report} == {"A0", "B"}
 
 
+def test_a_workflow_built_case_title_ends_with_the_label_its_run_was_selected_with(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The workspace's short label reaches the case titles of the real panel; a run selected by its path alone gets no suffix."""
+
+    def prepared(path: Path, **_kwargs: Any) -> PreparedRunArtifacts:
+        record = sequence_record("autonomous_full", "full")
+        record.identity.update(dataset_role="id", checkpoint_identity={"best_checkpoint_sha256": "d" * 64})
+        root = path / "analysis" / "id"
+        frame = production_frame((record,), artifact_root=str(root))
+        artifact = analysis.evaluation.artifact_loader.LoadedEvaluationArtifact(
+            split_role="eval", dataset_name="transient_dataset", root=root, frame=frame, identity_sha256="a" * 64
+        )
+        loaded = analysis.evaluation.artifact_loader.LoadedRunArtifacts(task="transient_drying", run_name="run", run_dir=path, id_artifact=artifact)
+        return analysis.artifacts.service.PreparedRunArtifacts(loaded_run=loaded, role_actions={"id": "reused"})
+
+    monkeypatch.setattr(analysis.artifacts.service, "load_prepared_run_artifacts", prepared)
+    plot, titles = analysis.evaluation.plots.transient.plot_state_maps, []
+
+    def rendered(record: Any, **kwargs: Any) -> Any:
+        figure = plot(record, **kwargs)
+        titles.append(figure.get_suptitle())
+        return figure
+
+    monkeypatch.setattr(analysis.evaluation.plots.transient, "plot_state_maps", rendered)
+    for label in ("FNO · B · seed 9", None):
+        workflow = analysis.evaluation.workflow.prepare_evaluation_workflow(
+            (analysis.evaluation.workflow.EvaluationRunSelection(tmp_path / "run", label=label),),
+            (analysis.evaluation.workflow.EvaluationContextSpec("id", "ID", "id"),),
+            sections=("sample_viewer",),
+        )
+        analysis.evaluation.panel._LAZY_PANELS[workflow.panel].open()
+        workflow.close()
+    assert len(titles) == 2
+    assert titles[0].endswith(" h (FNO · B · seed 9)")  # the label ends the rendered title, after the time
+    assert titles[1].endswith(" h")
+    plt.close("all")
+
+
 def test_single_model_uses_partitioned_case_union_while_comparison_requires_pairs() -> None:
     """Admit disjoint material artifacts for one run without weakening paired models."""
     single_cases = (
@@ -584,10 +627,10 @@ def test_single_model_uses_partitioned_case_union_while_comparison_requires_pair
     class FakeSession:
         def __init__(self) -> None:
             self.by_frame = {
-                "Single ID": single_cases[:2],
-                "Single Material OOD": single_cases[2:],
-                "UNO ID": single_cases[:2],
-                "FNO ID": single_cases[2:],
+                "Single · ID": single_cases[:2],
+                "Single · Material OOD": single_cases[2:],
+                "UNO · ID": single_cases[:2],
+                "FNO · ID": single_cases[2:],
             }
 
         def partitioned_case_inventory(self) -> tuple[Any, ...]:
@@ -791,7 +834,7 @@ def test_a_role_without_shared_membership_is_refused_alone_with_its_reason(monke
         refused_roles={"material_ood": "not ready in A1"},
     )
 
-    assert set(frames) == {"A0 ID", "A1 ID"}
+    assert set(frames) == {"A0 · ID", "A1 · ID"}
     assert tuple(context.key for context in result.contexts) == ("id",)
     assert all(row["artifact_roles"] == ["id"] for row in result.report)
     assert set(result.refused_roles) == {"parameter_ood", "material_ood"}
@@ -834,12 +877,58 @@ def test_a_comparison_without_the_id_role_loads_its_other_role_and_has_no_contro
         (analysis.evaluation.workflow.EvaluationContextSpec("material_ood", "Material OOD", "material_ood"),),
     )
 
-    assert set(frames) == {"A0 MATERIAL_OOD", "A1 MATERIAL_OOD"}
+    assert set(frames) == {"A0 · Material OOD", "A1 · Material OOD"}  # the run label and the role's display name, never a raw token
     assert all(row["artifact_roles"] == ["material_ood"] for row in result.report)
     assert result.transient_lineage is None
     assert result.transient_performance is None
     assert captured["training_performance"] is None
     assert "ID role" in str(result.matched_stage_unavailable_reason)
+    result.close()
+
+
+@pytest.mark.parametrize(
+    ("leaves", "labels", "run_name"),
+    [((("first", "run"), ("second", "run")), ("FNO", "FNO"), None), ((("first", "run"), ("second", "run")), (None, None), "run")],
+    ids=["equal explicit labels", "path-only runs of one directory leaf"],
+)
+def test_runs_of_equal_labels_build_distinct_frames_and_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, leaves: tuple[tuple[str, str], ...], labels: tuple[str | None, ...], run_name: str | None
+) -> None:
+    """Two runs shown alike (one explicit label, or one storage alias and run name) keep two frames per role, each run labelled apart."""
+    prepared = {}
+    for (parent, leaf), arm in zip(leaves, ("a0", "a1"), strict=True):
+        run_dir = (tmp_path / parent / leaf).resolve()
+        run = _prepared(run_dir, arm)
+        prepared[run_dir] = run if run_name is None else replace(run, loaded_run=replace(run.loaded_run, run_name=run_name))
+    frames: dict[str, pd.DataFrame] = {}
+    captured: dict[str, Any] = {}
+
+    class FakeSession:
+        def __init__(self, session_frames: dict[str, pd.DataFrame]) -> None:
+            frames.update(session_frames)
+
+        def close(self) -> None:
+            pass
+
+    def panel(**kwargs: Any) -> widgets.Label:
+        captured.update(kwargs)
+        return widgets.Label("comparison")
+
+    monkeypatch.setattr(analysis.artifacts.service, "load_prepared_run_artifacts", lambda path, **_kwargs: prepared[path])
+    monkeypatch.setattr(analysis.evaluation.transient_session, "TransientEvaluationSession", FakeSession)
+    monkeypatch.setattr(analysis.evaluation.panel, "build_transient_panel", panel)
+
+    result = analysis.evaluation.workflow.prepare_evaluation_workflow(
+        tuple(analysis.evaluation.workflow.EvaluationRunSelection(path, label=label) for path, label in zip(prepared, labels, strict=True)),
+        (analysis.evaluation.workflow.EvaluationContextSpec("id", "ID", "id"),),
+    )
+
+    run_labels = [run.label for run in captured["frame_runs"].values()]
+    assert len(frames) == 2
+    assert set(frames) == set(captured["frame_runs"])
+    assert len(set(run_labels)) == 2
+    assert all(label.startswith(labels[0] or "run") for label in run_labels)  # the shared label, with the smallest discriminator
+    assert len({row["display_label"] for row in result.report}) == 2
     result.close()
 
 
@@ -1044,3 +1133,161 @@ def test_every_opening_reads_the_histories_again_so_a_replaced_run_is_seen(
         captured["training_histories"]()
     assert [name for name, _digest in reads] == ["a0", "a1", "a0", "a1"]
     result.close()
+
+
+def test_the_transient_summary_table_lists_materials_by_display_label_and_horizons_ascending() -> None:
+    """Lentil enters first and horizon 2 before 1: the table lists Chickpea first and each material's horizons 1, 2 and the unsupported 4."""
+    records = tuple(
+        sequence_record("rolling_origin", horizon, case_id=f"{material}-case", material_family=material)
+        for material in ("lentil", "chickpea")
+        for horizon in (2, 1)
+    )
+    evaluation = analysis.evaluation.transient_session.TransientEvaluationSession({"id": sequence_frame(records)})
+    table = analysis.evaluation.panel._transient_summary_table(evaluation)
+    rows = table.loc[table["scope"] == "cumulative", ["material_family", "requested_horizon"]]
+    expected = [(material, horizon) for material in ("chickpea", "lentil") for horizon in (1, 2, 4)]
+    assert list(rows.itertuples(index=False, name=None)) == expected
+    evaluation.close()
+
+
+def test_the_transient_summary_table_orders_by_dataset_before_the_frame_order(tmp_path: Path) -> None:
+    """Runs A and B each hold an ID and a Material OOD frame: both ID frames come first, A before B, then both Material OOD frames."""
+    frames = {}
+    for run in ("A", "B"):
+        for role, material in (("id", "lentil"), ("material_ood", "chickpea")):
+            record = sequence_record("autonomous_full", "full", case_id=f"{material}-case", material_family=material)
+            record.identity["checkpoint_identity"] = {"best_checkpoint_sha256": run.lower() * 64}
+            frames[f"{run} {role}"] = production_frame((record,), artifact_root=str(tmp_path / f"{run}-{role}"), dataset_role=role)
+            frames[f"{run} {role}"].attrs["artifact_provenance"]["run"]["best_checkpoint_sha256"] = run.lower() * 64
+    evaluation = analysis.evaluation.transient_session.TransientEvaluationSession(frames)
+    table = analysis.evaluation.panel._transient_summary_table(evaluation)
+    assert list(dict.fromkeys(table["frame"])) == ["A id", "B id", "A material_ood", "B material_ood"]
+    evaluation.close()
+
+
+def test_the_outlier_view_opens_on_rank_one_of_its_ranking_field_whatever_case_another_view_chose(tmp_path: Path) -> None:
+    """The sample viewer chose case «a», the smallest error: the outlier focus still opens on «b», the largest T error, and names it so."""
+    records = tuple(
+        sequence_record("autonomous_full", "full", case_id=case_id, offset=offset) for case_id, offset in (("a", 1.0), ("b", 5.0), ("c", 3.0))
+    )
+    evaluation = analysis.evaluation.transient_session.TransientEvaluationSession({"id": production_frame(records, artifact_root=str(tmp_path))})
+    runs = (SimpleNamespace(run_dir=(tmp_path / "run").resolve()),)
+    group = analysis.evaluation.run_discovery.EvaluationRunGroup("a" * 64, "runs", "transient_drying", cast("Any", runs))
+    catalog = analysis.evaluation.run_discovery.EvaluationRunCatalog(cast("Any", runs), (group,), (), {}, {}, {}, {})
+    state = analysis.evaluation.selection.EvaluationSelectionState(catalog, comparison=False)
+    panel = analysis.evaluation.panel
+    temperature = SimpleNamespace(key="T", stored=True)
+    panel._publish_transient_capabilities(state, (temperature,), ("a", "b", "c"), channels=("T",), case_id="a")
+    ranks: dict[tuple[str, str], tuple[str, int]] = {}
+    focus = panel._CaseFocus(
+        evaluation,
+        panel._transient_inventory(evaluation, comparison=False, selection_state=state),
+        inventory=panel.dataset_cuts.transient_inventory(evaluation, refused={}),
+        multiple=False,
+        comparison=False,
+        selection_state=state,
+        status=analysis.ui.controls.StatusLine(),
+        on_change=lambda: None,
+        order=panel._transient_outlier_order(evaluation, fields=(temperature,), ranks=ranks),
+    )
+    focus.pull()
+    assert focus.entry.case_id == "b"  # the shared «a» stands third in the ranking
+    assert panel._transient_sample_title(focus.entry, outlier=True, rank=ranks[focus.entry.frame_name, "b"]).startswith("Largest $T$ error in")
+    evaluation.close()
+
+
+def test_the_outlier_ranking_ranks_finite_errors_only_and_titles_its_fallback_unranked() -> None:
+    """T is unavailable for every case and phi for «c»: phi ranks «b» before «a»; without any finite error the cases stay unranked."""
+    panel = analysis.evaluation.panel
+    frame = pd.DataFrame({"frame": "F", "case_id": ["a", "b", "c"], "requested_horizon": "full", "scope": "cumulative"})
+    frame = frame.assign(normalized_rmse_T=math.nan, normalized_rmse_phi=[0.1, 0.3, math.nan])
+    fields = (SimpleNamespace(key="T", stored=True), SimpleNamespace(key="phi", stored=True))
+    entries = tuple(SimpleNamespace(frame_name="F", case_id=case_id) for case_id in ("a", "b", "c"))
+    ranks: dict[tuple[str, str], tuple[str, int]] = {}
+    cases = (
+        (frame, ["b", "a"], {("F", "b"): ("phi", 1), ("F", "a"): ("phi", 2)}),
+        (frame.assign(normalized_rmse_phi=math.nan), ["a", "b", "c"], {}),  # the inventory order
+    )
+    for rows, expected, ranked in cases:
+        session = cast("Any", SimpleNamespace(case_dataframe=lambda rows=rows, **_kwargs: rows))
+        assert [entry.case_id for entry in panel._transient_outlier_order(session, fields=fields, ranks=ranks)(entries)] == expected
+        assert ranks == ranked
+    entry = SimpleNamespace(material_family="lentil", dataset_role="id", evaluation_assignment=None, case_label="case_a")
+    assert panel._transient_sample_title(entry, outlier=True, ranked=False).startswith("Unranked case in")
+
+
+def test_the_outlier_table_ranks_finite_errors_only_and_stays_explicitly_empty_without_any() -> None:
+    """T is NaN for «c» and infinite for «d»: only «b» and «a» rank, fewer than the table holds; without a finite error it is empty."""
+    panel = analysis.evaluation.panel
+    frame = pd.DataFrame(
+        {
+            "frame": "F",
+            "case_id": ["a", "b", "c", "d"],
+            "requested_horizon": "full",
+            "scope": "cumulative",
+            "material_family": "lentil",
+            "declared_evaluation_role": "id",
+            "normalized_rmse_T": [0.1, 0.3, math.nan, math.inf],
+        }
+    )
+    fields = (SimpleNamespace(key="T", stored=True, label="T", unit="K"),)
+    for rows, expected in ((frame, ["b", "a"]), (frame.assign(normalized_rmse_T=[math.nan, math.inf, math.nan, -math.inf]), [])):
+        session = cast("Any", SimpleNamespace(case_dataframe=lambda rows=rows, **_kwargs: rows, case_inventory=tuple))
+        table = panel._transient_outlier_table(session, fields=fields)
+        assert (table["Exact case"].tolist(), table["Rank"].tolist()) == (expected, list(range(1, len(expected) + 1)))
+
+
+@pytest.mark.parametrize(
+    ("pairs", "expected"),
+    [
+        (("b-a1__rollout-32",) * 3, ("FNO · B · seed 9", "RNO · B · seed 9", "U-NO · B · seed 9")),
+        (
+            ("b-a1__rollout-32", "b-a1__rollout-32", "b-a1__rollout-16"),
+            ("FNO · B · seed 9 · rollout-32", "RNO · B · seed 9 · rollout-32", "U-NO · B · seed 9 · rollout-16"),
+        ),
+    ],
+    ids=["equal-training", "differing-training"],
+)
+def test_a_comparison_names_its_runs_by_labels_unique_over_the_compared_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pairs: tuple[str, ...], expected: tuple[str, ...]
+) -> None:
+    """
+    FNO and RNO collide with smoke runs in the catalog, U-NO does not: the compared runs carry one schema, no facet for some only.
+
+    A training setting the compared runs differ in is shown for each, though the architectures alone separate them, and a load
+    failure lists the runs by the same labels.
+    """
+    workspace = analysis.evaluation.workspace
+    runs = tuple(
+        SimpleNamespace(
+            model_family=family,
+            model_label=family,
+            stage="B",
+            seed=9,
+            run_dir=tmp_path / family,
+            pair_label=pair,
+            config_label=f"{family}/config",
+            run_name=f"{family}-b",
+            dataset_id="demo",
+            task="transient_drying",
+        )
+        for family, pair in zip(("fno", "rno", "uno"), pairs, strict=True)
+    )
+    controller = object.__new__(workspace._EvaluationWorkspaceController)
+    controller._labels = {run.run_dir: f"{label} · rollout-32" for run, label in zip(runs, ("FNO · B · seed 9", "RNO · B · seed 9"), strict=False)}
+    controller._labels[runs[2].run_dir] = "U-NO · B · seed 9"
+    placeholder = cast("Any", None)
+    controller.state, controller.compute_preference, controller.widths = placeholder, cast("Any", "cpu"), placeholder
+    monkeypatch.setattr(controller, "_unshared_roles", lambda *_args: {})
+    captured: dict[str, Any] = {}
+
+    def prepare(_run_dirs: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        message = "stop after the labels"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(workspace.workflow, "prepare_model_comparison_evaluation_workspace", prepare)
+    outcome = controller._load_comparison(cast("Any", runs), ("id",))
+    assert "stop after the labels" in outcome.details
+    assert captured["labels"] == expected
+    assert all(f"<li>{label}: " in outcome.details for label in expected)

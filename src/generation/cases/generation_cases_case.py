@@ -601,9 +601,10 @@ def generate_case_input_bundle(
     case_index: int,
     destination: Path | str,
     *,
+    intervention: Mapping[str, Any] | None = None,
     _allow_workspace_marker: bool = False,
 ) -> CaseBundle:
-    """Generate one deterministic profile-specific scientific input bundle."""
+    """Generate one deterministic profile-specific scientific input bundle, optionally with one declared sampling intervention."""
     case_id = config.case_id(case_index)
     case_seed = config.case_seed(case_index)
     assignment = config.case_assignment(case_index)
@@ -612,7 +613,7 @@ def generate_case_input_bundle(
         bundle_dir,
         allow_workspace_marker=_allow_workspace_marker,
     )
-    sample = sampling_service.sample_case(config, case_index)
+    sample = sampling_service.sample_case(config, case_index, intervention=intervention)
     values = dict(sample.values)
     units = dict(sample.units)
     fixed = config.scientific_values["scientific_fixed_values"]

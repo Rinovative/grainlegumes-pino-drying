@@ -26,7 +26,8 @@ permeability:
     evidence: engineering_estimate
     source_refs:
     - ba
-    method: No kidney-bean airflow measurement exists. The value is the thesis value corrected by K_A = 1.92 (uncorrected about 1.9e-08 m^2); faba bean by Kozeny-Carman gives 3-5e-08 m^2, so the value is plausible but not proven.
+    - chickpea_airflow_masoumi_tabil_2008
+    method: Clean kidney-bean estimate without a K_A correction. The thesis measured clean red kidney beans (Tab. 17) at an apparent permeability of about 1.3e-08 m^2 at 0.14 m/s, but in a 41.5 mm tube only 2.7 bean lengths wide, which probably reads low. Ergun with the thesis porosity 0.47 and an effective diameter of 0.75 x 8.97 mm gives 4.8e-08 m^2, and clean Kabuli chickpeas of similar size give 3.0-5.0e-08 m^2 (Masoumi and Tabil 2008, Table 2), so the value is plausible but not measured.
     applicability:
       packing: Only for packing bands in each complete density record; generated mean
         eps must pass the material band.
@@ -54,7 +55,7 @@ thermal_properties:
       evidence: literature_transfer
       source_refs:
       - matouk_thermal
-      method: Transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover; no kidney-bean data exist and the value is unchanged.
+      method: Value unchanged, an estimate transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover. No bed values of Phaseolus beans were accessible (Thomeo et al. 2004 is restricted), and the bed values of lentil and chickpea (Oke 2021, Table 4.7) give grain conductivities of 0.19-0.28 W/(m*K) with the Maxwell-Eucken relation, so the value is uncertain.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -77,7 +78,7 @@ thermal_properties:
       evidence: literature_transfer
       source_refs:
       - matouk_thermal
-      method: Transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover; no kidney-bean data exist and the value is unchanged.
+      method: Value unchanged, transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover; no kidney-bean data were found. A Choi-Okos estimate from an assumed composition gives about 1.75 kJ/(kg*K) dry basis, inside the support.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -97,12 +98,12 @@ initial_moisture:
     - lower: 0.3
       upper: 0.35
     provenance:
-      evidence: engineering_estimate
+      evidence: literature_direct
       source_refs:
-      - ba
-      note: Natural material-dependent starting moisture in dry basis; range is an
-        explicit engineering envelope around project or product-compatible drying
-        evidence, not a market-target transfer.
+      - manitoba_field_beans
+      - saskpulse_storage
+      method: Values unchanged. Dry beans are combined at 16-22 % moisture and combining starts at 18-22 % (Manitoba Agriculture field-beans guidance; SaskPulse 2025, section Seed Moisture Content at Harvest); below 16 % the seed splits. The BA Table 7 reference record is at 18 %. No Swiss or Central European harvest data for dry beans were found. The OOD range 23.1-25.9 % wb lies above the recommended combining window and is a stress test.
+      note: Natural material-dependent starting moisture in dry basis, not a market-target transfer.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -136,8 +137,8 @@ initial_moisture:
     provenance:
       evidence: derived
       source_refs:
-      - ba
-      method: X_db=X_wb/(1-X_wb); lower bound is the target 0.14/0.86 plus margin_above_target_db 0.01, upper bound is the upper mean_db 0.22/0.78 plus the upper amplitude_db 0.05.
+      - saskpulse_storage
+      method: X_db=X_wb/(1-X_wb); lower bound is the target 0.14/0.86 (SaskPulse long-term storage moisture) plus the synthetic design margin margin_above_target_db 0.01, upper bound is the upper mean_db 0.22/0.78 plus the upper amplitude_db 0.05.
       verification: mathematically_reproduced
   margin_above_target_db: 0.01
 # Dimensionless support for generated bed-mean porosity; density calibration stores a compatible paired reference state.
@@ -227,7 +228,7 @@ target_moisture:
     source_refs:
     - swiss_crops
     - saskpulse_storage
-    method: The Oswin fit of this material gives the equilibrium moisture 0.14315 wb at water activity 0.65 and 20 degC, the storage condition of swiss granum chapter 3. The target stays 0.14 wb, the SaskPulse long-term storage moisture of 14 % for beans.
+    method: The Oswin fit of this material gives the equilibrium moisture 0.14315 wb at water activity 0.65 and 20 degC, the storage condition of swiss granum chapter 3. Chapter 3 is stated for cereals and Phaseolus beans do not appear in swiss granum, so this is a transfer. The target stays 0.14 wb, the SaskPulse long-term storage moisture of 14 % for beans (section Seed Moisture Content at Harvest).
     verification: mathematically_reproduced
     note: Single practical safe-storage drying target; market acceptance is not
       an operational target.
@@ -236,10 +237,10 @@ two_compartment_kinetics:
   record_id: kidney_bean_two_compartment_kinetics_v1
   components:
     r_surf_0:
-      nominal: 9.35e-05
+      nominal: 1.05e-04
       support:
-        lower: 4.4e-05
-        upper: 1.65e-04
+        lower: 4.94e-05
+        upper: 1.85e-04
       transform: log
     r_int_surf:
       nominal: 0.1
@@ -258,12 +259,12 @@ two_compartment_kinetics:
     evidence: calibration_prior
     source_refs:
     - kidney_drying
-    - lentil_drying_tahmasebi_2025
-    method: r_surf_0 and its support are the earlier design values multiplied by 5.5, the factor of lentil (Tahmasebi et al. 2025, calibrated at 35 degC and 20 % relative humidity), transferred because no comparable kidney-bean drying time exists (Doymaz 2016 starts at 53 % wb); r_int_surf and f_surf are unchanged.
+    - bean_drying_afonso_correa_1999
+    method: No comparable kidney-bean drying time exists (Doymaz 2016 starts at 53 % wb). r_surf_0 is taken from the same genus (fresh black bean Phaseolus vulgaris, 35 degC, Afonso Junior and Correa 1999, Table 1), matched at the moisture ratio of the target at the pilot air (35 degC, relative humidity 0.215), 1.46-1.57e-04, and scaled to the kidney Sauter diameter 6.51 mm (BA Table 7) against about 5.2 mm of the black bean with an exponent of 1 to 2, giving 0.80-1.53e-04 and 1.05e-04 as the centre. The support 4.94e-05 to 1.85e-04 is the nominal value times 0.47 and 1.76. The thin-layer time to the target at pilot air is 5.4 h. r_int_surf and f_surf are unchanged; the shape fit of the black-bean curve (0.115 and 0.33) is consistent with them.
     applicability:
       evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
         at known T, RH/omega, airflow and product state; T(t) if available
-      limitation: The rate prior is transferred from lentil, not fitted to experiments of this bed, and the drying times were not validated as real predictions.
+      limitation: Transfer from another cultivar of the same species with a size correction and an assumed black-bean diameter, not a kidney-bean curve; the rate prior is not fitted to experiments of this bed, and the drying times were not validated as real predictions.
   ood_provenance:
     evidence: synthetic_design
     source_refs: []

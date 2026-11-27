@@ -231,7 +231,7 @@ def test_lazy_panel_reuses_views_and_tracks_selection_capabilities(
     header = _dataset_header(tree)
     all_sections = tabs.children
     calls_after_first_open = tuple(factory_calls)
-    assert "2 von 2 gewählt" in header.description
+    assert "2 of 2 selected" in header.description
 
     close = next(item for item in tree if isinstance(item, widgets.Button) and item.description == "Close")
     close.click()
@@ -245,19 +245,19 @@ def test_lazy_panel_reuses_views_and_tracks_selection_capabilities(
     assert tabs.children != all_sections
     steady_sections = tabs.children
     assert _dataset_header(_walk(opened_panel)) is header
-    assert "1 von 2 gewählt" in header.description
+    assert "1 of 2 selected" in header.description
     state.select_datasets(())
     assert tabs.children == steady_sections
-    assert "0 von 2 gewählt" in header.description
+    assert "0 of 2 selected" in header.description
     state.select_datasets(tuple(view.key for view in catalog.views))
     assert tabs.children != steady_sections
     assert _dataset_header(_walk(opened_panel)) is header
-    assert "2 von 2 gewählt" in header.description
+    assert "2 of 2 selected" in header.description
 
 
 def _dataset_header(tree: tuple[widgets.Widget, ...]) -> widgets.ToggleButton:
     """Return the disclosure header of the panel's dataset selector."""
-    return next(item for item in tree if isinstance(item, widgets.ToggleButton) and "Datensätze" in item.description)
+    return next(item for item in tree if isinstance(item, widgets.ToggleButton) and "Datasets" in item.description)
 
 
 def test_published_tensor_view_shows_load_failure_and_clears_export() -> None:
@@ -266,6 +266,8 @@ def test_published_tensor_view_shows_load_failure_and_clears_export() -> None:
         "dataset_id": "pkg",
         "dataset_name": "Package",
         "dataset_view": "steady_flow",
+        "materials": ["lentil"],
+        "case_partition": None,
         "source_case_identities": [{"package_case_id": "c1", "source": {"simulation_case_id": "s1"}}],
     }
 
@@ -302,6 +304,18 @@ def test_channels_check_only_their_default_at_the_first_offer_then_keep_the_reta
     channels.checks.boxes["phi"].value = False
     channels.rebind(("T", "phi", "w_gr", "p"), {})
     assert channels.selected == ("T", "w_gr", "p")
+
+
+def test_a_selection_without_stored_times_leaves_no_time_on_the_status_line() -> None:
+    """The time of the previous selection is not shown once no stored time is offered."""
+    status = ui_controls.StatusLine()
+    time_axis = viewers._TimeAxis(selection.GeneratedOutputSelectionState(_catalog()), "spatial_field_maps", status)
+    time_axis.rebind((0.0, 24.0))
+    assert time_axis.timed
+    assert status.text
+    time_axis.rebind(())
+    assert not time_axis.timed
+    assert not status.text
 
 
 def test_deactivated_view_ignores_shared_selection_until_reactivated() -> None:
@@ -445,7 +459,7 @@ def test_deactivation_supersedes_a_render_in_flight(monkeypatch: pytest.MonkeyPa
 
 
 def test_a_dataset_keeps_its_line_style_and_hatch_when_another_is_deselected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The viewer resolves styles over the whole catalog: with A deselected, batch B of the same material stays dashed and hatched."""
+    """The viewer resolves styles over the whole catalog: with A deselected, batch B of the same material keeps the style it had beside A."""
     catalog = _catalog(specs=(("transient_drying", "A"), ("transient_drying", "B")))
     state = selection.GeneratedOutputSelectionState(catalog)
     drawn: list[tuple[tuple[str, ...], dict[str, Any]]] = []
@@ -464,8 +478,7 @@ def test_a_dataset_keeps_its_line_style_and_hatch_when_another_is_deselected(mon
     assert [names for names, _styles in drawn] == [("A", "B"), ("B",)]
     both, alone = drawn[0][1]["B"], drawn[1][1]["B"]
     assert alone == both
-    assert alone.linestyle != "-"
-    assert alone.hatch
+    assert (alone.linestyle, alone.hatch) == ("-", "")  # a generated batch has no evaluation role, so it is solid whatever its label
 
 
 def test_a_published_package_of_one_material_takes_that_materials_color_without_loading() -> None:
@@ -476,6 +489,7 @@ def test_a_published_package_of_one_material_takes_that_materials_color_without_
             "dataset_id": name,
             "dataset_name": name,
             "dataset_view": "transient_drying",
+            "case_partition": None,
             "materials": materials,
             "source_case_identities": [{"source": {"simulation_case_id": "1" * 64}}],
         }
@@ -489,9 +503,12 @@ def test_a_published_package_of_one_material_takes_that_materials_color_without_
 
 
 def test_a_published_package_label_shows_its_identity_once_when_the_name_equals_it() -> None:
+    """A whole mixed-material package, which has no one material, keeps its name, with its identity in brackets only when they differ."""
+
     def label(name: str) -> str:
         identities = [{"package_case_id": "c1", "source": {"simulation_case_id": "s1"}}]
-        manifest = {"dataset_id": "pkg", "dataset_name": name, "dataset_view": "steady_flow", "source_case_identities": identities}
+        manifest: dict[str, Any] = {"dataset_id": "pkg", "dataset_name": name, "dataset_view": "steady_flow", "source_case_identities": identities}
+        manifest["materials"] = ["lentil", "chickpea"]
         return selection.PublishedDatasetEDAView(manifest=manifest, case_limit=None, loader=pd.DataFrame).label
 
     assert label("pkg") == "pkg"

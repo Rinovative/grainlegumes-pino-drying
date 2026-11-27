@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 if (( $# < 2 )); then
-  printf 'Usage: %s SOURCE_TREE cli|campaign-case|node-worker [ARGS...]\n' "$0" >&2
+  printf 'Usage: %s SOURCE_TREE cli|campaign-case|field-test-step|node-worker [ARGS...]\n' "$0" >&2
   exit 2
 fi
 
@@ -19,7 +19,7 @@ fi
 
 # A case step repeats the checks that the node worker reported once at node start: its passing checks stay silent,
 # a failing check is still reported on stderr and ends the step.
-if [[ "${MODE}" == campaign-case ]]; then
+if [[ "${MODE}" == campaign-case || "${MODE}" == field-test-step ]]; then
   export GENERATION_PREFLIGHT_QUIET=1
 fi
 
@@ -135,6 +135,7 @@ sweep_stale_worker_scratch() {
 }
 
 CASE_RUN_ID=""
+CASE_COMMAND=()
 WORK_ROOT=""
 WORKER_LOCK=""
 MARKER_READY=false
@@ -166,7 +167,8 @@ on_case_exit() {
   local status="$?" cleanup_status=0
   trap - EXIT INT TERM
   set +e
-  if [[ -n "${INTERRUPTION_SIGNAL}" ]]; then
+  # Interruption receipts belong to campaigns; a field-test step's interruption is its own outcome evidence.
+  if [[ -n "${INTERRUPTION_SIGNAL}" && "${MODE}" == campaign-case ]]; then
     run_python record-worker-interruption "${CASE_RUN_ID}" \
       --signal "${INTERRUPTION_SIGNAL}" --exit-code "${status}" \
       --storage-root "${STORAGE_ROOT}" \
@@ -213,8 +215,7 @@ run_case_worker() {
 
   # Python starts directly in the background (not through run_python): a backgrounded shell function is a subshell,
   # and the trap's TERM would stop that subshell while the case worker kept running without its orderly stop.
-  "${GENERATION_NATIVE_VENV}/bin/python" -m "${PYTHON_MODULE}" run-campaign-case "${CASE_RUN_ID}" "${BATCH_NAME}" "${CASE_INDEX}" \
-    --storage-root "${STORAGE_ROOT}" --work-root "${WORK_ROOT}" &
+  "${GENERATION_NATIVE_VENV}/bin/python" "${CASE_COMMAND[@]}" --storage-root "${STORAGE_ROOT}" --work-root "${WORK_ROOT}" &
   CHILD_PID="$!"
   set +e
   wait "${CHILD_PID}"
@@ -301,6 +302,29 @@ case "${MODE}" in
     printf 'CASE START campaign_run_id=%s batch=%s case=%s case_index=%s job=%s step=%s dispatch=%s node=%s cores=%s started_at=%s\n' \
       "${CASE_RUN_ID}" "${BATCH_NAME}" "${CASE_ID}" "${CASE_INDEX}" \
       "${SLURM_JOB_ID}" "${SLURM_STEP_ID:-unavailable}" "${GENERATION_DISPATCH_KEY:-unavailable}" "${CASE_NODE}" "${CORES_PER_CASE}" "${CASE_STARTED_AT}"
+    CASE_COMMAND=(-m "${PYTHON_MODULE}" run-campaign-case "${CASE_RUN_ID}" "${BATCH_NAME}" "${CASE_INDEX}")
+    run_case_worker
+    ;;
+  field-test-step)
+    if (( $# != 5 )); then
+      printf 'Usage: %s SOURCE_TREE field-test-step TASK TEST_ID MEMBER_ID ATTEMPT CORES\n' "$0" >&2
+      exit 2
+    fi
+    # A field-test step is never a campaign case (the runner refuses campaign identity) and writes only its own field-test record.
+    if [[ ! "$1" =~ ^[a-z0-9]+(_[a-z0-9]+)*$ \
+      || ! "$2" =~ ^[a-z0-9]+([-_][a-z0-9]+)*$ \
+      || ! "$3" =~ ^[a-z0-9]+([-_][a-z0-9]+)*$ \
+      || ! "$4" =~ ^[1-9][0-9]*$ \
+      || ! "$5" =~ ^[1-9][0-9]*$ \
+      || "${SLURM_CPUS_PER_TASK}" -ne "$5" \
+      || -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+      printf 'Field-test step identity or Slurm allocation is inconsistent.\n' >&2
+      exit 2
+    fi
+    CASE_RUN_ID="field-test~$1~$2"
+    printf 'FIELD TEST STEP task=%s test=%s member=%s attempt=%s job=%s step=%s node=%s cores=%s\n' \
+      "$1" "$2" "$3" "$4" "${SLURM_JOB_ID}" "${SLURM_STEP_ID:-unavailable}" "${SLURMD_NODENAME:-${HOSTNAME:-unavailable}}" "$5"
+    CASE_COMMAND=(-m src.generation.cli.cli_field_test run-member "$1" "$2" "$3" "$4" --cores "$5")
     run_case_worker
     ;;
   node-worker)

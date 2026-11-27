@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check the run start block, the event line, the end line, the startup line and the Optuna lines
+  - Check that only an interrupted run is advised the rerun that continues it
   - Check that paths are relative to the storage root and credentials never reach diagnostics
 
 Design principles:
@@ -17,7 +18,7 @@ from typing import TYPE_CHECKING
 
 from support import configs
 
-from src import experiments
+from src import common, experiments
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -167,6 +168,27 @@ def test_startup_phases_print_one_line_and_failures_name_the_last_phase(
     assert len(line.splitlines()) == 1
     for expected in ("startup", "2 Train cases", "152 items", "126x201", "scaler hit", "76 updates/epoch"):
         assert expected in line
+
+
+def test_only_an_interrupted_run_is_advised_the_rerun_that_continues_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed run never continues, also beside its last checkpoint, so its next step advises no rerun; an interrupted one keeps it."""
+    reporter = _reporter(tmp_path, monkeypatch)
+    last = common.paths.resolve_last_checkpoint_file(reporter.run_dir)
+    last.parent.mkdir(parents=True)
+    last.write_bytes(b"")
+
+    reporter.failure(RuntimeError("boom"), status="failed")
+    failed = capsys.readouterr().err
+    reporter.failure(KeyboardInterrupt(), status="interrupted")
+    interrupted = capsys.readouterr().err
+
+    assert "next:" in failed
+    assert "rerun" not in failed.lower()
+    assert "rerun" in interrupted
 
 
 def test_console_failure_does_not_disclose_secrets(

@@ -2,6 +2,8 @@
 
 Responsibilities:
   - Check catalog accounting, lazy source admission, and steady/transient field projection
+  - Check the «material, role» labels and evaluation order of published views and the summary naming each package once
+  - Check that views no token separates take their exact package key, and that the first view in manifest order opens
 
 Design principles:
   - Failed and pending candidates stay visible without fabricated success
@@ -17,13 +19,17 @@ from typing import TYPE_CHECKING, Any, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import pytest
 from support.generation_fixtures import successful_source_case
 
 from src import common, datasets, generation
+from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda import eda_dataframe as dataframe
 from src.analysis.eda import eda_selection as selection
 from src.analysis.eda import eda_sources as sources
+from src.analysis.eda import eda_transient as transient
+from src.analysis.eda import eda_viewers as viewers
 from src.analysis.eda import eda_workspace as workspace
 from src.analysis.eda.plots import eda_plot_transient as transient_plots
 
@@ -277,6 +283,149 @@ def test_published_transient_eda_uses_actual_inputs_targets_and_bounded_cases(tr
     transition_count = len(cast("dict[str, np.ndarray]", time)["transition_t_n_hours"])
     with pytest.raises(ValueError, match="exact stored transition"):
         dataframe.published_tensor_values(frame, view.case_ids[0], transition=transition_count)
+
+
+def test_a_bounded_material_view_of_a_mixed_package_counts_the_material_membership(transient_package: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A material view loads under the material scope; its material's cases past the bound count as bounded, not the package's."""
+    storage = transient_package["root"]
+    manifest = datasets.packages.load_package_manifest("transient_drying", transient_package["train_dataset"], storage_root=storage)
+    manifest["source_case_identities"][0]["source"]["material_family"] = "chickpea"  # one relabelled case makes the package mixed
+    manifest["materials"] = ["chickpea", "lentil"]
+    monkeypatch.setattr(sources, "discover_published_dataset_eda_catalog", lambda **_kwargs: sources.PublishedDatasetEDACatalog((manifest,), ()))
+    monkeypatch.setattr(workspace.panel, "build_eda_panel", lambda **_kwargs: None)
+    prepared = workspace.prepare_published_dataset_eda_workspace(storage_root=storage, max_cases=2)
+    frame = prepared.catalog.view(f"{manifest['dataset_id']}/lentil").load()
+    assert frame.attrs["case_accounting_scope"] == "published_material_membership"
+    assert (frame.attrs["total_discovered_case_count"], frame.attrs["loaded_case_count"]) == (3, 2)
+    assert frame.attrs["dataset_manifest"] is manifest
+    assert transient.target_attainment_diagnostic(frame).exclusion_reasons["bounded_or_unselected"] == 1
+
+
+def _package(dataset_id: str, materials: tuple[str, ...], partition: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return a minimal package manifest whose case ``c<i>`` has the i-th of ``materials``."""
+    identities = [
+        {"package_case_id": f"c{index}", "source": {"simulation_case_id": str(index) * 64, "material_family": material}}
+        for index, material in enumerate(materials, start=1)
+    ]
+    return {
+        "dataset_id": dataset_id,
+        "dataset_name": dataset_id,
+        "dataset_view": "transient_drying",
+        "materials": list(dict.fromkeys(materials)),
+        "source_case_count": len(identities),
+        "source_case_identities": identities,
+        "case_partition": partition,
+    }
+
+
+def _published_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, packages: tuple[dict[str, Any], ...]
+) -> tuple[workspace.GeneratedOutputEDAWorkspace, list[tuple[dict[str, Any], str | None]]]:
+    """Prepare the published workspace over ``packages``; its stub loader records the manifest and material it gets."""
+    loaded: list[tuple[dict[str, Any], str | None]] = []
+
+    def load(manifest: dict[str, Any], *, material: str | None = None, **_kwargs: object) -> pd.DataFrame:
+        loaded.append((manifest, material))
+        identities = manifest["source_case_identities"] if material is None else dataframe.material_case_identities(manifest, material)
+        frame = pd.DataFrame(index=pd.Index(sorted(entry["source"]["simulation_case_id"] for entry in identities)))
+        frame.attrs.update(task_id="transient_drying")
+        return frame
+
+    monkeypatch.setattr(sources, "discover_published_dataset_eda_catalog", lambda **_kwargs: sources.PublishedDatasetEDACatalog(packages, ()))
+    monkeypatch.setattr(dataframe, "load_published_dataset_frame", load)
+    monkeypatch.setattr(workspace.panel, "build_eda_panel", lambda **_kwargs: None)
+    return workspace.prepare_published_dataset_eda_workspace(storage_root=tmp_path, max_cases=None), loaded
+
+
+def test_a_mixed_material_package_shows_one_view_per_material_over_its_intact_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    Each material of a mixed package is its own view over its own cases, loaded by material from the whole manifest.
+
+    The display order follows the evaluation (chickpea before lentil), while the view that opens stays the manifest's first.
+    """
+    packages = (_package("mixed", ("lentil", "chickpea", "lentil")), _package("single", ("lentil",)))
+    prepared, loaded = _published_workspace(monkeypatch, tmp_path, packages)
+
+    views = cast("tuple[selection.PublishedDatasetEDAView, ...]", prepared.catalog.views)
+    assert packages[0]["materials"] == ["lentil", "chickpea"]
+    assert [(view.package_key, view.material_family) for view in views] == [("mixed", "chickpea"), ("mixed", "lentil"), ("single", "lentil")]
+    chickpea, lentil, single = views
+    assert lentil.case_ids == ("1" * 64, "3" * 64)
+    assert chickpea.case_ids == ("2" * 64,)
+    assert single.key == "single"
+    assert len({view.key for view in views}) == len({view.label for view in views}) == 3
+    assert "mixed" in lentil.label
+    assert "mixed" in lentil.tooltip
+    assert lentil.manifest == packages[0]
+    assert prepared.selection_state is not None
+    assert prepared.selection_state.selection.dataset_keys == (lentil.key,)  # the tensor inspector needs exactly one view
+    lentil.load()
+    assert loaded == [(packages[0], "lentil")]
+
+
+def test_published_views_read_material_and_role_in_the_evaluation_order_and_name_each_package_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Views read «material, role» like the evaluation inventory, ordered by role, then material, within their package.
+
+    Only equal labels take the token of the package name that tells them apart; the summary names each package once. Keys
+    whose tokens no shortening tells apart (``a__b``, ``b__a``) take the exact package key instead of blocking the notebook.
+    """
+    roles = {"lentil": "id", "chickpea": "id", "kidney_bean": "ood"}
+    partition = {**_empty_partition(), "material_roles": roles, "train": ["c1", "c2"], "ood": ["c3"]}
+    first = _package("demo__seed-1", ("lentil", "chickpea", "kidney_bean"), partition)
+    second = _package("demo__seed-2", ("lentil",), {**_empty_partition(), "material_roles": {"lentil": "id"}, "train": ["c1"]})
+    prepared, _loaded = _published_workspace(monkeypatch, tmp_path, (first, second))
+
+    labels = [view.label for view in prepared.catalog.views]
+    assert labels == ["Chickpea, ID", "Lentil, ID · seed-1", "Kidney bean, Material OOD", "Lentil, ID · seed-2"]
+    assert all(prepared.summary_text.count(f": {key}\n") == 1 for key in ("demo__seed-1", "demo__seed-2"))
+    assert "- Chickpea, ID; Lentil, ID · seed-1; Kidney bean, Material OOD: demo__seed-1\n" in prepared.summary_text
+    shown = {view.label: view.load().attrs[capabilities.DISPLAY_LABEL_ATTRIBUTE] for view in prepared.catalog.views}
+    assert shown == {  # a frame keeps its label without the alias, which a figure shows where that label is unique
+        "Chickpea, ID": "Chickpea, ID",
+        "Lentil, ID · seed-1": "Lentil, ID",
+        "Kidney bean, Material OOD": "Kidney bean, Material OOD",
+        "Lentil, ID · seed-2": "Lentil, ID",
+    }
+    swapped, _loaded = _published_workspace(monkeypatch, tmp_path, (_package("a__b", ("lentil",)), _package("b__a", ("lentil",))))
+    assert [view.label for view in swapped.catalog.views] == ["Lentil, no single role · a__b", "Lentil, no single role · b__a"]
+
+
+def _empty_partition() -> dict[str, Any]:
+    """Return a fixed case partition without cases in any role."""
+    return {"material_roles": {}, "train": [], "validation": [], "id_test": [], "parameter_ood": [], "ood": []}
+
+
+def test_a_published_view_takes_the_one_evaluation_role_its_package_partition_gives_its_cases() -> None:
+    """Cases of one partition role give that role; cases of several roles, or a package without a fixed partition, give none."""
+    roles = {"lentil": "id", "chickpea": "ood"}
+    partition = {"material_roles": roles, "train": ["c1"], "validation": [], "id_test": [], "parameter_ood": ["c3"], "ood": ["c2"]}
+    mixed = _package("mixed", ("lentil", "chickpea", "lentil"), partition)
+
+    def role(package: dict[str, Any], material: str | None, case_limit: int | None = None) -> str | None:
+        return selection.PublishedDatasetEDAView(manifest=package, case_limit=case_limit, loader=pd.DataFrame, material=material).role
+
+    assert role(mixed, "chickpea") == "material_ood"
+    assert role(mixed, "lentil", case_limit=1) == "id"
+    assert role(mixed, "lentil") is None  # a train case beside a parameter-OOD case
+    assert role(_package("plain", ("lentil",)), None) is None
+
+
+def test_the_viewer_styles_give_a_published_view_the_line_style_of_its_role_and_a_view_without_one_stays_solid() -> None:
+    """The role of a published view reaches ``batch_styles``; a package without a fixed partition has none."""
+    partition = {"material_roles": {"chickpea": "ood"}, "train": [], "validation": [], "id_test": [], "parameter_ood": [], "ood": ["c1"]}
+    held_out = selection.PublishedDatasetEDAView(manifest=_package("ood", ("chickpea",), partition), case_limit=None, loader=pd.DataFrame)
+    plain = selection.PublishedDatasetEDAView(manifest=_package("plain", ("chickpea",)), case_limit=None, loader=pd.DataFrame)
+    styles = viewers._dataset_styles(cast("Any", SimpleNamespace(views=(held_out, plain))))
+    semantics = transient_plots.visual_semantics
+    assert (styles[held_out.label].linestyle, styles[held_out.label].hatch) == (
+        semantics.ROLE_LINESTYLES["material_ood"],
+        semantics.ROLE_HATCHES["material_ood"],
+    )
+    assert styles[plain.label].linestyle == "-"
+    assert styles[held_out.label].color == styles[plain.label].color  # one material, so the role alone tells them apart
 
 
 @pytest.mark.usefixtures("_dataset_producer_evidence")

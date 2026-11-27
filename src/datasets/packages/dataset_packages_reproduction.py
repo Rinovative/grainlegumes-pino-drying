@@ -1,7 +1,7 @@
 """Capture and inspect the recoverable dependencies of an immutable Dataset.
 
 Responsibilities:
-  - Bind new Dataset publications to retained producing source and environment evidence
+  - Bind new Dataset publications to retained producing source and environment evidence for the scope of the publication
   - Reuse the admitted, tree-verified snapshot as producing source when running from a frozen source tree
   - Present Source parameters, seeds, model and regeneration boundaries in one inspection
   - Declare the conversion code projection of each Dataset view and bind the converter implementation digest to it;
@@ -10,6 +10,8 @@ Responsibilities:
 Design principles:
   - Existing source snapshots retain code bytes; the Dataset manifest owns provenance
   - A frozen source tree never captures its own snapshot and never calls Git
+  - A live capture holds its snapshot's shared tree lock only inside its context, which the builder keeps from the
+    provenance through the publication, so a snapshot prune cannot delete the snapshot before the manifest refers to it
   - Availability and hash verification are separate from scientific reproduction
 
 This module does NOT:
@@ -19,6 +21,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import importlib.util
 import json
@@ -27,10 +30,13 @@ import re
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src import common
 from src.generation.contracts import generation_contracts_source as source_contract
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _PRODUCER_KEYS = frozenset({"source_snapshot", "environment"})
 _SNAPSHOT_KEYS = frozenset({"relative_path", "sha256", "git_commit", "source_fingerprint_sha256"})
@@ -157,40 +163,51 @@ def _admitted_tree_receipt(storage: Path) -> dict[str, str]:
     }
 
 
-def _captured_receipt(storage: Path) -> dict[str, str]:
-    """Capture the live producing source using the maintained scheduler snapshot mechanism."""
-    repository = common.paths.get_project_root()
-    script = repository / "scripts/source_fingerprint.py"
+def _source_script() -> Any:
+    """Load the maintained source snapshot implementation of the executing project."""
+    script = common.paths.get_project_root() / "scripts/source_fingerprint.py"
     spec = importlib.util.spec_from_file_location("dataset_source_snapshot", script)
     if spec is None or spec.loader is None:
         message = "The maintained source snapshot implementation is unavailable."
         raise RuntimeError(message)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.capture_source_snapshot(repository, common.paths.get_source_snapshots_root(storage_root=storage))
+    return module
 
 
-def capture_producer_evidence(*, storage_root: Path | str | None = None) -> dict[str, Any]:
-    """Bind the producing source: the admitted snapshot inside a source tree, otherwise a fresh live capture."""
+@contextlib.contextmanager
+def held_producer_evidence(*, storage_root: Path | str | None = None) -> Iterator[dict[str, Any]]:
+    """Bind the producing source for a Dataset publication that runs inside this context.
+
+    Inside a source tree the admitted snapshot is bound without a lock. Otherwise the live source is captured under its
+    snapshot's shared tree lock, held until the context exits, so a snapshot prune can delete neither a fresh nor a reused
+    snapshot before the published manifest refers to it; a reuse or a failure inside the context releases it as well.
+    """
     storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
-    receipt = _admitted_tree_receipt(storage) if common.paths.source_tree_id() is not None else _captured_receipt(storage)
-    snapshot_path = Path(receipt["snapshot_path"])
-    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    value = {
-        "source_snapshot": {
-            "relative_path": snapshot_path.relative_to(storage).as_posix(),
-            "sha256": receipt["snapshot_sha256"],
-            "git_commit": snapshot["git_commit"],
-            "source_fingerprint_sha256": receipt["fingerprint"],
-        },
-        "environment": {
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-            "packages": {name: importlib.metadata.version(name) for name in ("numpy", "h5py", "torch", "PyYAML")},
-        },
-    }
-    validate_producer_evidence(value)
-    return value
+    with (
+        contextlib.nullcontext(_admitted_tree_receipt(storage))
+        if common.paths.source_tree_id() is not None
+        else _source_script().held_source_snapshot(
+            common.paths.get_project_root(), common.paths.get_source_snapshots_root(storage_root=storage), common.paths.get_source_trees_root()
+        )
+    ) as receipt:
+        snapshot_path = Path(receipt["snapshot_path"])
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        value = {
+            "source_snapshot": {
+                "relative_path": snapshot_path.relative_to(storage).as_posix(),
+                "sha256": receipt["snapshot_sha256"],
+                "git_commit": snapshot["git_commit"],
+                "source_fingerprint_sha256": receipt["fingerprint"],
+            },
+            "environment": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "packages": {name: importlib.metadata.version(name) for name in ("numpy", "h5py", "torch", "PyYAML")},
+            },
+        }
+        validate_producer_evidence(value)
+        yield value
 
 
 def _contained_file(storage: Path, relative: str) -> Path:
@@ -483,14 +500,7 @@ def verify_current_producer(value: dict[str, Any], *, storage_root: Path | str |
     if not path.is_file() or common.serialization.file_sha256(path) != value["source_snapshot"]["sha256"]:
         message = "The exact producing source snapshot is missing or changed."
         raise ValueError(message)
-    script = common.paths.get_project_root() / "scripts/source_fingerprint.py"
-    spec = importlib.util.spec_from_file_location("dataset_reconstruction_source", script)
-    if spec is None or spec.loader is None:
-        message = "The maintained source verification implementation is unavailable."
-        raise RuntimeError(message)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.verify_source_snapshot(path, common.paths.get_project_root(), frozen=common.paths.source_tree_id() is not None)
+    _source_script().verify_source_snapshot(path, common.paths.get_project_root(), frozen=common.paths.source_tree_id() is not None)
     environment = value["environment"]
     current_versions = {name: importlib.metadata.version(name) for name in environment["packages"]}
     if environment["python"] != platform.python_version() or current_versions != environment["packages"]:

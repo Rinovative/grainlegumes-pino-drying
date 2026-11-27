@@ -3,6 +3,7 @@
 Responsibilities:
   - Keep view keys, labels, and order explicit in one immutable registry
   - Omit transient schedules and moisture views when unavailable, and the paired template comparison unless two campaigns share a design
+  - Give the view of a section left with one view to the section before it, so a steady-only catalog keeps its boundary view
   - Delegate display numbering to the shared presentation contract
 
 Design principles:
@@ -32,6 +33,7 @@ _TRANSIENT_ONLY_VIEW_KEYS: Final = frozenset(
     }
 )
 _TEMPLATE_VIEW_KEY: Final = "template_comparison"
+_MINIMUM_SECTION_VIEWS: Final = 2  # the shared registry's least number of views per visible section
 
 GENERATION_INPUT_SECTIONS: Final = (
     shared_registry.SectionPresentation(
@@ -122,7 +124,9 @@ def sections_for_profiles(
     Transient schedules and moisture/sorption are the only profile-gated
     views. The paired template comparison is shown only when ``template_comparison``
     says two campaigns of one task share a design. All other sections preserve the
-    same scientific responsibilities.
+    same scientific responsibilities. A section left with a single view, the boundary
+    conditions without schedules, adds it to the section before it, since a section
+    offers at least two views.
     """
     available = frozenset(profile_ids)
     if not available:
@@ -131,20 +135,20 @@ def sections_for_profiles(
     for profile_id in available:
         profiles.resolve_profile(profile_id)
     has_transient = profiles.TRANSIENT_DRYING_PROFILE in available
-    sections = tuple(
-        shared_registry.SectionPresentation(
-            key=section.key,
-            name=section.name,
-            plots=tuple(
-                plot
-                for plot in section.plots
-                if (has_transient or plot.key not in _TRANSIENT_ONLY_VIEW_KEYS) and (template_comparison or plot.key != _TEMPLATE_VIEW_KEY)
-            ),
+    sections: list[shared_registry.SectionPresentation] = []
+    for section in GENERATION_INPUT_SECTIONS:
+        plots = tuple(
+            plot
+            for plot in section.plots
+            if (has_transient or plot.key not in _TRANSIENT_ONLY_VIEW_KEYS) and (template_comparison or plot.key != _TEMPLATE_VIEW_KEY)
         )
-        for section in GENERATION_INPUT_SECTIONS
-    )
+        if len(plots) < _MINIMUM_SECTION_VIEWS and sections:
+            previous = sections[-1]
+            sections[-1] = shared_registry.SectionPresentation(key=previous.key, name=previous.name, plots=(*previous.plots, *plots))
+        else:
+            sections.append(shared_registry.SectionPresentation(key=section.key, name=section.name, plots=plots))
     shared_registry.validate_registry(sections)
-    return sections
+    return tuple(sections)
 
 
 shared_registry.validate_registry(GENERATION_INPUT_SECTIONS)

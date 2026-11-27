@@ -3,8 +3,13 @@
 Responsibilities:
   - Check that report mode lists an orphan and writes nothing, and that --apply deletes it under an existing lock file
   - Check each keeping condition: storage references, a same-named tree, scheduler evidence, recent changes, defective records
-  - Check the fail-closed stops: symlinks, a missing or held lock, the shared budget, a change between scan and deletion
-  - Check the command line's sorted JSON keys, its scheduler queries and its exit codes
+  - Check the fail-closed stops: symlinks, a missing or held lock, the shared budget, also when it runs out in a
+    deletion recheck, and a change between scan and deletion
+  - Check that the lock-file bootstrap accepts a lock file that a launcher creates meanwhile and blocks on any other error
+  - Check that --apply searches the storage records once, after the exclusive locks, so a reference published just before
+    them keeps its snapshot
+  - Check the command line's sorted JSON keys, its scheduler queries and its exit codes, including a lock that another
+    process holds on the only snapshot
 
 Design principles:
   - Every case builds its own storage and runtime folders under tmp_path and injects scheduler evidence and clock
@@ -96,7 +101,7 @@ def _outcome(**changes: Any) -> dict[str, Any]:
 
 
 def _on_first_lock(store: _Store, monkeypatch: pytest.MonkeyPatch, action: Callable[[], object]) -> None:
-    """Run ``action`` once, as soon as the prune holds its first tree lock: after the scan, before the recheck."""
+    """Run ``action`` once, as soon as the prune holds its first tree lock: after the scan, before the storage search and the rechecks."""
     real_lock = store.script["_tree_lock"]
     done: list[bool] = []
 
@@ -223,33 +228,55 @@ def test_a_missing_lock_file_is_created_and_nothing_is_deleted(store: _Store) ->
     assert (store.snapshots / name / "snapshot.json").is_file()
 
 
-def test_a_held_tree_lock_refuses_the_snapshot(store: _Store) -> None:
-    name = _snapshot(store.storage, "1")
-    _lock(store.trees, name)
-    with store.script["_tree_lock"](store.trees, name, exclusive=False):  # a launcher reuses the snapshot's tree
-        result = store.prune(apply=True)
-    assert result == _outcome(refused={name: "tree lock held by a launcher or a prune"})
-    assert (store.snapshots / name / "snapshot.json").is_file()
+@pytest.mark.parametrize("interference", ["launcher", "denied"])
+def test_the_lock_file_bootstrap_tolerates_only_a_concurrent_creation(store: _Store, monkeypatch: pytest.MonkeyPatch, interference: str) -> None:
+    """A lock file that a launcher creates meanwhile is accepted and the next one still created; any other error blocks."""
+    names = [_snapshot(store.storage, digit) for digit in "12"]
+    real_open = os.open
+    first: list[str] = []
+
+    def interfere_once(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if str(path).endswith(".lock") and flags & os.O_EXCL and not first:  # the bootstrap's first exclusive create
+            first.append(str(path))
+            if interference == "denied":
+                raise PermissionError(errno.EACCES, "injected")
+            os.close(real_open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666, dir_fd=dir_fd))  # the launcher creates it first
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", interfere_once)
+    result = store.prune(apply=True)
+    created = [name for name in names if (store.trees / ".locks" / f"{name}.lock").is_file()]
+    expected = {
+        "launcher": (_outcome(skipped="lock files created; deletion in a later quiet run"), names),
+        "denied": (_outcome(blocked=f"lock files: [Errno {errno.EACCES}] injected"), []),
+    }
+    assert (result, created) == expected[interference]
+    assert first == [f"{names[0]}.lock"]
+    assert all((store.snapshots / name / "snapshot.json").is_file() for name in names)
 
 
 @pytest.mark.parametrize("limit", ["_SCAN_MAX_ENTRIES", "_SCAN_MAX_TOTAL_BYTES", "_SCAN_SECONDS"])
-def test_a_budget_exhausted_in_the_first_recheck_blocks_all_further_deletion(store: _Store, monkeypatch: pytest.MonkeyPatch, limit: str) -> None:
+def test_a_budget_exhausted_in_a_recheck_stops_the_remaining_deletions(store: _Store, monkeypatch: pytest.MonkeyPatch, limit: str) -> None:
+    """A budget that runs out after the search and the first deletion blocks the run in the next candidate's recheck."""
     names = [_snapshot(store.storage, digit) for digit in "12"]
     for name in names:
         _lock(store.trees, name)
-    real_monotonic = time.monotonic
+    size = _size(store.snapshots / names[0])
+    real_monotonic, real_state = time.monotonic, store.script["_trees_state"]
 
-    def exhaust() -> None:
-        if limit == "_SCAN_SECONDS":  # the deadline is fixed when the run starts, so the clock moves past it instead
-            monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + 3600)
-        else:
-            monkeypatch.setitem(store.script, limit, 0)
+    def exhausted_once_the_first_orphan_is_gone(*arguments: Any) -> tuple[set[str], int]:
+        if not (store.snapshots / names[0]).exists():  # the second candidate's recheck
+            if limit == "_SCAN_SECONDS":  # the deadline is fixed when the run starts, so the clock moves past it instead
+                monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + 3600)
+            else:
+                monkeypatch.setitem(store.script, limit, 0)
+        return real_state(*arguments)
 
-    _on_first_lock(store, monkeypatch, exhaust)
+    monkeypatch.setitem(store.script, "_trees_state", exhausted_once_the_first_orphan_is_gone)
     result = store.prune(apply=True)
-    assert result == _outcome(blocked=result["blocked"])
+    assert result == _outcome(orphans=[names[0]], bytes=size, blocked=result["blocked"])
     assert "over budget" in result["blocked"]
-    assert all((store.snapshots / name / "snapshot.json").is_file() for name in names)
+    assert (store.snapshots / names[1] / "snapshot.json").is_file()
 
 
 def test_a_snapshot_changed_between_scan_and_deletion_is_refused(store: _Store, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,6 +286,45 @@ def test_a_snapshot_changed_between_scan_and_deletion_is_refused(store: _Store, 
     _on_first_lock(store, monkeypatch, lambda: edit("VALUE = 2  # edited after the scan\n", encoding="utf-8"))
     assert store.prune(apply=True) == _outcome(refused={name: "snapshot changed since the scan"})
     assert (store.snapshots / name / "snapshot.json").is_file()
+
+
+def test_a_reference_published_just_before_the_prune_locks_keeps_the_snapshot(store: _Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Dataset that publishes its manifest and releases its shared lock just before the prune locks keeps its snapshot."""
+    name = _snapshot(store.storage, "1")
+    _lock(store.trees, name)
+    manifest = store.storage / "02_datasets/steady_flow/reused/dataset_manifest.json"
+    real_lock = store.script["_tree_lock"]
+
+    def publish_then_lock(*arguments: Any, **options: Any) -> Any:
+        if not manifest.exists():  # only a search that starts under the lock can see this reference
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({"relative_path": f"source_snapshots/{name}/snapshot.json"}), encoding="utf-8")
+        return real_lock(*arguments, **options)
+
+    monkeypatch.setitem(store.script, "_tree_lock", publish_then_lock)
+    assert store.prune(apply=True) == _outcome()
+    assert (store.snapshots / name / "snapshot.json").is_file()
+
+
+def test_apply_searches_the_storage_records_once_for_all_candidates(store: _Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One storage walk decides every candidate of an apply run: the orphan is deleted, the referenced snapshot kept silently."""
+    orphan, referenced = _snapshot(store.storage, "1"), _snapshot(store.storage, "2")
+    for name in (orphan, referenced):
+        _lock(store.trees, name)
+    (store.storage / "03_runs").mkdir()
+    (store.storage / "03_runs/session.json").write_text(json.dumps({"tree": referenced}), encoding="utf-8")
+    size = _size(store.snapshots / orphan)
+    real_referenced = store.script["_referenced"]
+    searches: list[set[str]] = []
+
+    def counted(*arguments: Any) -> set[str]:
+        searches.append(set(arguments[1]))
+        return real_referenced(*arguments)
+
+    monkeypatch.setitem(store.script, "_referenced", counted)
+    assert store.prune(apply=True) == _outcome(orphans=[orphan], bytes=size)
+    assert searches == [{orphan, referenced}]
+    assert (store.snapshots / referenced / "snapshot.json").is_file()
 
 
 @pytest.mark.parametrize("change", ["queue", "trees"])
@@ -360,26 +426,24 @@ def test_a_snapshot_swapped_for_a_symlink_after_its_recheck_removes_nothing_else
 
 
 @pytest.mark.parametrize("lock", ["held", "missing"])
-def test_a_locks_folder_symlinked_after_the_scan_is_never_used(store: _Store, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lock: str) -> None:
+def test_a_locks_folder_symlinked_after_the_candidate_checks_is_never_used(store: _Store, tmp_path: Path, lock: str) -> None:
     """Neither the lock nor the lock-file bootstrap may reach another folder through a symlinked .locks."""
     name = _snapshot(store.storage, "1")
     store.trees.mkdir(parents=True)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    real_referenced = store.script["_referenced"]
 
-    def scan_then_link(*arguments: Any) -> set[str]:
-        found = real_referenced(*arguments)
-        (store.trees / ".locks").symlink_to(elsewhere, target_is_directory=True)
-        return found
+    def link_then_quiet() -> tuple[bool | None, bool | None]:
+        if not (store.trees / ".locks").is_symlink():  # the last check before the locks are taken
+            (store.trees / ".locks").symlink_to(elsewhere, target_is_directory=True)
+        return True, True
 
-    monkeypatch.setitem(store.script, "_referenced", scan_then_link)
     with contextlib.ExitStack() as stack:
         if lock == "held":  # a launcher holds the lock file that the symlink leads to
             handle = stack.enter_context((elsewhere / f"{name}.lock").open("a+"))
             fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-        result = store.prune(apply=True)
-    assert (store.trees / ".locks").is_symlink()  # the swap after the scan happened
+        result = store.prune(apply=True, scheduler=link_then_quiet)
+    assert (store.trees / ".locks").is_symlink()  # the swap after the candidate checks happened
     assert result == _outcome(blocked=result["blocked"])
     assert isinstance(result["blocked"], str)
     assert sorted(path.name for path in elsewhere.iterdir()) == ([f"{name}.lock"] if lock == "held" else [])
@@ -429,11 +493,16 @@ def test_modes_never_follow_an_entry_swapped_for_a_symlink(store: _Store, monkey
     assert stat.S_IMODE((outside / "file.txt").stat().st_mode) == 0o444
 
 
-def test_command_line_prints_sorted_json_queries_slurm_and_exits_two_on_a_refusal(store: _Store, tmp_path: Path) -> None:
-    name = _snapshot(store.storage, "1")
-    stamp = time.time() - 2 * _DAY  # the command line uses the real clock
-    for path in [store.snapshots / name, *(store.snapshots / name).rglob("*")]:
-        os.utime(path, (stamp, stamp), follow_symlinks=False)
+def _age(*roots: Path) -> None:
+    """Date every entry below ``roots`` two days back, because the command line uses the real clock."""
+    stamp = time.time() - 2 * _DAY
+    for root in roots:
+        for path in [root, *root.rglob("*")]:
+            os.utime(path, (stamp, stamp), follow_symlinks=False)
+
+
+def _command_line(store: _Store, tmp_path: Path) -> tuple[Callable[..., subprocess.CompletedProcess[str]], Path]:
+    """Return a runner of the prune command line against quiet fake Slurm clients, and the clients' query log."""
     binary = tmp_path / "bin"
     binary.mkdir()
     log = tmp_path / "slurm.log"
@@ -445,6 +514,27 @@ def test_command_line_prints_sorted_json_queries_slurm_and_exits_two_on_a_refusa
     def run(*extra: str) -> subprocess.CompletedProcess[str]:
         command = [sys.executable, str(_SCRIPT), "--prune-snapshots", str(store.storage), str(store.trees), *extra]
         return subprocess.run(command, env=environment, capture_output=True, text=True, check=False)  # noqa: S603 -- test-owned argument vector
+
+    return run, log
+
+
+def test_command_line_refuses_a_single_snapshot_whose_lock_another_process_holds(store: _Store, tmp_path: Path) -> None:
+    """The only orphan, otherwise deletable, is refused with exit 2 while a capture or launcher holds its shared lock."""
+    name = _snapshot(store.storage, "1")
+    _lock(store.trees, name)
+    _age(store.snapshots / name, store.trees)
+    run, _log = _command_line(store, tmp_path)
+    with store.script["_tree_lock"](store.trees, name, exclusive=False):
+        applied = run("--apply")
+    refusal = "tree lock held by a launcher, a snapshot capture or a prune"
+    assert (applied.returncode, json.loads(applied.stdout)) == (2, _outcome(refused={name: refusal}))
+    assert (store.snapshots / name / "snapshot.json").is_file()
+
+
+def test_command_line_prints_sorted_json_queries_slurm_and_exits_two_on_a_refusal(store: _Store, tmp_path: Path) -> None:
+    name = _snapshot(store.storage, "1")
+    _age(store.snapshots / name)
+    run, log = _command_line(store, tmp_path)
 
     report = run()
     assert (report.returncode, json.loads(report.stdout)) == (0, _outcome(orphans=[name], bytes=_size(store.snapshots / name)))

@@ -2,7 +2,8 @@
 
 Responsibilities:
   - Check evaluation preparation, nested restore rollback, work accounting, and schema admission
-  - Check that every stage selects checkpoints on whole autonomous trajectories
+  - Check that every stage selects checkpoints on whole autonomous trajectories, and that a finite rollout whose
+    standardized final state overflows is an incomplete case
   - Check that the teacher-forced state loss equals the group-weighted Train-scaled increment error
   - Check RNO training on consecutive trajectory windows with a rest window, truncated gradients, warm Stage-B starts,
     and the carried one-step view
@@ -211,11 +212,7 @@ def test_every_stage_selects_checkpoints_on_the_whole_autonomous_trajectory(monk
     ) -> Any:
         assert (model_kind, initial_hidden, capture, require_finite) == ("fno", None, (), False)
         teacher_windows.append((float(window.t_n[0, 0]), window.rollout_length))
-        return SimpleNamespace(
-            normalized_prediction=window.t_n[:, :, None, None, None].expand(-1, -1, 4, 1, 1),
-            physical_prediction=window.next_state,
-            captured_hidden={},
-        )
+        return SimpleNamespace(physical_prediction=window.t_n[:, :, None, None, None].expand(-1, -1, 4, 1, 1), captured_hidden={})
 
     monkeypatch.setattr(adapter_module, "teacher_forced_rollout", teacher)
     monkeypatch.setattr(adapter_module, "autonomous_rollout", self_fed)
@@ -225,10 +222,10 @@ def test_every_stage_selects_checkpoints_on_the_whole_autonomous_trajectory(monk
 
     assert self_fed_lengths == [8]
     assert views.processed_target_transitions == 8
-    assert views.normalized_prediction.shape[1] == 8
+    assert views.physical_prediction.shape[1] == 8
     # The one-step view covers every transition in memory-bounded chunks, in order.
     assert teacher_windows == [(0.0, 3), (3.0, 3), (6.0, 2)]
-    assert torch.equal(views.one_step_normalized_prediction[0, :, 0, 0, 0], torch.arange(8, dtype=torch.float32))
+    assert torch.equal(views.one_step_physical_prediction[0, :, 0, 0, 0], torch.arange(8, dtype=torch.float32))
     assert views.one_step_physical_prediction.shape == views.physical_target.shape
 
 
@@ -397,6 +394,38 @@ def test_rno_stage_a_trains_consecutive_windows_with_the_carried_state(monkeypat
     assert torch.allclose(views.physical_prediction, autonomous.physical_prediction)
     assert torch.allclose(views.one_step_physical_prediction, full.physical_prediction)
     assert not torch.allclose(views.physical_prediction, views.one_step_physical_prediction)
+
+
+class _FlaggedIncrement(torch.nn.Module):
+    """Predict the scaled increment 2e38 in every state channel of the rows whose fifth input channel is 1, none where it is 0."""
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return 2.0e38 * value[:, 4:5].expand(-1, 4, -1, -1)
+
+
+def test_a_finite_rollout_whose_standardized_final_state_overflows_is_an_incomplete_case() -> None:
+    """
+    With a Train scale of 1e-7, two increments of 2e38 leave case 0 at the finite states 2e31 and 4e31.
+
+    The first state standardizes to 2e38 and is fed back; the final one overflows float32 when standardized,
+    so case 0 is incomplete although its physical rollout is finite, and case 1, without increments, is complete.
+    """
+    scale = 1.0e-7
+    adapter: Any = _adapter_with_fake_tensorizer()
+    _stage_a(adapter, MatchedComputeController(arm="A0", stage="stage_a_teacher_forcing", config_digest=_digest("overflow")))
+    # The autonomous input flags case 0 (sample number 0) only; the teacher-forced inputs flag every row.
+    adapter.tensorizer = SimpleNamespace(
+        scaling=SimpleNamespace(device=torch.device("cpu"), encode_state=lambda value: value / scale),
+        assemble_step=lambda state, _static, _boundary, scalars, _time: torch.cat((state / scale, (1.0 - scalars[:, :1]).view(-1, 1, 1, 1)), dim=1),
+        reconstruct_next_state_diagnostic=lambda state, delta: (state + delta * scale, delta * scale),
+        tensorize=lambda raw: raw["batch"],
+    )
+
+    views = adapter.evaluation_step(_FlaggedIncrement(), _trajectory_batch(length=2, increments=torch.zeros(2, 2)))
+
+    assert views.physical_prediction.isfinite().all()
+    assert views.physical_prediction[0, :, 0, 0, 0].tolist() == pytest.approx([2.0e31, 4.0e31], rel=1e-6)
+    assert views.case_complete.tolist() == [False, True]
 
 
 def _window_loss_and_gradient(carried: float, weight: float, cumulative_inputs: tuple[float, ...]) -> tuple[float, float]:

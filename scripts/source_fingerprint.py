@@ -3,9 +3,11 @@
 Responsibilities:
   - Hash tracked changes against HEAD and untracked source contents
   - Capture immutable source snapshots of clean or dirty trees and restore them for reproduction
+  - Hold one shared tree lock from a snapshot capture until the tree or record that refers to the snapshot is published
   - Materialize and verify read-only source trees restored from snapshots
   - Record job leases on source trees and prune trees that no queued or running job uses
-  - Report orphan source snapshots and delete them only with --apply, on a quiet cluster and under each tree lock
+  - Report orphan source snapshots and delete them only with --apply, on a quiet cluster and under each tree lock,
+    with the one storage reference search started under these locks
   - Expose fingerprint, restore, materialize, materialize-snapshot, verify-tree, lease, prune, and prune-snapshots command-line operations
 
 Design principles:
@@ -27,8 +29,11 @@ Notes:
     <commit12>-<fingerprint12>/ is one read-only tree named like its snapshot,
     whose manifest must carry that same commit and fingerprint;
     .leases/<tree_id>/<lease_id> are empty lease files for a Slurm job ID;
-    .locks/<tree_id>.lock serializes reuse and leasing (shared) against
-    pruning (exclusive, rechecked under the lock);
+    .locks/<tree_id>.lock serializes a capture until its tree or record is
+    published, tree reuse, restore and leasing (shared) against tree and
+    snapshot pruning (exclusive and never waiting: a held lock keeps the entry;
+    rechecked under the lock); it protects only processes that use the same
+    trees_root;
     .staging-<tree_id>-<suffix>/ is an unpublished restore. Files and
     directories lose all write bits, and verification compares their modes
     with write bits masked.
@@ -742,7 +747,7 @@ def _set_tree_write(root: Path, *, writable: bool) -> None:
 
 @contextlib.contextmanager
 def _tree_lock(trees_root: Path, tree_id: str, *, exclusive: bool, blocking: bool = True) -> Iterator[None]:
-    """Hold the per-tree lock: shared while a tree is reused or leased, exclusive while pruning decides and deletes.
+    """Hold the per-tree lock: shared to capture, restore, reuse or lease, exclusive while pruning decides and deletes.
 
     Without ``blocking`` a lock held elsewhere raises _LockHeldError instead of waiting; a symlinked lock file or
     ``.locks`` raises OSError.
@@ -824,13 +829,44 @@ def _authenticated_snapshot_commit(snapshot: Path) -> str:
     return commit
 
 
+@contextlib.contextmanager
+def held_source_snapshot(root: Path, destination_root: Path, trees_root: Path) -> Iterator[dict[str, str]]:
+    """
+    Capture the source snapshot under its shared tree lock and hold the lock while the caller uses the receipt.
+
+    Snapshot pruning deletes only under the exclusive lock of the same name, so neither a fresh nor a reused
+    snapshot can vanish between its capture and the tree or storage record that refers to it, provided the caller
+    publishes that tree or record inside this context and the prune uses the same ``trees_root``: a capture under
+    another runtime root locks another file. The lock is taken before capturing, for the name of the source
+    state seen then; a source that changes before the capture finishes fails closed. The caller must not take
+    this tree lock again inside the context: on NFS, flock becomes a POSIX lock, and an inner release drops it.
+
+    Raises
+    ------
+    RuntimeError
+        If the source changes between naming the lock and finishing the capture.
+
+    """
+    root = root.resolve()
+    head = _git(root, "rev-parse", "HEAD", capture_output=True, text=True).stdout.strip()
+    name = f"{head[:_SNAPSHOT_NAME_PART_LENGTH]}-{source_fingerprint(root)[:_SNAPSHOT_NAME_PART_LENGTH]}"
+    with _tree_lock(trees_root, name, exclusive=False):
+        receipt = capture_source_snapshot(root, destination_root)
+        if Path(receipt["snapshot_path"]).parent.name != name:
+            message = "Generation source changed while its snapshot was captured."
+            raise RuntimeError(message)
+        yield receipt
+
+
 def materialize_source_tree(repository: Path, snapshot_root: Path, trees_root: Path) -> dict[str, str]:
     """
     Return the verified read-only source tree of the repository's current code state.
 
     The state is captured as a snapshot (clean or dirty) and restored once into
     ``trees_root/<commit12>-<fingerprint12>``. An existing tree is verified and
-    reused, never repaired or overwritten.
+    reused, never repaired or overwritten. One shared tree lock is held from the
+    capture through the reuse or publication of the tree, so a snapshot prune
+    cannot delete the snapshot in between.
 
     Parameters
     ----------
@@ -857,8 +893,8 @@ def materialize_source_tree(repository: Path, snapshot_root: Path, trees_root: P
         If the source changes while it is captured.
 
     """
-    receipt = capture_source_snapshot(repository, snapshot_root)
-    return _publish_tree(repository, Path(receipt["snapshot_path"]), trees_root)
+    with held_source_snapshot(repository, snapshot_root, trees_root) as receipt:
+        return _publish_tree(repository, Path(receipt["snapshot_path"]), trees_root)
 
 
 def materialize_snapshot_tree(repository: Path, snapshot_path: Path, trees_root: Path) -> dict[str, str]:
@@ -868,7 +904,8 @@ def materialize_snapshot_tree(repository: Path, snapshot_path: Path, trees_root:
     Unlike :func:`materialize_source_tree` this never captures the repository's
     current state: it restores the recorded snapshot, for example to continue a
     unit bound to an older code state whose tree was pruned. The repository only
-    supplies the snapshot's base commit.
+    supplies the snapshot's base commit. The reuse or restore and publication run
+    under the snapshot's shared tree lock.
 
     Parameters
     ----------
@@ -896,24 +933,21 @@ def materialize_snapshot_tree(repository: Path, snapshot_path: Path, trees_root:
     if snapshot_path.name != "snapshot.json" or snapshot_path.is_symlink() or not snapshot_path.is_file():
         message = f"Source snapshot manifest is missing or unsafe: {snapshot_path}"
         raise FileNotFoundError(message)
-    return _publish_tree(repository, snapshot_path, trees_root)
+    with _tree_lock(trees_root, snapshot_path.parent.name, exclusive=False):
+        return _publish_tree(repository, snapshot_path, trees_root)
 
 
 def _publish_tree(repository: Path, snapshot_path: Path, trees_root: Path) -> dict[str, str]:
-    """Reuse the verified tree of one snapshot or restore and publish it atomically."""
+    """Reuse the verified tree of one snapshot or restore and publish it atomically, under the caller's shared tree lock."""
     snapshot_root = snapshot_path.parent.parent
     tree_id = snapshot_path.parent.name
     _authenticated_snapshot_commit(snapshot_path)
-    trees_root.mkdir(parents=True, exist_ok=True)
     tree = trees_root / tree_id
-    reused = False
-    with _tree_lock(trees_root, tree_id, exclusive=False):
-        if tree.exists() or tree.is_symlink():
-            if not tree.is_symlink():
-                os.utime(tree)  # mark the reused tree as recent under the lock, so a waiting prune rechecks and keeps it
-            verify_source_tree(tree, snapshot_root)
-            reused = True
-    if not reused:
+    if tree.exists() or tree.is_symlink():
+        if not tree.is_symlink():
+            os.utime(tree)  # mark the reused tree as recent under the lock, so a waiting prune rechecks and keeps it
+        verify_source_tree(tree, snapshot_root)
+    else:
         staging = trees_root / f"{_STAGING_PREFIX}{tree_id}-{secrets.token_hex(4)}"
         try:
             restore_source_snapshot(repository, snapshot_path, staging)
@@ -921,14 +955,13 @@ def _publish_tree(repository: Path, snapshot_path: Path, trees_root: Path) -> di
         except BaseException:
             _discard_directory(staging)
             raise
-        with _tree_lock(trees_root, tree_id, exclusive=False):
-            try:
-                staging.rename(tree)
-            except OSError:
-                _discard_directory(staging)
-                if tree.is_symlink() or not tree.is_dir():
-                    raise
-                verify_source_tree(tree, snapshot_root)  # another process published the same tree first
+        try:
+            staging.rename(tree)
+        except OSError:
+            _discard_directory(staging)
+            if tree.is_symlink() or not tree.is_dir():
+                raise
+            verify_source_tree(tree, snapshot_root)  # another process published the same tree first
     manifest = json.loads(snapshot_path.read_bytes())
     return {
         "tree_id": tree_id,
@@ -990,6 +1023,9 @@ def prune_source_trees(
     """
     Delete source trees that no known job uses and that nobody touched recently.
 
+    The prune never waits, because launchers run it before every launch: a tree
+    or staging directory whose lock another process holds is kept for a later prune.
+
     Parameters
     ----------
     trees_root : Path
@@ -1020,10 +1056,14 @@ def prune_source_trees(
         if entry.name.startswith(_STAGING_PREFIX):
             if active_job_ids is None:
                 continue
-            # Under the tree's exclusive lock, which a prune holds while it discards its own quarantine of that tree.
+            # Under the tree's exclusive lock, which a prune holds while it discards its own quarantine of that tree and a
+            # launcher holds shared while it restores into a staging directory; a held lock leaves it to a later prune.
             tree_id = entry.name.removeprefix(_STAGING_PREFIX).rpartition("-")[0]
-            with _tree_lock(trees_root, tree_id, exclusive=True) if _TREE_ID_PATTERN.fullmatch(tree_id) else contextlib.nullcontext():
-                if entry.is_dir() and entry.stat().st_mtime < cutoff:  # a concurrent prune may have removed it meanwhile
+            with (
+                contextlib.suppress(_LockHeldError),
+                _tree_lock(trees_root, tree_id, exclusive=True, blocking=False) if _TREE_ID_PATTERN.fullmatch(tree_id) else contextlib.nullcontext(),
+            ):
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:  # a concurrent prune may have removed it after the listing
                     _discard_directory(entry)
                     removed.append(entry.name)
             continue
@@ -1033,8 +1073,13 @@ def prune_source_trees(
             kept.append(entry.name)
             continue
         # Decide and delete under the exclusive tree lock, so a launcher that reuses or leases the tree meanwhile is seen.
-        with _tree_lock(trees_root, entry.name, exclusive=True):
-            if not entry.is_dir():  # a concurrent prune removed it while this one waited for the lock
+        with contextlib.ExitStack() as held:
+            try:
+                held.enter_context(_tree_lock(trees_root, entry.name, exclusive=True, blocking=False))
+            except _LockHeldError:  # launchers prune before every launch, so a lock held elsewhere keeps the tree instead of waiting
+                kept.append(entry.name)
+                continue
+            if not entry.is_dir():  # a concurrent prune removed it after the listing
                 continue
             lease_directory = trees_root / _LEASES_DIRNAME / entry.name
             leases = sorted(lease_directory.iterdir()) if lease_directory.is_dir() else []
@@ -1216,14 +1261,20 @@ def _remove_snapshot(snapshots_root: Path, name: str, inode: int) -> None:
 
 def _delete_orphans(
     outcome: dict[str, Any],
-    snapshots_root: Path,
+    storage_root: Path,
     trees_root: Path,
     plans: dict[str, _EntryPlan],
+    needles: dict[str, tuple[bytes, bytes]],
     scheduler: Callable[[], tuple[bool | None, bool | None]],
     cutoff_ns: int,
     budget: _Budget,
 ) -> None:
-    """Delete each orphan under its exclusive tree lock after conditions b to e and its scanned plan hold again."""
+    """Lock the candidates, search the storage records once, and delete each unreferenced one whose b to e and plan hold again.
+
+    Every candidate's exclusive tree lock is tried before the search starts, so a manifest that a Dataset published before
+    it released its shared lock is found; the apply path therefore walks the storage records once, on the shared budget.
+    """
+    snapshots_root = storage_root / _SNAPSHOTS_DIRNAME
     locks = trees_root / _LOCKS_DIRNAME
     missing = [name for name in plans if not os.path.lexists(locks / f"{name}.lock")]
     if missing:  # created like a launcher creates them; as recent activity (d) they defer the deletion to a later quiet run
@@ -1232,7 +1283,8 @@ def _delete_orphans(
             directory = os.open(locks, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
             try:
                 for name in missing:
-                    os.close(os.open(f"{name}.lock", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o666, dir_fd=directory))
+                    with contextlib.suppress(FileExistsError):  # a launcher or another prune created it meanwhile
+                        os.close(os.open(f"{name}.lock", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o666, dir_fd=directory))
             finally:
                 os.close(directory)
         except OSError as error:
@@ -1240,10 +1292,25 @@ def _delete_orphans(
         else:
             outcome["skipped"] = "lock files created; deletion in a later quiet run"
         return
-    for name, plan in plans.items():
-        snapshot = snapshots_root / name
+    with contextlib.ExitStack() as held:
+        locked: list[str] = []
         try:
-            with _tree_lock(trees_root, name, exclusive=True, blocking=False):
+            for name in plans:
+                with contextlib.suppress(_LockHeldError):  # a held lock leaves the candidate out of the deletion
+                    held.enter_context(_tree_lock(trees_root, name, exclusive=True, blocking=False))
+                    locked.append(name)
+            referenced = _referenced(storage_root, needles, budget)
+            budget.spend()  # the deadline once more before the result is accepted
+        except (OSError, ValueError, _SnapshotPruneStopError) as error:  # as in the report, a check that cannot be made ends the run
+            outcome["blocked"] = str(error)
+            return
+        for name in sorted(set(plans) - set(locked) - referenced):
+            outcome["refused"][name] = "tree lock held by a launcher, a snapshot capture or a prune"
+        for name in locked:
+            if name in referenced:  # a storage record names it, so it is no orphan
+                continue
+            snapshot = snapshots_root / name
+            try:
                 _require_quiet_scheduler(scheduler)
                 trees, newest = _trees_state(trees_root, budget)
                 if newest > cutoff_ns:
@@ -1251,20 +1318,18 @@ def _delete_orphans(
                 if name in trees:
                     _invalid(f"a tree of this name exists in {trees_root}")
                 _snapshot_digest(snapshot, budget)
-                if _entry_plan(snapshot, budget) != plan:
+                if _entry_plan(snapshot, budget) != plans[name]:
                     _invalid("snapshot changed since the scan")
                 budget.spend()  # no removal starts after the deadline
-                _remove_snapshot(snapshots_root, name, plan["."][1])
-        except _LockHeldError:
-            outcome["refused"][name] = "tree lock held by a launcher or a prune"
-        except ValueError as error:  # this snapshot changed since the scan, or a tree of its name appeared
-            outcome["refused"][name] = str(error)
-        except (OSError, _SnapshotPruneStopError) as stop:  # a check that cannot be made, or a routine reason, ends the run
-            outcome["skipped" if isinstance(stop, _SnapshotPruneStopError) and stop.routine else "blocked"] = str(stop)
-            break
-        else:
-            outcome["orphans"].append(name)
-            outcome["bytes"] += _plan_bytes(plan)
+                _remove_snapshot(snapshots_root, name, plans[name]["."][1])
+            except ValueError as error:  # the snapshot changed since the scan, or a tree of its name appeared
+                outcome["refused"][name] = str(error)
+            except (OSError, _SnapshotPruneStopError) as stop:  # a check that cannot be made, or a routine reason, ends the run
+                outcome["skipped" if isinstance(stop, _SnapshotPruneStopError) and stop.routine else "blocked"] = str(stop)
+                break
+            else:
+                outcome["orphans"].append(name)
+                outcome["bytes"] += _plan_bytes(plans[name])
 
 
 def prune_source_snapshots(
@@ -1303,10 +1368,13 @@ def prune_source_snapshots(
 
     Notes
     -----
-    With ``apply`` a missing lock file is created and nothing is deleted in that
-    run; each deletion takes the exclusive tree lock without waiting and checks
-    the tree, scheduler, recency and ``snapshot.json`` conditions and the scanned
-    plan again. An entry replaced inside the snapshot between that check and the
+    With ``apply`` a missing lock file of a candidate is created, or accepted when
+    a launcher or another prune creates it meanwhile, and nothing is deleted in
+    that run; otherwise the run tries the exclusive tree lock of every
+    candidate without waiting, then searches the storage records once, and before
+    each deletion checks the tree, scheduler, recency and ``snapshot.json``
+    conditions and the scanned plan again. Without ``apply`` the search takes no
+    lock. An entry replaced inside the snapshot between that check and the
     removal is removed with it: a window under the exclusive lock, on a quiet
     cluster, after the quiet window without change. The folder is removed under a private
     name ``.prune-<name>-<token>``; one left by a crash is reported as defective.
@@ -1322,6 +1390,7 @@ def prune_source_snapshots(
     cutoff_ns = int((now - _SNAPSHOT_QUIET_SECONDS) * 1_000_000_000)
     plans: dict[str, _EntryPlan] = {}
     digests: dict[str, str] = {}
+    needles: dict[str, tuple[bytes, bytes]] = {}  # each candidate's folder name and full fingerprint, as a record would name it
     orphans: list[str] = []
     try:
         if storage_root.is_symlink() or snapshots_root.is_symlink() or not snapshots_root.is_dir():
@@ -1345,19 +1414,21 @@ def prune_source_snapshots(
             if newest > cutoff_ns:
                 _stop(f"{trees_root} changed within the last {_SNAPSHOT_QUIET_TEXT}", routine=True)
             _require_quiet_scheduler(scheduler)
-            referenced = _referenced(storage_root, {name: (name.encode(), digest.encode()) for name, digest in candidates.items()}, budget)
-            budget.spend()  # the deadline once more before the result is accepted
-            orphans = sorted(set(candidates) - referenced)
+            needles = {name: (name.encode(), digest.encode()) for name, digest in candidates.items()}
+            if not apply:  # with apply, the one search runs under the candidates' exclusive locks
+                referenced = _referenced(storage_root, needles, budget)
+                budget.spend()  # the deadline once more before the result is accepted
+                orphans = sorted(set(candidates) - referenced)
     except _SnapshotPruneStopError as stop:
         outcome["skipped" if stop.routine else "blocked"] = str(stop)
         return outcome
     except (OSError, ValueError) as error:  # an unreadable folder, or a storage record that is no regular file or too large
         outcome["blocked"] = str(error)
         return outcome
-    if apply:
-        _delete_orphans(outcome, snapshots_root, trees_root, {name: plans[name] for name in orphans}, scheduler, cutoff_ns, budget)
-    else:
+    if not apply:
         outcome.update(orphans=orphans, bytes=sum(_plan_bytes(plans[name]) for name in orphans))
+    elif needles:
+        _delete_orphans(outcome, storage_root, trees_root, {name: plans[name] for name in needles}, needles, scheduler, cutoff_ns, budget)
     return outcome
 
 

@@ -21,7 +21,7 @@ _LABELS = {"id": "ID", "parameter_ood": "Parameter OOD", "material_ood": "Materi
 
 
 def _item(material: str, group: str) -> selection.DatasetItem:
-    return selection.DatasetItem((material, group), material, group, selection.dataset_label(material, _LABELS[group]))
+    return selection.DatasetItem((material, group), material, group, selection.dataset_label(material, group))
 
 
 def _inventory(*, poolable: bool = True) -> selection.DatasetInventory:
@@ -30,13 +30,13 @@ def _inventory(*, poolable: bool = True) -> selection.DatasetInventory:
         group_order=selection.EVALUATION_GROUP_ORDER,
         group_labels=_LABELS,
         poolable=poolable,
-        unavailable=[(_item("lentil", "parameter_ood"), "keine gemeinsamen Fälle in run b")],
+        unavailable=[(_item("lentil", "parameter_ood"), "no shared cases in run b")],
     )
 
 
 def test_labels_name_the_material_and_group_with_spaces_for_underscores() -> None:
-    assert selection.dataset_label("lentil", "ID") == "lentil, ID"
-    assert selection.dataset_label("kidney_bean", "Material OOD") == "kidney bean, Material OOD"
+    assert selection.dataset_label("lentil", "id") == "Lentil, ID"
+    assert selection.dataset_label("kidney_bean", "material_ood") == "Kidney bean, Material OOD"
 
 
 def test_separate_choices_follow_group_and_inventory_order_not_selection_order() -> None:
@@ -45,7 +45,7 @@ def test_separate_choices_follow_group_and_inventory_order_not_selection_order()
 
     choices = selection.resolve_choices(inventory, selected, pooled=False)
 
-    assert [choice.label for choice in choices] == ["lentil, ID", "kidney bean, ID", "lentil, Material OOD"]
+    assert [choice.label for choice in choices] == ["Lentil, ID", "Kidney bean, ID", "Lentil, Material OOD"]
     assert all(choice.available and len(choice.items) == 1 for choice in choices)
     assert choices[0].members == (("lentil", "id"),)
 
@@ -56,10 +56,10 @@ def test_pooled_choice_merges_a_group_and_names_how_many_materials_it_holds() ->
     partial = selection.resolve_choices(inventory, [("lentil", "id"), ("chickpea", "id"), ("lentil", "material_ood")], pooled=True)
     everything = selection.resolve_choices(inventory, [item.key for item in inventory.items], pooled=True)
 
-    assert [choice.label for choice in partial] == ["ID, 2 von 3 Materialien", "lentil, Material OOD"]
+    assert [choice.label for choice in partial] == ["ID, 2 of 3 materials", "Lentil, Material OOD"]
     assert partial[0].members == (("lentil", "id"), ("chickpea", "id"))
-    assert [choice.label for choice in everything] == ["ID, alle Materialien", "lentil, Material OOD"]
-    assert [choice.label for choice in selection.resolve_choices(inventory, [("chickpea", "id")], pooled=True)] == ["chickpea, ID"]
+    assert [choice.label for choice in everything] == ["ID, all materials", "Lentil, Material OOD"]
+    assert [choice.label for choice in selection.resolve_choices(inventory, [("chickpea", "id")], pooled=True)] == ["Chickpea, ID"]
 
 
 def test_a_pooled_label_counts_the_unavailable_materials_of_its_group() -> None:
@@ -68,12 +68,12 @@ def test_a_pooled_label_counts_the_unavailable_materials_of_its_group() -> None:
         group_order=selection.EVALUATION_GROUP_ORDER,
         group_labels=_LABELS,
         poolable=True,
-        unavailable=[(_item("kidney_bean", "id"), "keine gemeinsamen Fälle in run b")],
+        unavailable=[(_item("kidney_bean", "id"), "no shared cases in run b")],
     )
 
     choices = selection.resolve_choices(inventory, [item.key for item in inventory.items], pooled=True)
 
-    assert [choice.label for choice in choices] == ["ID, 2 von 3 Materialien"]  # never «alle» while a material of the group is unavailable
+    assert [choice.label for choice in choices] == ["ID, 2 of 3 materials"]  # never «all» while a material of the group is unavailable
 
 
 def test_a_choice_refuses_items_of_another_group() -> None:
@@ -87,7 +87,7 @@ def test_unavailable_items_stay_apart_and_are_never_pooled() -> None:
 
     choices = selection.resolve_choices(inventory, [("lentil", "id"), refused], pooled=True)
 
-    assert [(choice.label, choice.available) for choice in choices] == [("lentil, ID", True), ("lentil, Parameter OOD", False)]
+    assert [(choice.label, choice.available) for choice in choices] == [("Lentil, ID", True), ("Lentil, Parameter OOD", False)]
     assert refused not in {item.key for item in inventory.items}
 
 

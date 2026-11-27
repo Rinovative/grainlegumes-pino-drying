@@ -63,23 +63,21 @@ class UnitLossTask(Protocol):
 @dataclass(frozen=True, slots=True)
 class AdapterEvaluationViews:
     """
-    Return aligned normalized and physical evidence for metric accumulation.
+    Return aligned physical evidence for metric accumulation.
 
     The primary views drive checkpoint selection. The one-step views predict the
     same targets with every transition started from its reference state and feed
     the one-step guardrail, a diagnostic. ``case_complete`` ``[B]`` marks the cases
-    whose autonomous prediction is finite over the whole trajectory; an incomplete
-    case holds its non-finite evidence and NaN after its stop. ``bound_violations``
-    maps every state channel to the batch's diagnostic of finite autonomous values
-    outside the task's physical bounds: row-aligned with the batch, each case's
-    physical time in hours of its first violation (``None`` without one).
+    whose autonomous prediction and its standardized view are finite over the whole
+    trajectory; an incomplete case holds its non-finite evidence and NaN after its
+    stop. ``bound_violations`` maps every state channel to the batch's diagnostic
+    of finite autonomous values outside the task's physical bounds: row-aligned
+    with the batch, each case's physical time in hours of its first violation
+    (``None`` without one).
     """
 
-    normalized_prediction: torch.Tensor
-    normalized_target: torch.Tensor
     physical_prediction: torch.Tensor
     physical_target: torch.Tensor
-    one_step_normalized_prediction: torch.Tensor
     one_step_physical_prediction: torch.Tensor
     sample_count: int
     processed_target_transitions: int

@@ -7,12 +7,15 @@ Responsibilities:
   - Keep schedule state out of a teacher handoff source, so a continuation inherits only optimizer state
   - Validate the unit sampler's epoch order and committed group position as the exact continuation point
   - Validate checkpoint identity before mutating runtime objects
-  - Admit a continuation source only in the SIF it was produced in, native only natively; reading admits a
-    native and a container checkpoint alike
+  - Admit a checkpoint only in the numerical environment it was produced in, a continuation source in its SIF too
+    (native only natively) while reading admits a native and a container checkpoint alike, and refuse another
+    environment as an environment error when every other identity field matches
   - Carry the committed training-work counts across resume; the global step equals their optimizer steps
   - Validate the objective history: a finite value exactly at eligible validation points, the best among them
   - Record a stage's divergence in its terminal last checkpoint, so a resume finalizes it instead of training on
-  - Publish best and last checkpoints through atomic replacement, a new best together with its last
+  - Publish best and last checkpoints through atomic replacement, a new best together with its last; a failed write
+    before their renames keeps the previous pair and stays an ``OSError``, also one torch hides in its archive writer,
+    while a failure between their renames, which leaves a pair no resume admits, is terminal
   - Declare the per-task model projection and the training projection that includes it
   - Bind run identity to the producer digests a resolved config records, never to the running code
 
@@ -21,7 +24,7 @@ Design principles:
   - ``best_checkpoint.pt`` is the inference and artifact source; it carries the full state only
     as the matched-A0 teacher handoff source and evaluation state otherwise
   - Resume continues at the saved update-group boundary, an epoch end or inside an epoch
-  - Missing, extra, or mismatched state fails closed before runtime restoration
+  - Missing, extra, or mismatched state fails closed before runtime restoration; an unreadable file is a contract error
 
 This module does NOT:
   - Allocate run directories, choose resume policy, or validate mutable run status
@@ -33,6 +36,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import io
 import json
 import math
 import os
@@ -61,6 +65,9 @@ if TYPE_CHECKING:
 CheckpointRole = Literal["best", "last"]
 CheckpointPayloadKind = Literal["full", "evaluation"]
 CHECKPOINT_SCHEMA_KIND = "experiment_training_checkpoint"
+# The RuntimeError text torch's CPU allocator raises when the host refuses an allocation: CAFFE_ENFORCE in
+# c10/core/impl/alloc_cpu.cpp (torch/lib/libc10.so), verified in the installed torch 2.4.1.
+_CPU_ALLOCATOR_OUT_OF_MEMORY: Final = "DefaultCPUAllocator: can't allocate memory"
 _SHA256_LENGTH: Final = 64
 _CHECKPOINT_IDENTITY_KEYS: Final = frozenset(
     {
@@ -270,6 +277,10 @@ _CONTINUATION_KEYS: Final = frozenset(
         "divergence",
     }
 )
+
+
+class ResumeEnvironmentError(ValueError):
+    """Refuse a checkpoint in another numerical environment than its producing one, which admits it; resuming binds the image too."""
 
 
 def _selected_config_mapping(
@@ -534,8 +545,20 @@ def _validate_objective(value: Any, *, label: str) -> dict[str, Any]:
     return copy.deepcopy(dict(objective))
 
 
-def _validate_checkpoint_identity(value: Any, *, label: str) -> dict[str, Any]:
-    """Validate one current dependency-scoped checkpoint identity."""
+def validate_checkpoint_identity(value: Any, *, label: str) -> dict[str, Any]:
+    """
+    Validate one current dependency-scoped checkpoint identity and return an isolated copy.
+
+    The one schema of the identity every checkpoint carries and every finished run summary records for its producer.
+
+    Raises
+    ------
+    TypeError
+        If the identity, a nested mapping, the task or an objective field has the wrong type.
+    ValueError
+        If its keys, digests, roles, numerical environment, objective or identity contract differ from the schema.
+
+    """
     identity = _required_mapping(value, label=label)
     keys = set(identity)
     if keys != _CHECKPOINT_IDENTITY_KEYS:
@@ -657,7 +680,7 @@ def build_checkpoint_identity(
     memberships = split.membership_digests()
     ood_roles = datasets.preprocessing.splits.OOD_SPLIT_ROLES
     persisted = dict(persisted_config or config)
-    return _validate_checkpoint_identity(
+    return validate_checkpoint_identity(
         {
             "identity_contract_sha256": TRAINING_IDENTITY_CONTRACT_DIGEST,
             "task": task,
@@ -872,7 +895,7 @@ def make_checkpoint(
         msg = f"Checkpoint capture requires one concrete CPU or CUDA torch.device, got {runtime_device!r}."
         raise TypeError(msg)
 
-    validated_identity = _validate_checkpoint_identity(identity, label="identity")
+    validated_identity = validate_checkpoint_identity(identity, label="identity")
     adapter_state: dict[str, Any] | None = None
     if adapter is not None:
         raw_adapter_state = adapter.state_dict()
@@ -979,9 +1002,10 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     adapter_expected : bool, optional
         Require task-owned adapter continuation evidence in the checkpoint.
     resume : bool, optional
-        Admit the checkpoint as a continuation source: its ``sif_sha256`` must equal
-        the expected one exactly, ``None`` (native) matching only ``None``. Otherwise
-        a native and a container identity are compared without their SIF digest.
+        Admit the checkpoint as a continuation source: its numerical environment must
+        equal the expected one exactly, ``sif_sha256`` ``None`` (native) matching only
+        ``None``. Otherwise a native and a container identity are compared without
+        their SIF digest.
 
     Returns
     -------
@@ -995,6 +1019,10 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     ValueError
         If schema, identity, role, progress, best selection, or component presence
         contradicts the expected run contract.
+    ResumeEnvironmentError
+        A ``ValueError`` if a checkpoint that matches every other identity field was
+        produced in another numerical environment, for a continuation source its image
+        included: the environment, not the checkpoint, differs.
 
     Notes
     -----
@@ -1030,24 +1058,26 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     if adapter_expected and not isinstance(payload["adapter_state_dict"], Mapping):
         msg = "Transient checkpoint adapter_state_dict must be a mapping."
         raise TypeError(msg)
-    identity = _validate_checkpoint_identity(payload["identity"], label="identity")
-    expected = _validate_checkpoint_identity(expected_identity, label="expected identity")
+    identity = validate_checkpoint_identity(payload["identity"], label="identity")
+    expected = validate_checkpoint_identity(expected_identity, label="expected identity")
     comparison_identity = copy.deepcopy(identity)
     comparison_expected = copy.deepcopy(expected)
-    saved_sif = comparison_identity["numerical_environment"]["sif_sha256"]
-    actual_sif = comparison_expected["numerical_environment"]["sif_sha256"]
-    if saved_sif != actual_sif:
-        # A run continues only in the container it was produced in, the rule of the history's identity digest.
-        if resume:
-            msg = "Exact resume requires the producing SIF identity in the actual training environment; a native run resumes only natively."
-            raise ValueError(msg)
-        # Reading admits a native and a container run alike; two different containers stay incompatible.
-        if actual_sif is None or saved_sif is None:
-            comparison_identity["numerical_environment"]["sif_sha256"] = None
-            comparison_expected["numerical_environment"]["sif_sha256"] = None
+    saved_environment = comparison_identity.pop("numerical_environment")
+    actual_environment = comparison_expected.pop("numerical_environment")
+    incompatible = "Checkpoint run identity is incompatible with config, task, dataset, split, normalizer, or objective state."
+    # Every other field is the run's own identity: a difference there contradicts the run, whatever its environment.
     if comparison_identity != comparison_expected:
-        msg = "Checkpoint run identity is incompatible with config, task, dataset, split, normalizer, or objective state."
-        raise ValueError(msg)
+        raise ValueError(incompatible)
+    # Reading admits a native and a container run alike; two different containers stay apart.
+    if not resume and None in (saved_environment["sif_sha256"], actual_environment["sif_sha256"]):
+        saved_environment["sif_sha256"] = actual_environment["sif_sha256"] = None
+    differing = ", ".join(key for key in sorted(saved_environment) if saved_environment[key] != actual_environment[key])
+    if differing:
+        # A checkpoint is admitted only in the numerical environment it was produced in, a continuation source in its
+        # container too, the rule of the history's identity digest: the environment differs, and the producing one admits it.
+        use, rule = ("Exact resume", "a native run resumes only natively") if resume else ("Reading", "a native and a container run read alike")
+        msg = f"{use} requires the producing numerical environment, which differs in {differing}; {rule}."
+        raise ResumeEnvironmentError(msg)
 
     completed_epoch = payload["completed_epoch"]
     global_step = payload["global_step"]
@@ -1215,6 +1245,16 @@ def save_checkpoints(*publications: tuple[Mapping[str, Any], Path | str]) -> Non
         Complete best- or last-checkpoint mappings with their exact role-qualified
         paths, in rename order.
 
+    Raises
+    ------
+    OSError
+        If a write fails before the first rename, also inside the archive torch writes, which
+        torch reports as a ``RuntimeError`` with that ``OSError`` in its context: every
+        destination keeps its previous checkpoint.
+    RuntimeError
+        If anything ends the publication between its first and its last rename: the replaced
+        checkpoint disagrees with the kept one (a best newer than its last), which no resume admits.
+
     Notes
     -----
     Every payload is first published atomically to its fixed staged sibling
@@ -1222,17 +1262,34 @@ def save_checkpoints(*publications: tuple[Mapping[str, Any], Path | str]) -> Non
     a failure before the renames leaves every destination unchanged. A handled
     failure removes all staged files; a crash leaves at most one staged file per
     destination, which ``discard_staged_checkpoints`` removes before the next run.
+    A failure between the renames does not restore the previous pair; it is terminal.
 
     """
     staged = [(_staged_path(Path(path)), Path(path)) for _payload, path in publications]
+    renamed = 0
     try:
         for (payload, _path), (temporary, _final) in zip(publications, staged, strict=True):
             common.serialization.atomic_torch_save(dict(payload), temporary)
         for temporary, final in staged:
             temporary.replace(final)
-    except BaseException:
+            renamed += 1
+    except BaseException as error:
         with suppress(OSError):  # a failed cleanup must not replace the publication error
             discard_staged_checkpoints(*(final for _temporary, final in staged))
+        if 0 < renamed < len(staged):
+            msg = (
+                f"{staged[renamed - 1][1].name} was replaced but {staged[renamed][1].name} was not, so they disagree "
+                f"and no resume admits them: {type(error).__name__}: {error}"
+            )
+            raise RuntimeError(msg) from error
+        # torch's archive writer reports a failed write as a RuntimeError ("unexpected pos") with the OSError in its context.
+        written: BaseException | None = error if isinstance(error, Exception) else None
+        seen: set[int] = set()
+        while written is not None and not isinstance(written, OSError) and id(written) not in seen:
+            seen.add(id(written))
+            written = written.__cause__ or written.__context__
+        if isinstance(written, OSError) and written is not error:
+            raise type(written)(*written.args) from error
         raise
     if staged:
         _fsync_directory(staged[-1][1].parent)
@@ -1288,12 +1345,38 @@ def load_checkpoint(
     dict[str, Any]
         Fully validated checkpoint mapping.
 
+    Raises
+    ------
+    FileNotFoundError
+        If the checkpoint is absent.
+    ValueError
+        If its bytes are no readable checkpoint (empty, truncated or other content), or by :func:`validate_checkpoint`.
+    OSError
+        If reading the file fails: the job's environment, not the checkpoint, ended the load.
+    MemoryError
+        If decoding runs out of CPU memory, also as torch's CPU allocator reports it: the job's environment as well.
+
+    Notes
+    -----
+    The file is read whole before ``torch.load`` decodes it, so every other decoding failure reads as an unreadable
+    checkpoint.
+
     """
     checkpoint_path = Path(path)
     if not checkpoint_path.is_file():
         msg = f"Required {expected_role} checkpoint not found: {checkpoint_path}"
         raise FileNotFoundError(msg)
-    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    # A failed read or allocation is the job's environment; once the bytes are read, whatever else ends their decoding is content.
+    content = checkpoint_path.read_bytes()
+    try:
+        payload = torch.load(io.BytesIO(content), map_location="cpu", weights_only=False)
+    except MemoryError:
+        raise
+    except Exception as error:
+        if isinstance(error, RuntimeError) and _CPU_ALLOCATOR_OUT_OF_MEMORY in str(error):
+            raise MemoryError(str(error)) from error
+        msg = f"Checkpoint is unreadable: {checkpoint_path}."
+        raise ValueError(msg) from error
     if not isinstance(payload, Mapping):
         msg = f"Checkpoint must contain a mapping: {checkpoint_path}"
         raise TypeError(msg)

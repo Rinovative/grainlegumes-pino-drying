@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Build dropdowns, toggles, checkboxes, one-line choice groups, and action buttons sized from their full text
-  - Provide the shared control vocabularies (error mode, scale mode, kappa scale, scope, display stride, channel, scale lock)
+  - Provide the shared control vocabularies (error mode, scale mode, kappa scale, scope, clock, display stride, channel, scale lock)
   - Keep direct channel checkboxes whose rebinding retains valid choices and names removed ones
   - Show one wrapping status line, one failure display with a collapsed traceback, and guard busy actions
   - Measure, label-align, and round every element to whole grid columns
@@ -41,7 +41,7 @@ ActionKind = Literal["open", "close", "export", "compute"]
 Option = str | tuple[str, Any]
 
 LEVELS: Final[tuple[Level, ...]] = ("normal", "warning", "error")
-COMPUTE_LABEL: Final = "Berechnen"
+COMPUTE_LABEL: Final = "Compute"
 ACTION_LABELS: Final = ("Close", "Export PDF", "Export GIF", COMPUTE_LABEL)
 
 _LOGGER = logging.getLogger(__name__)
@@ -269,6 +269,11 @@ def scope_group(value: Literal["aggregate", "single"] = "aggregate") -> widgets.
     return choice_group((("Aggregate", "aggregate"), ("Single case", "single")), value=value)
 
 
+def clock_group(value: Literal["phase", "hours"]) -> widgets.ToggleButtons:
+    """Return the clock choice of a time view pooled over several cases: the drying phase or hours."""
+    return choice_group((("Drying phase", "phase"), ("Hours", "hours")), value=value)
+
+
 def display_stride_dropdown() -> widgets.Dropdown:
     """Return the presentation-only map sampling choice; the full grid stays in the data."""
     return dropdown((("Auto", "auto"), ("Full", 1), ("Stride 2", 2), ("Stride 4", 4)), description="Display stride", value="auto")
@@ -293,7 +298,7 @@ def action_button(label: str, *, kind: ActionKind) -> widgets.Button:
     """
     Return an action button: open primary, close danger, export neutral, compute primary.
 
-    Close, Export PDF, Export GIF and Berechnen share one width; an open button carries the panel title and is as wide
+    Close, Export PDF, Export GIF and Compute share one width; an open button carries the panel title and is as wide
     as that title, rounded to the grid.
     """
     if kind not in _BUTTON_STYLES:

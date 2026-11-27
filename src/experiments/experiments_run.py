@@ -4,22 +4,34 @@ Responsibilities:
   - Allocate fresh run leaves exclusively and transition explicit statuses
   - Derive stable labeled seeds and set the process numerics (TF32, cuDNN autotuning, determinism) in one place early
   - Derive each stage's budget: steady and A0 in seen units, B in K x N supervised transitions, A1 in B's receipt
-  - Admit every B and A1 attempt only on its pair's one GPU model
+  - Admit every B and A1 attempt only on its pair's one GPU model, and B's recorded device evidence in every admission
   - Persist immutable run inputs and mutable lifecycle outputs atomically
   - Record every attempt in runtime_sessions: device, driver, precision, and at its end its seconds and committed work
   - Derive the run's total and attempted seconds from its attempts and refuse to continue an earlier attempt schema
-  - Enforce allowed resume config changes and exact last-checkpoint continuation, admitting the history read-only
-    before the attempt changes the run
+  - Enforce allowed resume config changes and exact last-checkpoint continuation: admit the saved config, checkpoints
+    and history read-only before the writer lease and again under it, and restore the last checkpoint in full before
+    the attempt's first write, so a continuation that ends before it changes nothing in the run; one its persisted state
+    or pinned inputs refuse is offered for no rerun, and one the job's environment ends before its attempt reported is
+    marked for the command's rerun line
+  - Read the job's Slurm provenance once, before any check of a run's state, as the job's environment
+  - Record the producer's checkpoint identity in every finished summary and bind a finished run's history to it;
+    without a checkpoint, bind its numerical environment to the runtime session of the attempt that ended the run
   - Refuse continuing or reusing a run, and handing an A0 to B or A1, when its recorded training code is not current
-  - Continue an interrupted run when a start names it, its full saved identity matches and its source binding admits the job
-  - Validate the completed/loadable contract consumed by inference and artifacts
+  - Continue an interrupted run when a start names it, its full saved identity matches and its source binding admits the job;
+    report a finished one, also an unsuccessful one, once the finished-run admission of a matched leaf admits it
+  - Replace in place, by its own start command, a single run or matched stage of the same science, training digest
+    included, whose attempt ended before its first checkpoint, decided by one read-only admission before the writer
+    lease and again under it; ``--resume`` refuses it
+  - Validate the completed/loadable contract consumed by inference and artifacts, with the history of either task
   - Free a finished Optuna trial's checkpoints with its terminal summary and validate such a trial without them
   - Merge caller-owned terminal status and evidence into the one terminal summary of every run and trial
 
 Design principles:
   - A start that names an existing run continues it only when its saved science matches; anything else is refused
   - A finished run is never extended: budget, k and schedule belong to its identity and name
-  - KeyboardInterrupt and SystemExit end as interrupted; a failure to record a failure never replaces the primary error
+  - KeyboardInterrupt and SystemExit end as interrupted, so do an OSError of a started attempt's own history,
+    checkpoint or receipt-copy write and host memory exhausted after its start; a failure to record a failure never
+    replaces the primary error
   - A run last executed by a Slurm job in one source tree is continued only in that tree unless the job switched explicitly
   - Config, split, and normalizer artifacts are immutable after fresh creation
   - Best and last checkpoints have distinct enforced lifecycle roles and config-derived payload kinds
@@ -40,12 +52,14 @@ import os
 import random
 import re
 import shutil
+import stat
 import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -105,7 +119,8 @@ RUN_STATUSES = frozenset(
 )
 _TERMINAL_RUN_STATUSES = RUN_STATUSES.difference({"initializing", "running"})
 # A failure may end a run before or after it starts running; only training reaches completed or unsuccessful.
-_FAILURE_RUN_STATUSES = _TERMINAL_RUN_STATUSES.difference({"completed", "unsuccessful"})
+_FINISHED_RUN_STATUSES = frozenset({"completed", "unsuccessful"})
+_FAILURE_RUN_STATUSES = _TERMINAL_RUN_STATUSES.difference(_FINISHED_RUN_STATUSES)
 _PRUNED_RUN_STATUSES = frozenset({"pruned", "nonfinite_pruned", "oom_pruned"})
 _TRANSITIONS: dict[str | None, frozenset[str]] = {
     None: frozenset({"initializing"}),
@@ -134,6 +149,9 @@ _TRAINING_CONTINUATION_REMEDY = "finish it in its bound source tree or start a n
 # Caller facts merged into a terminal summary: called with the result before the completed transition (a raise
 # fails the run) and with the error on the guarded failure path, always before a trial's best checkpoint goes.
 TerminalEvidence = Callable[[str, Mapping[str, Any] | BaseException], Mapping[str, Any]]
+# How a failed matched stage's leaf goes on, by its read-only recovery check (:func:`_matched_failed_stage_recovery`): its
+# checks pass, it is finished, its persisted state refuses, or the job's environment ended the check.
+StageRecovery = Literal["resumable", "finished", "refused", "environment"]
 
 
 class RunLifecycleError(RuntimeError):
@@ -150,6 +168,20 @@ class SourceBindingError(RunLifecycleError):
     """Report an implicit switch of a run or study to another frozen source tree."""
 
 
+class ContinuationRefusedError(RunLifecycleError):
+    """
+    Report a continuation that the run's persisted state refuses before its attempt changed the run.
+
+    The same command is refused again until that state is resolved, so no rerun is offered; so is a finished B whose leaf
+    holds another receipt than it publishes. A failure of the job's environment there (device or GPU type, image, Slurm
+    provenance, an active writer, I/O, out of memory) keeps its own type.
+    """
+
+
+class UnpublishedReceiptError(OSError):
+    """Report a finished B whose receipt the job's environment kept it from publishing; its plan's B step publishes it."""
+
+
 class ExistingRunAdmissionError(FileExistsError):
     """Carry a read-only fail-closed report for a rejected fresh-run collision."""
 
@@ -162,24 +194,24 @@ class ExistingRunAdmissionError(FileExistsError):
 class MatchedStageExecutionError(RuntimeError):
     """Keep the failed matched leaf and read-only recovery evidence with its cause."""
 
-    def __init__(self, stage: str, run_dir: Path, *, resumable: bool, reason: str) -> None:
+    def __init__(self, stage: str, run_dir: Path, *, recovery: StageRecovery, reason: str) -> None:
         """Capture the exact failed branch and verified recovery classification."""
         super().__init__(f"Matched stage {stage} failed at {run_dir}.")
         self.stage = stage
         self.run_dir = run_dir
-        self.resumable = resumable
+        self.recovery = recovery
         self.recovery_reason = reason
 
 
 class MatchedStageInterrupted(KeyboardInterrupt):
     """Preserve exit-130 interrupt semantics with an exact matched leaf."""
 
-    def __init__(self, stage: str, run_dir: Path, *, resumable: bool, reason: str) -> None:
+    def __init__(self, stage: str, run_dir: Path, *, recovery: StageRecovery, reason: str) -> None:
         """Capture the interrupted branch and verified recovery classification."""
         super().__init__(f"Matched stage {stage} interrupted at {run_dir}.")
         self.stage = stage
         self.run_dir = run_dir
-        self.resumable = resumable
+        self.recovery = recovery
         self.recovery_reason = reason
 
 
@@ -235,6 +267,172 @@ def run_writer_lease(
     except common.locking.FileLockUnavailableError as error:
         msg = f"Run already has an active writer lease: {path}"
         raise RunLifecycleError(msg) from error
+
+
+def _writer_lease_is_held(run_dir: Path) -> bool:
+    """
+    Return whether another writer holds the run, by a probe that creates no lock file.
+
+    A lock marker that exists but is no regular file is the run's stored state, which a rerun in another allocation meets
+    again: it refuses the continuation (:func:`_refused_by_state`). Any other failed probe is the job's environment.
+    """
+    lock_path = _run_writer_lock_path(run_dir)
+    try:
+        return common.locking.file_lock_is_active(lock_path)
+    except OSError as error:
+        if stat.S_ISREG(lock_path.lstat().st_mode):
+            raise
+        with _refused_by_state():
+            msg = f"Run writer lock marker exists but is no regular file: {lock_path}"
+            raise RunLifecycleError(msg) from error
+
+
+def _require_no_active_writer(run_dir: Path) -> None:
+    """Refuse a run that another writer holds before its state is read, by a probe that creates no lock file."""
+    if _writer_lease_is_held(run_dir):
+        msg = f"Run already has an active writer lease: {run_dir}"
+        raise RunLifecycleError(msg)
+
+
+@contextmanager
+def _refused_by_state() -> Iterator[None]:
+    """
+    Raise the one ``ContinuationRefusedError`` when a check of the run's persisted state refuses a continuation.
+
+    It wraps only such checks, so what they raise is that state, or an input it pins, contradicting the continuation:
+    a missing, conflicting or unreadable file (an empty checkpoint, a config that is no YAML or a writer lock marker that
+    is no regular file), a status, history, checkpoint, summary or config that contradicts it, also the request's, a
+    training-digest drift, a Dataset that contradicts the saved split, a last checkpoint that does not restore, A0, B or
+    their parent record refusing the stage, an identity another run directory owns or another source tree. The job's
+    environment keeps its own error: another numerical environment, image included, than the producing one, CUDA out
+    of memory (a ``RuntimeError``) and any other ``OSError``. A refusal raised inside passes unchanged.
+    """
+    try:
+        yield
+    except (learning.training.checkpoint.ResumeEnvironmentError, torch.cuda.OutOfMemoryError, ContinuationRefusedError):
+        raise
+    except (ValueError, TypeError, KeyError, RuntimeError, FileNotFoundError, FileExistsError) as error:
+        message = (
+            "The continuation was refused before its attempt started, so the run is unchanged: "
+            f"{type(error).__name__}: {console.sanitized_exception_message(error)}"
+        )
+        raise ContinuationRefusedError(message) from error
+
+
+def _first_unsafe_dataset_path(config: Mapping[str, Any]) -> Path | None:
+    """
+    Return the first pinned Dataset path in its manifest reader's order that exists but is no real folder or regular file.
+
+    The training Dataset's folder, manifest and payload come first, then each material-OOD Dataset's, each checked by
+    ``lstat``, which follows no symbolic link. The first absent path ends the scan with ``None``, as it ended the read, so
+    no later path decides; any other failed ``lstat`` is the job's environment and raises.
+    """
+    files = (common.paths.DATASET_MANIFEST_FILENAME, common.paths.get_dataset_payload_filename(str(config["task"])))
+    for directory in config_loader.pinned_dataset_dirs(config):
+        for path, is_kind in ((directory, stat.S_ISDIR), *((directory / name, stat.S_ISREG) for name in files)):
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                return None
+            if not is_kind(mode):
+                return path
+    return None
+
+
+@contextmanager
+def _refused_by_pinned_datasets(config: Mapping[str, Any]) -> Iterator[None]:
+    """
+    Refuse a continuation whose Datasets contradict its saved split or scaling, while Datasets the job cannot read keep their error.
+
+    The Datasets' contract checks, the saved split's and scaling's included, raise ``ValueError`` or ``TypeError``, which
+    :func:`_refused_by_state` turns into the refusal; a manifest that lacks a key or an item its schema reads is refused
+    naming the manifests (:func:`config_loader.admit_pinned_datasets`). Any other ``LookupError``, such as of a payload's
+    or shard's content, is malformed Dataset content, refused by its type and message and the pinned Datasets' folders.
+    The first pinned Dataset path in its reader's order that is absent or unsafe decides a ``FileNotFoundError``: one that
+    exists but is no real folder or regular file, such as a symbolic link, which the manifest reader reports as missing, is
+    refused naming it, by ``lstat`` as :func:`_writer_lease_is_held` classifies its marker. A read that failed is the job's
+    environment, like any other error: an absent path, as behind an unavailable mount (``FileNotFoundError``), or an I/O
+    error that a reader reports as an unreadable file (its ``OSError`` cause). It wraps the continuation's loaders and the
+    resume admission's check of its pinned Datasets by their steps, so a matched stage's recovery check refuses what its
+    rerun refuses.
+    """
+    try:
+        yield
+    except LookupError as error:
+        folders = " or ".join(map(str, config_loader.pinned_dataset_dirs(config)))
+        with _refused_by_state():
+            msg = f"Dataset content is malformed: {type(error).__name__}: {error}, in {folders}."
+            raise ValueError(msg) from error
+    except FileNotFoundError as error:
+        unsafe = _first_unsafe_dataset_path(config)
+        if unsafe is None:
+            raise
+        with _refused_by_state():
+            msg = f"Dataset path exists but is no real folder or regular file: {unsafe}."
+            raise ValueError(msg) from error
+    except (ValueError, TypeError) as error:
+        cause = error.__cause__
+        while cause is not None and not isinstance(cause, OSError):
+            cause = cause.__cause__
+        if cause is not None:
+            raise
+        with _refused_by_state():
+            raise
+
+
+@contextmanager
+def _unstarted_continuation() -> Iterator[None]:
+    """
+    Mark an end by the job's environment before a continuation's attempt reports, so the command prints its rerun.
+
+    It wraps a continuation's admission, a finished matched leaf's included, where no console reporter exists yet, and the
+    job's Slurm provenance, which the command reads before any run's state. A refusal by that state is the one ``ContinuationRefusedError`` and stays
+    unmarked; any other exception there, an interrupt aside, is the job's environment: the run is unchanged, and a rerun
+    in a matching allocation continues it (:func:`unstarted_by_environment`).
+    """
+    try:
+        yield
+    except ContinuationRefusedError:
+        raise
+    except Exception as error:
+        with suppress(Exception):
+            error.unstarted_by_environment = True  # type: ignore[attr-defined]
+        raise
+
+
+def unstarted_by_environment(error: BaseException) -> bool:
+    """Return whether the job's environment ended a continuation before its attempt reported, leaving the run unchanged."""
+    return getattr(error, "unstarted_by_environment", False) is True
+
+
+def partly_replaced(error: BaseException) -> bool:
+    """Return whether the job's environment ended a replacement midway, which may have changed its leaf partly; its start replaces it."""
+    return getattr(error, "partly_replaced", False) is True
+
+
+@contextmanager
+def _own_persistence() -> Iterator[None]:
+    """Mark an ``OSError`` of a started attempt's own persistence outside its training loop, its history's read included, as the job's environment."""
+    try:
+        yield
+    except OSError as error:
+        error.interrupted_by_environment = True  # type: ignore[attr-defined]
+        raise
+
+
+def interrupted_by_environment(error: BaseException | None) -> bool:
+    """
+    Return whether the job's environment interrupted a started attempt, which leaves its last checkpoint intact.
+
+    That is an ``OSError`` of the attempt's own persistence: its history and checkpoint writes in the training loop
+    (``learning.training.loop.PERSISTENCE_PHASES``), its history reconciliation's read and write and A1's receipt copy
+    (:func:`_own_persistence`), each write replacing one file atomically; and host memory exhausted after the attempt
+    started (a ``MemoryError``, such as A1 decoding its best after its terminal last), marked by the attempt. The
+    report, the run's status and a matched stage's advice all read this one classification; the rerun continues.
+    """
+    return getattr(error, "interrupted_by_environment", False) is True or (
+        isinstance(error, OSError) and getattr(error, "training_phase", None) in learning.training.loop.PERSISTENCE_PHASES
+    )
 
 
 def _utc_now() -> str:
@@ -787,7 +985,7 @@ def read_run_summary(run_dir: Path | str) -> dict[str, Any]:
     try:
         with path.open(encoding="utf-8") as stream:
             payload = json.load(stream)
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         msg = f"Run summary is invalid JSON: {path}: {error}"
         raise RunLifecycleError(msg) from error
     if not isinstance(payload, dict):
@@ -814,6 +1012,7 @@ def _transition_run_status_locked(
     *,
     updates: Mapping[str, Any] | None = None,
     keep_trial_best: bool = False,
+    anew: bool = False,
 ) -> dict[str, Any]:
     """
     Atomically transition summary.json through the explicit run state machine.
@@ -828,6 +1027,8 @@ def _transition_run_status_locked(
         Additional JSON-safe summary fields.
     keep_trial_best : bool, optional
         Keep a trial's best checkpoint at its terminal status, because its evidence was not recorded.
+    anew : bool, optional
+        Start the state machine anew, as in a fresh leaf, replacing the summary of a replaced leaf in one atomic write.
 
     Returns
     -------
@@ -838,7 +1039,7 @@ def _transition_run_status_locked(
     summary_path = common.paths.resolve_run_summary_path(run_dir)
     current: dict[str, Any] = {}
     current_status: str | None = None
-    if summary_path.exists():
+    if summary_path.exists() and not anew:
         current = read_run_summary(run_dir)
         raw_status = current.get("status")
         if not isinstance(raw_status, str):
@@ -1031,7 +1232,14 @@ def inspect_existing_run_admission(
     *,
     config_path: Path | str,
 ) -> dict[str, Any]:
-    """Build a lightweight read-only lifecycle and resume-compatibility report."""
+    """
+    Build a lightweight read-only lifecycle and resume-compatibility report.
+
+    What the run's files hold, a missing file and a writer lock marker that is no regular file included, becomes the
+    report's reason. Any other ``OSError``, also of the writer probe, is the job's environment, which leaves the run
+    unchanged: it propagates instead of making the run incompatible. A finished run, completed or unsuccessful, is
+    ``completed``: its rerun reports it once the finished-run admission passed (:func:`_existing_run_continuation`).
+    """
     path = Path(run_dir).expanduser().resolve(strict=False)
     summary_path = common.paths.resolve_run_summary_path(path)
     config_file = common.paths.resolve_run_config_path(path)
@@ -1051,8 +1259,8 @@ def inspect_existing_run_admission(
 
     try:
         summary = read_run_summary(path)
-    except (OSError, RunLifecycleError) as error:
-        issues.append(str(error))
+    except (FileNotFoundError, RunLifecycleError) as error:
+        issues.append(console.sanitized_exception_message(error))
     else:
         raw_status = summary.get("status")
         if isinstance(raw_status, str) and raw_status:
@@ -1063,7 +1271,8 @@ def inspect_existing_run_admission(
         if type(raw_completed) is int and raw_completed >= 0:
             completed_epoch = raw_completed
 
-    missing_resume = common.paths.missing_resume_run_files(path)
+    # A finished run is never resumed: the finished-run admission of its rerun decides which of its files it needs.
+    missing_resume = () if status in _FINISHED_RUN_STATUSES else common.paths.missing_resume_run_files(path)
     if missing_resume:
         issues.append("Missing resume state: " + ", ".join(item.name for item in missing_resume) + ".")
     if status == "completed" and completed_epoch is None:
@@ -1079,25 +1288,25 @@ def inspect_existing_run_admission(
             existing_config_digest = run_identity.resolved_config_digest(saved_config)
             _require_current_training(saved_config, unit=f"Run {path}")
             validate_resume_config(requested_config, saved_config)
-        except (OSError, KeyError, TypeError, ValueError) as error:
-            issues.append(str(error))
+        except (FileNotFoundError, KeyError, TypeError, ValueError) as error:
+            # One bounded line: the report's reason is the command's rejection line.
+            issues.append(console.sanitized_exception_message(error))
 
     lock_state: bool | None
     try:
-        lock_state = common.locking.file_lock_is_active(_run_writer_lock_path(path))
-    except OSError as error:
+        lock_state = _writer_lease_is_held(path)
+    except ContinuationRefusedError as error:
         lock_state = None
-        issues.append(f"Active writer state could not be verified: {error}")
-
-    if lock_state is True:
+        issues.append(console.sanitized_exception_message(error.__cause__ or error))
+    if lock_state:
         compatibility = "blocked"
         reason = "An active writer lease already owns this run."
     elif issues:
         compatibility = "incompatible"
         reason = issues[0]
-    elif status == "completed":
+    elif status in _FINISHED_RUN_STATUSES:
         compatibility = "completed"
-        reason = "The existing run is already completed, at its budget end or after a divergence."
+        reason = "The existing run already finished: completed, at its budget end or after a divergence, or unsuccessful."
     elif status not in {"running", "interrupted"}:
         compatibility = "incompatible"
         reason = f"Lifecycle status {status!r} is not eligible for explicit checkpoint resume."
@@ -1160,6 +1369,19 @@ def _validate_resume_output_root(
         raise ValueError(msg)
 
 
+def _initial_summary(config: Mapping[str, Any], summary_extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return the fields of a fresh leaf's initializing summary, also of a replaced one."""
+    return {
+        "task": str(config["task"]),
+        "run_name": str(config["run"]["name"]),
+        "objective": dict(config["evaluation"]["objective"]),
+        # Every summary records its attempts from creation, so a resume admits only the current history schema.
+        "runtime_sessions": [],
+        "duration_contract": copy.deepcopy(RUN_DURATION_CONTRACT),
+        **dict(summary_extra or {}),
+    }
+
+
 def _prepare_fresh_run_locked(
     config: Mapping[str, Any],
     *,
@@ -1174,22 +1396,11 @@ def _prepare_fresh_run_locked(
     lease. If initialization fails after allocation, it best-effort publishes a
     terminal failure while preserving the original exception.
     """
-    task = str(config["task"])
-    run_name = str(config["run"]["name"])
     destination = Path(run_dir) if run_dir is not None else common.paths.resolve_config_run_dir(config)
     with run_registry.reserve(config, destination):
         allocated = allocate_run_directory(destination)
-    initial = {
-        "task": task,
-        "run_name": run_name,
-        "objective": dict(config["evaluation"]["objective"]),
-        # Every summary records its attempts from creation, so a resume admits only the current history schema.
-        "runtime_sessions": [],
-        "duration_contract": copy.deepcopy(RUN_DURATION_CONTRACT),
-        **dict(summary_extra or {}),
-    }
     try:
-        transition_run_status(allocated, "initializing", updates=initial)
+        transition_run_status(allocated, "initializing", updates=_initial_summary(config, summary_extra))
         config_loader.save_yaml(dict(config), common.paths.resolve_run_config_path(allocated))
     except BaseException as error:
         if common.paths.resolve_run_summary_path(allocated).is_file():
@@ -1376,11 +1587,16 @@ def _terminal_budget_evidence(budget: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _failure_status(error: BaseException, resolver: Callable[[BaseException], str] | None) -> str:
-    """Return ``interrupted`` for an interrupt, otherwise the caller's admitted failure status or ``failed``."""
+    """
+    Return ``interrupted`` for an interrupt, otherwise the resolver's admitted status or ``failed``.
+
+    Without a resolver an attempt the job's environment interrupted is ``interrupted`` too (:func:`interrupted_by_environment`);
+    an Optuna trial's resolver decides every other end, because its study records the same status.
+    """
     if isinstance(error, (KeyboardInterrupt, SystemExit)):
         return "interrupted"
     if resolver is None:
-        return "failed"
+        return "interrupted" if interrupted_by_environment(error) else "failed"
     try:
         status = resolver(error)
     except BaseException as secondary:  # noqa: BLE001 -- a broken classifier, even an interrupt in it, must not replace the run's own failure
@@ -1446,6 +1662,63 @@ def _history_binding(config: Mapping[str, Any], identity: Mapping[str, Any], las
     }
 
 
+def _admit_resume_checkpoints(
+    run_dir: Path,
+    config: Mapping[str, Any],
+    *,
+    persisted_config: Mapping[str, Any],
+    split_indices: Mapping[str, Any],
+    last_path: Path,
+) -> None:
+    """
+    Admit a continuation's checkpoints read-only: its last checkpoint, a best checkpoint that agrees with it, and its history.
+
+    The one checkpoint pre-check of the resume admission (:func:`_admit_resolved_resume`) and of the
+    matched-stage recovery offer, after both admitted the saved config and its training digest. It needs
+    no data; the full restore of the last checkpoint needs the built runtime, so the attempt runs it
+    before its first write (:func:`_execute_prepared_run_locked`), and truncates the history records
+    ahead of the checkpoint only after it.
+    """
+    checkpoint = learning.training.checkpoint
+    identity = checkpoint.build_checkpoint_identity(
+        config,
+        split_indices,
+        normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
+        persisted_config=persisted_config,
+    )
+    scheduler_expected = config.get("scheduler") is not None
+    adapter_expected = config["task"] == "transient_drying"
+    last = checkpoint.load_checkpoint(
+        last_path,
+        expected_identity=identity,
+        expected_role="last",
+        payload_kind="full",
+        scheduler_expected=scheduler_expected,
+        require_best=False,
+        adapter_expected=adapter_expected,
+        resume=True,
+    )
+    best_path = common.paths.resolve_best_checkpoint_file(run_dir)
+    if last["best_metric"] is None:
+        if best_path.exists():
+            msg = "Resume run contains a best checkpoint that is inconsistent with last_checkpoint.pt."
+            raise RunLifecycleError(msg)
+    else:
+        best = checkpoint.load_checkpoint(
+            best_path,
+            expected_identity=identity,
+            expected_role="best",
+            payload_kind=checkpoint.best_payload_kind(config),
+            scheduler_expected=scheduler_expected,
+            require_best=True,
+            adapter_expected=adapter_expected,
+        )
+        if best["best_metric"] != last["best_metric"] or best["best_epoch"] != last["best_epoch"]:
+            msg = "Resume run best and last checkpoints disagree about selected objective state."
+            raise RunLifecycleError(msg)
+    learning.training.history.validate_resume_history(run_dir, **_history_binding(config, identity, last))
+
+
 def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
     config: dict[str, Any],
     *,
@@ -1460,6 +1733,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
     terminal_status_resolver: Callable[[BaseException], str] | None = None,
     terminal_evidence: TerminalEvidence | None = None,
     matched_receipt: Mapping[str, Any] | None = None,
+    identity_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Build and execute one fresh or continued run in an allocated leaf.
@@ -1469,10 +1743,20 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
     state remain authoritative when a requested observer fails closed.
 
     Fresh execution atomically publishes fitted normalizer and split artifacts.
-    Resume requires the identical admitted scaling and unchanged membership.
-    The helper owns status transitions, factories, checkpoint execution, terminal
-    digests, observer finalization, and the guarded failure publication while its
-    caller retains the exclusive writer lease.
+    Resume requires the identical admitted scaling and unchanged membership, and
+    builds its runtime, restores its last checkpoint in full and builds its start
+    entry before its first write, the running status. A continuation that ends
+    there leaves the run unchanged: one its persisted state refuses raises
+    ``ContinuationRefusedError`` and prints its reason without a rerun; one its
+    environment fails, or an interrupt ends, raises its own error and prints the
+    rerun in a matching allocation. A start that continues an existing run passes
+    its request as ``identity_binding``, whose binding the attempt repairs right
+    before that write. A matched A1 publishes its copy of B's receipt once its
+    attempt has started, so an A1 that ends before changes no run; a write of it
+    that the job's environment fails leaves the run interrupted. The helper owns
+    status transitions, factories, checkpoint execution, terminal digests, observer
+    finalization, and the guarded failure publication, after which it reports the
+    failure's next step, while its caller retains the exclusive writer lease.
     """
     attempt_started = time.monotonic()
     start_time = datetime.now(UTC)
@@ -1480,7 +1764,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
     # Filled by the training loop at its start and at every durable state, so an exceptional end still publishes the committed work.
     attempt_work = learning.training.loop.AttemptWork()
     budget: learning.training.budget.StageBudget | None = None
-    attempt_started_entry = False
+    started = False
     runtime_session_id = uuid.uuid4().hex
     tracker: tracking.WandbSession | None = None
     tracking_status = "failed"
@@ -1495,17 +1779,19 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
         study_name=str(summary_extra["study_name"]) if summary_extra and "study_name" in summary_extra else None,
         trial_number=int(summary_extra["trial_number"]) if summary_extra and "trial_number" in summary_extra else None,
     )
+    # The job's logs are linked into the folder named as their owner; a trial's logs belong to its study.
+    names_log_owner = not is_trial_config(config)
     try:
-        # Named before any check can fail the attempt, so a failed run keeps its logs; a trial's logs belong to its study.
-        if not is_trial_config(config):
+        # A fresh run is named before any check can fail it, so a failed run keeps its logs.
+        if names_log_owner and resume_from is None:
             common.paths.record_job_log_owner(run_dir)
         validate_deterministic_model_device_policy(config, device_resolution)
         device = _validated_runtime_device(config, device_resolution)
         seed_plan = build_seed_plan(int(config["run"]["seed"]), stage=_stage(config))
-        transition_run_status(
-            run_dir,
-            "running",
-            updates={
+
+        def start_updates() -> dict[str, Any]:
+            """Build the running status's updates with the attempt's start entry, whose runtime queries can still fail the attempt."""
+            return {
                 "started_at": start_time.isoformat(),
                 "operational_timing": copy.deepcopy(operational_timing),
                 "seed_plan": seed_plan,
@@ -1519,9 +1805,16 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                     session_id=runtime_session_id,
                     tracking_state=initial_tracking_state(config),
                 ),
-            },
-        )
-        attempt_started_entry = True
+            }
+
+        def start_attempt(updates: Mapping[str, Any]) -> None:
+            """Publish the running status with the attempt's start entry, the attempt's first change to the run."""
+            nonlocal started
+            transition_run_status(run_dir, "running", updates=updates)
+            started = True
+
+        if resume_from is None:
+            start_attempt(start_updates())
         configure_reproducibility(config, device=device)
         is_transient = config["task"] == "transient_drying"
         console_reporter.startup(resolved_device=str(device))
@@ -1546,25 +1839,28 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                     raise RunLifecycleError(message)  # noqa: TRY301
             else:
                 local_normalizer = common.paths.resolve_normalizer_path(run_dir)
-                handoff_manifest = transient_handoff.validate_local_teacher_handoff(
-                    run_dir / "teacher_handoff_manifest.json",
-                    local_normalizer_path=local_normalizer,
-                    target_config=config,
-                )
-                handoff_scaling = datasets.preprocessing.scaling.read_scaling_artifact(local_normalizer)
+                with _refused_by_state():
+                    handoff_manifest = transient_handoff.validate_local_teacher_handoff(
+                        run_dir / "teacher_handoff_manifest.json",
+                        local_normalizer_path=local_normalizer,
+                        target_config=config,
+                    )
+                    handoff_scaling = datasets.preprocessing.scaling.read_scaling_artifact(local_normalizer)
 
         def persist_split(resolved: Mapping[str, Any]) -> None:
             """Save exact Experiment membership before any scaler is fitted."""
             common.serialization.atomic_torch_save(dict(resolved), common.paths.resolve_split_indices_path(run_dir))
 
-        dataloaders = config_loader.create_dataloaders_from_config(
-            config,
-            split_indices=saved_split_indices,
-            scaling_artifact=handoff_scaling,
-            seed_plan=seed_plan,
-            startup_callback=console_reporter.startup_phase,
-            split_persist_callback=persist_split if resume_from is None else None,
-        )
+        # A continuation's Datasets are pinned inputs: one that contradicts its saved split or scaling refuses it.
+        with _refused_by_pinned_datasets(config) if resume_from is not None else nullcontext():
+            dataloaders = config_loader.create_dataloaders_from_config(
+                config,
+                split_indices=saved_split_indices,
+                scaling_artifact=handoff_scaling,
+                seed_plan=seed_plan,
+                startup_callback=console_reporter.startup_phase,
+                split_persist_callback=persist_split if resume_from is None else None,
+            )
         train_scaling = dataloaders["scaling"]
         split_indices = dataloaders["split_indices"]
 
@@ -1590,7 +1886,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             learning.models.factory.validate_transient_model_spatial_shape(config, train_scaling.spatial_shape)
         model = learning.models.factory.build_model(config, device=device)
         console_reporter.startup_phase("model_cuda_ready", {"device": str(device), "seconds": time.perf_counter() - model_started})
-        _update_runtime_session_locked(run_dir, runtime_session_id, learning.training.loop.attempt_precision(model), field="precision")
         # The relative H1 metrics of both tasks, the steady physics and the H1 data loss differentiate on the Train grid.
         grid_spacing = _grid_spacing(config, dataloaders["train"])
         train_loss = learning.losses.factory.build_training_loss(config, device=device, grid_spacing=grid_spacing)
@@ -1619,8 +1914,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 teacher_handoff=teacher_identity,
                 matched_receipt_sha256=(str(matched_receipt["receipt_sha256"]) if matched_receipt is not None else None),
             )
-            if matched_receipt is not None:
-                matched_budget.publish_b_receipt(run_dir, matched_receipt)
         else:
             loop_scaling = device_scaling
         eval_metrics = learning.metrics.metrics.build_evaluation_metrics(
@@ -1640,21 +1933,60 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
             persisted_config=persisted_config,
         )
+        train_sampler = learning.training.loop.train_unit_sampler(dataloaders["train"])
+        budget = _stage_budget(config, training_units=learning.training.loop.unit_evidence(train_sampler), matched_receipt=matched_receipt)
 
-        # Both tasks keep the history: a resume first reconciles it to the records its last checkpoint counts.
+        scheduler: learning.training.optim.LearningRateSchedule | None = None
         saved_last: dict[str, Any] | None = None
         if resume_from is not None:
-            saved_last = learning.training.checkpoint.load_checkpoint(
-                resume_from,
-                expected_identity=identity,
-                expected_role="last",
-                payload_kind="full",
-                scheduler_expected=scheduler_expected,
-                require_best=False,
-                adapter_expected=is_transient,
-                resume=True,
-            )
-        initial_history = learning.training.history.reconcile_history(run_dir, **_history_binding(config, identity, saved_last))
+            # A continuation restores no teacher handoff, so its schedule exists before the restore that loads its state.
+            scheduler = learning.training.optim.build_scheduler(optimizer, config, lr_scale=lr_scale)
+            # The full restore is the continuation's admission: a last checkpoint whose model, optimizer, schedule, strict loss,
+            # adapter, budget, sampler or RNG state does not restore is refused before the attempt's first write, while CUDA
+            # out of memory in it is the job's environment. The training loop restores it again right before its first group,
+            # so nothing in between shifts its RNG streams.
+            with _refused_by_state():
+                saved_last = learning.training.checkpoint.load_checkpoint(
+                    resume_from,
+                    expected_identity=identity,
+                    expected_role="last",
+                    payload_kind="full",
+                    scheduler_expected=scheduler_expected,
+                    require_best=False,
+                    adapter_expected=is_transient,
+                    resume=True,
+                )
+                learning.training.checkpoint.restore_checkpoint(
+                    saved_last,
+                    expected_identity=identity,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    loss=train_loss,
+                    train_loader=dataloaders["train"],
+                    budget=budget,
+                    adapter=adapter,
+                    adapter_expected=adapter is not None,
+                )
+            # The start entry, whose runtime queries (the CUDA driver version) can still fail the continuation, is built before
+            # the identity binding of a start that continues an existing run, the last step before the attempt's first write.
+            updates = start_updates()
+            if identity_binding is not None:
+                with _refused_by_state():
+                    run_registry.ensure_bound(identity_binding, run_dir)
+            start_attempt(updates)
+            # Named only now: the job's logs linked into a refused continuation would change it.
+            if names_log_owner:
+                common.paths.record_job_log_owner(run_dir)
+        _update_runtime_session_locked(run_dir, runtime_session_id, learning.training.loop.attempt_precision(model), field="precision")
+        # A write of the attempt's own files that the job's environment fails interrupts it, as in its training loop, and so
+        # does a failed read of the history; a missing or malformed history is the run's state, refused as a ValueError.
+        with _own_persistence():
+            if is_transient and matched_receipt is not None:
+                # A1's own copy only, compared read-only at admission.
+                matched_budget.publish_b_receipt(run_dir, matched_receipt)
+            # Both tasks keep the history: a resume reconciles it to the records its restored last checkpoint counts.
+            initial_history = learning.training.history.reconcile_history(run_dir, **_history_binding(config, identity, saved_last))
         history_callback = learning.training.history.make_epoch_state_callback(
             run_dir,
             task=str(config["task"]),
@@ -1733,11 +2065,9 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 loss=train_loss,
                 train_loader=dataloaders["train"],
             )
-        # Built after the handoff, so a continuation keeps A0's moments and step counters but not its rate.
-        scheduler = learning.training.optim.build_scheduler(optimizer, config, lr_scale=lr_scale)
-
-        train_sampler = learning.training.loop.train_unit_sampler(dataloaders["train"])
-        budget = _stage_budget(config, training_units=learning.training.loop.unit_evidence(train_sampler), matched_receipt=matched_receipt)
+        if resume_from is None:
+            # Built after the handoff, so a continuation keeps A0's moments and step counters but not its rate.
+            scheduler = learning.training.optim.build_scheduler(optimizer, config, lr_scale=lr_scale)
         console_reporter.startup_phase("training_start", {"updates_per_epoch": train_sampler.updates_per_epoch})
         result = learning.training.loop.train_loop(
             config=config,
@@ -1771,6 +2101,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             terminal: dict[str, Any] = {"terminal_controller": None} if adapter is None else _terminal_adapter_evidence(adapter)
             last_file = common.paths.resolve_last_checkpoint_file(run_dir)
             terminal_updates = {
+                "checkpoint_identity": copy.deepcopy(identity),
                 "completed_epoch": result["completed_epoch"],
                 "global_step": result["global_step"],
                 "training_work": dict(result["training_work"]),
@@ -1843,7 +2174,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 message = "Transient completion requires adapter and scaling evidence."
                 raise AssertionError(message)  # noqa: TRY301
             transient_completion_evidence = {
-                "checkpoint_identity": copy.deepcopy(identity),
                 "transient_scaling": copy.deepcopy(dict(transient_scaling_payload)),
                 "spatial_view": copy.deepcopy(dict(dataloaders["spatial_view"])),
                 **_terminal_adapter_evidence(adapter),
@@ -1880,6 +2210,8 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             "normalizer_sha256": common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
             "best_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_best_checkpoint_file(run_dir)),
             **last_checkpoint_evidence,
+            # The producer identity binds the history; a trial without checkpoints is admitted against it in any environment.
+            "checkpoint_identity": copy.deepcopy(identity),
             "effective_config_digest": identity["effective_config_digest"],
             "operational_timing": copy.deepcopy(operational_timing),
             "ended_at": end_time.isoformat(),
@@ -1902,19 +2234,27 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
         tracking_status = "completed"
         tracking_result = result
     except BaseException as error:
+        if started and isinstance(error, MemoryError):
+            # Host memory is the job's environment; the attempt's files stay as its last durable state left them.
+            with suppress(Exception):
+                error.interrupted_by_environment = True  # type: ignore[attr-defined]
         tracking_status, tracking_error = _failure_status(error, terminal_status_resolver), error
-        if tracking_enabled and tracker is None and not tracking_initialization_attempted:
+        # A continuation that ends before its attempt started changes nothing in the run, whether its persisted state refused
+        # it, the job's environment failed it or an interrupt ended it.
+        unstarted_continuation = resume_from is not None and not started
+        if tracking_enabled and tracker is None and not tracking_initialization_attempted and not unstarted_continuation:
             _record_tracking_never_started(
                 run_dir,
                 runtime_session_id,
                 error,
                 f"Local run {'was interrupted' if tracking_status == 'interrupted' else 'admission failed'} before tracking initialization.",
             )
-        # A pruned trial is a normal outcome that its study reports in one line.
-        if tracking_status not in _PRUNED_RUN_STATUSES:
-            console_reporter.failure(error, status=tracking_status)
+        if unstarted_continuation:
+            # A rerun repeats a state refusal, so its line advises none; after any other end it continues the unchanged run.
+            console_reporter.unstarted(error, refused=isinstance(error, ContinuationRefusedError))
+            raise
         ended: dict[str, Any] = {}
-        if attempt_started_entry:
+        if started:
             try:
                 ended = _ended_attempt_updates(run_dir, runtime_session_id, started=attempt_started, work=attempt_work, budget=budget)
             except BaseException as secondary:  # noqa: BLE001 -- the attempt's own failure must propagate; its start entry then stays unknown
@@ -1933,6 +2273,15 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 **({"training_work": {key: durable[key] for key in sorted(learning.training.checkpoint.TRAINING_WORK_KEYS)}} if durable else {}),
             },
         )
+        if tracking_status not in _PRUNED_RUN_STATUSES:
+            # A pruned trial is a normal outcome that its study reports in one line. The advice reads the published end: the
+            # same command restarts an interrupted run without a checkpoint only when its replacement admission admits it.
+            restarts = False
+            with suppress(Exception):
+                # The start's own leaf path, unresolved, as its admission checks it: run_dir has its links resolved.
+                leaf = common.paths.resolve_config_run_dir(config)
+                restarts = tracking_status == "interrupted" and _replaceable_leaf(leaf, config, matched_receipt=matched_receipt) is not None
+            console_reporter.failure(error, status=tracking_status, restarts=restarts)
         raise
     finally:
         if tracker is not None:
@@ -1963,10 +2312,6 @@ def execute_prepared_run(
     config: dict[str, Any],
     *,
     run_dir: Path,
-    persisted_config: Mapping[str, Any] | None = None,
-    saved_split_indices: dict[str, Any] | None = None,
-    restored_scaling_artifact: Mapping[str, Any] | None = None,
-    resume_from: Path | None = None,
     event_callback: Callable[[int, dict[str, float]], None] | None = None,
     summary_extra: Mapping[str, Any] | None = None,
     device_resolution: learning.device.DeviceResolution,
@@ -1974,25 +2319,14 @@ def execute_prepared_run(
     terminal_evidence: TerminalEvidence | None = None,
 ) -> dict[str, Any]:
     """
-    Execute a prepared fresh or resume run under its exclusive writer lease.
+    Execute a prepared fresh run under its exclusive writer lease.
 
     Parameters
     ----------
     config : dict[str, Any]
-        Fully resolved runtime config. On resume this may change only execution
-        settings (device policy, memory batch) while preserving the saved identity.
+        Fully resolved config that the prepared run leaf saved as its identity.
     run_dir : pathlib.Path
         Already initialized run leaf whose lifecycle this call exclusively owns.
-    persisted_config : Mapping[str, Any] | None, optional
-        Immutable saved config used for checkpoint identity. Defaults to
-        ``config`` for fresh execution.
-    saved_split_indices : dict[str, Any] | None, optional
-        Admitted saved membership reused while a run continues.
-    restored_scaling_artifact : Mapping[str, Any] | None, optional
-        Admitted saved scaling artifact (``normalizer.pt``) reused while a run continues.
-    resume_from : pathlib.Path | None, optional
-        Validated ``last_checkpoint.pt`` continuation source. ``None`` starts a
-        fresh training state.
     event_callback : Callable[[int, dict[str, float]], None] | None, optional
         Local authoritative callback invoked with the global step after every
         training event (validation point, epoch end, budget end), before the
@@ -2028,8 +2362,7 @@ def execute_prepared_run(
     Notes
     -----
     Fresh execution atomically publishes split and normalizer state before model
-    construction. Resume reuses those immutable artifacts and restores only the
-    last checkpoint. The best checkpoint remains the selected inference source.
+    construction. The best checkpoint remains the selected inference source.
     Local summary/checkpoint publication is authoritative. A failure in an
     explicitly requested online or offline W&B session during the run follows
     the tracking contract and fails the run. A W&B finish failure after the
@@ -2037,20 +2370,15 @@ def execute_prepared_run(
     end state unchanged.
 
     This is a lower-level service for callers that already prepared lifecycle
-    state. Normal CLI/notebook launches should prefer :func:`run_experiment`.
+    state, an Optuna trial. Normal CLI/notebook launches should prefer
+    :func:`run_experiment`, the only path that continues a run: its admission
+    reads the saved config, split and normalizer from the run itself.
 
     """
-    if resume_from is not None:
-        # The service boundaries guard their own resumes; this public entry continues persisted computation directly.
-        _require_current_training(config, unit=f"Run {run_dir}")
     with run_writer_lease(run_dir):
         return _execute_prepared_run_locked(
             config,
             run_dir=run_dir,
-            persisted_config=persisted_config,
-            saved_split_indices=saved_split_indices,
-            restored_scaling_artifact=restored_scaling_artifact,
-            resume_from=resume_from,
             event_callback=event_callback,
             summary_extra=summary_extra,
             device_resolution=device_resolution,
@@ -2208,36 +2536,23 @@ def validate_evaluable_run(run_dir: Path | str) -> dict[str, Any]:
         return admitted
 
 
-def _validate_transient_summary_evidence(
+def _admit_completed_history(
     run_dir: Path,
-    *,
-    summary: Mapping[str, Any],
     config: Mapping[str, Any],
-    normalizer_state: Any,
+    *,
     checkpoint_identity: Mapping[str, Any],
     completed_epoch: int,
     validations: Sequence[Mapping[str, Any]] | Sequence[int],
-) -> None:
+    global_step: object,
+) -> dict[str, Any]:
     """
-    Cross-check the summary's transient completion evidence and the training history against saved state.
+    Admit a finished run's ``history.json``, of either task, as exactly the records its checkpoint or terminal summary counts.
 
-    ``validations`` is the last checkpoint's objective history, or a trial's terminal-budget points
-    (:func:`learning.training.history.validate_completed_history`).
+    ``validations`` is the last checkpoint's objective history, or a run's terminal-budget points without one
+    (:func:`learning.training.history.validate_completed_history`). The newest record lies exactly at the run's
+    terminal ``global_step``, its last checkpoint's or, without one, its summary's (step 0 without records). A
+    missing history is refused.
     """
-    if not {"checkpoint_identity", "transient_scaling"}.issubset(summary):
-        message = "Completed transient run summary lacks required completion evidence."
-        raise RunLifecycleError(message)
-    _validate_transient_terminal_state(summary, None, config=config)
-    if summary["checkpoint_identity"] != checkpoint_identity:
-        message = "Completed transient summary checkpoint identity mismatch."
-        raise RunLifecycleError(message)
-    scaling = summary["transient_scaling"]
-    if not isinstance(scaling, Mapping) or scaling.get("semantic_digest") != normalizer_state.digest:
-        message = "Completed transient summary scaling identity mismatch."
-        raise RunLifecycleError(message)
-    if scaling.get("task_contract_digest") != config["task_contract"]["digest"]:
-        message = "Completed transient summary task contract digest mismatch."
-        raise RunLifecycleError(message)
     try:
         history = learning.training.history.validate_completed_history(
             run_dir,
@@ -2248,8 +2563,91 @@ def _validate_transient_summary_evidence(
             validations=validations,
         )
     except (FileNotFoundError, TypeError, ValueError) as error:
-        message = f"Completed transient history admission failed: {error}"
+        message = f"Finished run history admission failed: {error}"
         raise RunLifecycleError(message) from error
+    newest = max((records[-1]["global_step"] for records in (history["epochs"], history["validations"]) if records), default=0.0)
+    if type(global_step) is not int or newest != global_step:
+        message = f"Finished run history admission failed: its newest record lies at step {newest}, not at the terminal global step {global_step!r}."
+        raise RunLifecycleError(message)
+    return history
+
+
+def _recorded_producer_environment(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Admit the numerical environment that a finished run without a checkpoint records for its producer.
+
+    The summary's checkpoint identity passes the one checkpoint identity schema. Its image digest and, for a CUDA
+    attempt, its CUDA build must equal what the runtime session of the attempt that ended the run, its last, records
+    from the same sources: the Slurm job's provenance (no image outside one) and PyTorch's CUDA build. The rest (Python,
+    the package versions, the neuraloperator digest) is provenance recorded once, schema-checked but not independently
+    verifiable. The session's PyTorch version is not compared: it is the module's own version string, the environment's
+    is the installed package's version, and these sources differ by contract, so one installation may report them
+    differently and a comparison would refuse a valid run.
+    """
+    try:
+        identity = learning.training.checkpoint.validate_checkpoint_identity(
+            summary.get("checkpoint_identity"), label="summary.json checkpoint_identity"
+        )
+    except (TypeError, ValueError) as error:
+        message = f"Finished run summary checkpoint identity is invalid: {error}"
+        raise RunLifecycleError(message) from error
+    environment = identity["numerical_environment"]
+    sessions = summary.get("runtime_sessions")
+    session = sessions[-1] if isinstance(sessions, list) and sessions else None
+    slurm = session.get("slurm") if isinstance(session, Mapping) else None
+    if (
+        not isinstance(session, Mapping)
+        or environment["sif_sha256"] != (slurm.get("sif_sha256") if isinstance(slurm, Mapping) else None)
+        or environment["torch_cuda_build"] != session.get("cuda_build_version", environment["torch_cuda_build"])
+    ):
+        message = "Finished run summary numerical environment disagrees with, or lacks, the runtime session of the attempt that ended the run."
+        raise RunLifecycleError(message)
+    return environment
+
+
+def _finished_run_identity(summary: Mapping[str, Any], rebuilt: Mapping[str, Any], checkpoint: Mapping[str, Any] | None) -> dict[str, Any]:
+    """
+    Return the producer's checkpoint identity, which binds a finished run's history and which its summary records exactly.
+
+    It is the identity of the run's checkpoint or, for a run without one (a trial, or a stage that committed no
+    optimizer group), the identity its saved config, split and normalizer rebuild (``rebuilt``) in the numerical
+    environment its summary recorded: the producer's, never the reader's, so a trial trained in the container is
+    admitted natively too. That environment is admitted against the run's own session (:func:`_recorded_producer_environment`).
+    """
+    recorded = summary.get("checkpoint_identity")
+    if checkpoint is not None:
+        identity = dict(checkpoint["identity"])
+    else:
+        identity = {**rebuilt, "numerical_environment": _recorded_producer_environment(summary)}
+    if recorded != identity:
+        message = "Finished run summary checkpoint identity disagrees with its checkpoint, or with its saved config, split and normalizer."
+        raise RunLifecycleError(message)
+    return identity
+
+
+def _validate_transient_summary_evidence(
+    *,
+    summary: Mapping[str, Any],
+    config: Mapping[str, Any],
+    normalizer_state: Any,
+    history: Mapping[str, Any],
+) -> None:
+    """
+    Cross-check the summary's transient completion evidence against saved state and the final record of its admitted history.
+
+    The summary's checkpoint identity, recorded by both tasks, is admitted before (:func:`_finished_run_identity`).
+    """
+    if "transient_scaling" not in summary:
+        message = "Completed transient run summary lacks required completion evidence."
+        raise RunLifecycleError(message)
+    _validate_transient_terminal_state(summary, None, config=config)
+    scaling = summary["transient_scaling"]
+    if not isinstance(scaling, Mapping) or scaling.get("semantic_digest") != normalizer_state.digest:
+        message = "Completed transient summary scaling identity mismatch."
+        raise RunLifecycleError(message)
+    if scaling.get("task_contract_digest") != config["task_contract"]["digest"]:
+        message = "Completed transient summary task contract digest mismatch."
+        raise RunLifecycleError(message)
     # A trial keeps no last checkpoint to compare, so the values are admitted by their owner against the final epoch record.
     try:
         records = history["epochs"]
@@ -2410,7 +2808,7 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
     -------
     dict[str, Any]
         Validated summary, config, split/normalizer state, checkpoint identity,
-        and distinct best/last checkpoint payloads.
+        distinct best/last checkpoint payloads, and the admitted ``history``.
 
     Raises
     ------
@@ -2438,12 +2836,13 @@ def validate_finished_run(run_dir: Path | str) -> dict[str, Any]:
     A completed run is validated in full (:func:`validate_completed_run`). An unsuccessful
     run has no selected checkpoint; its last checkpoint, bound by digest, is validated like a
     completed run's (saved data, identity, read-only CPU load) and its budget must equal the
-    summary's terminal budget. Only a stage that committed no optimizer group (a divergence in
-    its first group, or an A1 matched to such a B) has none; a transient stage's terminal evidence
-    keeps its stage's shape either way. Both return the terminal budget
-    their training outcome was admitted against (:func:`validate_training_outcome`) and the last
-    checkpoint (``None`` without one). Matched B admission uses both, because B's receipt exists
-    for every end of B.
+    summary's terminal budget. Only an Optuna trial, which writes none, and a stage that committed
+    no optimizer group (a divergence in its first group, or an A1 matched to such a B) have none;
+    a transient stage's terminal evidence keeps its stage's shape either way, and the history of
+    either task holds exactly the records its producer wrote (:func:`_validate_unsuccessful_history`).
+    Both return the terminal budget their training outcome was admitted against
+    (:func:`validate_training_outcome`) and the last checkpoint (``None`` without one). Matched B
+    admission uses both, because B's receipt exists for every end of B.
     """
     path = Path(run_dir)
     summary = read_run_summary(path) if common.paths.resolve_run_summary_path(path).is_file() else {}
@@ -2474,44 +2873,45 @@ def validate_finished_run(run_dir: Path | str) -> dict[str, Any]:
     # The terminal evidence binds a matched stage's receipt and handoff: its shape always, the last checkpoint's state when one exists.
     if config["task"] == "transient_drying":
         _validate_transient_terminal_state(summary, last_payload, config=config)
-        _validate_unsuccessful_history(path, config, last_payload)
     budget = _validate_terminal_budget(summary, saved_budget, lifecycle="unsuccessful", target=_finished_stage_target(path, config, summary))
-    if (saved_budget is None) != (budget.spent == 0) or (saved_budget is None and last.exists()) or summary.get("best_epoch") is not None:
+    # Every non-trial stage that committed an optimizer group ends with its last checkpoint; a trial never writes one.
+    expects_last = budget.spent > 0 and not is_trial_config(config)
+    if (saved_budget is not None) != expects_last or (saved_budget is None and last.exists()) or summary.get("best_epoch") is not None:
         message = f"Unsuccessful run evidence is inconsistent: {path}"
         raise RunLifecycleError(message)
+    _validate_unsuccessful_history(path, config, summary, budget, last_payload)
     return {"run_dir": path, "summary": dict(summary), "config": dict(config), "terminal_budget": budget, "last_checkpoint": last_payload}
 
 
-def _validate_unsuccessful_history(path: Path, config: Mapping[str, Any], last_payload: Mapping[str, Any] | None) -> None:
+def _validate_unsuccessful_history(
+    path: Path,
+    config: Mapping[str, Any],
+    summary: Mapping[str, Any],
+    budget: learning.training.budget.StageBudget,
+    last_payload: Mapping[str, Any] | None,
+) -> None:
     """
-    Require an unsuccessful transient run's training history to hold exactly the records its producer wrote.
+    Require an unsuccessful run's training history, of either task, to hold exactly the records its producer wrote.
 
-    With a last checkpoint these are the epochs it counts (:func:`recorded_history_epochs`) and
-    exactly the validations of its objective history. A stage that committed no group wrote none:
-    its history is absent, or empty when a restart reset the records of an attempt that crashed
-    before its first checkpoint.
+    With a last checkpoint these are the epochs it counts (:func:`recorded_history_epochs`) and exactly the
+    validations of its objective history, up to its step. Without one (an Optuna trial, or a stage that
+    committed no optimizer group) they are the summary's terminal epochs up to its step and the terminal
+    budget's validated points. Both are bound to the producer identity the summary records
+    (:func:`_finished_run_identity`), which the summary records also when a stage that committed no group
+    wrote none: its history is then absent or holds no record.
     """
-    validations: list[dict[str, Any]] = []
-    if last_payload is not None:
-        identity, epochs = last_payload["identity"], learning.training.checkpoint.recorded_history_epochs(last_payload)
-        validations = last_payload["objective_history"]
-    elif learning.training.history.history_path(path).exists():
-        last = common.paths.resolve_last_checkpoint_file(path)
-        identity, epochs = _saved_run_identity(path, config, checkpoint_path=last, purpose="execution")[2], 0
-    else:
+    rebuilt = _saved_run_identity(path, config, checkpoint_path=common.paths.resolve_last_checkpoint_file(path), purpose="execution")[2]
+    identity = _finished_run_identity(summary, rebuilt, last_payload)
+    history = learning.training.history.history_path(path)
+    if last_payload is None and budget.spent == 0 and not history.exists() and not history.is_symlink():
         return
-    try:
-        learning.training.history.validate_completed_history(
-            path,
-            task=str(config["task"]),
-            run_name=str(config["run"]["name"]),
-            checkpoint_identity=identity,
-            completed_epoch=epochs,
-            validations=validations,
-        )
-    except (FileNotFoundError, TypeError, ValueError) as error:
-        message = f"Unsuccessful transient history admission failed: {error}"
-        raise RunLifecycleError(message) from error
+    if last_payload is None:
+        # The history admission refuses a summary epoch or step that is no non-negative integer.
+        epochs, validations, step = cast("int", summary.get("completed_epoch")), budget.validated_points, summary.get("global_step")
+    else:
+        epochs = learning.training.checkpoint.recorded_history_epochs(last_payload)
+        validations, step = last_payload["objective_history"], last_payload["global_step"]
+    _admit_completed_history(path, config, checkpoint_identity=identity, completed_epoch=epochs, validations=validations, global_step=step)
 
 
 def _validate_trial_summary_evidence(summary: Mapping[str, Any], config: Mapping[str, Any]) -> None:
@@ -2548,7 +2948,11 @@ def _validate_completed_run(
     *,
     purpose: Literal["execution", "saved_artifacts"],
 ) -> dict[str, Any]:
-    """Validate shared completed evidence for execution or saved artifact reading."""
+    """
+    Validate shared completed evidence for execution or saved artifact reading.
+
+    Status, digests, config and saved data refuse in any environment, checkpoint content only where its producing environment admits reading it.
+    """
     path = Path(run_dir)
     _require_completed_status(path)
     checkpoints = (common.paths.resolve_best_checkpoint_file(path), common.paths.resolve_last_checkpoint_file(path))
@@ -2592,16 +2996,17 @@ def _validate_completed_run(
     if trial:
         _validate_trial_summary_evidence(summary, config)
         terminal_budget = _validate_terminal_budget(summary, None, lifecycle="completed", target=target)
+        identity = _finished_run_identity(summary, identity, None)
+        history = _admit_completed_history(
+            path,
+            config,
+            checkpoint_identity=identity,
+            completed_epoch=int(summary["completed_epoch"]),
+            validations=terminal_budget.validated_points,
+            global_step=summary["global_step"],
+        )
         if config["task"] == "transient_drying":
-            _validate_transient_summary_evidence(
-                path,
-                summary=summary,
-                config=config,
-                normalizer_state=normalizer_state,
-                checkpoint_identity=identity,
-                completed_epoch=int(summary["completed_epoch"]),
-                validations=terminal_budget.validated_points,
-            )
+            _validate_transient_summary_evidence(summary=summary, config=config, normalizer_state=normalizer_state, history=history)
         if summary.get("effective_config_digest") != identity["effective_config_digest"]:
             msg = "Completed trial summary/config identity mismatch."
             raise RunLifecycleError(msg)
@@ -2614,6 +3019,7 @@ def _validate_completed_run(
             "storage_alias": path.name,
             "effective_config_digest": identity["effective_config_digest"],
             "terminal_budget": terminal_budget,
+            "history": history,
         }
     scheduler_expected = config.get("scheduler") is not None
     best = learning.training.checkpoint.load_checkpoint(
@@ -2636,16 +3042,17 @@ def _validate_completed_run(
     if last["best_metric"] != best["best_metric"] or last["best_epoch"] != best["best_epoch"]:
         msg = "Completed run best and last checkpoints disagree."
         raise RunLifecycleError(msg)
+    # Both tasks write the history, so a completed run of either is admitted only with exactly the records its last checkpoint counts.
+    history = _admit_completed_history(
+        path,
+        config,
+        checkpoint_identity=_finished_run_identity(summary, identity, best),
+        completed_epoch=int(last["completed_epoch"]),
+        validations=last["objective_history"],
+        global_step=last["global_step"],
+    )
     if config["task"] == "transient_drying":
-        _validate_transient_summary_evidence(
-            path,
-            summary=summary,
-            config=config,
-            normalizer_state=normalizer_state,
-            checkpoint_identity=best["identity"],
-            completed_epoch=int(last["completed_epoch"]),
-            validations=last["objective_history"],
-        )
+        _validate_transient_summary_evidence(summary=summary, config=config, normalizer_state=normalizer_state, history=history)
         _validate_transient_terminal_state(summary, last, config=config)
     terminal_budget = _validate_terminal_budget(summary, last["budget_state_dict"], lifecycle="completed", target=target)
     expected_summary_values = {
@@ -2673,6 +3080,7 @@ def _validate_completed_run(
         ),
         "last_checkpoint": last,
         "terminal_budget": terminal_budget,
+        "history": history,
     }
 
 
@@ -2685,6 +3093,72 @@ def _resume_runtime_config(saved_config: Mapping[str, Any], requested: Mapping[s
     # Execution only (outside identity): the attempt splits its updates as requested; the summary records it.
     runtime_config["training"]["memory_batch"] = requested["training"]["memory_batch"]
     return runtime_config
+
+
+def _admit_resolved_resume(
+    run_dir: Path,
+    requested: Mapping[str, Any],
+    *,
+    output_root: Path | str | None,
+    device_resolution: learning.device.DeviceResolution | None,
+    matched_receipt: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], Path]:
+    """
+    Admit the continuation of a saved run read-only and return its runtime and saved config, split, normalizer artifact and last checkpoint.
+
+    It runs before the writer lease, so a resume it refuses there creates no lock file, and again under it, where
+    no other writer can change what it admitted: a leaf that ended before its first checkpoint, refused naming its start
+    command, which replaces it, before the source binding, then the resume files, status, attempt history, an A1's receipt
+    copy, the pair's device, the saved config and training digest, the output root, the saved data, checkpoints and
+    history, then the pinned Datasets by their loaders' steps without a payload, which the saved split must match
+    (:func:`config_loader.admit_pinned_datasets`). Its state checks raise the one ``ContinuationRefusedError``; the pair's GPU model
+    is the job's environment and keeps its own error, as do another numerical environment, image included, than the
+    checkpoint's and a Dataset the job cannot read. Without a ``device_resolution``
+    it runs its state checks alone, the evidence of B's attempts' one device included, for a failed matched stage's
+    recovery check (:func:`_matched_failed_stage_recovery`).
+    """
+    # The one admission point of every continuation (single, matched stage, saved-config resume); the binding module imports this one.
+    from . import experiments_run_source_binding as source_binding  # noqa: PLC0415
+
+    with _refused_by_state():
+        missing = common.paths.missing_resume_run_files(run_dir)
+        # The start's own leaf path, unresolved, as its admission checks it: a resumed run_dir has its links resolved.
+        if missing and _replaceable_leaf(common.paths.resolve_config_run_dir(requested), requested, matched_receipt=matched_receipt) is not None:
+            # A --resume request is the saved config itself, so only this check meets a training-code change, which no start replaces.
+            _require_current_training(requested, unit=f"Run {run_dir}")
+            msg = (
+                f"Run {run_dir} ended before its first checkpoint, so it has none to continue from; "
+                "its start command (train CONFIG, or its plan for a matched stage) replaces it with a fresh start."
+            )
+            raise RunLifecycleError(msg)
+        source_binding.admit_continuation((run_dir,))
+        if missing:
+            names = ", ".join(path.name for path in missing)
+            msg = f"Resume run is incomplete: {run_dir}. Missing: {names}."
+            raise RunLifecycleError(msg)
+        summary = read_run_summary(run_dir)
+        _require_resumable_status(summary, run_dir)
+        _require_attempt_history(summary, run_dir)
+        if matched_receipt is not None:
+            # A1's own copy, read-only: its attempt's publication would refuse a differing one only after the start entry.
+            matched_budget.verify_b_receipt_copy(run_dir, matched_receipt)
+    _require_pair_device(requested, device_resolution, sessions=summary["runtime_sessions"], matched_receipt=matched_receipt)
+    with _refused_by_state():
+        saved_config = config_loader.validate_resolved_config(config_loader.load_yaml(common.paths.resolve_run_config_path(run_dir)))
+        _require_current_training(saved_config, unit=f"Run {run_dir}")
+        validate_resume_config(requested, saved_config)
+        _validate_resume_output_root(run_dir, saved_config, output_root)
+        runtime_config = _resume_runtime_config(saved_config, requested, run_dir=run_dir)
+        split, normalizer_artifact = _read_saved_data_artifacts(run_dir)
+        split_indices = split.as_payload()
+        _validate_saved_data_contract(saved_config, split, normalizer_artifact)
+        last_path = common.paths.resolve_last_checkpoint_file(run_dir)
+        _admit_resume_checkpoints(run_dir, runtime_config, persisted_config=saved_config, split_indices=split_indices, last_path=last_path)
+    # Then the pinned Datasets by its loaders' steps before a payload: one that contradicts them or the saved split refuses,
+    # a failed read is the environment.
+    with _refused_by_pinned_datasets(runtime_config):
+        config_loader.admit_pinned_datasets(runtime_config, split_indices)
+    return runtime_config, saved_config, split_indices, normalizer_artifact, last_path
 
 
 def _run_resolved_experiment(
@@ -2700,9 +3174,18 @@ def _run_resolved_experiment(
     Resolve and execute a fresh experiment or continue an interrupted one.
 
     Config, requested device, and concrete device requirements
-    are validated before fresh output allocation. Resume acquires the run writer
-    lease before reading mutable lifecycle artifacts and restores only the
-    identity-validated last checkpoint.
+    are validated before fresh output allocation. Resume admits the run read-only
+    before the writer lease, so these checks create no lock file, and again under it
+    (:func:`_admit_resolved_resume`); its attempt then restores the identity-validated
+    last checkpoint in full before its first write. A continuation that ends before that
+    write changes nothing in the run and binds no identity: one the run's persisted state
+    refuses raises the one ``ContinuationRefusedError``, a failure of the job's environment
+    its own error, which until the attempt reports is marked for the command
+    (:func:`unstarted_by_environment`). An end under the lease, by that restore or because
+    the run changed after the checks before it, leaves the lease's persistent lock anchor
+    below ``.state/runs/locks`` (:func:`run_writer_lease`): lease infrastructure, never run
+    content. A start that names a leaf whose attempt ended before its first checkpoint
+    replaces it in place (:func:`_replace_leaf_locked`) and trains it as a fresh run.
 
     Parameters
     ----------
@@ -2716,7 +3199,8 @@ def _run_resolved_experiment(
         Exact immutable B receipt admitted before matched A1 execution.
     resume : pathlib.Path | str | None, optional
         Existing run directory explicitly continued from ``last_checkpoint.pt``.
-        ``None`` requires exclusive allocation of a new run leaf.
+        ``None`` requires exclusive allocation of a new run leaf, or the replacement of one
+        that ended before its first checkpoint.
     output_root : pathlib.Path | str | None, optional
         Fresh-run destination override. On resume it must resolve to the exact
         saved task/run leaf. Dataset roots remain unchanged.
@@ -2730,20 +3214,30 @@ def _run_resolved_experiment(
     Raises
     ------
     FileNotFoundError
-        If the YAML, the saved-config resume leaf, or a required resume artifact is absent.
+        If the YAML or the saved-config resume leaf is absent.
     FileExistsError
         ``ExistingRunAdmissionError`` if an existing destination cannot continue, or
-        ``IdenticalExperimentError`` if another directory already owns the experiment.
+        ``IdenticalExperimentError`` if another directory already owns a fresh experiment.
     config_loader.ConfigError
         If YAML or an override violates the semantic experiment schema.
     learning.device.DeviceResolutionError
         If runtime policy is invalid or strict CUDA is unusable.
+    ContinuationRefusedError
+        A ``RunLifecycleError`` if the run's persisted state refuses a continuation
+        before its attempt's first write, with its cause chained: a missing or
+        unreadable resume file, a writer lock marker that is no regular file, a saved
+        status, config, output root, data, checkpoint identity, best/last role or
+        history that is not resumable, a completed run, a training-digest drift, a
+        Dataset that contradicts the saved split, a last checkpoint that does not
+        restore, an identity another directory owns or another source tree; also a
+        finished run's state that fails the finished-run admission or the
+        identity binding of its rerun.
     RunLifecycleError
-        If a writer lease is active or saved status, data, checkpoint identity,
-        best/last roles, or lifecycle history is not resumable.
-    ValueError
-        If the requested identity differs from the saved config, the run already
-        completed, or an output-root override identifies another leaf.
+        If another writer holds the run or a B or A1 attempt resolved another GPU
+        model than its pair's: the job's environment, which leaves the run unchanged
+        for a rerun in a matching allocation, as do another numerical environment,
+        image included, than the checkpoint's, an I/O error and CUDA out of memory
+        before the attempt's first write.
 
     Notes
     -----
@@ -2755,46 +3249,59 @@ def _run_resolved_experiment(
     source.
 
     Training or admission failures publish failed/interrupted state best-effort
-    before the original exception propagates. Local lifecycle files remain
+    before the original exception propagates, except for a continuation that ends
+    before its attempt started, which publishes nothing. Local lifecycle files remain
     authoritative, while any failure in an explicitly requested online or offline
     W&B session fails the operation after durable local evidence is published.
 
     """
     fresh_destination: Path | None = None
     finished: dict[str, Any] | None = None
+    continued_in_place = replaced = False
     if resume is None:
         if output_root is not None:
             requested["paths"]["output_root"] = str(Path(output_root).expanduser())
         destination = common.paths.resolve_config_run_dir(requested)
         if destination.exists() or destination.is_symlink():
-            finished = _existing_run_continuation(destination, requested, config_path=config_path)
-            if finished is None:
-                resume = destination
+            admission = _existing_run_continuation(destination, requested, config_path=config_path, matched_receipt=matched_receipt)
+            if admission == "continue":
+                resume, continued_in_place = destination, True
                 output_root = None  # Already applied to the requested layout, which located this leaf.
+            elif admission == "replace":
+                fresh_destination, replaced = destination, True
+            else:
+                finished = admission
         else:
             run_registry.ensure_available(requested, destination)
             fresh_destination = destination
 
-    if device_resolution is None:
-        device_resolution = learning.device.resolve_device(
-            requested["run"]["device"],
-            path="run.device",
-        )
-    validate_deterministic_model_device_policy(requested, device_resolution)
+    # The device of a continuation, a replacement or a finished run's rerun is the job's environment, which leaves the run unchanged.
+    with nullcontext() if resume is None and finished is None and not replaced else _unstarted_continuation():
+        if device_resolution is None:
+            device_resolution = learning.device.resolve_device(requested["run"]["device"], path="run.device")
+        validate_deterministic_model_device_policy(requested, device_resolution)
     if finished is not None:
+        # Repaired only after the device admission, so a rerun it refuses changes nothing: a malformed binding is the stored
+        # state, a failed registry read or write the job's environment.
+        with _unstarted_continuation(), _refused_by_state():
+            run_registry.ensure_bound(requested, finished["run_dir"])
+        # Reported only now, when nothing can end the rerun any more.
+        console.run_admission_event("already_complete", completed_epoch=finished.pop("completed_epoch"), run_dir=str(finished["run_dir"]))
         return {**finished, "device_resolution": device_resolution}
     if resume is None:
         if fresh_destination is None:
             msg = "Fresh-run destination was not resolved before runtime admission."
             raise AssertionError(msg)
-        _require_pair_device(requested, device_resolution, sessions=[], matched_receipt=matched_receipt)
-        summary_identity = {"run_identity": run_identity.run_identity_evidence(requested, config_path=config_path)}
-        with run_writer_lease(fresh_destination):
-            run_dir = _prepare_fresh_run_locked(
-                requested,
-                run_dir=fresh_destination,
-                summary_extra=summary_identity,
-            )
+        with ExitStack() as lease:
+            # Until a replaced leaf's fresh summary, the leaf can still be replaced: an end there by the job's environment is its rerun.
+            with _unstarted_continuation() if replaced else nullcontext():
+                _require_pair_device(requested, device_resolution, sessions=None, matched_receipt=matched_receipt)
+                summary_identity = {"run_identity": run_identity.run_identity_evidence(requested, config_path=config_path)}
+                lease.enter_context(run_writer_lease(fresh_destination))
+                if replaced:
+                    run_dir = _replace_leaf_locked(fresh_destination, requested, summary_extra=summary_identity, matched_receipt=matched_receipt)
+                else:
+                    run_dir = _prepare_fresh_run_locked(requested, run_dir=fresh_destination, summary_extra=summary_identity)
             result = _execute_prepared_run_locked(
                 requested,
                 run_dir=run_dir,
@@ -2806,121 +3313,78 @@ def _run_resolved_experiment(
         return {"run_dir": run_dir, "result": result, "device_resolution": device_resolution, "task": str(requested["task"])}
 
     run_dir = Path(resume).expanduser().resolve()
-    if not run_dir.is_dir():
-        msg = f"Resume run directory not found: {run_dir}"
-        raise FileNotFoundError(msg)
-    if common.paths.resolve_run_summary_path(run_dir).is_file():
-        # A finished run or another GPU model is refused by reads before the writer lease, which creates its lock file; both
-        # are checked again under the lease.
-        prechecked = read_run_summary(run_dir)
-        _require_resumable_status(prechecked, run_dir)
-        sessions = prechecked.get("runtime_sessions")
-        if isinstance(sessions, list) and all(isinstance(session, Mapping) for session in sessions):
-            # A malformed attempt history is reported under the lease, after the source binding.
-            _require_pair_device(requested, device_resolution, sessions=sessions, matched_receipt=matched_receipt)
-    with run_writer_lease(run_dir):
-        # The one admission point of every continuation (single, matched stage, saved-config resume); the binding module imports this one.
-        from . import experiments_run_source_binding as source_binding  # noqa: PLC0415
-
-        source_binding.admit_continuation((run_dir,))
-        missing = common.paths.missing_resume_run_files(run_dir)
-        if missing:
-            names = ", ".join(path.name for path in missing)
-            msg = f"Resume run is incomplete: {run_dir}. Missing: {names}."
-            raise RunLifecycleError(msg)
-        summary = read_run_summary(run_dir)
-        _require_resumable_status(summary, run_dir)
-        _require_attempt_history(summary, run_dir)
-        _require_pair_device(requested, device_resolution, sessions=summary["runtime_sessions"], matched_receipt=matched_receipt)
-        saved_config = config_loader.validate_resolved_config(config_loader.load_yaml(common.paths.resolve_run_config_path(run_dir)))
-        _require_current_training(saved_config, unit=f"Run {run_dir}")
-        validate_resume_config(requested, saved_config)
-        _validate_resume_output_root(run_dir, saved_config, output_root)
-        runtime_config = _resume_runtime_config(saved_config, requested, run_dir=run_dir)
-
-        split, normalizer_artifact = _read_saved_data_artifacts(run_dir)
-        split_indices = split.as_payload()
-        _validate_saved_data_contract(saved_config, split, normalizer_artifact)
-        identity = learning.training.checkpoint.build_checkpoint_identity(
-            runtime_config,
-            split_indices,
-            normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
-            persisted_config=saved_config,
-        )
-        last = learning.training.checkpoint.load_checkpoint(
-            common.paths.resolve_last_checkpoint_file(run_dir),
-            expected_identity=identity,
-            expected_role="last",
-            payload_kind="full",
-            scheduler_expected=runtime_config.get("scheduler") is not None,
-            require_best=False,
-            adapter_expected=runtime_config["task"] == "transient_drying",
-            resume=True,
-        )
-        best_path = common.paths.resolve_best_checkpoint_file(run_dir)
-        if last["best_metric"] is None:
-            if best_path.exists():
-                msg = "Resume run contains a best checkpoint that is inconsistent with last_checkpoint.pt."
-                raise RunLifecycleError(msg)
-        else:
-            best = learning.training.checkpoint.load_checkpoint(
-                best_path,
-                expected_identity=identity,
-                expected_role="best",
-                payload_kind=learning.training.checkpoint.best_payload_kind(runtime_config),
-                scheduler_expected=runtime_config.get("scheduler") is not None,
-                require_best=True,
-                adapter_expected=runtime_config["task"] == "transient_drying",
+    with ExitStack() as lease:
+        # The admission before the attempt, which reports its own end; the lease is held until the attempt ended.
+        with _unstarted_continuation():
+            with _refused_by_state():
+                if not run_dir.is_dir():
+                    msg = f"Resume run directory not found: {run_dir}"
+                    raise FileNotFoundError(msg)
+            # Another writer is the job's environment, never the run's state: a rerun once it finished continues the run.
+            _require_no_active_writer(run_dir)
+            _admit_resolved_resume(run_dir, requested, output_root=output_root, device_resolution=device_resolution, matched_receipt=matched_receipt)
+            if continued_in_place:
+                # The fresh start's read-only registry check: an identity another existing directory owns is refused before the lease.
+                with _refused_by_state():
+                    run_registry.ensure_available(requested, run_dir)
+            lease.enter_context(run_writer_lease(run_dir))
+            runtime_config, saved_config, split_indices, normalizer_artifact, last_path = _admit_resolved_resume(
+                run_dir, requested, output_root=output_root, device_resolution=device_resolution, matched_receipt=matched_receipt
             )
-            if best["best_metric"] != last["best_metric"] or best["best_epoch"] != last["best_epoch"]:
-                msg = "Resume run best and last checkpoints disagree about selected objective state."
-                raise RunLifecycleError(msg)
-        # Read-only under the lease, so a history the attempt would refuse changes nothing; the attempt truncates it.
-        learning.training.history.validate_resume_history(run_dir, **_history_binding(runtime_config, identity, last))
-
         result = _execute_prepared_run_locked(
             runtime_config,
             run_dir=run_dir,
             persisted_config=saved_config,
             saved_split_indices=split_indices,
             restored_scaling_artifact=normalizer_artifact,
-            resume_from=common.paths.resolve_last_checkpoint_file(run_dir),
+            resume_from=last_path,
             device_resolution=device_resolution,
             matched_receipt=matched_receipt,
+            identity_binding=requested if continued_in_place else None,
         )
-        return {
-            "run_dir": run_dir,
-            "result": result,
-            "device_resolution": device_resolution,
-            "task": str(requested["task"]),
-        }
+    return {
+        "run_dir": run_dir,
+        "result": result,
+        "device_resolution": device_resolution,
+        "task": str(requested["task"]),
+    }
 
 
 def _require_pair_device(
     config: Mapping[str, Any],
-    resolution: learning.device.DeviceResolution,
+    resolution: learning.device.DeviceResolution | None,
     *,
-    sessions: list[Any],
+    sessions: list[Any] | None,
     matched_receipt: Mapping[str, Any] | None,
 ) -> None:
     """
     Admit a B or A1 attempt only on its pair's one GPU model, before the attempt changes the run.
 
     The reported B/A1 time ratio compares one GPU model: A1 trains on its B receipt's device,
-    a resumed B on its first attempt's. A0 and Optuna trials bind no device, because budgets
-    count supervised transitions, not seconds. Example: B ran on an RTX 6000 Ada, so its A1 is
-    refused on an RTX A6000 and admitted on any RTX 6000 Ada.
+    a resumed B on its earlier attempts' one model. A0 and Optuna trials bind no device, because
+    budgets count supervised transitions, not seconds. Example: B ran on an RTX 6000 Ada, so its A1
+    is refused on an RTX A6000 and admitted on any RTX 6000 Ada. Another GPU model is the job's
+    environment; malformed evidence of B's attempts, attempts on several models or, for a continuation
+    (``sessions`` given, a B with its checkpoint), none at all is B's persisted state, which refuses it,
+    by the rule of B's receipt (``matched_budget.pair_device``); a fresh B passes ``None``. That state is
+    checked in every admission; without a ``resolution``, for a failed matched stage's recovery check,
+    nothing is compared with a running device.
     """
     protocol = config["training"].get("matched_a1_b")
     role = None if protocol is None else protocol["role"]
     if role == "a1":
         if matched_receipt is None:
+            if resolution is None:
+                return
             msg = "A matched A1 requires B's supervised-transition receipt."
             raise RunLifecycleError(msg)
         expected = dict(matched_receipt["device"])
-    elif role == "b" and sessions:
-        expected = transient_handoff.device_evidence(sessions[0])
+    elif role == "b" and sessions is not None:
+        with _refused_by_state():
+            expected = matched_budget.pair_device(sessions)
     else:
+        return
+    if resolution is None:
         return
     current = transient_handoff.device_evidence(resolution.as_dict())
     if current != expected:
@@ -2939,37 +3403,155 @@ def _require_resumable_status(summary: Mapping[str, Any], run_dir: Path) -> None
         raise RunLifecycleError(msg)
 
 
+def _replaceable_leaf(
+    run_dir: Path, requested: Mapping[str, Any], *, matched_receipt: Mapping[str, Any] | None
+) -> tuple[str, tuple[Path, ...]] | None:
+    """
+    Admit read-only the replacement of a leaf whose attempt ended before its first checkpoint; return its status and stale files.
+
+    The one replacement admission of a start, a matched plan, a failed stage's recovery check, ``--resume`` and an
+    interrupted run's advice. Such a leaf belongs to a single run or a matched stage, never an Optuna trial, its summary
+    reads ``interrupted`` or ``running`` and it holds no ``last_checkpoint.pt`` or ``best_checkpoint.pt``, since only a
+    checkpoint commits work. Its saved config must hold the request's full identity (:func:`validate_resume_config`), the
+    recorded training digest included: after a code change it keeps the ``--revision`` advice of other science.
+    Read-only: its caller probed the writer or holds the lease. ``None`` leaves any other leaf, a damaged summary or config
+    included, to its continuation admission. The leaf's state refuses it (:func:`_refused_by_state`) when a folder below
+    the output root down to the leaf is no real folder or its config or summary no regular file, each checked by ``lstat``
+    before anything is read through it, when an entry is none its layout writes (another file, a folder or a symbolic
+    link), when an A1 receipt copy is not B's and when another directory owns its identity. The stale files exclude the
+    config and summary, which the replacement overwrites atomically; the job's ``logs`` and W&B mirror folders and A1's
+    copy stay.
+    """
+    if is_trial_config(requested):
+        return None
+    config_file, summary_file = common.paths.resolve_run_config_path(run_dir), common.paths.resolve_run_summary_path(run_dir)
+    checkpoints = {common.paths.RUN_LAST_CHECKPOINT_FILENAME, common.paths.RUN_BEST_CHECKPOINT_FILENAME}
+    depth = len(common.paths.resolve_config_run_dir(requested, output_root=Path()).parts)
+    with _refused_by_state():
+        for folder in (*reversed(run_dir.parents[: depth - 1]), run_dir):
+            if not stat.S_ISDIR(folder.lstat().st_mode):
+                msg = f"{folder}, a folder of run {run_dir} below its output root, is no real folder, so nothing replaces the run."
+                raise RunLifecycleError(msg)
+        entries = tuple(run_dir.iterdir())
+        if any(entry.name in checkpoints for entry in entries):
+            return None
+        for path in (config_file, summary_file):
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                return None
+            if not stat.S_ISREG(mode):
+                msg = f"Run {run_dir} ended before its first checkpoint, but its {path.name} is no regular file, so nothing replaces it."
+                raise RunLifecycleError(msg)
+    try:
+        status = read_run_summary(run_dir).get("status")
+        saved = config_loader.validate_resolved_config(config_loader.load_yaml(config_file))
+        validate_resume_config(requested, saved)
+    except (FileNotFoundError, KeyError, TypeError, ValueError, RunLifecycleError):
+        return None
+    if not isinstance(status, str) or status not in {"running", "interrupted"}:
+        return None
+    overwritten = {config_file.name, summary_file.name}
+    # No committed work either: the checkpoint writer's staged siblings (``.<name>.staged``) and, by the destination their
+    # name encodes, the atomic writers' temporaries of every file here; a teacher-handoff manifest only where it is written.
+    files = {*overwritten, *checkpoints, *(f".{name}.staged" for name in checkpoints), common.paths.RUN_SPLIT_INDICES_FILENAME}
+    files |= {common.paths.RUN_NORMALIZER_FILENAME, learning.training.history.history_path(run_dir).name}
+    if saved["task"] == "transient_drying" and saved["training"]["teacher_handoff"] is not None:
+        files.add("teacher_handoff_manifest.json")
+    kept = {common.paths.JOB_LOGS_DIRNAME, "wandb"}
+    stale: list[Path] = []
+    with _refused_by_state():
+        if matched_receipt is not None:
+            matched_budget.verify_b_receipt_copy(run_dir, matched_receipt)
+        for entry in entries:
+            mode = entry.lstat().st_mode
+            owner = common.serialization.atomic_write_temporary_destination(entry) or entry
+            # A1's copy stays; the temporary its writer leaves when killed is stale.
+            receipt_temporary = matched_receipt is not None and entry.name.startswith(matched_budget.RECEIPT_TEMPORARY_PREFIX)
+            if stat.S_ISREG(mode) and (owner.name in files or receipt_temporary):
+                if entry.name not in overwritten:
+                    stale.append(entry)
+            elif not (stat.S_ISDIR(mode) and entry.name in kept) and not (matched_receipt is not None and entry.name == matched_budget.RECEIPT_NAME):
+                msg = (
+                    f"Run {run_dir} ended before its first checkpoint but holds {entry.name!r}, which is no file of its run, so nothing replaces it."
+                )
+                raise RunLifecycleError(msg)
+        # The fresh start's read-only registry check, before the lease that binds the identity to this leaf.
+        run_registry.ensure_available(requested, run_dir)
+    return status, tuple(stale)
+
+
+def _replace_leaf_locked(
+    run_dir: Path, config: Mapping[str, Any], *, summary_extra: Mapping[str, Any], matched_receipt: Mapping[str, Any] | None
+) -> Path:
+    """
+    Make a replaceable leaf what a fresh start of ``config`` in it makes before its attempt, under its writer lease.
+
+    The admission (:func:`_replaceable_leaf`) runs again and the identity stays bound to this leaf. Then the request's
+    config replaces the saved one, the earlier attempt's other files go, its history included, and the fresh
+    initializing summary replaces the old one last, each atomically, so an end by the job's environment before that
+    summary leaves a leaf that is still replaceable, marked as possibly partly replaced (:func:`partly_replaced`). The
+    one console line names the replacement for the job's log.
+    """
+    replaceable = _replaceable_leaf(run_dir, config, matched_receipt=matched_receipt)
+    with _refused_by_state():
+        if replaceable is None:
+            msg = f"Run {run_dir} changed after its read-only check and is no longer replaceable."
+            raise RunLifecycleError(msg)
+        run_registry.ensure_bound(config, run_dir)
+    status, stale = replaceable
+    try:
+        config_loader.save_yaml(dict(config), common.paths.resolve_run_config_path(run_dir))
+        for entry in stale:
+            entry.unlink()
+        _transition_run_status_locked(run_dir, "initializing", updates=_initial_summary(config, summary_extra), anew=True)
+    except Exception as error:
+        with suppress(Exception):
+            error.partly_replaced = True  # type: ignore[attr-defined]
+        raise
+    console.run_admission_event("replaced", previous_status=status, run_dir=str(run_dir))
+    return run_dir.resolve()
+
+
 def _existing_run_continuation(
     run_dir: Path,
     requested: Mapping[str, Any],
     *,
     config_path: Path | str,
-) -> dict[str, Any] | None:
-    """Decide how a start that names an existing run proceeds.
+    matched_receipt: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | Literal["continue", "replace"]:
+    """Decide read-only how a start that names an existing run proceeds.
 
-    Returns the finished outcome when the run is already completed (also after a divergence),
-    ``None`` when it must continue in place after an interruption, and raises
-    when it cannot continue.
+    Returns the finished outcome when the run already finished (completed, also after a divergence,
+    or unsuccessful), with its ``completed_epoch`` for the caller's report once nothing can end the rerun,
+    ``"continue"`` when it must continue in place after an interruption, ``"replace"`` when its attempt
+    ended before its first checkpoint (:func:`_replaceable_leaf`) and no other writer holds it, and raises
+    when it cannot continue. The caller repairs the identity binding of each, a replacement's under its lease.
 
     Raises
     ------
     ExistingRunAdmissionError
         If the existing run holds different science, is written by another
         process or is in a state that cannot continue.
+    ContinuationRefusedError
+        If a finished run's state fails the finished-run admission (:func:`validate_finished_run`), a replaceable
+        leaf holds an entry outside its run's layout or its identity another directory owns; an end there by the
+        job's environment, such as another numerical environment than its checkpoints', keeps its own error.
 
     """
-    report = inspect_existing_run_admission(run_dir, requested, config_path=config_path)
+    # An inspection fails only by the job's environment, which leaves the run unchanged for a rerun in a matching allocation.
+    with _unstarted_continuation():
+        report = inspect_existing_run_admission(run_dir, requested, config_path=config_path)
     compatibility = report["resume_compatibility"]
-    if compatibility in {"completed", "compatible"}:
-        run_registry.ensure_bound(requested, run_dir)
     if compatibility == "completed":
-        summary = read_run_summary(run_dir)
-        # The run's one result is its saved outcome: a divergence with a best checkpoint stays a divergence.
-        training_outcome = summary.get("training_outcome")
-        if not isinstance(training_outcome, Mapping) or training_outcome.get("status") not in _LIFECYCLE_TRAINING_OUTCOMES["completed"]:
-            msg = f"Completed run {run_dir} has no valid training_outcome."
-            raise RunLifecycleError(msg)
-        console.run_admission_event("already_complete", completed_epoch=report["completed_epoch"], run_dir=str(run_dir))
+        # The finished-run admission of a matched leaf, history included; the caller repairs the binding after its device
+        # admission, and an interrupted run's attempt binds it once its restore admitted the continuation
+        # (_execute_prepared_run_locked). It reads the checkpoints, so another numerical environment than theirs ends it like
+        # any end by the job's environment.
+        with _unstarted_continuation(), _refused_by_state():
+            summary = validate_finished_run(run_dir)["summary"]
+        # The run's one result is its admitted saved outcome: a divergence with a best checkpoint stays a divergence.
+        training_outcome = summary["training_outcome"]
         return {
             "run_dir": run_dir.resolve(),
             "result": {
@@ -2980,10 +3562,16 @@ def _existing_run_continuation(
             },
             "task": str(requested["task"]),
             "already_complete": True,
+            "completed_epoch": report["completed_epoch"],
         }
     if compatibility == "compatible":
-        return None
-    raise reject_existing_fresh_run(run_dir, requested, config_path=config_path)
+        return "continue"
+    with _unstarted_continuation():
+        # The inspection probed the writer: an active one, or a marker that is no regular file, keeps its rejection.
+        if report["active_lock"] is False and _replaceable_leaf(run_dir, requested, matched_receipt=matched_receipt) is not None:
+            return "replace"
+        rejection = reject_existing_fresh_run(run_dir, requested, config_path=config_path)
+    raise rejection
 
 
 def _apply_device_override(raw: dict[str, Any], device: str | None) -> None:
@@ -3040,55 +3628,148 @@ def _matched_failed_stage_recovery(
     run_dir: Path,
     requested: Mapping[str, Any],
     *,
-    config_path: Path | str,
-) -> tuple[bool, str]:
-    """Check the persisted resume admission, checkpoint and history without mutating the leaf."""
-    if not run_dir.is_dir() or run_dir.is_symlink():
-        return False, "No safe persisted stage leaf is available for checkpoint resume."
+    prerequisites: Callable[[Mapping[str, Any] | None], Mapping[str, Any] | None],
+) -> tuple[StageRecovery, str]:
+    """
+    Classify how a failed stage's leaf goes on by the state checks of its admission alone, read-only.
+
+    After the probe for another writer the resume admission runs first, the plan's checks of the stage run as it runs
+    them, without the pair's GPU model or a runtime: its finished leaf (:func:`_finished_matched_leaf`), its
+    ``prerequisites``, which return A1's receipt and compare a finished A1's copy with it, and a continuation's resume
+    admission (:func:`_admit_resolved_resume`). Classified by cause (:func:`_refused_by_state`): ``finished`` for a
+    finished leaf whose checks pass, which has nothing to resume, ``refused`` when persisted state refuses, ``environment``
+    for any other end, such as an active writer, an I/O error, also on the leaf's stat, or another numerical environment,
+    image included, than the checkpoint's, and ``resumable`` when the checks pass, also for a leaf that its rerun replaces
+    (:func:`_replaceable_leaf`) instead of continuing it.
+    """
+    replaceable = None
     try:
-        report = inspect_existing_run_admission(run_dir, requested, config_path=config_path)
-        if report["resume_compatibility"] != "compatible":
-            return False, str(report["reason"])
-        saved_config = config_loader.validate_resolved_config(config_loader.load_yaml(common.paths.resolve_run_config_path(run_dir)))
-        split, normalizer_artifact = _read_saved_data_artifacts(run_dir)
-        _validate_saved_data_contract(saved_config, split, normalizer_artifact)
-        identity = learning.training.checkpoint.build_checkpoint_identity(
-            requested,
-            split.as_payload(),
-            normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
-            persisted_config=saved_config,
+        if not run_dir.is_dir() or run_dir.is_symlink():
+            return "refused", "No safe persisted stage leaf is available for checkpoint resume."
+        _require_no_active_writer(run_dir)
+        finished = _finished_matched_leaf(run_dir)
+        receipt = prerequisites(finished)
+        if finished is None:
+            replaceable = _replaceable_leaf(run_dir, requested, matched_receipt=receipt)
+        if finished is None and replaceable is None:
+            _admit_resolved_resume(run_dir, requested, output_root=None, device_resolution=None, matched_receipt=receipt)
+    except ContinuationRefusedError as error:
+        return "refused", f"Persisted state of the stage or its prerequisites refuses its continuation: {error.__cause__ or error}"
+    except Exception as error:  # noqa: BLE001 -- what the persisted state does not refuse is the job's environment
+        cause = f"{type(error).__name__}: {console.sanitized_exception_message(error)}"
+        return "environment", f"The job's environment, not the leaf's state, ended the check: {cause}"
+    if finished is not None:
+        return "finished", "The leaf is finished and passes its admission, so it has nothing to resume."
+    if replaceable is not None:
+        return "resumable", "The leaf ended before its first checkpoint, so its rerun replaces it with a fresh start."
+    return "resumable", "Persisted lifecycle, data state, checkpoint and history passed read-only resume checks."
+
+
+def _continued_stage_leaf(run_dir: Path, requested: Mapping[str, Any], *, matched_receipt: Mapping[str, Any] | None) -> Path | None:
+    """
+    Return an unfinished stage's existing leaf, which continues from its last checkpoint, or ``None`` for its start.
+
+    That start allocates an absent leaf or replaces one whose attempt ended before its first checkpoint
+    (:func:`_replaceable_leaf`); another writer is the job's environment, probed first as by every continuation.
+    """
+    if not run_dir.exists():
+        return None
+    with _unstarted_continuation():
+        _require_no_active_writer(run_dir)
+        return None if _replaceable_leaf(run_dir, requested, matched_receipt=matched_receipt) is not None else run_dir
+
+
+def _finished_matched_leaf(run_dir: Path) -> dict[str, Any] | None:
+    """
+    Return a matched stage's finished leaf, ``None`` for an absent or unfinished leaf, which its continuation admission decides.
+
+    A leaf whose summary records a finished status is admitted as finished alone: what refuses that admission is the
+    stage's refusal with its reason, the one ``ContinuationRefusedError``, never left to a continuation's status check.
+    Its admission reads the leaf's checkpoints, so another numerical environment than theirs ends the stage by the job's
+    environment, which the command reports like a finished run's rerun (:func:`_unstarted_continuation`).
+    """
+    if not run_dir.exists():
+        return None
+    with _unstarted_continuation():
+        try:
+            with _refused_by_state():
+                return validate_finished_run(run_dir)
+        except ContinuationRefusedError:
+            with _refused_by_state():
+                summary_path = common.paths.resolve_run_summary_path(run_dir)
+                finished = summary_path.is_file() and read_run_summary(run_dir).get("status") in _FINISHED_RUN_STATUSES
+            if finished:
+                raise
+            return None
+
+
+def _finished_stage_leaf(name: str, run_dir: Path, stage_failure: Callable[[str, BaseException], BaseException]) -> dict[str, Any] | None:
+    """
+    Return a selected stage's finished leaf for its plan (:func:`_finished_matched_leaf`), ``None`` for any other leaf.
+
+    A finished leaf its admission refuses is the stage's refusal (``stage_failure``). An end by the job's environment, such
+    as another numerical environment than the leaf's checkpoints', keeps its own error before any stage report, like a rerun.
+    """
+    try:
+        return _finished_matched_leaf(run_dir)
+    except ContinuationRefusedError as error:
+        raise stage_failure(name, error) from error
+
+
+def _finished_b_receipt(b_dir: Path, *, record: Mapping[str, Any], a0_dir: Path, finished_b: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """
+    Build B's receipt from its finished leaf alone, saved config included, with its parent record's identity and A0's handoff, and validate it.
+
+    Read-only, and the one build every reader of B's receipt runs: a finished B's admission, in its plan and in its
+    recovery check, builds it from ``finished_b``, the leaf its finished-run admission already returned, so evidence its
+    receipt refuses, such as B's devices or a receipt that fails the receipt's own rules
+    (:func:`matched_budget.validate_b_receipt`), refuses B there as at B's step.
+    """
+    finished_b = validate_finished_run(b_dir) if finished_b is None else finished_b
+    return matched_budget.validate_b_receipt(
+        matched_budget.build_b_receipt(
+            parent_identity_sha256=record["parent_identity_sha256"],
+            a0_handoff_sha256=common.serialization.file_sha256(a0_dir / transient_handoff.HANDOFF_DIRECTORY / "manifest.json"),
+            b_config=finished_b["config"],
+            finished_b=finished_b,
         )
-        checkpoint = learning.training.checkpoint
-        last = checkpoint.load_checkpoint(
-            common.paths.resolve_last_checkpoint_file(run_dir),
-            expected_identity=identity,
-            expected_role="last",
-            payload_kind="full",
-            scheduler_expected=requested.get("scheduler") is not None,
-            require_best=False,
-            adapter_expected=True,
-            resume=True,
+    )
+
+
+def _require_published_b_receipt(b_dir: Path, receipt: Mapping[str, Any]) -> None:
+    """Require, read-only, the receipt B publishes as its completion record, the one its leaf rebuilds: A1's prerequisite."""
+    if not matched_budget.verify_b_receipt_copy(b_dir, receipt):
+        msg = f"B finished without its budget receipt; run its plan with --train-stages b, which publishes it for a finished B: {b_dir}"
+        raise RunLifecycleError(msg)
+
+
+def _publish_b_receipt(b_dir: Path, *, record: Mapping[str, Any], a0_dir: Path) -> None:
+    """
+    Publish B's receipt, its completion record, idempotently once B finished, which it stays whatever ends the build or write.
+
+    Another receipt in B's leaf, or B's finished state refusing the receipt built from it, its rules included
+    (:func:`_finished_b_receipt`), is B's state: the one ``ContinuationRefusedError``. The job's environment failing the
+    write, or the read or decode of B's finished state that builds the receipt (an ``OSError`` or a ``MemoryError``),
+    raises ``UnpublishedReceiptError``, naming B's step, because a finished B is never resumed.
+    """
+    try:
+        with _refused_by_state():
+            receipt = _finished_b_receipt(b_dir, record=record, a0_dir=a0_dir)
+        matched_budget.publish_b_receipt(b_dir, receipt)
+    except ContinuationRefusedError as error:
+        refusal = error.__cause__ or error
+        reason = f"{type(refusal).__name__}: {console.sanitized_exception_message(refusal)}"
+        msg = f"B finished, but its finished state refuses its budget receipt: {reason}"
+        raise ContinuationRefusedError(msg) from refusal
+    except FileExistsError as error:
+        msg = f"B finished, but its leaf holds another budget receipt than it publishes: {console.sanitized_exception_message(error)}"
+        raise ContinuationRefusedError(msg) from error
+    except (OSError, MemoryError) as error:
+        msg = (
+            "B finished, but the job's environment ended the publication of its budget receipt; run its plan with --train-stages b "
+            f"in a matching allocation, which publishes it for a finished B: {type(error).__name__}: {console.sanitized_exception_message(error)}"
         )
-        best_path = common.paths.resolve_best_checkpoint_file(run_dir)
-        if last["best_metric"] is None:
-            if best_path.exists():
-                return False, "Best checkpoint conflicts with the last checkpoint."
-        else:
-            best = checkpoint.load_checkpoint(
-                best_path,
-                expected_identity=identity,
-                expected_role="best",
-                payload_kind=checkpoint.best_payload_kind(requested),
-                scheduler_expected=requested.get("scheduler") is not None,
-                require_best=True,
-                adapter_expected=True,
-            )
-            if best["best_metric"] != last["best_metric"] or best["best_epoch"] != last["best_epoch"]:
-                return False, "Best and last checkpoints disagree about the selected objective."
-        learning.training.history.validate_resume_history(run_dir, **_history_binding(requested, identity, last))
-    except Exception:  # noqa: BLE001
-        return False, "Persisted resume state, checkpoint or history validation failed."
-    return True, "Persisted lifecycle, data state, checkpoint and history passed read-only resume checks."
+        raise UnpublishedReceiptError(msg) from error
 
 
 def _run_transient_matched_plan(  # noqa: C901, PLR0912
@@ -3110,82 +3791,98 @@ def _run_transient_matched_plan(  # noqa: C901, PLR0912
     if not selected or selected.difference(dirs) or len(selected) != len(train_stages):
         msg = "--train-stages must select one or more distinct a0,b,a1 stages."
         raise ValueError(msg)
-    device_resolution = learning.device.resolve_device(configs["a0"]["run"]["device"], path="run.device")
-    for config in configs.values():
-        validate_deterministic_model_device_policy(config, device_resolution)
+    # The device of a plan that continues an existing leaf is the job's environment, as for any continuation.
+    with _unstarted_continuation() if any(dirs[name].exists() for name in selected) else nullcontext():
+        device_resolution = learning.device.resolve_device(configs["a0"]["run"]["device"], path="run.device")
+        for config in configs.values():
+            validate_deterministic_model_device_policy(config, device_resolution)
     record = run_identity.build_transient_experiment_record(configs["a0"], configs["b"], stage_a1=configs["a1"], config_path=config_path)
     record_path = run_identity.experiment_record_path(record, output_root=configs["a0"]["paths"]["output_root"])
 
-    # Reject incompatible existing leaves and absent unselected dependencies before any allocation.
-    for name, run_dir in dirs.items():
-        if run_dir.exists() or run_dir.is_symlink():
-            saved_path = common.paths.resolve_run_config_path(run_dir)
-            if run_dir.is_symlink() or not saved_path.is_file():
-                msg = f"Matched stage {name} has an unsafe or incomplete config: {run_dir}"
-                raise RunLifecycleError(msg)
-            saved = config_loader.validate_resolved_config(config_loader.load_yaml(saved_path))
-            _require_current_training(saved, unit=f"Matched stage {name} {run_dir}")
-            if name == "a0" and saved["run"]["layout"]["a0_id"] != configs["a0"]["run"]["layout"]["a0_id"]:
-                msg = (
-                    f"The existing A0 at {run_dir} has another scientific identity than the requested plan. "
-                    "Train the changed science with --revision <label>."
-                )
-                raise RunLifecycleError(msg)
-            validate_resume_config(configs[name], saved)
-    if record_path.exists():
-        run_identity.validate_persisted_transient_experiment_record(record, output_root=configs["a0"]["paths"]["output_root"])
-    elif any(dirs[name].exists() for name in ("b", "a1")):
-        msg = "Matched children exist without their exact parent experiment record."
-        raise RunLifecycleError(msg)
+    # Reject incompatible existing leaves and absent unselected dependencies before any allocation: the leaves' persisted
+    # state refuses them.
+    with _unstarted_continuation(), _refused_by_state():
+        for name, run_dir in dirs.items():
+            if run_dir.exists() or run_dir.is_symlink():
+                saved_path = common.paths.resolve_run_config_path(run_dir)
+                if run_dir.is_symlink() or not saved_path.is_file():
+                    msg = f"Matched stage {name} has an unsafe or incomplete config: {run_dir}"
+                    raise RunLifecycleError(msg)
+                saved = config_loader.validate_resolved_config(config_loader.load_yaml(saved_path))
+                _require_current_training(saved, unit=f"Matched stage {name} {run_dir}")
+                if name == "a0" and saved["run"]["layout"]["a0_id"] != configs["a0"]["run"]["layout"]["a0_id"]:
+                    msg = (
+                        f"The existing A0 at {run_dir} has another scientific identity than the requested plan. "
+                        "Train the changed science with --revision <label>."
+                    )
+                    raise RunLifecycleError(msg)
+                validate_resume_config(configs[name], saved)
+        if record_path.exists():
+            run_identity.validate_persisted_transient_experiment_record(record, output_root=configs["a0"]["paths"]["output_root"])
+        elif any(dirs[name].exists() for name in ("b", "a1")):
+            msg = "Matched children exist without their exact parent experiment record."
+            raise RunLifecycleError(msg)
     outcomes: dict[str, dict[str, Any]] = {}
-    a0_handoff_path = dirs["a0"] / transient_handoff.HANDOFF_DIRECTORY / "manifest.json"
 
-    def admitted_a0() -> None:
-        _validate_reusable_stage_a(dirs["a0"], requested_a=configs["a0"], requested_b=configs["b"])
+    admitted_a0 = partial(_validate_reusable_stage_a, dirs["a0"], requested_a=configs["a0"], requested_b=configs["b"])
 
-    def admitted_receipt(*, before_a1: bool) -> dict[str, Any]:
-        admitted_a0()
-        finished_b = validate_finished_run(dirs["b"])
-        validate_resume_config(configs["b"], finished_b["config"])
-        receipt = matched_budget.build_b_receipt(
-            parent_identity_sha256=record["parent_identity_sha256"],
-            a0_handoff_sha256=common.serialization.file_sha256(a0_handoff_path),
-            b_config=configs["b"],
-            finished_b=finished_b,
+    def admitted_prerequisites(name: str, finished: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+        """
+        Admit a stage's prerequisites read-only and return A1's receipt; what they refuse is persisted state.
+
+        A0 for B and A1, for a finished B the receipt it publishes at its step, which a copy already in its leaf must equal
+        byte for byte, and for A1 the receipt B published, rebuilt from its finished leaf, which a finished A1's copy must
+        equal byte for byte. The plan's admission and a failed stage's recovery check both run them.
+        """
+        receipt = None
+        with _refused_by_state():
+            if name != "a0":
+                admitted_a0()
+            if name == "b" and finished is not None:
+                matched_budget.verify_b_receipt_copy(dirs["b"], _finished_b_receipt(dirs["b"], record=record, a0_dir=dirs["a0"], finished_b=finished))
+            if name == "a1":
+                receipt = _finished_b_receipt(dirs["b"], record=record, a0_dir=dirs["a0"])
+                _require_published_b_receipt(dirs["b"], receipt)
+                if finished is not None:
+                    matched_budget.verify_b_receipt_copy(dirs["a1"], receipt)
+        return receipt
+
+    def admitted_stage(name: str, finished: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+        """Admit a stage's prerequisites, then A1's GPU model, read-only, and return A1's receipt."""
+        receipt = admitted_prerequisites(name, finished)
+        if receipt is not None:
+            # The pair's GPU model, read-only before A1's own admission repeats it: another one ends the plan before any leaf.
+            _require_pair_device(configs["a1"], device_resolution, sessions=None, matched_receipt=receipt)
+        return receipt
+
+    def stage_failure(name: str, error: BaseException) -> MatchedStageExecutionError | MatchedStageInterrupted:
+        """Classify a selected stage that ended before or in its attempt by its cause, never by the phase it ended in."""
+        if isinstance(error, ContinuationRefusedError):
+            # Refused by the leaf's or its prerequisites' persisted state before its attempt changed it, also by the full
+            # restore the read-only recovery check never runs: the same command is refused again, so no resume is offered.
+            return MatchedStageExecutionError(name, dirs[name], recovery="refused", reason=str(error))
+        # A failure of the job's environment, or an interrupt, keeps its type and gets the read-only recovery check: the
+        # state checks of the stage's admission, its prerequisites' included.
+        recovery, reason = _matched_failed_stage_recovery(
+            dirs[name], configs[name], prerequisites=lambda finished: admitted_prerequisites(name, finished)
         )
-        if before_a1:
-            # A read-only device check before B's receipt is published, so an A1 refused on another GPU model changes no run;
-            # A1's own admission repeats it.
-            _require_pair_device(configs["a1"], device_resolution, sessions=[], matched_receipt=receipt)
-        matched_budget.publish_b_receipt(dirs["b"], receipt)
-        return matched_budget.load_b_receipt(
-            dirs["b"] / matched_budget.RECEIPT_NAME,
-            parent_identity_sha256=record["parent_identity_sha256"],
-            a0_handoff_sha256=common.serialization.file_sha256(a0_handoff_path),
-            b_run_name=configs["b"]["run"]["name"],
-        )
+        if isinstance(error, KeyboardInterrupt):
+            return MatchedStageInterrupted(name, dirs[name], recovery=recovery, reason=reason)
+        return MatchedStageExecutionError(name, dirs[name], recovery=recovery, reason=reason)
 
     if "b" in selected and "a0" not in selected:
-        admitted_a0()
+        with _unstarted_continuation():
+            admitted_prerequisites("b", None)
     if "a1" in selected and "b" not in selected:
         try:
-            admitted_receipt(before_a1=True)
-        except KeyboardInterrupt as error:
-            msg = "a1"
-            raise MatchedStageInterrupted(
-                msg,
-                dirs["a1"],
-                resumable=False,
-                reason="A0/B prerequisite admission was interrupted before A1 execution.",
-            ) from error
-        except Exception as error:
-            msg = "a1"
-            raise MatchedStageExecutionError(
-                msg,
-                dirs["a1"],
-                resumable=False,
-                reason="A0/B prerequisite admission failed before A1 execution.",
-            ) from error
+            with _unstarted_continuation():
+                admitted_stage("a1", None)
+        except (KeyboardInterrupt, Exception) as error:
+            if unstarted_by_environment(error):
+                # Like B's prerequisite admission above, the job's environment ended the plan before any leaf: the rerun.
+                raise
+            a1_failure = stage_failure("a1", error)
+            raise a1_failure from error
 
     if not record_path.exists():
         record_path = run_identity.admit_fresh_transient_experiment_record(record, output_root=configs["a0"]["paths"]["output_root"])
@@ -3194,62 +3891,42 @@ def _run_transient_matched_plan(  # noqa: C901, PLR0912
         if name not in selected:
             continue
         run_dir = dirs[name]
-        prerequisites_admitted = False
+        completed = _finished_stage_leaf(name, run_dir, stage_failure)
         try:
-            receipt = None
-            if name == "b":
-                admitted_a0()
-            if name == "a1":
-                receipt = admitted_receipt(before_a1=True)
-            prerequisites_admitted = True
-            if run_dir.exists():
-                try:
-                    completed: dict[str, Any] | None = validate_finished_run(run_dir)
-                except (FileNotFoundError, RunLifecycleError):
-                    completed = None
-                if completed is None:
-                    outcome = _run_resolved_experiment(
-                        configs[name],
-                        config_path=config_path,
-                        resume=run_dir,
-                        device_resolution=device_resolution,
-                        matched_receipt=receipt,
-                    )
-                else:
-                    outcome = {
-                        "run_dir": run_dir,
-                        "result": {
-                            "status": completed["summary"]["training_outcome"]["status"],
-                            "training_outcome": completed["summary"]["training_outcome"],
-                            "best_epoch": completed["summary"]["best_epoch"],
-                            "best_metric": completed["summary"]["best_metric"],
-                        },
-                        "device_resolution": device_resolution,
-                        "task": "transient_drying",
-                        "already_complete": True,
-                    }
+            # The stage's prerequisite admission, before its own: what A0 or B refuse is persisted state, so is a finished
+            # A1's copy of the receipt B published that is not byte-identical.
+            with _unstarted_continuation():
+                receipt = admitted_stage(name, completed)
+            if completed is not None:
+                outcome: dict[str, Any] = {
+                    "run_dir": run_dir,
+                    "result": {
+                        "status": completed["summary"]["training_outcome"]["status"],
+                        "training_outcome": completed["summary"]["training_outcome"],
+                        "best_epoch": completed["summary"]["best_epoch"],
+                        "best_metric": completed["summary"]["best_metric"],
+                    },
+                    "device_resolution": device_resolution,
+                    "task": "transient_drying",
+                    "already_complete": True,
+                }
             else:
+                resume = _continued_stage_leaf(run_dir, configs[name], matched_receipt=receipt)
                 outcome = _run_resolved_experiment(
                     configs[name],
                     config_path=config_path,
-                    output_root=output_root,
+                    resume=resume,
+                    output_root=output_root if resume is None else None,
                     device_resolution=device_resolution,
                     matched_receipt=receipt,
                 )
-        except (ExistingRunAdmissionError, SourceBindingError):
+        except ExistingRunAdmissionError:
             raise
-        except KeyboardInterrupt as error:
-            if prerequisites_admitted:
-                resumable, reason = _matched_failed_stage_recovery(run_dir, configs[name], config_path=config_path)
-            else:
-                resumable, reason = False, "Prerequisite admission was interrupted before this stage executed."
-            raise MatchedStageInterrupted(name, run_dir, resumable=resumable, reason=reason) from error
-        except Exception as error:
-            if prerequisites_admitted:
-                resumable, reason = _matched_failed_stage_recovery(run_dir, configs[name], config_path=config_path)
-            else:
-                resumable, reason = False, "Prerequisite admission failed before this stage executed."
-            raise MatchedStageExecutionError(name, run_dir, resumable=resumable, reason=reason) from error
+        except (KeyboardInterrupt, Exception) as error:
+            if isinstance(error, ContinuationRefusedError) and isinstance(error.__cause__, SourceBindingError):
+                # A source-tree refusal stays an admission refusal, which the command reports as rejected.
+                raise
+            raise stage_failure(name, error) from error
         outcomes[name] = outcome
         if name == "a0" and outcome["result"]["best_epoch"] is None:
             # Only an A0 without an eligible checkpoint is no branch point; a diverged A0 branches from its best eligible one.
@@ -3257,7 +3934,11 @@ def _run_transient_matched_plan(  # noqa: C901, PLR0912
         if name == "a0":
             admitted_a0()
         if name == "b":
-            admitted_receipt(before_a1=False)
+            # B owns its receipt, its completion record: published, idempotently, whether B trained now or finished before.
+            try:
+                _publish_b_receipt(dirs["b"], record=record, a0_dir=dirs["a0"])
+            except ContinuationRefusedError as error:
+                raise stage_failure(name, error) from error
 
     last_name = next(reversed(outcomes))
     return {
@@ -3279,78 +3960,80 @@ def _run_saved_effective_resume(
     output_root: Path | str | None,
     train_stages: tuple[str, ...] | None,
 ) -> dict[str, Any]:
-    """Continue one exact saved effective configuration through strict execution admission."""
+    """
+    Continue one exact saved effective configuration through strict execution admission.
+
+    Its saved config, Optuna trial layout and stage selection, and a stage's parent record, A0 and B receipt are the saved
+    run's state: what they refuse raises the one ``ContinuationRefusedError``. A B continued to its end publishes its
+    receipt; an A1 requires the receipt B published, read-only, and a finished B without one refuses it.
+    The device is resolved by the continuation's own admission (:func:`_run_resolved_experiment`).
+    Its status refuses a completed run before any check of the job's environment: such a run is never resumed whatever the environment is.
+    """
     run_dir = Path(resume).expanduser().absolute()
-    requested = config_loader.validate_resolved_config(config_loader.load_yaml(config_path))
-    if requested["run"]["layout"]["trial"] is not None:
-        msg = f"Optuna trials are not resumed: {run_dir}. Reopen the study instead; interrupted trials restart as fresh trials."
-        raise RunLifecycleError(msg)
-    # A direct bundle has no parent-relative dependencies: its explicit run_dir
-    # remains authoritative after rename. Parent-linked stages retain layout
-    # inversion so their shared A0 and immutable branch records stay contained.
-    actual_root = Path(requested["paths"]["output_root"])
-    if requested["run"]["layout"]["stage"] != "single":
-        actual_root = common.paths.resolve_config_output_root(requested, run_dir)
-        requested["paths"]["output_root"] = str(actual_root)
-    _apply_device_override(requested, device)
-    arm = requested["training"].get("comparison_arm")
-    stage = str(requested["run"]["layout"]["stage"])
-    if train_stages is not None and train_stages != (stage,):
-        msg = "Saved-effective resume selects only its exact saved stage."
-        raise ValueError(msg)
-    device_resolution = learning.device.resolve_device(requested["run"]["device"], path="run.device")
     receipt = None
-    stage_runs: dict[str, Path] = {stage: run_dir}
-    marker = common.paths.resolve_config_branch_dir(requested, output_root=actual_root) / common.paths.EXPERIMENT_RECORD_FILENAME
-    # Every pair shares the seed group's A0; its immutable record lives beside its own B/A1 leaves.
-    if arm in {"b", "a1"}:
-        admitted = run_identity.load_readonly_transient_experiment_record(marker, experiments_root=actual_root)
-        record = admitted["record"]
-        child = record["children"].get(f"stage_{arm}")
-        if not isinstance(child, Mapping) or child["semantic_config_sha256"] != learning.training.checkpoint.config_digest(requested):
-            msg = "Saved stage scientific identity disagrees with its immutable parent."
+    b_record: Mapping[str, Any] | None = None
+    with _unstarted_continuation(), _refused_by_state():
+        requested = config_loader.validate_resolved_config(config_loader.load_yaml(config_path))
+        if requested["run"]["layout"]["trial"] is not None:
+            msg = f"Optuna trials are not resumed: {run_dir}. Reopen the study instead; interrupted trials restart as fresh trials."
             raise RunLifecycleError(msg)
-        stage_runs = {
-            key.removeprefix("stage_"): run_identity.resolve_readonly_experiment_child(record, child_record, marker=marker, output_root=actual_root)
-            for key, child_record in record["children"].items()
-        }
-        if stage_runs[arm].resolve(strict=False) != run_dir.resolve(strict=False):
-            msg = "Saved stage does not identify its immutable parent child."
-            raise RunLifecycleError(msg)
-        saved_a0 = config_loader.validate_resolved_config(config_loader.load_yaml(common.paths.resolve_run_config_path(stage_runs["a0"])))
-        prerequisite_b = (
-            requested
-            if arm == "b"
-            else config_loader.validate_resolved_config(config_loader.load_yaml(common.paths.resolve_run_config_path(stage_runs["b"])))
-        )
-        _validate_reusable_stage_a(stage_runs["a0"], requested_a=saved_a0, requested_b=prerequisite_b)
-        if arm == "a1":
-            # Receipt admission preserves the current execution implementation,
-            # finished B controller, common A0 checkpoint and exact handoff.
-            finished_b = validate_finished_run(stage_runs["b"])
-            expected = matched_budget.build_b_receipt(
-                parent_identity_sha256=record["parent_identity_sha256"],
-                a0_handoff_sha256=common.serialization.file_sha256(stage_runs["a0"] / transient_handoff.HANDOFF_DIRECTORY / "manifest.json"),
-                b_config=finished_b["config"],
-                finished_b=finished_b,
-            )
-            receipt = matched_budget.load_b_receipt(
-                stage_runs["b"] / matched_budget.RECEIPT_NAME,
-                parent_identity_sha256=record["parent_identity_sha256"],
-                a0_handoff_sha256=expected["a0_handoff_sha256"],
-                b_run_name=finished_b["config"]["run"]["name"],
-            )
-            if receipt != expected:
-                msg = "Immutable B receipt disagrees with its completed controller evidence."
+        # Before the job's device, writer and an A0's numerical environment are checked: no environment makes it resumable.
+        _require_resumable_status(read_run_summary(run_dir), run_dir)
+        # A direct bundle has no parent-relative dependencies: its explicit run_dir
+        # remains authoritative after rename. Parent-linked stages retain layout
+        # inversion so their shared A0 and immutable branch records stay contained.
+        actual_root = Path(requested["paths"]["output_root"])
+        if requested["run"]["layout"]["stage"] != "single":
+            actual_root = common.paths.resolve_config_output_root(requested, run_dir)
+            requested["paths"]["output_root"] = str(actual_root)
+        _apply_device_override(requested, device)
+        arm = requested["training"].get("comparison_arm")
+        stage = str(requested["run"]["layout"]["stage"])
+        if train_stages is not None and train_stages != (stage,):
+            msg = "Saved-effective resume selects only its exact saved stage."
+            raise ValueError(msg)
+        stage_runs: dict[str, Path] = {stage: run_dir}
+        marker = common.paths.resolve_config_branch_dir(requested, output_root=actual_root) / common.paths.EXPERIMENT_RECORD_FILENAME
+        # Every pair shares the seed group's A0; its immutable record lives beside its own B/A1 leaves.
+        if arm in {"b", "a1"}:
+            admitted = run_identity.load_readonly_transient_experiment_record(marker, experiments_root=actual_root)
+            record = admitted["record"]
+            child = record["children"].get(f"stage_{arm}")
+            if not isinstance(child, Mapping) or child["semantic_config_sha256"] != learning.training.checkpoint.config_digest(requested):
+                msg = "Saved stage scientific identity disagrees with its immutable parent."
                 raise RunLifecycleError(msg)
+            stage_runs = {
+                key.removeprefix("stage_"): run_identity.resolve_readonly_experiment_child(
+                    record, child_record, marker=marker, output_root=actual_root
+                )
+                for key, child_record in record["children"].items()
+            }
+            if stage_runs[arm].resolve(strict=False) != run_dir.resolve(strict=False):
+                msg = "Saved stage does not identify its immutable parent child."
+                raise RunLifecycleError(msg)
+            saved_a0 = config_loader.validate_resolved_config(config_loader.load_yaml(common.paths.resolve_run_config_path(stage_runs["a0"])))
+            prerequisite_b = (
+                requested
+                if arm == "b"
+                else config_loader.validate_resolved_config(config_loader.load_yaml(common.paths.resolve_run_config_path(stage_runs["b"])))
+            )
+            _validate_reusable_stage_a(stage_runs["a0"], requested_a=saved_a0, requested_b=prerequisite_b)
+            if arm == "b":
+                b_record = record
+            else:
+                # B's published receipt must equal the one its current implementation, finished state and A0's handoff rebuild.
+                receipt = _finished_b_receipt(stage_runs["b"], record=record, a0_dir=stage_runs["a0"])
+                _require_published_b_receipt(stage_runs["b"], receipt)
     outcome = _run_resolved_experiment(
         requested,
         config_path=config_path,
         resume=run_dir,
         output_root=output_root,
-        device_resolution=device_resolution,
         matched_receipt=receipt,
     )
+    if b_record is not None:
+        # B owns its receipt: continued to its end, it publishes it like its plan's B step; an unfinished B raised above.
+        _publish_b_receipt(run_dir, record=b_record, a0_dir=stage_runs["a0"])
     if arm is not None:
         outcome["stage_runs"] = stage_runs
         outcome["stage_outcomes"] = {stage: dict(outcome)}
@@ -3404,13 +4087,27 @@ def run_experiment(
     dict[str, Any]
         Final single-run outcome or the last executed matched stage's outcome.
 
+    Raises
+    ------
+    RunLifecycleError
+        If the job's Slurm provenance is invalid, read before any run's state on every path: the job's environment.
+    ContinuationRefusedError
+        If a continuation's persisted state refuses it before its attempt changed the run, scientific overrides of a
+        saved-config resume included.
+
     """
+    # The job's Slurm provenance is its environment, read once before any check of a run's state: an invalid one
+    # leaves every run unchanged for a rerun in a matching allocation.
+    with _unstarted_continuation():
+        slurm_runtime_provenance()
     if resume is not None and Path(config_path).expanduser().resolve(strict=False) == common.paths.resolve_run_config_path(
         Path(resume).expanduser()
     ).resolve(strict=False):
-        if any(value is not None for value in (epochs, train_dataset, rollout_length, lr_scale, revision, seed)):
-            msg = "Saved-effective resume cannot override scientific settings; it continues its saved config exactly."
-            raise ValueError(msg)
+        # An override contradicts the saved run, which refuses it like any other change of its saved science.
+        with _refused_by_state():
+            if any(value is not None for value in (epochs, train_dataset, rollout_length, lr_scale, revision, seed)):
+                msg = "Saved-effective resume cannot override scientific settings; it continues its saved config exactly."
+                raise ValueError(msg)
         return _run_saved_effective_resume(
             config_path,
             resume=resume,

@@ -2,10 +2,15 @@
 
 Responsibilities:
   - Check exact resumed state, the wall-time last-checkpoint cadence, checkpoint roles and payload
-    kinds, a global step equal to the committed updates, transactional restore, evaluation cadence,
-    and objective selection
+    kinds, a cut archive as unreadable content and a failed read or exhausted CPU memory, also as
+    torch's allocator reports it, as the environment's, a global step equal to the committed updates,
+    transactional restore, evaluation cadence, and objective selection
+  - Check that a failed rename of the last after its new best's, which leaves a pair no resume admits, is
+    no failed write of the environment but a ``RuntimeError`` naming the pair
   - Check that checkpoint and history admit a resume only in the producing container, while reading
     admits a native and a container checkpoint alike
+  - Check that another numerical environment refuses a resume as the training environment's error and
+    any other identity difference as the run's
 
 Design principles:
   - Synthetic deterministic training distinguishes best selection from last resume state
@@ -17,6 +22,7 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import inspect
 import itertools
@@ -86,7 +92,6 @@ class _DatasetMSE:
     """
 
     id = "mse"
-    space = "physical"
 
     def reset(self) -> None:
         """Clear accumulated squared error and element count."""
@@ -98,12 +103,10 @@ class _DatasetMSE:
         pred: torch.Tensor,
         target: torch.Tensor,
         *,
-        space: str,
         batch_index: int,
     ) -> None:
         """Accumulate one physical batch using elementwise SSE and count."""
         del batch_index
-        assert space == self.space
         difference = pred - target
         self.total += float(torch.sum(difference * difference))
         self.count += difference.numel()
@@ -147,12 +150,10 @@ class _ObjectiveStreamMetric(_DatasetMSE):
         pred: torch.Tensor,
         target: torch.Tensor,
         *,
-        space: str,
         batch_index: int,
     ) -> None:
-        """Validate physical routing without accumulating batch values."""
+        """Accept one physical batch without accumulating batch values."""
         del pred, target, batch_index
-        assert space == self.space
 
     def compute(self) -> float:
         """Consume and return the next prescribed selection objective."""
@@ -818,7 +819,9 @@ def test_failure_between_the_two_renames_leaves_a_best_newer_than_last_that_fina
 
     This is the one window the paired publication leaves open: ``best`` is newer
     than ``last`` and no staged file remains. Run admission refuses to resume such
-    a pair; a loop that reaches completed finalization with it rejects it too.
+    a pair, so the failed rename is no failed write of the job's environment, which
+    a resume would continue, but a ``RuntimeError`` that names the pair; a loop that
+    reaches completed finalization with it rejects it too.
     """
     real_replace = type(tmp_path).replace
     last_renames: list[Path] = []
@@ -832,8 +835,9 @@ def test_failure_between_the_two_renames_leaves_a_best_newer_than_last_that_fina
         return real_replace(source, target)
 
     monkeypatch.setattr(type(tmp_path), "replace", fail_second_last_rename)
-    with pytest.raises(OSError, match="injected last-rename failure"):
+    with pytest.raises(RuntimeError, match=r"best_checkpoint\.pt was replaced but last_checkpoint\.pt was not") as ended:
         _streamed_loop(tmp_path, [0.5, 0.4])
+    assert isinstance(ended.value.__cause__, OSError)
     monkeypatch.undo()
 
     assert [path.name for path in tmp_path.iterdir() if path.name.startswith(".")] == []
@@ -1024,6 +1028,63 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
         )
 
 
+def test_a_cut_checkpoint_archive_is_unreadable_content_and_a_failed_read_stays_the_environments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A checkpoint archive cut short is an unreadable checkpoint, a ``ValueError``; a read that fails keeps its ``OSError``.
+
+    The bytes are read before torch decodes them, so a failed read is the job's environment, EINVAL included, and never
+    the checkpoint's content; so is a decoding that runs out of CPU memory, also when torch's CPU allocator reports it as
+    a ``RuntimeError``, which reaches the caller as a ``MemoryError``.
+    """
+    path = tmp_path / "last_checkpoint.pt"
+    torch.save({"weights": torch.zeros(8192)}, path)
+    archive = path.read_bytes()
+
+    def load() -> dict[str, Any]:
+        return learning.training.checkpoint.load_checkpoint(
+            path, expected_identity=_identity(), expected_role="last", payload_kind="full", scheduler_expected=False, require_best=False
+        )
+
+    # Without its central directory, an archive of a few kilobytes even makes torch's archive reader seek to a negative offset.
+    path.write_bytes(archive[: len(archive) // 2])
+    with pytest.raises(ValueError, match="Checkpoint is unreadable"):
+        load()
+    path.write_bytes(archive)
+    read_bytes = type(path).read_bytes
+
+    def failing_read(candidate: Path) -> bytes:
+        if candidate == path:
+            raise OSError(errno.EINVAL, "Invalid argument", str(candidate))
+        return read_bytes(candidate)
+
+    monkeypatch.setattr(type(path), "read_bytes", failing_read)
+    with pytest.raises(OSError, match="Invalid argument"):
+        load()
+    monkeypatch.undo()
+
+    def exhausted_load(*_args: Any, **_kwargs: Any) -> Any:
+        raise MemoryError
+
+    # Running out of CPU memory while decoding a healthy checkpoint is the job's environment, never its content.
+    monkeypatch.setattr(torch, "load", exhausted_load)
+    with pytest.raises(MemoryError):
+        load()
+
+    def allocator_exhausted_load(*_args: Any, **_kwargs: Any) -> Any:
+        # The text torch's CPU allocator raises when the host refuses an allocation (c10/core/impl/alloc_cpu.cpp).
+        msg = (
+            "[enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate "
+            "34359738368 bytes. Error code 12 (Cannot allocate memory)"
+        )
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(torch, "load", allocator_exhausted_load)
+    with pytest.raises(MemoryError, match="DefaultCPUAllocator"):
+        load()
+
+
 def test_the_training_identity_binds_the_held_out_evaluation_gate() -> None:
     """Every checkpoint identity and training fingerprint records that training and tuning never evaluate held-out roles.
 
@@ -1066,7 +1127,10 @@ def test_schema_or_identity_failure_precedes_runtime_mutation(tmp_path: Path, mi
 
     model, optimizer, scheduler, loss, train_loader, _ = _components(99)
     before = copy.deepcopy(model.state_dict())
-    with pytest.raises(ValueError, match=r"identity is incompatible|identity keys do not match"):
+    # Only another numerical environment is the training environment's error; any other identity difference is the run's.
+    environment = mismatch == "numerical_environment"
+    refusal = "producing numerical environment, which differs in numpy" if environment else r"identity is incompatible|identity keys do not match"
+    with pytest.raises(ValueError, match=refusal) as refused:
         learning.training.checkpoint.restore_checkpoint(
             payload,
             expected_identity=expected,
@@ -1077,6 +1141,7 @@ def test_schema_or_identity_failure_precedes_runtime_mutation(tmp_path: Path, mi
             train_loader=train_loader,
             budget=_budget(2),
         )
+    assert isinstance(refused.value, learning.training.checkpoint.ResumeEnvironmentError) == environment
     _assert_nested_equal(before, model.state_dict())
 
 
@@ -1133,16 +1198,20 @@ def test_resume_admits_only_the_container_its_run_was_produced_in(tmp_path: Path
         # Inference and artifact reading admit a native and a container run alike.
         admit_reading()
     else:
-        with pytest.raises(ValueError, match="identity is incompatible"):
+        # Reading in another container is the environment's error as well, which the producing container admits.
+        with pytest.raises(learning.training.checkpoint.ResumeEnvironmentError, match="differs in sif_sha256"):
             admit_reading()
     if saved == actual:
         admit_resume()
         restore()
         reconcile()
         return
-    for admit in (admit_resume, restore, reconcile):
-        with pytest.raises(ValueError, match="identity"):
+    # The checkpoint refuses another container as the training environment's error; the history binds the whole identity.
+    for admit in (admit_resume, restore):
+        with pytest.raises(learning.training.checkpoint.ResumeEnvironmentError, match="differs in sif_sha256"):
             admit()
+    with pytest.raises(ValueError, match="identity"):
+        reconcile()
     _assert_nested_equal(before, model.state_dict())
 
 

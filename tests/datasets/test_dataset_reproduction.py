@@ -2,11 +2,14 @@
 
 Responsibilities:
   - Exercise source capture and isolated restoration without changing real Git state
+  - Check that a live capture holds its snapshot's prune lock from the capture through the builder's publication, frees it
+    after its scope on success, reuse or error, and fails closed on a changed source
   - Check package identity boundaries, producer evidence and atomic single-folder publication
 
 Design principles:
   - Tiny controlled Git responses retain real filesystem, patch and hash checks
   - Corrupt recovery evidence and changed selected source bytes fail closed
+  - Lock contention is probed from a child process: under NFS a probe from the holding process proves nothing
 
 This module does NOT:
   - Run scientific generation, consume production data or initialize Git repositories
@@ -21,6 +24,7 @@ import json
 import runpy
 import shlex
 import shutil
+import subprocess
 import sys
 import tarfile
 from contextlib import contextmanager
@@ -38,6 +42,7 @@ from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_partition as partition
 from src.datasets.packages import dataset_packages_builder as builder
 from src.datasets.packages import dataset_packages_manifest as manifests
+from src.datasets.packages import dataset_packages_planning as planning
 from src.datasets.packages import dataset_packages_reproduction as reproduction
 from src.datasets.packages import dataset_packages_selection as selection
 
@@ -116,6 +121,107 @@ def test_snapshot_commit_identity_and_corruption_fail_closed(snapshot_fixture: t
     saved.write_text("corrupted\n")
     with pytest.raises(ValueError, match=r"verification|fingerprint"):
         module["capture_source_snapshot"](repository, snapshots)
+
+
+_EXCLUSIVE_PROBE = """
+import runpy, sys
+from pathlib import Path
+
+script = runpy.run_path(sys.argv[1])
+try:
+    with script["_tree_lock"](Path(sys.argv[2]), sys.argv[3], exclusive=True, blocking=False):
+        pass
+except script["_LockHeldError"]:
+    sys.exit(3)
+"""
+
+
+@pytest.fixture
+def live_capture(snapshot_fixture: tuple, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Capture the producing source live, outside a tree, reusing an existing snapshot as a prune could find it."""
+    module, repository, _snapshots, _head = snapshot_fixture
+    storage, trees = tmp_path / "storage", tmp_path / "runtime/sources"
+    monkeypatch.delenv("SOURCE_TREE_ID", raising=False)
+    monkeypatch.setenv("PROJECT_ROOT", str(repository))
+    monkeypatch.setenv("RUNTIME_ROOT", str(tmp_path / "runtime"))
+    monkeypatch.setattr(reproduction, "_source_script", lambda: SimpleNamespace(held_source_snapshot=module["held_source_snapshot"]))
+    name = Path(module["capture_source_snapshot"](repository, storage / "source_snapshots")["snapshot_path"]).parent.name
+
+    def assert_lock(*, held: bool) -> None:
+        """Try the snapshot prune's exclusive lock from a child process; under NFS a probe from the holder proves nothing."""
+        probe = subprocess.run([sys.executable, "-c", _EXCLUSIVE_PROBE, module["__file__"], str(trees), name], check=False)  # noqa: S603 -- test-owned argument vector
+        assert probe.returncode == (3 if held else 0)
+
+    return SimpleNamespace(module=module, storage=storage, name=name, assert_lock=assert_lock)
+
+
+def test_a_live_capture_holds_its_snapshot_lock_from_the_capture_until_its_scope_ends(
+    live_capture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prune lock is held from the start of the capture through the scope and free after it, also after an error."""
+    capture = live_capture.module["capture_source_snapshot"]
+    live = capture.__globals__  # the script's live globals, not the runpy copy
+
+    def capture_under_the_lock(root: Path, destination: Path) -> dict[str, str]:
+        live_capture.assert_lock(held=True)  # before the capture inspects or reuses the snapshot
+        return capture(root, destination)
+
+    def failed_publication() -> None:
+        with reproduction.held_producer_evidence(storage_root=live_capture.storage):
+            message = "publication failed"
+            raise RuntimeError(message)
+
+    monkeypatch.setitem(live, "capture_source_snapshot", capture_under_the_lock)
+    with reproduction.held_producer_evidence(storage_root=live_capture.storage) as evidence:
+        assert Path(evidence["source_snapshot"]["relative_path"]).parent.name == live_capture.name
+        live_capture.assert_lock(held=True)
+    live_capture.assert_lock(held=False)
+    with pytest.raises(RuntimeError, match="publication failed"):
+        failed_publication()
+    live_capture.assert_lock(held=False)
+
+
+def test_the_builder_holds_a_live_capture_through_publication_and_frees_it_on_reuse_or_failure(
+    live_capture: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No prune can delete the producing snapshot before the manifest naming it exists; reuse or a failed build frees it."""
+    provenance = _provenance()
+    prepared = planning.PreparedPackage(
+        request={key: provenance[key] for key in ("source_task", "dataset_name", "dataset_view", "selection")},
+        cases=(),
+        source_case_identities=tuple(provenance["source_case_identities"]),
+        grid=provenance["grid"],
+        source_outcomes=tuple(provenance["source_outcomes"]),
+    )
+    failures = iter([None, RuntimeError("publication failed")])
+
+    def publish(**arguments: Any) -> tuple[Path, Path, bool, dict[str, Any]]:
+        live_capture.assert_lock(held=True)
+        failure = next(failures)
+        if failure is not None:
+            raise failure
+        return Path("dataset.pt"), Path("dataset_manifest.json"), True, {**arguments["prefix"], "sample_count": 1, "transition_count": 0}
+
+    monkeypatch.setattr(planning, "prepare_dataset_selection", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(builder, "_publish", publish)
+    assert builder.build_dataset_selection(prepared.request, storage_root=live_capture.storage)["status"] == "reused"
+    live_capture.assert_lock(held=False)
+    with pytest.raises(RuntimeError, match="publication failed"):
+        builder.build_dataset_selection(prepared.request, storage_root=live_capture.storage)
+    live_capture.assert_lock(held=False)
+
+
+def test_a_source_change_between_locking_and_capturing_fails_closed(snapshot_fixture: tuple, tmp_path: Path) -> None:
+    module, repository, snapshots, head = snapshot_fixture
+    capture = module["capture_source_snapshot"]
+
+    def capture_after_a_commit(root: Path, destination: Path) -> dict[str, str]:
+        head["value"] = "b" * 40
+        return capture(root, destination)
+
+    capture.__globals__["capture_source_snapshot"] = capture_after_a_commit  # the script's live globals, not the runpy copy
+    with pytest.raises(RuntimeError, match="changed while"), module["held_source_snapshot"](repository, snapshots, tmp_path / "trees"):
+        pass
 
 
 def test_restore_rejects_escaping_links_and_occupied_destination(snapshot_fixture: tuple, tmp_path: Path) -> None:

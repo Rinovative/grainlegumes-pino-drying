@@ -1,15 +1,21 @@
 """Plot transient completed-output exploratory diagnostics.
 
 Responsibilities:
-  - Render exact physical-time state and static-field snapshots
-  - Plot physical trajectories and simulated-support schedules in a main and a start-up time window (the shared windows of the ui time module);
-    the aggregate state rows alternatively over the drying phase of ``analysis_ui_time.phase_cohort``, its cohort labels in the note
+  - Render exact physical-time state and static-field snapshots, a one-signed velocity state on the velocity colormap of the steady
+    plots; cells within round-off of 0 count as 0 for its sign and scale only, the map and its range note keep the stored values
+  - Plot state trajectories in the documented drying windows of the ui time module (one below 72 h, else the first 24 h, the
+    middle in days and the last 24 h), the aggregate state rows alternatively over the drying phase of
+    ``analysis_ui_time.phase_cohort``, its cohort labels in the note; authored schedules keep their start-up and
+    exact-support clock up to each exact stop, in the trajectory view and in the band over the snapshots
+  - Count the cases each dataset draws, and the eligible ones a bound leaves out, for the titles and notes of the EDA summaries
   - Consolidate target outcomes, terminal timing, final moisture, and exact evidence
 
 Design principles:
   - Every incompatible physical channel owns a separately labelled axis
   - Plot reductions delegate to the transient EDA semantic owner
   - Missing timing or physical-time evidence remains visibly unavailable
+  - Figure text names a dataset by its plotted label (``eda_capabilities.plotted_labels``); frames, styles and case ids stay
+    keyed by the dataset key
 
 This module does NOT:
   - Change established steady-flow plot functions or presentation styling
@@ -21,7 +27,7 @@ from __future__ import annotations
 
 import itertools
 from numbers import Integral
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -30,7 +36,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import MaxNLocator
 
-from src import generation
+from src import domain, generation
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda import eda_transient as transient
 from src.analysis.presentation import analysis_display_grid as display_grid
@@ -55,47 +61,69 @@ _SCHEDULE_ROW_SPACING: Final = 0.24
 _LEGEND_WIDTH_INCHES: Final = 2.4
 LEGEND_WRAP_WIDTH: Final = 26  # characters per line of a dataset legend entry
 _ORDER_COLORS: Final = ("#000000", "#F0E442", "#7F7F7F", "#332288", "#882255", "#AA4499", "#DDCC77", "#44AA99")  # no material color
-_BATCH_LINESTYLES: Final[tuple[visual_semantics.LineStyle, ...]] = ("-", "--", ":", "-.")  # batches of one material, by sorted label rank
 _HATCH_COLOR: Final = "white"  # Matplotlib draws a hatch in the edge color; white shows on every dataset color
-_BATCH_HATCHES: Final = ("", "//", "..", "xx")  # the same rank as bar fill pattern
+_SINGLETON_MARKER: Final = "o"  # a series with one stored time in a window shows as a point, since a line needs two
+_MAX_SIGNIFICANT_DIGITS: Final = 17  # significant digits that tell any two distinct float64 values apart
 FOOTNOTE_INCHES: Final = (0.1, 0.08)  # lower-left corner of a figure's disclosure line
-_TRAJECTORY_ROW_LABEL_X: Final = -0.28 * 0.5
 _TRAJECTORY_ROW_HEIGHT_INCHES: Final = 4.0 * 0.75
 _TRAJECTORY_WIDTH_INCHES: Final = 9.0
 _EARLY_OPERATION_END_HOURS: Final = time_axis.STARTUP_WINDOWS[1].stop_hours
-_RANGE_SERIES_VALUE_COUNT: Final = 3
 _MINIMUM_DISPERSION_SUPPORT: Final = 2
 _DATASET_HEADER_WRAP_WIDTH: Final = 38
 _MAXIMUM_DATASET_HEADER_LINES: Final = 2
 _OUTCOME_LABELS: Final = ("Reached target", "Right-censored")
 _COMPLETION_FIGURE_WIDTH_INCHES: Final = 10.5
+_COUNT_STRIP_HEIGHT_RATIO: Final = 0.3  # a contributor-count strip relative to the quantity row above it
+_NEAR_UNIFORM_RELATIVE_SPAN: Final = 0.01  # a map whose observed span is below this share of its magnitude names its range
+_WRAPPED_MAP_COLUMNS: Final = 2  # the fields of one dataset's retained maps fill this many columns
+_NOTE_LINE_INCHES: Final = 0.2  # the rise of a column header over its note line (14 pt)
+_VELOCITY_COMPONENTS: Final = next(group.fields for group in domain.tasks.registry.get_task("steady_flow").output_groups if group.id == "velocity")
+_VELOCITY_COLORMAP: Final = "turbo"  # docs/06: u and v of the steady plots use turbo
+_ROUNDOFF_RELATIVE: Final = 1e-9  # a velocity cell this small against the field's peak is round-off (v holds -1e-13 on the inlet row)
+
+# One window of a plotted row: coordinates, centre, range (lower, upper) or none, and the contributing cases of an aggregate.
+type _Series = tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]
 
 
-def batch_styles(materials: Mapping[str, str | None]) -> dict[str, visual_semantics.SeriesStyle]:
+def batch_styles(materials: Mapping[str, str | None], roles: Mapping[str, str | None] | None = None) -> dict[str, visual_semantics.SeriesStyle]:
     """
     Return the line color, style and bar hatch of every dataset, keyed by concise dataset label; the one mapping of the EDA plots.
 
     ``materials`` maps every dataset label to its one registered material or ``None``. A dataset with a registered material always
-    owns that material's color. Every other dataset takes, by its label's sorted rank, a solid line in a color of ``_ORDER_COLORS``,
-    which no material uses. Datasets that share one material tell apart by line style and hatch, taken by the sorted rank of their
-    labels; the first stays solid and unhatched. Viewers resolve this once over every loaded dataset, so a style never follows a selection.
+    owns that material's color; every other dataset takes, by its label's sorted rank, a color of ``_ORDER_COLORS``, which no
+    material uses. Line style and hatch are those of the dataset's evaluation role in ``roles`` (``analysis_visual_semantics``); a
+    dataset without a role is solid and unhatched, whatever its label. Viewers resolve this once over every loaded dataset, so a
+    style never follows a selection.
     """
     materials = {label: material if material in visual_semantics.MATERIAL_COLORS else None for label, material in materials.items()}
     unmatched = sorted(label for label, material in materials.items() if material is None)
     styles: dict[str, visual_semantics.SeriesStyle] = {}
     for label, material in materials.items():
-        if material is not None:
-            same = sorted(other for other, candidate in materials.items() if candidate == material)
-            rank = same.index(label)
-            styles[label] = visual_semantics.SeriesStyle(
-                visual_semantics.material_color(material),
-                _BATCH_LINESTYLES[rank % len(_BATCH_LINESTYLES)],
-                None,
-                _BATCH_HATCHES[rank % len(_BATCH_HATCHES)],
-            )
-        else:
-            styles[label] = visual_semantics.SeriesStyle(_ORDER_COLORS[unmatched.index(label) % len(_ORDER_COLORS)], "-", None)
+        role = None if roles is None else roles.get(label)
+        color = _ORDER_COLORS[unmatched.index(label) % len(_ORDER_COLORS)] if material is None else visual_semantics.material_color(material)
+        linestyle: visual_semantics.LineStyle = "-" if role is None else visual_semantics.ROLE_LINESTYLES[role]
+        styles[label] = visual_semantics.SeriesStyle(color, linestyle, None, "" if role is None else visual_semantics.ROLE_HATCHES[role])
     return styles
+
+
+def case_count_text(datasets: Mapping[str, pd.DataFrame], max_cases: int | None, *, plotted: Mapping[str, str]) -> tuple[str, str]:
+    """
+    Return a title's count of the cases each dataset draws (its first ``max_cases``, all without a bound) and a note of those left out.
+
+    ``datasets`` are only those that contribute to the view; ``plotted`` maps each to the label the figure writes. The count
+    reads «N cases» for one dataset, «N cases per Dataset» when every dataset draws N, else «label: N cases» for each. The note
+    names, for every dataset the bound leaves cases of, the drawn of its eligible cases (the frame's ``available_case_count``,
+    known before the load: the package or material membership, the successful cases of a source batch); else it is empty.
+    """
+    drawn = {label: len(frame) if max_cases is None else min(max_cases, len(frame)) for label, frame in datasets.items()}
+    counts = set(drawn.values())
+    if len(counts) > 1:
+        count = ", ".join(f"{plotted[label]}: {number} cases" for label, number in drawn.items())
+    else:
+        count = f"{next(iter(counts), 0)} cases{' per Dataset' if len(drawn) > 1 else ''}"
+    eligible = {label: frame.attrs.get("available_case_count") for label, frame in datasets.items()}
+    bounded = [f"{plotted[label]}: {drawn[label]} of {total}" for label, total in eligible.items() if isinstance(total, int) and total > drawn[label]]
+    return count, f"First cases drawn of the eligible ones — {'; '.join(bounded)}." if bounded else ""
 
 
 def _integer_count(value: object, *, label: str) -> int:
@@ -185,7 +213,7 @@ def _draw_exact_schedule_split_axes(
                     main_values,
                     color=colors[label],
                     linestyle=linestyles[label],
-                    marker=None,
+                    **_singleton_point(main_times.size),
                 )
                 main_support_by_row[field_index].append(main_times)
             if startup_times.size:
@@ -194,7 +222,7 @@ def _draw_exact_schedule_split_axes(
                     startup_values,
                     color=colors[label],
                     linestyle=linestyles[label],
-                    marker=None,
+                    **_singleton_point(startup_times.size),
                 )
             actual = case_times.get(label)
             if actual is None:
@@ -213,6 +241,7 @@ def _draw_exact_schedule_split_axes(
                 marker="o",
                 s=28,
                 zorder=4,
+                clip_on=False,  # whole also on a window's frame, where 1 h, the main window's start, puts it
             )
     for field_index, (main_axis, startup_axis) in enumerate(zip(main_axes, startup_axes, strict=True)):
         _configure_split_time_axes(main_axis, startup_axis, main_support_by_row[field_index], bottom=field_index == len(fields) - 1)
@@ -273,6 +302,12 @@ def _draw_inlet_pressure_axis(
     axis.grid(axis="y", alpha=0.20)
 
 
+def _without_roundoff(values: np.ndarray) -> np.ndarray:
+    """Return a copy of ``values`` for the scale only, each cell within solver round-off of 0 (against the peak) at 0: noise gives no second sign."""
+    peak = float(np.max(np.abs(values), initial=0.0))
+    return np.where(np.abs(values) <= _ROUNDOFF_RELATIVE * peak, 0.0, values)
+
+
 def _spatial_map_figure(
     *,
     datasets: Mapping[str, pd.DataFrame],
@@ -285,8 +320,9 @@ def _spatial_map_figure(
     title: str,
     styles: Mapping[str, visual_semantics.SeriesStyle],
     display_spatial_stride: display_grid.DisplayStride = "auto",
+    case_number: int | None = None,
 ) -> Figure:
-    """Render one union-capability map grid with optional exact split schedules, whose lines take their ``styles``."""
+    """Render one union-capability map grid with optional exact split schedules, whose lines take their ``styles``; ``case_number`` ends the title."""
     if not datasets or tuple(case_ids) != tuple(datasets):
         message = "Spatial-map datasets and case IDs must match in order."
         raise ValueError(message)
@@ -301,6 +337,7 @@ def _spatial_map_figure(
         view=field_view,
         requested=requested_fields,
     )
+    plotted = capabilities.plotted_labels(datasets)
     needs_time = any(
         capabilities.is_dynamic_field(datasets[label], field) for field in resolution.fields for label in resolution.datasets_by_field[field]
     )
@@ -330,67 +367,146 @@ def _spatial_map_figure(
             )
             values_by_label[label] = capabilities.field_display_values(frame, rows[label], field, values)
         unit, representation = next(iter(units)), next(iter(representations))
-        shared = spatial_field_scale(field, unit, representation, *values_by_label.values()) if lock_scale else None
+        # Round-off cells of a velocity count as 0 for its scale (sign and bands) only; the map and its range note show stored values.
+        scaled = {label: _without_roundoff(values) if field in _VELOCITY_COMPONENTS else values for label, values in values_by_label.items()}
+        shared = spatial_field_scale(field, unit, representation, *scaled.values(), velocity_state=True) if lock_scale else None
         for label, values in values_by_label.items():
-            cells[field, label] = (values, shared if shared is not None else spatial_field_scale(field, unit, representation, values))
+            scale = shared if shared is not None else spatial_field_scale(field, unit, representation, scaled[label], velocity_state=True)
+            cells[field, label] = (values, scale)
     extents = [display_grid.physical_extent(*coordinates[label]) for label in coordinates]
     extent = (min(e[0] for e in extents), max(e[1] for e in extents), min(e[2] for e in extents), max(e[3] for e in extents))
     schedule_fields = _schedule_fields() if include_schedules else ()
+    # One dataset's retained maps fill two columns, a field per cell, instead of one tall column.
+    wrapped = len(datasets) == 1 and not include_schedules and len(resolution.fields) > 1
+    if wrapped:
+        positions = {(field, label): divmod(index, _WRAPPED_MAP_COLUMNS) for index, field in enumerate(resolution.fields) for label in datasets}
+        shape = (-(-len(resolution.fields) // _WRAPPED_MAP_COLUMNS), _WRAPPED_MAP_COLUMNS)
+    else:
+        positions = {
+            (field, label): (row, column) for (row, field), (column, label) in itertools.product(enumerate(resolution.fields), enumerate(datasets))
+        }
+        shape = (len(resolution.fields), len(datasets))
+    notes = {  # the range of a near-uniform map, on a note line above it
+        positions[key]: note
+        for key, (values, _scale) in cells.items()
+        if (note := _near_uniform_range_note(values, capabilities.field_display_unit(datasets[key[1]], key[0])))
+    }
+    # A note under a first-row header raises the header by a line, so a schedule band above stands that line higher.
+    clearance_in = _NOTE_LINE_INCHES if include_schedules and any(row == 0 for row, _column in notes) else 0.0
     geometry = layout.plan_geometry(
-        len(resolution.fields),
-        len(datasets),
+        *shape,
         (extent[1] - extent[0], extent[3] - extent[2]),
+        row_labels=not wrapped,
         width_cap=None,
-        above_in=(1 + len(schedule_fields)) * _LINE_ROW_HEIGHT_INCHES if include_schedules else 0.0,
+        above_in=(1 + len(schedule_fields)) * _LINE_ROW_HEIGHT_INCHES + clearance_in if include_schedules else 0.0,
         right_in=_LEGEND_WIDTH_INCHES if include_schedules else 0.0,
     )
     figure, axes, slots = layout.map_grid(geometry, extent=extent)
     try:
         if include_schedules:
-            _draw_line_band(figure, geometry, datasets, case_ids, schedule_fields, master_time, case_times, styles)
-        for (field_index, field), (column, (label, frame)) in itertools.product(enumerate(resolution.fields), enumerate(datasets.items())):
+            _draw_line_band(
+                figure, geometry, datasets, case_ids, schedule_fields, master_time, case_times, styles, plotted=plotted, clearance_in=clearance_in
+            )
+        for (field, label), cell in positions.items():
             if (field, label) not in cells:
-                layout.empty_cell(axes[field_index, column], f"{field} unavailable")
+                layout.empty_cell(axes[cell], f"{field} unavailable")
                 continue
             values, scale = cells[field, label]
             indices = display_grid.display_indices(values.shape, display_spatial_stride)
             x, y = coordinates[label]
-            image = axes[field_index, column].pcolormesh(
+            image = axes[cell].pcolormesh(
                 display_grid.display_sample(x, indices),
                 display_grid.display_sample(y, indices),
                 display_grid.display_sample(values, indices),
                 shading="auto",
                 **scale.pcolormesh_kwargs(),
             )
-            unit_label = f"[{capabilities.field_display_unit(frame, field)}]"
-            layout.add_field_map_colorbar(figure, image, slots[field_index, column], scale, label=unit_label)
-        for field_index, field in enumerate(resolution.fields):  # an empty first cell hands its y labels to the row's first map
-            first = next((column for column, label in enumerate(datasets) if (field, label) in cells), 0)
-            if first:
-                axes[field_index, first].set_ylabel("y [m]", fontsize=figure_layout.LABEL_PT)
-                axes[field_index, first].tick_params(labelleft=True)
-        names = [_section_three_dataset_header(label) if include_schedules else label for label in datasets]
-        headers = [
-            display_labels.wrapped_dataset_display_label(
-                f"{name}{_display_case_time(case_times.get(label))}", width=_DATASET_HEADER_WRAP_WIDTH, max_lines=_MAXIMUM_DATASET_HEADER_LINES
-            )
-            for name, label in zip(names, datasets, strict=True)
-        ]
-        layout.set_column_headers(axes, headers, ())
-        row_labels = [
+            layout.add_field_map_colorbar(figure, image, slots[cell], scale, label=f"[{capabilities.field_display_unit(datasets[label], field)}]")
+        field_names = [
             capabilities.field_display_name(next(iter(capabilities.compatible_frames(datasets, resolution, field).values())), field, mathtext=True)
             for field in resolution.fields
         ]
-        layout.set_row_labels(axes, row_labels)
-        layout.set_map_title(figure, f"{title} · {next(iter(case_ids.values()))}" if len(datasets) == 1 else title)
-        if availability := capabilities.availability_note(resolution):
-            figure.text(
-                FOOTNOTE_INCHES[0] / figure.get_figwidth(), FOOTNOTE_INCHES[1] / figure.get_figheight(), availability, va="bottom", fontsize=8
-            )
+        if wrapped:
+            _label_wrapped_cells(axes, field_names, notes)
+        else:
+            for field_index, field in enumerate(resolution.fields):  # an empty first cell hands its y labels to the row's first map
+                first = next((column for column, label in enumerate(datasets) if (field, label) in cells), 0)
+                if first:
+                    axes[field_index, first].set_ylabel("y [m]", fontsize=figure_layout.LABEL_PT)
+                    axes[field_index, first].tick_params(labelleft=True)
+            names = [_section_three_dataset_header(plotted[label]) if include_schedules else plotted[label] for label in datasets]
+            headers = [
+                display_labels.wrapped_dataset_display_label(
+                    f"{name}{_display_case_time(case_times.get(label))}", width=_DATASET_HEADER_WRAP_WIDTH, max_lines=_MAXIMUM_DATASET_HEADER_LINES
+                )
+                for name, label in zip(names, datasets, strict=True)
+            ]
+            _label_grid_cells(axes, headers, field_names, notes)
+        layout.set_map_title(figure, title if case_number is None else f"{title} — Case {case_number}")
+        details = _single_case_details(plotted, case_ids, case_times, wrapped=wrapped)
+        if footnote := "; ".join(part for part in (details, capabilities.availability_note(resolution, plotted=plotted)) if part):
+            figure.text(FOOTNOTE_INCHES[0] / figure.get_figwidth(), FOOTNOTE_INCHES[1] / figure.get_figheight(), footnote, va="bottom", fontsize=8)
     except Exception:
         plt.close(figure)
         raise
     return figure
+
+
+def range_text(lower: float, upper: float, *, digits: int) -> str:
+    """Write ``lower to upper`` with ``digits`` significant digits, or as many more as tell unequal endpoints apart."""
+    while lower != upper and digits < _MAX_SIGNIFICANT_DIGITS and f"{lower:.{digits}g}" == f"{upper:.{digits}g}":
+        digits += 1
+    return f"{lower:.{digits}g} to {upper:.{digits}g}"
+
+
+def _near_uniform_range_note(values: np.ndarray, unit: str) -> str:
+    """Return the observed full-support range of a near-uniform map in its display ``unit``, or ``""`` for any other map."""
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return ""
+    lower, upper = float(finite.min()), float(finite.max())
+    reach = max(abs(lower), abs(upper))
+    if reach == 0.0 or upper - lower > _NEAR_UNIFORM_RELATIVE_SPAN * reach:
+        return ""
+    suffix = "" if unit == field_labels.display_unit("1") else f" {unit}"
+    return f"constant {lower:.6g}{suffix}" if lower == upper else f"range {range_text(lower, upper, digits=6)}{suffix}"
+
+
+def _label_grid_cells(axes: np.ndarray, headers: Sequence[str], field_names: Sequence[str], notes: Mapping[tuple[int, int], str]) -> None:
+    """Head the dataset columns, label the field rows, and write every ``notes`` line above its map, in the first row under the header."""
+    layout.set_column_headers(axes, headers, [notes.get((0, column), "") for column in range(axes.shape[1])])
+    layout.set_row_labels(axes, field_names)
+    for (row, column), note in notes.items():
+        if row:  # a lower row's note line stands in the gap above its map
+            layout.add_map_note(axes[row, column], note)
+
+
+def _label_wrapped_cells(axes: np.ndarray, field_names: Sequence[str], notes: Mapping[tuple[int, int], str]) -> None:
+    """Head every wrapped cell with its field and its ``notes`` line, blank the cells after the last, and give a map above a blank one x labels."""
+    columns = axes.shape[1]
+    for row in range(axes.shape[0]):
+        row_notes = [notes.get((row, column), "") for column in range(columns)]
+        layout.set_column_headers(axes[row : row + 1], field_names[row * columns : (row + 1) * columns], row_notes)
+    for index in range(len(field_names), axes.size):
+        row, column = divmod(index, columns)
+        axes[row, column].set_axis_off()
+        if row:
+            axes[row - 1, column].tick_params(labelbottom=True)
+            axes[row - 1, column].set_xlabel("x [m]", fontsize=figure_layout.LABEL_PT)
+
+
+def _single_case_details(
+    plotted: Mapping[str, str],
+    case_ids: Mapping[str, str],
+    case_times: Mapping[str, time_axis.ResolvedPhysicalTime],
+    *,
+    wrapped: bool,
+) -> str:
+    """Return the exact case of a one-dataset figure, plus its ``plotted`` label and time when no column header names them; ``""`` for several."""
+    if len(plotted) != 1:
+        return ""
+    label = next(iter(plotted))
+    return f"{plotted[label]}{_display_case_time(case_times.get(label))} · case {case_ids[label]}" if wrapped else f"Case {case_ids[label]}"
 
 
 def _draw_line_band(
@@ -402,8 +518,11 @@ def _draw_line_band(
     master_time: float | None,
     case_times: Mapping[str, time_axis.ResolvedPhysicalTime],
     styles: Mapping[str, visual_semantics.SeriesStyle],
+    *,
+    plotted: Mapping[str, str],
+    clearance_in: float,
 ) -> None:
-    """Draw the inlet pressure and the split schedules in the band above the maps, the dataset legend right of it from the top."""
+    """Draw the inlet pressure and the split schedules above the maps, its lowest ``clearance_in`` left free, the ``plotted`` legend right of it."""
     if master_time is None:
         message = "Transient schedule maps require one selected master time."
         raise ValueError(message)
@@ -415,7 +534,7 @@ def _draw_line_band(
         1,
         left=left,
         right=left + width,
-        bottom=bottom,
+        bottom=bottom + clearance_in / geometry.figure_height,
         top=bottom + height,
         height_ratios=(1.0, float(len(schedule_fields))),
         hspace=_PRESSURE_SCHEDULE_GROUP_SPACING,
@@ -448,7 +567,8 @@ def _draw_line_band(
     for axis, window in zip(schedule_axes[0], time_axis.STARTUP_WINDOWS, strict=True):
         axis.set_title(window.title)
     handles = [
-        Line2D([], [], color=colors[label], label=display_labels.wrapped_dataset_display_label(label, width=LEGEND_WRAP_WIDTH)) for label in datasets
+        Line2D([], [], color=colors[label], label=display_labels.wrapped_dataset_display_label(plotted[label], width=LEGEND_WRAP_WIDTH))
+        for label in datasets
     ]
     for handle, label in zip(handles, datasets, strict=True):
         handle.set(linestyle=linestyles[label])
@@ -466,22 +586,29 @@ def _has_complete_schedules(datasets: Mapping[str, pd.DataFrame]) -> bool:
     return all(frame.attrs.get("complete_schedule_available", True) for frame in datasets.values())
 
 
-def spatial_field_scale(field: str, unit: str, representation: str, *values: np.ndarray) -> field_maps.FieldMapDefinition:
+def spatial_field_scale(
+    field: str, unit: str, representation: str, *values: np.ndarray, velocity_state: bool = False
+) -> field_maps.FieldMapDefinition:
     """
     Build one data-derived scale (round bands; geometric for permeability) from full arrays; masked unphysical water cells stay off it.
 
     Only a quantity signed by meaning (``Kxy``, a ``delta_`` field, a centred visual semantic) is diverging about 0; any other
-    one, also with negative values (log10 permeability, a pressure undershoot), is sequential over its own range.
+    one, also with negative values (log10 permeability, a pressure undershoot), is sequential over its own range. With
+    ``velocity_state`` (a retained map), a velocity component of one sign is a sequential state on the velocity colormap of
+    the steady plots; one of both signs keeps the diverging scale that shows its direction.
     """
     combined = np.concatenate(tuple(np.ravel(value) for value in values))
     if moisture_display.is_moisture_field(field):
         combined = combined[np.isfinite(combined)]
     semantic = field_maps.FieldMapSemantic.LINEAR_SEQUENTIAL if np.any(combined < 0.0) else field_maps.FieldMapSemantic.LINEAR_POSITIVE
+    colormap = None
     if field in {"Kxx", "Kyy", "K_min", "K_max"} and unit == "m^2":
         semantic = field_maps.FieldMapSemantic.LOG_POSITIVE
+    elif velocity_state and field in _VELOCITY_COMPONENTS and (np.all(combined >= 0.0) or np.all(combined <= 0.0)):
+        colormap = _VELOCITY_COLORMAP
     elif field == "Kxy" or field.startswith("delta_") or visual_semantics.field_visual_semantics(field).centered:
         semantic = field_maps.FieldMapSemantic.LINEAR_SIGNED
-    return field_maps.build_field_map(combined, semantic=semantic, field=field, unit=unit, display_transform=representation)
+    return field_maps.build_field_map(combined, semantic=semantic, field=field, unit=unit, display_transform=representation, colormap_name=colormap)
 
 
 def plot_spatial_field_comparison(
@@ -492,9 +619,11 @@ def plot_spatial_field_comparison(
     lock_scale: bool = False,
     physical_time_hours: float | None = None,
     display_spatial_stride: display_grid.DisplayStride = "auto",
+    case_number: int | None = None,
 ) -> Figure:
-    """Compare compatible spatial fields across steady and transient datasets."""
+    """Compare compatible spatial fields across steady and transient datasets, the title naming the shared ``case_number``."""
     return _spatial_map_figure(
+        case_number=case_number,
         datasets=datasets,
         case_ids=case_ids,
         requested_fields=fields,
@@ -517,9 +646,11 @@ def plot_state_snapshot_comparison(
     channels: Sequence[str] | None = None,
     lock_scale: bool = False,
     display_spatial_stride: display_grid.DisplayStride = "auto",
+    case_number: int | None = None,
 ) -> Figure:
-    """Compare exact/latest-prior transient states with inlet schedules, drawn in the dataset ``styles`` of the viewer."""
+    """Compare exact/latest-prior transient states with inlet schedules in the viewer's dataset ``styles``; ``case_number`` ends the title."""
     return _spatial_map_figure(
+        case_number=case_number,
         datasets=datasets,
         case_ids=case_ids,
         requested_fields=channels,
@@ -533,37 +664,85 @@ def plot_state_snapshot_comparison(
     )
 
 
+def _window_points(window: time_axis.TimeWindow, times: np.ndarray, end: float | None, *values: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Return the window coordinates of the stored ``times`` inside ``window`` (of a case ending at ``end``) and the ``values`` there."""
+    inside = window.select(times, end_hours=end)
+    return (window.hours(times[inside], end_hours=end), *(value[inside] for value in values))
+
+
+def _schedule_points(window: time_axis.TimeWindow, item: transient.SupportedScheduleSeries) -> np.ndarray:
+    """Return one schedule's nodes inside the clock ``window`` plus the window edges inside its support, drawn on both sides of an edge."""
+    support = (float(item.physical_time_hours[0]), item.final_time_hours)
+    edges = np.asarray([edge for edge in (window.start_hours, window.stop_hours) if support[0] <= edge <= support[1]], dtype=np.float64)
+    return np.unique(np.concatenate([_window_points(window, item.physical_time_hours, None)[0], window.hours(edges)]))
+
+
 def _aggregate_supported_schedule(
-    frame: pd.DataFrame,
-    case_ids: Sequence[str],
-    quantity: str,
+    series: Sequence[transient.SupportedScheduleSeries], window: time_axis.TimeWindow
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Evaluate authored piecewise-linear schedules within their simulated support."""
-    series = tuple(transient.supported_schedule_series(frame, case_id, quantity) for case_id in case_ids)
+    """
+    Evaluate authored piecewise-linear schedules within their simulated support at every node inside one clock window.
+
+    The coordinates are the cases' nodes inside ``window``, their exact stops included; at each, every case whose support holds
+    that time contributes its value, so a stopped case drops out without a forward fill. Returns the coordinates, q10, median,
+    q90 and the contributing case count.
+    """
     if not series:
         message = "Aggregate schedule plotting requires at least one selected case."
         raise ValueError(message)
-    physical_time = np.asarray(
-        sorted({float(value) for item in series for value in item.physical_time_hours}),
-        dtype=np.float64,
-    )
-    q10 = np.empty_like(physical_time)
-    median = np.empty_like(physical_time)
-    q90 = np.empty_like(physical_time)
-    contributor_count = np.empty(physical_time.shape, dtype=np.int64)
-    for index, time_value in enumerate(physical_time):
-        contributors = tuple(
-            item.value_at(float(time_value)) for item in series if item.physical_time_hours[0] <= time_value <= item.final_time_hours
-        )
+    coordinates = np.unique(np.concatenate([_schedule_points(window, item) for item in series]))
+    q10, median, q90 = (np.empty_like(coordinates) for _quantile in range(3))
+    contributor_count = np.empty(coordinates.shape, dtype=np.int64)
+    for index, time_value in enumerate(coordinates):
+        contributors = [item.value_at(float(time_value)) for item in series if item.physical_time_hours[0] <= time_value <= item.final_time_hours]
         if not contributors:
             message = "Aggregate schedule timeline contains unsupported physical time."
             raise RuntimeError(message)
-        q10[index], median[index], q90[index] = np.quantile(
-            np.asarray(contributors, dtype=np.float64),
-            (0.1, 0.5, 0.9),
-        )
+        q10[index], median[index], q90[index] = np.quantile(np.asarray(contributors, dtype=np.float64), (0.1, 0.5, 0.9))
         contributor_count[index] = len(contributors)
-    return physical_time, q10, median, q90, contributor_count
+    return coordinates, q10, median, q90, contributor_count
+
+
+def _schedule_window(
+    series: Sequence[transient.SupportedScheduleSeries], field: generation.contracts.FieldContract, window: time_axis.TimeWindow, *, aggregate: bool
+) -> _Series | None:
+    """Return one clock window of authored schedules at nodes and window edges: the exact case, else the median, q10-q90 and count."""
+    if aggregate:
+        times, q10, median, q90, counts = _aggregate_supported_schedule(series, window)
+        lower, centre, upper = (field_labels.display_values(values, field.unit, field=field.name) for values in (q10, median, q90))
+        return (times, centre, lower, upper, counts) if times.size else None
+    times = _schedule_points(window, series[0])
+    values = np.asarray([series[0].value_at(float(time)) for time in times], dtype=np.float64)
+    return (times, field_labels.display_values(values, field.unit, field=field.name), None, None, None) if times.size else None
+
+
+def _state_window(
+    trajectories: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    completion: Sequence[time_axis.Completion],
+    ends: np.ndarray,
+    window: time_axis.TimeWindow,
+    *,
+    aggregate: bool,
+) -> _Series | None:
+    """
+    Return one window of a state row: an exact case's spatial mean and min-max, else the median and q10-q90 of the cases' means.
+
+    In hours the cases meet on exactly equal window coordinates (``transient.aggregate_exact_series``); the drying-phase window
+    pools the reached cases (``transient.aggregate_phase_series``). ``None`` when no stored time lies in the window.
+    """
+    if window.unit == "1":
+        times_by_case, means_by_case = [item[0] for item in trajectories], [item[1] for item in trajectories]
+        q10, median, q90, cohort = transient.aggregate_phase_series(times_by_case, means_by_case, completion)
+        return time_axis.PHASE_GRID, median, q10, q90, np.full(time_axis.PHASE_GRID.shape, len(cohort.cases))
+    shown = [_window_points(window, times, float(end), *values) for (times, *values), end in zip(trajectories, ends, strict=True)]
+    if not aggregate:
+        ((times, means, lower, upper),) = shown
+        return (times, means, lower, upper, None) if times.size else None
+    present = [(times, means) for times, means, *_extrema in shown if times.size]
+    if not present:
+        return None
+    times, q10, median, q90, counts = transient.aggregate_exact_series([item[0] for item in present], [item[1] for item in present])
+    return times, median, q10, q90, counts
 
 
 def _split_physical_time_support(
@@ -592,41 +771,51 @@ def _split_physical_time_support(
     )
 
 
-def _plot_split_time_series(
-    main_axis: Axes,
-    startup_axis: Axes,
-    physical_time_hours: np.ndarray,
-    centre: np.ndarray,
-    *,
-    lower: np.ndarray | None,
-    upper: np.ndarray | None,
-    style: visual_semantics.SeriesStyle,
-    contributor_count: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Plot exact support, in hours, in the main and startup windows in the color and line style of ``style``."""
-    color = style.color
-    values = (centre,) if lower is None or upper is None else (centre, lower, upper)
-    has_range = len(values) == _RANGE_SERIES_VALUE_COUNT
-    if contributor_count is not None:
-        values = (*values, contributor_count)
-    main, startup = _split_physical_time_support(
-        physical_time_hours,
-        *values,
-    )
-    for axis, (times, split_values) in ((main_axis, main), (startup_axis, startup)):
-        if times.size == 0:
-            continue
-        axis.plot(times, split_values[0], color=color, linestyle=style.linestyle, marker=None)
-        if has_range:
-            axis.fill_between(
-                times,
-                split_values[1],
-                split_values[2],
-                color=color,
-                alpha=0.18,
-                where=split_values[-1] >= _MINIMUM_DISPERSION_SUPPORT if contributor_count is not None else None,
-            )
-    return main[0], startup[0]
+def _singleton_point(count: int) -> dict[str, Any]:
+    """
+    Return the plot keywords of a series with ``count`` stored times in one window: one time shows as a point, more add nothing.
+
+    A line needs two times, and a lone time often sits on the window's frame (an open window ends at its last shown time, the
+    start-up window at 0 and 1 hour), so the point is drawn unclipped to show its whole disc without padding the shared limits.
+    """
+    return {"marker": _SINGLETON_MARKER, "clip_on": False} if count == 1 else {}
+
+
+def _draw_range(
+    axis: Axes, times: np.ndarray, lower: np.ndarray, upper: np.ndarray, supported: np.ndarray, style: visual_semantics.SeriesStyle
+) -> None:
+    """
+    Draw one window's range at its ``supported`` times: shaded between adjacent supported times, else a vertical interval.
+
+    A band of zero width shows nothing, so a supported time without a supported neighbour (a window's only time among them)
+    shows its range as an unclipped interval in the series' color and line style.
+    """
+    joined = supported & (np.r_[False, supported[:-1]] | np.r_[supported[1:], False])
+    if joined.any():
+        axis.fill_between(times, lower, upper, color=style.color, alpha=0.18, where=joined)
+    if (isolated := supported & ~joined).any():
+        axis.vlines(
+            times[isolated], lower[isolated], upper[isolated], colors=style.color, linestyles=style.linestyle, alpha=0.4, linewidth=2.0, clip_on=False
+        )
+
+
+def _draw_counts(axis: Axes, times: np.ndarray, counts: np.ndarray, style: visual_semantics.SeriesStyle) -> None:
+    """Disclose every stored-time count as a step line in the series' color and line style, without implying interpolated support."""
+    axis.plot(times, counts, color=style.color, linestyle=style.linestyle, drawstyle="steps-post", alpha=0.5, **_singleton_point(times.size))
+
+
+def _draw_series(axis: Axes, series: _Series, style: visual_semantics.SeriesStyle, strip: Axes | None = None) -> None:
+    """
+    Draw one window of a series in ``style``: its centre line and its range, and its contributing cases on the count ``strip``.
+
+    The range shows where at least two cases contribute (at every time of a series without counts), as ``_draw_range`` says.
+    """
+    times, centre, lower, upper, counts = series
+    axis.plot(times, centre, color=style.color, linestyle=style.linestyle, **_singleton_point(times.size))
+    if lower is not None and upper is not None:
+        _draw_range(axis, times, lower, upper, np.ones(times.shape, dtype=bool) if counts is None else counts >= _MINIMUM_DISPERSION_SUPPORT, style)
+    if strip is not None and counts is not None:
+        _draw_counts(strip, times, counts, style)
 
 
 def _configure_split_time_axes(main_axis: Axes, startup_axis: Axes, main_times: Sequence[np.ndarray], *, bottom: bool) -> None:
@@ -637,64 +826,34 @@ def _configure_split_time_axes(main_axis: Axes, startup_axis: Axes, main_times: 
     time_axis.style_window_axis(startup_axis, startup_window, bottom=bottom)
 
 
-def _contributor_axes(axes: Sequence[Axes], maximum: int) -> tuple[Axes, ...]:
-    """Keep exact contributor counts distinct from each physical quantity."""
-    result = tuple(axis.twinx() for axis in axes)
-    for axis in result:
+def _style_count_strips(strips: np.ndarray, maximum: int, label: str) -> None:
+    """Give every thin count strip ``[row, window]`` below a quantity row the integer range 0 to ``maximum`` and its ``label``."""
+    for axis in strips[:, 0]:  # the windows of a row share their y axis
         axis.set_ylim(0.0, maximum + 0.5)
-        axis.yaxis.set_major_locator(MaxNLocator(nbins=3, integer=True))
-        axis.set_ylabel("n(t)")
-    return result
+        axis.yaxis.set_major_locator(MaxNLocator(nbins=2, integer=True))
+        axis.set_ylabel(label, rotation=0, ha="right", va="center")
+        axis.grid(axis="y", alpha=0.20)
 
 
-def _plot_contributors(
-    main_axis: Axes,
-    startup_axis: Axes,
-    physical_time_hours: np.ndarray,
-    counts: np.ndarray,
-    *,
-    style: visual_semantics.SeriesStyle,
+def _style_window_block(
+    data: np.ndarray, strips: np.ndarray | None, windows: Sequence[time_axis.TimeWindow], maximum: int, shown_end: float | None
 ) -> None:
-    """Disclose every stored-time count as a step line in the dataset's color and line style, without implying interpolated support."""
-    main, startup = _split_physical_time_support(physical_time_hours, counts)
-    for axis, (times, values) in ((main_axis, main), (startup_axis, startup)):
-        axis.plot(times, values[0], color=style.color, linestyle=style.linestyle, drawstyle="steps-post", alpha=0.5)
+    """
+    Title the ``windows`` over the first row of one block, fit every axis to its window, the time numbers under the block only.
 
-
-def _case_series(frame: pd.DataFrame, field: str, max_cases: int | None) -> tuple[list[np.ndarray], list[np.ndarray], list[time_axis.Completion]]:
-    """Return the stored hours, displayed spatial means and completion of the frame's first ``max_cases`` cases."""
-    cases = [capabilities.case_row(frame, str(case_id)) for case_id in frame.index[:max_cases]]
-    trajectories = [capabilities.field_display_trajectory(frame, case, field)[:2] for case in cases]
-    return [times for times, _means in trajectories], [means for _times, means in trajectories], [transient.case_completion(case) for case in cases]
-
-
-def _plot_phase_row(
-    axes: tuple[Axes, Axes, Axes, Axes],
-    series: Mapping[str, tuple[Sequence[np.ndarray], Sequence[np.ndarray], Sequence[time_axis.Completion]]],
-    styles: Mapping[str, visual_semantics.SeriesStyle],
-    *,
-    first: bool,
-    bottom: bool,
-) -> dict[str, str]:
-    """Draw one state row's pooled median, q10-q90 band and n(τ) per dataset over the phase, hiding the start-up axes; return the cohort labels."""
-    axis, count_axis, *hidden = axes
-    for unused in hidden:
-        unused.set_visible(False)
-    count_axis.set_ylabel("n(τ)")
-    time_axis.style_window_axis(axis, time_axis.PHASE_WINDOW, bottom=bottom)
-    axis.grid(axis="y", alpha=0.20)
-    if first:
-        figure_layout.set_panel_title(axis, time_axis.PHASE_WINDOW.title)
-    labels = {}
-    for label, (times_by_case, means_by_case, completion) in series.items():
-        lower, median, upper, cohort = transient.aggregate_phase_series(times_by_case, means_by_case, completion)
-        style, grid, count = styles[label], time_axis.PHASE_GRID, len(cohort.cases)
-        axis.plot(grid, median, color=style.color, linestyle=style.linestyle)
-        if count >= _MINIMUM_DISPERSION_SUPPORT:
-            axis.fill_between(grid, lower, upper, color=style.color, alpha=0.18)
-        count_axis.plot(grid, np.full(grid.shape, count), color=style.color, linestyle=style.linestyle, drawstyle="steps-post", alpha=0.5)
-        labels[label] = cohort.label()
-    return labels
+    An open window (the schedules' main one) ends at ``shown_end``, the last time the block draws.
+    """
+    last = data.shape[0] - 1
+    for row, axes in enumerate(data):
+        for column, axis in enumerate(axes):
+            time_axis.style_window_axis(axis, windows[column], shown_end_hours=shown_end, bottom=row == last and strips is None)
+            axis.grid(axis="y", alpha=0.20)
+            if strips is not None:
+                time_axis.style_window_axis(strips[row, column], windows[column], shown_end_hours=shown_end, bottom=row == last)
+    for axis, window in zip(data[0], windows, strict=True):
+        figure_layout.set_panel_title(axis, window.title)
+    if strips is not None:
+        _style_count_strips(strips, maximum, "n(τ)" if windows[0].unit == "1" else "n(t)")
 
 
 def _trajectory_figure(
@@ -705,8 +864,17 @@ def _trajectory_figure(
     max_cases: int | None,
     styles: Mapping[str, visual_semantics.SeriesStyle],
     clock: str = "hours",
+    case_number: int | None = None,
 ) -> Figure:
-    """Render exact-case or exact-coordinate aggregate schedules and trajectories (aggregate states optionally over the phase) in ``styles``."""
+    """
+    Render exact-case or aggregate schedules and state trajectories in ``styles``; exact cases are titled by ``case_number``.
+
+    The authored schedules keep their start-up and exact-support clock (``analysis_ui_time.STARTUP_WINDOWS``) up to each
+    exact stop, in a block above the states. The state rows take the drying windows of the longest case
+    (``analysis_ui_time.drying_windows``): one below 72 h, else the first 24 h in hours, the middle in days and the last
+    24 h in hours, counted before each case's end (its last stored state) when the cases' ends differ at all; over the
+    drying phase they take its one window.
+    """
     if not datasets or (case_ids is None) == (max_cases is None):
         message = "Trajectory plotting requires exactly one case map or aggregate bound."
         raise ValueError(message)
@@ -714,151 +882,60 @@ def _trajectory_figure(
     if phase and (lacking := [label for label, frame in datasets.items() if not transient.has_completion_evidence(frame)]):
         message = f"The drying phase pools reached cases, but datasets {lacking} lack completion evidence (published Datasets have none)."
         raise ValueError(message)
-    phase_notes: dict[str, str] = {}
-    resolution = capabilities.resolve_fields(
-        datasets,
-        view="state_trajectory",
-        requested=channels,
+    resolution = capabilities.resolve_fields(datasets, view="state_trajectory", requested=channels)
+    plotted = capabilities.plotted_labels(datasets)
+    schedules = {field.name: field for field in _schedule_fields()} if _has_complete_schedules(datasets) else {}
+    aggregate = case_ids is None
+    cases = {label: (case_ids[label],) if case_ids is not None else tuple(map(str, frame.index[:max_cases])) for label, frame in datasets.items()}
+    rows = {label: [capabilities.case_row(datasets[label], case) for case in ids] for label, ids in cases.items()}
+    completion: dict[str, list[time_axis.Completion]] = {
+        label: [transient.case_completion(row) for row in case_rows] for label, case_rows in rows.items()
+    }
+    ends = {  # a case's end is its last stored state, at most one interval before its exact stop, as the evaluation's
+        label: np.asarray([transient.available_physical_times(datasets[label], case, include_exact_stop=False)[-1] for case in ids])
+        for label, ids in cases.items()
+    }
+    longest, shortest = max(float(end.max()) for end in ends.values()), min(float(end.min()) for end in ends.values())
+    states = (time_axis.PHASE_WINDOW,) if phase else time_axis.drying_windows(longest, before_end=longest != shortest)
+    blocks = [(names, windows) for names, windows in ((tuple(schedules), time_axis.STARTUP_WINDOWS), (resolution.fields, states)) if names]
+    heights = [1.0, _COUNT_STRIP_HEIGHT_RATIO] if aggregate else [1.0]  # an aggregate row keeps its case counts in a thin strip below it
+    figure = plt.figure(
+        figsize=(_TRAJECTORY_WIDTH_INCHES, _TRAJECTORY_ROW_HEIGHT_INCHES * sum(heights) * sum(len(names) for names, _windows in blocks)),
+        layout=figure_layout.panel_engine(),
     )
-    schedule_fields = _schedule_fields() if _has_complete_schedules(datasets) else ()
-    rows = len(schedule_fields) + len(resolution.fields)
-    figure = plt.figure(figsize=(_TRAJECTORY_WIDTH_INCHES, _TRAJECTORY_ROW_HEIGHT_INCHES * rows), layout=figure_layout.panel_engine())
-    maximum_count = max(min(max_cases, len(frame)) for frame in datasets.values()) if max_cases is not None else 0
-    window_grid = layout.window_axes(figure, figure.add_gridspec(1, 1)[0, 0], time_axis.STARTUP_WINDOWS, [1.0] * rows)
-    main_axes, startup_axes = (tuple(window_grid[:, column]) for column in range(len(time_axis.STARTUP_WINDOWS)))
-    for axis, window in zip(window_grid[0], time_axis.STARTUP_WINDOWS, strict=True):
-        figure_layout.set_panel_title(axis, window.title)  # a first state row over the phase retitles its main axis
-    legend_panels = window_grid
-    main_counts = _contributor_axes(main_axes, maximum_count) if maximum_count else ()
-    startup_counts = _contributor_axes(startup_axes, maximum_count) if maximum_count else ()
-    for index, schedule_field in enumerate(schedule_fields):
-        layout.add_channel_row_label(
-            main_axes[index],
-            field_labels.field_label_with_unit(
-                schedule_field.name,
-                schedule_field.unit,
-                mathtext=True,
-            ),
-            axis_x=_TRAJECTORY_ROW_LABEL_X,
-        )
-        main_times: list[np.ndarray] = []
-        for label, frame in datasets.items():
-            contributors = None
-            if case_ids is not None:
-                series = transient.supported_schedule_series(
-                    frame,
-                    case_ids[label],
-                    schedule_field.name,
-                )
-                physical_time = series.physical_time_hours
-                q10 = None
-                median = field_labels.display_values(
-                    series.values,
-                    schedule_field.unit,
-                    field=schedule_field.name,
-                )
-                q90 = None
+    outer = figure.add_gridspec(len(blocks), 1, height_ratios=[len(names) for names, _windows in blocks])
+    notes: dict[str, str] = {}
+    row_labels: list[tuple[Axes, str]] = []
+    for block, (names, windows) in enumerate(blocks):
+        grid = layout.window_axes(figure, outer[block, 0], windows, heights * len(names))
+        data, strips = (grid[0::2], grid[1::2]) if aggregate else (grid, None)
+        shown_ends: list[float] = []
+        for row, name in enumerate(names):
+            shown: dict[str, list[_Series | None]] = {}
+            if name in schedules:
+                row_label = field_labels.field_label_with_unit(name, schedules[name].unit, mathtext=True)
+                for label, frame in datasets.items():
+                    series = [transient.supported_schedule_series(frame, case, name) for case in cases[label]]
+                    shown[label] = [_schedule_window(series, schedules[name], window, aggregate=aggregate) for window in windows]
             else:
-                if max_cases is None:
-                    message = "Aggregate trajectory plotting lost its case bound."
-                    raise RuntimeError(message)
-                selected_case_ids = tuple(str(value) for value in frame.index[:max_cases])
-                physical_time, q10, median, q90, contributors = _aggregate_supported_schedule(
-                    frame,
-                    selected_case_ids,
-                    schedule_field.name,
-                )
-                q10, median, q90 = (
-                    field_labels.display_values(values, schedule_field.unit, field=schedule_field.name) for values in (q10, median, q90)
-                )
-            if contributors is not None:
-                _plot_contributors(main_counts[index], startup_counts[index], physical_time, contributors, style=styles[label])
-            main_support, _startup_support = _plot_split_time_series(
-                main_axes[index],
-                startup_axes[index],
-                physical_time,
-                median,
-                lower=q10,
-                upper=q90,
-                style=styles[label],
-                contributor_count=contributors,
-            )
-            if main_support.size:
-                main_times.append(main_support)
-        # Over the phase the state rows read τ, so the last schedule row carries the clock's numbers and label.
-        bottom = index == rows - 1 or (phase and index == len(schedule_fields) - 1)
-        _configure_split_time_axes(main_axes[index], startup_axes[index], main_times, bottom=bottom)
-        main_axes[index].grid(axis="y", alpha=0.20)
-        startup_axes[index].grid(axis="y", alpha=0.20)
-
-    trajectory_offset = len(schedule_fields)
-    for field_index, field in enumerate(resolution.fields):
-        row_index = trajectory_offset + field_index
-        compatible = capabilities.compatible_frames(
-            datasets,
-            resolution,
-            field,
-        )
-        reference = next(iter(compatible.values()))
-        layout.add_channel_row_label(
-            main_axes[row_index],
-            capabilities.field_quantity_label(
-                reference,
-                field,
-                mathtext=True,
-            ),
-            axis_x=_TRAJECTORY_ROW_LABEL_X,
-        )
-        if phase:
-            row_axes = (main_axes[row_index], main_counts[row_index], startup_axes[row_index], startup_counts[row_index])
-            phase_series = {label: _case_series(frame, field, max_cases) for label, frame in compatible.items()}
-            phase_notes |= _plot_phase_row(row_axes, phase_series, styles, first=field_index == 0, bottom=row_index == rows - 1)
-            continue
-        main_times = []
-        startup_times = []
-        for label, frame in compatible.items():
-            contributors = None
-            if case_ids is not None:
-                row = capabilities.case_row(frame, case_ids[label])
-                physical_time, median, lower, upper = capabilities.field_display_trajectory(frame, row, field)
-            else:
-                if max_cases is None:
-                    message = "Aggregate trajectory plotting lost its case bound."
-                    raise RuntimeError(message)
-                times_by_case, means_by_case, _completion = _case_series(frame, field, max_cases)
-                physical_time, lower, median, upper, contributors = transient.aggregate_exact_series(
-                    times_by_case,
-                    means_by_case,
-                )
-                _plot_contributors(main_counts[row_index], startup_counts[row_index], physical_time, contributors, style=styles[label])
-            main_support, startup_support = _plot_split_time_series(
-                main_axes[row_index],
-                startup_axes[row_index],
-                physical_time,
-                median,
-                lower=lower,
-                upper=upper,
-                style=styles[label],
-                contributor_count=contributors,
-            )
-            if main_support.size:
-                main_times.append(main_support)
-            if startup_support.size:
-                startup_times.append(startup_support)
-        _configure_split_time_axes(main_axes[row_index], startup_axes[row_index], main_times, bottom=row_index == rows - 1)
-        if not main_times and not startup_times:
-            main_axes[row_index].text(
-                0.5,
-                0.5,
-                "Trajectory unavailable on stored physical times",
-                ha="center",
-                va="center",
-                transform=main_axes[row_index].transAxes,
-            )
-        main_axes[row_index].grid(axis="y", alpha=0.20)
-        startup_axes[row_index].grid(axis="y", alpha=0.20)
-
+                compatible = capabilities.compatible_frames(datasets, resolution, name)
+                row_label = capabilities.field_quantity_label(next(iter(compatible.values())), name, mathtext=True)
+                for label, frame in compatible.items():
+                    trajectories = [capabilities.field_display_trajectory(frame, case_row, name) for case_row in rows[label]]
+                    shown[label] = [_state_window(trajectories, completion[label], ends[label], window, aggregate=aggregate) for window in windows]
+                    if phase:  # the note's lines name their dataset by its plotted label
+                        notes[plotted[label]] = time_axis.phase_cohort([item[0] for item in trajectories], completion[label]).label()
+            row_labels.append((data[row, 0], row_label))
+            for label, items in shown.items():
+                for column, item in enumerate(items):
+                    if item is not None:
+                        _draw_series(data[row, column], item, styles[label], None if strips is None else strips[row, column])
+                        shown_ends.append(float(item[0][-1]))
+        _style_window_block(data, strips, windows, max(map(len, cases.values())), max(shown_ends, default=None))
     figure_layout.apply_text_sizes(figure.axes)
+    for axis, text in row_labels:  # the y label of the first column: the layout puts it left of that column's tick labels
+        axis.set_ylabel(figure_layout.bold_label(text), fontsize=figure_layout.PANEL_TITLE_PT, fontweight="bold")
+        axis.yaxis.label.set_gid("channel-row-label")
     handles: list[Line2D | Patch] = [
         Line2D(
             [],
@@ -866,40 +943,38 @@ def _trajectory_figure(
             color=styles[label].color,
             linestyle=styles[label].linestyle,
             label=display_labels.wrapped_dataset_display_label(
-                label if max_cases is None else f"{label} ({min(max_cases, len(frame))} cases)", width=LEGEND_WRAP_WIDTH
+                f"{plotted[label]} ({len(ids)} cases)" if aggregate else plotted[label], width=LEGEND_WRAP_WIDTH
             ),
         )
-        for label, frame in datasets.items()
+        for label, ids in cases.items()
     ]
-    dataset_labels = [str(handle.get_label()) for handle in handles]
-    handles.extend(
-        (
-            Line2D([], [], color="black", label="Mean / median"),
-            Patch(facecolor="black", alpha=0.18, label="Range / q10-q90"),
-            *_temporal_support_legend(aggregate=max_cases is not None, schedules=bool(schedule_fields)),
-        )
-    )
-    scope = "single exact cases" if case_ids is not None else "available exact-time support"
+    dataset_handles = list(handles)  # the Dataset group owns these entries by identity
+    centre, spread = ("Median over cases", "q10-q90 over cases") if aggregate else ("State: spatial mean", "State: spatial min-max")
+    counts = ", ".join(dict.fromkeys("n(τ)" if windows[0].unit == "1" else "n(t)" for _names, windows in blocks)) if aggregate else ""
+    handles += [Line2D([], [], color="black", label=centre), Patch(facecolor="black", alpha=0.18, label=spread)]
+    handles += _temporal_support_legend(counts=counts, schedules=bool(schedules))
+    scope = ("single exact cases" if case_number is None else f"Case {case_number}") if case_ids is not None else "available exact-time support"
     scope = "states over drying phase, reached cases only" if phase else scope
+    panels = np.asarray(figure.axes, dtype=object)[np.newaxis, :]  # the blocks' grids differ in their window count
     figure_layout.set_figure_title(
         figure,
-        window_grid,
+        panels,
         (
             f"Schedules and reference physical trajectories — {scope}"
-            if schedule_fields
+            if schedules
             else f"Reference physical trajectories — {scope}; full authored schedules unavailable"
         ),
-        note=time_axis.phase_note(phase_notes),
+        note=time_axis.phase_note(notes),
     )
-    figure_layout.add_legend(figure, legend_panels, handles, [str(handle.get_label()) for handle in handles], groups={"Datasets": dataset_labels})
+    figure_layout.add_legend(figure, panels, handles, [str(handle.get_label()) for handle in handles], groups={"Dataset": dataset_handles})
     return figure
 
 
-def _temporal_support_legend(*, aggregate: bool, schedules: bool) -> list[Line2D]:
-    """Disclose distinct support semantics beside the dataset legend, one single-line entry each."""
+def _temporal_support_legend(*, counts: str, schedules: bool) -> list[Line2D]:
+    """Disclose distinct support semantics beside the dataset legend, one single-line entry each; ``counts`` names the strips' symbols."""
     handles = []
-    if aggregate:
-        handles.append(Line2D([], [], color="black", drawstyle="steps-post", alpha=0.5, label="n(t): contributors (right axes)"))
+    if counts:
+        handles.append(Line2D([], [], color="black", drawstyle="steps-post", alpha=0.5, label=f"{counts}: contributors (strip below each row)"))
     if schedules:
         handles.extend(Line2D([], [], linestyle="none", label=text) for text in ("Schedules: authored, running cases", "States: observed times only"))
     return handles
@@ -911,8 +986,9 @@ def plot_state_trajectory_comparison(
     case_ids: Mapping[str, str],
     styles: Mapping[str, visual_semantics.SeriesStyle],
     channels: Sequence[str] | None = None,
+    case_number: int | None = None,
 ) -> Figure:
-    """Compare exact case schedules and trajectories without resampling, in the dataset ``styles`` of the viewer."""
+    """Compare exact case schedules and trajectories without resampling, in the dataset ``styles`` of the viewer, titled by ``case_number``."""
     if tuple(case_ids) != tuple(datasets):
         message = "Transient trajectory datasets and case IDs must match in order."
         raise ValueError(message)
@@ -922,6 +998,7 @@ def plot_state_trajectory_comparison(
         case_ids=case_ids,
         max_cases=None,
         styles=styles,
+        case_number=case_number,
     )
 
 
@@ -966,6 +1043,7 @@ def plot_completion_target_analysis(
 ) -> Figure:
     """Plot distinct outcome-share, timing, and final-state questions in the dataset ``styles`` of the viewer."""
     analysis = transient.completion_target_analysis(datasets)
+    plotted = capabilities.plotted_labels(datasets)
     colors = {label: style.color for label, style in styles.items()}
     figure = plt.figure(figsize=(_COMPLETION_FIGURE_WIDTH_INCHES, 9.4), layout=figure_layout.panel_engine())
     grid = figure.add_gridspec(2, 2, height_ratios=(0.95, 1.05))
@@ -1023,7 +1101,7 @@ def plot_completion_target_analysis(
         outcome_axis.text(
             0.5,
             0.04,
-            "No eligible cases: " + ", ".join(zero_eligible),
+            "No eligible cases: " + ", ".join(plotted[label] for label in zero_eligible),
             transform=outcome_axis.transAxes,
             ha="center",
             va="bottom",
@@ -1076,7 +1154,7 @@ def plot_completion_target_analysis(
                     alpha=0.85,
                 )
         display_time.configure(time_plot_axis)
-        time_plot_axis.set_yticks(range(len(datasets)), list(datasets))  # each row names its dataset
+        time_plot_axis.set_yticks(range(len(datasets)), [plotted[label] for label in datasets])  # each row names its dataset
         time_plot_axis.set_ylabel("Dataset")
         figure_layout.set_panel_title(time_plot_axis, "Target-attainment and censoring times")
         time_plot_axis.grid(axis="y", alpha=0.15)
@@ -1125,7 +1203,8 @@ def plot_completion_target_analysis(
         )
         figure_layout.set_panel_title(moisture_axis, "Final bulk moisture and target")
         moisture_axis.grid(alpha=0.25)
-        wet_fraction_axis.set_xticks(list(block_centres.values()), list(block_centres), rotation=20, ha="right")  # the blocks name their datasets
+        blocks = [plotted[label] for label in block_centres]  # the blocks name their datasets
+        wet_fraction_axis.set_xticks(list(block_centres.values()), blocks, rotation=20, ha="right")
         wet_fraction_axis.set_xlabel("Dataset (eligible cases in order)")
         wet_fraction_axis.set_ylabel("Wet fraction [-]")
         figure_layout.set_panel_title(wet_fraction_axis, "Final wet fraction and allowed limit")
@@ -1137,7 +1216,7 @@ def plot_completion_target_analysis(
             edgecolor=_HATCH_COLOR,
             alpha=0.88,
             hatch=styles[label].hatch,
-            label=display_labels.wrapped_dataset_display_label(label, width=LEGEND_WRAP_WIDTH),
+            label=display_labels.wrapped_dataset_display_label(plotted[label], width=LEGEND_WRAP_WIDTH),
         )
         for label in datasets
     ]
@@ -1161,7 +1240,7 @@ def plot_completion_target_analysis(
             row["omitted_case_count"],
             label="Omitted case count",
         )
-        omission_lines.append(f"{row['dataset']} — eligible cases: {eligible_count}; non-eligible omitted: {omitted_count}{suffix}.")
+        omission_lines.append(f"{plotted[row['dataset']]} — eligible cases: {eligible_count}; non-eligible omitted: {omitted_count}{suffix}.")
     figure.supxlabel("\n".join(omission_lines), x=0.01, ha="left", linespacing=1.25, fontsize=8.8)
     figure_layout.apply_text_sizes(figure.axes)
     figure_layout.set_figure_title(figure, panels, "Completion and target attainment")

@@ -2438,16 +2438,25 @@ def test_resumable_stager_rejects_symbolic_staging_root(tmp_path: Path) -> None:
         )
 
 
-def _run_all_completed_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Finalize exact staged cases without reopening any inference-time owner; return the resume identity the generator opened its stage with."""
-    case_id = _CASE_ID
+def _generate_one_case_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cpu_model: str | None = "Test CPU",
+    device_type: str = "cpu",
+    bounded: bool = False,
+) -> Any:
+    """Run the generator for the one-case ID role into ``tmp_path / "stage"`` on the CPU ``cpu_model``, past run admission and grid resolution.
+
+    A ``cuda`` device records one GPU model; ``bounded`` passes the role as the saved role, as a bounded (scoped) build does.
+    """
     role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
         dataset_name="transient_dataset",
         source_dataset_ids=("transient_dataset",),
         source_identities=({"dataset_id": "transient_dataset"},),
-        case_ids_by_source=((case_id,),),
+        case_ids_by_source=((_CASE_ID,),),
         membership_digests=("a" * 64,),
     )
     representation = SimpleNamespace(
@@ -2465,6 +2474,33 @@ def _run_all_completed_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         "selected_checkpoint_epoch": 1,
         "normalizer_sha256": "d" * 64,
     }
+    monkeypatch.setattr(artifact_generator, "_require_completed_transient", lambda value: value)
+    monkeypatch.setattr(
+        artifact_generator, "resolve_transient_artifact_spatial_representations", lambda *_args, **_kwargs: (representation, representation)
+    )
+    monkeypatch.setattr(artifact_generator.runtime_node, "read_cpu_model", lambda: cpu_model)
+    gpu_model = "NVIDIA RTX 6000 Ada Generation" if device_type == "cuda" else None
+    return artifact_generator.generate_transient_role_artifact(
+        run_dir=tmp_path / "run",
+        role=role,
+        saved_role=role if bounded else None,
+        device_resolution=cast(
+            "Any",
+            SimpleNamespace(
+                device=torch.device(device_type),
+                as_dict=dict,
+                metadata=SimpleNamespace(device_type=device_type, cuda_device_name=gpu_model, pytorch_version=torch.__version__),
+            ),
+        ),
+        dataset_root=tmp_path / "02_datasets",
+        staging_root=tmp_path / "stage",
+        completed=completed,
+    )
+
+
+def _run_all_completed_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Finalize exact staged cases without reopening any inference-time owner; return the resume identity the generator opened its stage with."""
+    case_id = _CASE_ID
     identity = {
         "case_id": case_id,
         "material_family": "lentil",
@@ -2499,10 +2535,6 @@ def _run_all_completed_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
             finalized.append(provenance)
             return object()
 
-    monkeypatch.setattr(artifact_generator, "_require_completed_transient", lambda value: value)
-    monkeypatch.setattr(
-        artifact_generator, "resolve_transient_artifact_spatial_representations", lambda *_args, **_kwargs: (representation, representation)
-    )
     monkeypatch.setattr(artifact_generator.sequence_artifact, "TransientSequenceArtifactStager", Stager)
     monkeypatch.setattr(artifact_generator, "_restore_resumed_case_evidence", lambda *_args, **_kwargs: resumed)
     monkeypatch.setattr(artifact_generator.transient_timing, "build_transient_timing_report", lambda _cases: {"report": "restored"})
@@ -2528,23 +2560,9 @@ def _run_all_completed_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(
         artifact_plan, "generation_case_sources", lambda *_args, **_kwargs: pytest.fail("all-completed resume loaded generation sources")
     )
-    monkeypatch.setattr(artifact_generator, "_materialize_case", lambda *_args, **_kwargs: pytest.fail("all-completed resume materialized a case"))
+    monkeypatch.setattr(artifact_generator, "materialize_case", lambda *_args, **_kwargs: pytest.fail("all-completed resume materialized a case"))
 
-    result = artifact_generator.generate_transient_role_artifact(
-        run_dir=tmp_path / "run",
-        role=role,
-        device_resolution=cast(
-            "Any",
-            SimpleNamespace(
-                device=torch.device("cpu"),
-                as_dict=dict,
-                metadata=SimpleNamespace(device_type="cpu", cuda_device_name=None, pytorch_version=torch.__version__),
-            ),
-        ),
-        dataset_root=tmp_path / "02_datasets",
-        staging_root=tmp_path / "stage",
-        completed=completed,
-    )
+    result = _generate_one_case_role(tmp_path, monkeypatch)
 
     assert result is not None
     assert len(finalized) == 1
@@ -2583,6 +2601,90 @@ def test_partial_stage_resumes_only_with_the_analysis_code_that_started_it(tmp_p
     assert {path: path.read_bytes() for path in sorted((run_root / "stage").rglob("*")) if path.is_file()} == before
     _run_analysis(monkeypatch, "a" * 64)
     assert _run_all_completed_resume(run_root, monkeypatch) == identities[0]
+
+
+class _InferenceStartedError(Exception):
+    """The generator found a case left to compute and began building its inference owners."""
+
+
+class _KeptCaseReusedError(Exception):
+    """The generator reached the first kept case of its stage, so the real stager admitted that case."""
+
+
+def _generate_on_cpu_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_model: str | None, **options: Any) -> None:
+    """Run the generator with the real stager on ``cpu_model``; it stops when inference starts or a kept case is reused.
+
+    ``options`` (device type, bounded build) go to ``_generate_one_case_role``.
+    """
+
+    def start_inference(*_args: Any, **_kwargs: Any) -> Any:
+        raise _InferenceStartedError
+
+    def reuse_kept_case(*_args: Any, **_kwargs: Any) -> Any:
+        raise _KeptCaseReusedError
+
+    monkeypatch.setattr(artifact_generator.learning.inference.transient, "build_transient_inference_context", start_inference)
+    monkeypatch.setattr(artifact_generator, "_restore_resumed_case_evidence", reuse_kept_case)
+    _generate_one_case_role(tmp_path, monkeypatch, cpu_model=cpu_model, **options)
+
+
+def _stage_with_a_kept_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cpu_model: str | None, **options: Any) -> dict[Path, bytes]:
+    """Let the generator open its stage on ``cpu_model``, persist the role's one case there through the real stager, return the stage files."""
+    with pytest.raises(_InferenceStartedError):
+        _generate_on_cpu_model(tmp_path, monkeypatch, cpu_model, **options)
+    stage = tmp_path / "stage"
+    recorded = artifact.recorded_resume_identity(stage)
+    assert recorded is not None
+    stager = artifact.TransientSequenceArtifactStager(stage, dataset_name="transient_dataset", dataset_role="id", resume_identity=recorded)
+    stager.write_case(
+        (_cache_test_record(_CASE_ID, mode="autonomous_full"), _cache_test_record(_CASE_ID, mode="teacher_forced_one_step")),
+        resume_evidence={"case_id": _CASE_ID},
+    )
+    return {path: path.read_bytes() for path in sorted(stage.rglob("*")) if path.is_file()}
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_a_kept_case_resumes_only_on_the_cpu_model_that_timed_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device_type: str) -> None:
+    """A kept case's timing binds the CPU model, in a CUDA build too: another model refuses the stage unchanged, the same model reuses it."""
+    before = _stage_with_a_kept_case(tmp_path, monkeypatch, "Intel Xeon Gold 6248", device_type=device_type)
+
+    with pytest.raises(artifact.TransientSequenceArtifactError, match=r"incompatible; rerun with --rebuild"):
+        _generate_on_cpu_model(tmp_path, monkeypatch, "AMD EPYC 7742", device_type=device_type)
+    assert {path: path.read_bytes() for path in sorted((tmp_path / "stage").rglob("*")) if path.is_file()} == before
+
+    with pytest.raises(_KeptCaseReusedError):
+        _generate_on_cpu_model(tmp_path, monkeypatch, "Intel Xeon Gold 6248", device_type=device_type)
+
+
+@pytest.mark.parametrize(("bounded", "remedy"), [(False, r"rerun with --rebuild"), (True, r"delete the bounded stage \S+ by hand, then rerun")])
+def test_a_kept_case_timed_on_an_unknown_cpu_model_is_never_resumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bounded: bool, remedy: str
+) -> None:
+    """Two unreadable CPU models compare equal, so an unknown model never matches; the stage stays unchanged and the remedy fits the build."""
+    before = _stage_with_a_kept_case(tmp_path, monkeypatch, None, bounded=bounded)
+
+    with pytest.raises(
+        artifact.TransientSequenceArtifactError, match=rf"unknown CPU model never matches \(recorded None, current None\).*; {remedy}\.$"
+    ):
+        _generate_on_cpu_model(tmp_path, monkeypatch, None, bounded=bounded)
+    assert {path: path.read_bytes() for path in sorted((tmp_path / "stage").rglob("*")) if path.is_file()} == before
+
+
+def test_a_damaged_bounded_stage_and_a_stale_analysis_name_the_remedy_of_their_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bounded build takes no --rebuild: its stage refusal, like the analysis-code check, ends with the remedy the caller gives."""
+    _stage_with_a_kept_case(tmp_path, monkeypatch, "Intel Xeon Gold 6248", bounded=True)
+    with pytest.raises(artifact.TransientSequenceArtifactError, match=r"incompatible; delete the bounded stage \S+ by hand, then rerun") as damaged:
+        _generate_on_cpu_model(tmp_path, monkeypatch, "AMD EPYC 7742", bounded=True)
+    assert "--rebuild" not in str(damaged.value)
+
+    _run_analysis(monkeypatch, "b" * 64)
+    stale = {"producer": {"analysis_sha256": "a" * 64}}
+    contracts = artifact_generator.contracts
+    with pytest.raises(ValueError, match="--rebuild"):  # the default remedy is a full build's
+        contracts.require_current_analysis(stale, task_id="transient_drying", unit="Stage")
+    with pytest.raises(ValueError, match="by hand") as bounded:
+        contracts.require_current_analysis(stale, task_id="transient_drying", unit="Stage", remedy="delete the stage by hand")
+    assert "--rebuild" not in str(bounded.value)
 
 
 def test_transient_artifact_identity_excludes_the_executing_source_tree(tmp_path: Path) -> None:

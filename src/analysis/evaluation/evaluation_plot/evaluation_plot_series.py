@@ -8,12 +8,15 @@ Responsibilities:
   - Resolve the styles of a transient comparison once from the entity facts of all its runs (``comparison_styles``) and look a
     view's series up in them (``select_styles``)
   - Group the keys of steady comparison frames into datasets (panels) and models (lines or bars within a panel)
+  - Reduce a pooled series, one frame per material, to the equal-weight mean of its materials' values (``material_mean``)
 
 Design principles:
   - The colour identifies the model of several runs: the architecture hue, one shade per run of one architecture by sorted run key;
-    else the single material, else the pooled role; the role is the line style or hatch
+    else the single material, else the pooled role; a run-level view (``by_run``) takes the run colour also for a single run;
+    the role is the line style or hatch
   - The marker is the material where one run spans several materials, so runs differ in every plot type and materials only in some
   - Styles are resolved once over all frames, so one model keeps one style in every panel
+  - A pooled series weights its materials equally, never by their case counts; one unavailable material makes the pooled value unavailable
 
 This module does NOT:
   - Draw axes, legends or figures
@@ -28,11 +31,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final
 
+import numpy as np
+
 from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.presentation import analysis_display_labels as display_labels
 from src.analysis.presentation import analysis_visual_semantics as visual_semantics
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable, Iterable, Sequence
+    from collections.abc import Callable, Hashable, Iterable, Sequence
 
     import pandas as pd
 
@@ -77,12 +83,13 @@ def _single_run_style(entity: SeriesEntity) -> visual_semantics.SeriesStyle:
     return visual_semantics.series_style(role=entity.role, pooled=True)
 
 
-def resolve_styles(entities: Sequence[SeriesEntity]) -> SeriesStyles:
+def resolve_styles(entities: Sequence[SeriesEntity], *, by_run: bool = False) -> SeriesStyles:
     """
     Return the fixed colour, line style, hatch and marker of every entity, keyed by its label.
 
     The role gives the line style and the hatch. One run: the entity's single material gives the colour, else (several materials or a
-    whole role) the pooled role colour. Several runs: the colour identifies the model, the hue of its architecture; runs of one
+    whole role) the pooled role colour; ``by_run`` colours one run as several are coloured, for a view whose series are runs. Several
+    runs: the colour identifies the model, the hue of its architecture; runs of one
     architecture (physics flag included) get one shade each in sorted run-key order, so a run keeps its colour in every panel and
     runs differ in every plot type. When an architecture has more than ``visual_semantics.SHADE_LIMIT`` runs, the figure switches to
     run colours (``run_colours`` is true): every run takes its own color of ``visual_semantics.RUN_COLORS`` in sorted run-key order,
@@ -90,7 +97,7 @@ def resolve_styles(entities: Sequence[SeriesEntity]) -> SeriesStyles:
     materials, else none.
     """
     styles = SeriesStyles()
-    if len({entity.run_key for entity in entities}) <= 1:
+    if not by_run and len({entity.run_key for entity in entities}) <= 1:
         styles.update((entity.label, _single_run_style(entity)) for entity in entities)
         return styles
     runs_by_architecture: dict[str, set[Hashable]] = {}
@@ -145,15 +152,21 @@ def model_metadata(frame: pd.DataFrame) -> tuple[str, int, bool]:
     return family, trainable, physics_enabled
 
 
-def series_styles(datasets: Mapping[str, pd.DataFrame]) -> SeriesStyles:
+def series_styles(datasets: Mapping[str, pd.DataFrame], pools: Iterable[Sequence[str]] = (), *, by_run: bool = False) -> SeriesStyles:
     """
     Resolve the styles of steady dataset frames, keyed by the datasets' keys.
 
-    The inputs are the persisted provenance: run, role, selected materials and, only of several runs, the model.
+    The inputs are the persisted provenance: run, role, selected materials and, only of several runs, the model. ``pools`` lists
+    the keys of each pooled series (one frame per material, see ``panel_series``): these keys take the style of the series, that of
+    all its materials together, instead of the style of their own material. ``by_run`` styles a view whose series are runs (the
+    break-even): every frame takes its run's architecture colour by the shade rule, a single run too, read from its persisted model.
     """
     provenances = {label: dataframe.require_complete_provenance(frame) for label, frame in datasets.items()}
+    materials = {label: tuple(provenance.get("selection", {}).get("material_families") or ()) for label, provenance in provenances.items()}
+    for keys in pools:
+        materials.update(dict.fromkeys(keys, tuple(dict.fromkeys(material for key in keys for material in materials[key]))))
     run_keys = {label: (provenance["run"].get("name"), provenance["run"].get("effective_config_digest")) for label, provenance in provenances.items()}
-    several_runs = len(set(run_keys.values())) > 1
+    several_runs = by_run or len(set(run_keys.values())) > 1
     entities = []
     for label, frame in datasets.items():
         family, _trainable, physics_enabled = model_metadata(frame) if several_runs else ("", 0, False)
@@ -164,11 +177,11 @@ def series_styles(datasets: Mapping[str, pd.DataFrame]) -> SeriesStyles:
                 family=family,
                 physics_enabled=physics_enabled,
                 role="id" if split == "eval" else split,
-                materials=tuple(provenances[label].get("selection", {}).get("material_families") or ()),
+                materials=materials[label],
                 run_key=run_keys[label],
             )
         )
-    return resolve_styles(entities)
+    return resolve_styles(entities, by_run=by_run)
 
 
 def _entity_facts(member: Sequence[Any], *, label: str) -> tuple[str, str, str, str]:
@@ -248,3 +261,39 @@ def panel_groups(labels: Mapping[str, tuple[str, str]]) -> dict[str, dict[str, s
             raise ValueError(msg)
         groups.setdefault(dataset, {})[model] = key
     return groups
+
+
+def panel_series(labels: Mapping[str, tuple[str, str]]) -> dict[str, dict[str, tuple[str, ...]]]:
+    """
+    Group the keys of steady frames into panels as ``panel_groups`` does, with the keys of each series in order.
+
+    A series is one key, or, for a pooled choice, one key per material under the same (dataset label, model label) pair. Only the
+    views that pool read this; every other view takes ``panel_groups``, which refuses a repeated pair.
+    """
+    groups: dict[str, dict[str, list[str]]] = {}
+    for key, (dataset, model) in labels.items():
+        groups.setdefault(dataset, {}).setdefault(model, []).append(key)
+    return {dataset: {model: tuple(keys) for model, keys in models.items()} for dataset, models in groups.items()}
+
+
+def series_heads(groups: Mapping[str, Mapping[str, tuple[str, ...]]]) -> dict[str, dict[str, str]]:
+    """Return the first key of every series of ``panel_series`` in the shape of ``panel_groups``, for a legend and the series style."""
+    return {dataset: {model: keys[0] for model, keys in models.items()} for dataset, models in groups.items()}
+
+
+def material_name(frame: pd.DataFrame) -> str:
+    """Return the display name of the one material a pooled series' frame holds (``display_labels.material_display_label``)."""
+    (material,) = dataframe.require_complete_provenance(frame)["selection"]["material_families"]
+    return display_labels.material_display_label(str(material))
+
+
+def material_mean(keys: Sequence[str], value: Callable[[str], Sequence[float]]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return the value of one series and, per key, the value of its material: the one place where materials are pooled.
+
+    ``value`` reduces the frame of one key to its components (one number, or one per diagnostic). A series of one key is its own
+    value. Several keys, one per material, give the unweighted mean over the materials, whatever their case counts; a component
+    that is NaN (unavailable) in any material is NaN in the series, never a mean of the rest.
+    """
+    per_key = np.array([value(key) for key in keys], dtype=float)
+    return per_key.mean(axis=0), per_key

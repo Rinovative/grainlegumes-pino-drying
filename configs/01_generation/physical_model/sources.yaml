@@ -293,7 +293,8 @@ sources:
   source_type: book_or_manual
 - source_key: saskpulse_storage
   citation: Saskatchewan Pulse Growers (2025). Post-harvest and long-term storage
-    of pulses (Barker, August 2025, Table 1). Web page.
+    of pulses (Barker, August 2025, section Seed Moisture Content at Harvest; Table
+    1 gives the Canadian Grain Commission moisture specifications). Web page.
   identifier: Saskatchewan Pulse Growers web page
   canonical_locator: https://saskpulse.com/resources/post-harvest-and-long-term-storage-of-pulses
   alternate_locators: []
@@ -306,9 +307,46 @@ sources:
   alternate_locators: []
   source_type: journal_article
 - source_key: pulse_thermal_oke_baik_2022
-  citation: Oke & Baik (2022). International Journal of Food Properties, 25(1), 764-779.
-    Thermal properties of pulses (lentil, chickpea); open access.
+  citation: Oke & Baik (2022). Thermal properties of lentil and chickpea in relation
+    to radio frequency heat treatment. International Journal of Food Properties,
+    25(1), 764-779. The abstract ranges are flour values; the packed seed values
+    are in Oke (2021), Table 4.7 (oke_thesis_2021).
   identifier: doi:10.1080/10942912.2022.2058013
   canonical_locator: https://doi.org/10.1080/10942912.2022.2058013
+  alternate_locators: []
+  source_type: journal_article
+- source_key: oke_thesis_2021
+  citation: Oke, D. B. (2021). Viability of anti-nutritional factors and negative
+    flavours reduction in lentil and chickpea with 50-ohm radio frequency heating
+    system. M.Sc. thesis, University of Saskatchewan. Chapter 4 (manuscript of Oke
+    & Baik 2022); Table 4.2 bulk porosity and particle density, Table 4.7 thermal
+    conductivity of whole seeds.
+  identifier: hdl:10388/13532
+  canonical_locator: https://harvest.usask.ca/handle/10388/13532
+  alternate_locators: []
+  source_type: institutional_record
+- source_key: hatzendorf_chickpea_2025
+  citation: Versuchsstation fuer Pflanzenbau Hatzendorf (2025). Versuchsbericht 2025,
+    Kichererbsen Sorten. Fachschulen Steiermark. Plot harvest on 19 September 2025
+    at mostly 25-30 % moisture.
+  identifier: Versuchsbericht 2025 Kichererbsen Sorten
+  canonical_locator: https://www.fachschulen.steiermark.at/cms/dokumente/13006130_152714127/6affbff7/8_Kichererbsen_2025.pdf
+  alternate_locators: []
+  source_type: institutional_record
+- source_key: lentil_drying_tang_sokhansanj_1993
+  citation: Tang, J. & Sokhansanj, S. (1993). Drying parameter effects on lentil seed
+    viability. Transactions of the ASAE, 36(3), 855-861. Table 3 gives thin-layer
+    drying curves of fresh Laird lentils at 66-70 degC.
+  identifier: Transactions of the ASAE 36(3):855-861
+  canonical_locator: https://wpcdn.web.wsu.edu/wp-labs/uploads/sites/1254/2016/09/tang15.pdf
+  alternate_locators: []
+  source_type: journal_article
+- source_key: bean_drying_afonso_correa_1999
+  citation: Afonso Junior, P. C. & Correa, P. C. (1999). Comparacao de modelos matematicos
+    para descricao da cinetica de secagem em camada fina de sementes de feijao. Revista
+    Brasileira de Engenharia Agricola e Ambiental, 3(3), 349-353. Table 1 gives Page
+    coefficients of fresh black beans (Phaseolus vulgaris) at 35-50 degC.
+  identifier: doi:10.1590/1807-1929/agriambi.v3n3p349-353
+  canonical_locator: https://doi.org/10.1590/1807-1929/agriambi.v3n3p349-353
   alternate_locators: []
   source_type: journal_article

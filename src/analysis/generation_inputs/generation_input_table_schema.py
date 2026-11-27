@@ -6,6 +6,7 @@ Responsibilities:
   - Expand schedule component weights into independently comparable rows
   - Preserve deterministic category and row ordering across table views
   - Group sampled campaign parameters by those sections for the parameter choice and plots
+  - Head the columns of the campaign candidate, rate and failure-reason tables with display names
 
 Design principles:
   - Presentation metadata never changes persisted names or scientific values
@@ -42,6 +43,31 @@ AIRFLOW_SECTION: Final = "Airflow"
 DRYING_SECTION: Final = "Drying"
 UNCATEGORIZED_SECTION: Final = "Other"
 COMPONENT_WEIGHT_NAMES: Final = ("smooth", "event", "trend")
+# Display headers of the campaign candidate, rate and failure-reason tables; sampled parameters keep their exact names.
+CANDIDATE_COLUMN_LABELS: Final = MappingProxyType(
+    {
+        "material_family": "Material",
+        "sampling_regime": "Role",
+        "domain_profile": "Domain profile",
+        "case_id": "Case",
+        "origin": "Origin",
+        "outcome": "Outcome",
+        "selected": "Selected",
+        "design_key": "Design",
+        "duration_seconds": "Duration [s]",
+        "attempts": "Attempts",
+        "failure_stage": "Failure stage",
+        "failure_class": "Failure class",
+        "reason_code": "Reason",
+        "input_admission": "Input admission",
+        "successful": "Successful",
+        "failed": "Failed",
+        "pending": "Pending",
+        "success_fraction_terminal": "Success rate of terminal [-]",
+        "terminal_candidates": "Terminal candidates",
+        "reason_fraction_terminal": "Share of terminal [-]",
+    }
+)
 
 
 def _rows(

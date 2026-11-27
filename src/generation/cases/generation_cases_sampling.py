@@ -4,12 +4,15 @@ Responsibilities:
   - Draw the points of one scrambled Sobol sequence over all profile-active block dimensions of a design
   - Apply typed registry transforms, coupled selections, and parameter OOD tails
   - Persist the design seed, digest, block columns, point index, and selection evidence
+  - Canonicalize and apply one declared field-test intervention to resolved primitives and report one primitive's feasible range at fixed companions
 
 Design principles:
   - Point i of a design is the i-th point of its sequence (no skip, leap or row permutation), so designs are prefix-stable
   - Every per-case random stream derives from the design seed and the point index, never from the batch or campaign position
   - Coupled sets, family identity, and seeds are metadata rather than dimensions
   - Case values are independent of process ordering, concurrency, and resume
+  - Sampling and intervention checks share one conditioning chain, so a feasible override is exactly a value sampling could produce
+  - An intervention keeps the case seed, never reconditions a companion, and changes only its primitives and their derived dependents
 
 This module does NOT:
   - Define material ranges, invent unresolved values, or generate spatial fields
@@ -36,10 +39,19 @@ from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
+
+    # A chained conditioning step receives one parameter's conditional interval and returns its value.
+    _Choose = Callable[[str, float, float], float]
 
 # The one design recipe: scrambled Sobol, one sequence over all block dimensions in block order, point i is the i-th point.
 DESIGN_RECIPE: Final = "scrambled_sobol_single_sequence"
+# Primitive kinds an intervention may set; fixed, derived, categorical and coupled entries are never set directly.
+_INTERVENABLE_KINDS: Final = frozenset({"interval", "integer", "simplex"})
+# Relative slack for comparing an intervention value with a support edge computed in floating point.
+_SUPPORT_RELATIVE_TOLERANCE: Final = 1e-12
+_SIMPLEX_SUM_TOLERANCE: Final = 1e-9
+_RANGE_BISECTION_STEPS: Final = 64
 
 
 class _SamplingConfig(Protocol):
@@ -83,6 +95,22 @@ class CaseSample:
     coupled_selections: dict[str, str]
     block_provenance: dict[str, dict[str, Any]]
     ood_provenance: dict[str, Any]
+
+
+class InterventionError(ValueError):
+    """Refuse one declared intervention; the subclass names the contract it violates."""
+
+
+class UnknownInterventionParameterError(InterventionError):
+    """An intervention names no sampled primitive of the batch's active blocks."""
+
+
+class InfeasibleInterventionError(InterventionError):
+    """An intervention value lies outside its registry support or its conditional support at fixed companions."""
+
+
+class InterventionScopeError(InterventionError):
+    """An intervention changed a value that is neither a declared primitive nor one of its derived dependents."""
 
 
 def design_points(*, seed: int, dimensions: int, count: int) -> np.ndarray:
@@ -229,15 +257,23 @@ def _remap_interval(
     return _interval_value(entry, coordinate, bounds={"lower": lower, "upper": upper})
 
 
+def _remap_chooser(registry: Mapping[str, Mapping[str, Any]], coordinates: Mapping[str, float]) -> _Choose:
+    """Return the sampling chooser: map each DOE coordinate through its conditional interval."""
+
+    def choose(name: str, lower: float, upper: float) -> float:
+        return _remap_interval(registry[name], coordinates[name], lower=lower, upper=upper, label=name)
+
+    return choose
+
+
 def _condition_operation_values(
     values: dict[str, Any],
     *,
-    registry: Mapping[str, Mapping[str, Any]],
-    coordinates: Mapping[str, float],
+    choose: _Choose,
     bounds: Mapping[str, Mapping[str, Any]],
     fixed: Mapping[str, Any],
 ) -> None:
-    """Condition the complete exact-amplitude schedule inside physical support."""
+    """Condition the complete exact-amplitude schedule inside physical support, one chained parameter at a time."""
     temperature_base_bounds = bounds["T_in_base"]
     temperature_amplitude_bounds = bounds["T_in_amp"]
     humidity_base_bounds = bounds["omega_in_base"]
@@ -258,40 +294,34 @@ def _condition_operation_values(
         float(temperature_base_bounds["upper"]),
         float(fixed["T_in_max"]) - temperature_amplitude_lower,
     )
-    ambient = _remap_interval(
-        registry["T_amb"],
-        coordinates["T_amb"],
-        lower=max(float(ambient_bounds["lower"]), minimum_source_temperature),
-        upper=min(
+    ambient = choose(
+        "T_amb",
+        max(float(ambient_bounds["lower"]), minimum_source_temperature),
+        min(
             float(ambient_bounds["upper"]),
             maximum_feasible_temperature_base - temperature_amplitude_lower,
         ),
-        label="T_amb",
     )
     values["T_amb"] = ambient
 
-    temperature_base = _remap_interval(
-        registry["T_in_base"],
-        coordinates["T_in_base"],
-        lower=max(
+    temperature_base = choose(
+        "T_in_base",
+        max(
             float(temperature_base_bounds["lower"]),
             float(fixed["T_in_min"]) + temperature_amplitude_lower,
             ambient + temperature_amplitude_lower,
         ),
-        upper=maximum_feasible_temperature_base,
-        label="T_in_base",
+        maximum_feasible_temperature_base,
     )
-    temperature_amplitude = _remap_interval(
-        registry["T_in_amp"],
-        coordinates["T_in_amp"],
-        lower=temperature_amplitude_lower,
-        upper=min(
+    temperature_amplitude = choose(
+        "T_in_amp",
+        temperature_amplitude_lower,
+        min(
             float(temperature_amplitude_bounds["upper"]),
             temperature_base - float(fixed["T_in_min"]),
             float(fixed["T_in_max"]) - temperature_base,
             temperature_base - ambient,
         ),
-        label="T_in_amp",
     )
     values["T_in_base"] = temperature_base
     values["T_in_amp"] = temperature_amplitude
@@ -325,29 +355,25 @@ def _condition_operation_values(
         inlet_humidity_maximum,
         source_humidity_maximum,
     )
-    humidity_base = _remap_interval(
-        registry["omega_in_base"],
-        coordinates["omega_in_base"],
-        lower=max(
+    humidity_base = choose(
+        "omega_in_base",
+        max(
             float(humidity_base_bounds["lower"]),
             humidity_operational_lower + humidity_amplitude_lower,
         ),
-        upper=min(
+        min(
             float(humidity_base_bounds["upper"]),
             humidity_operational_upper - humidity_amplitude_lower,
         ),
-        label="omega_in_base",
     )
-    humidity_amplitude = _remap_interval(
-        registry["omega_in_amp"],
-        coordinates["omega_in_amp"],
-        lower=humidity_amplitude_lower,
-        upper=min(
+    humidity_amplitude = choose(
+        "omega_in_amp",
+        humidity_amplitude_lower,
+        min(
             float(humidity_amplitude_bounds["upper"]),
             humidity_base - humidity_operational_lower,
             humidity_operational_upper - humidity_base,
         ),
-        label="omega_in_amp",
     )
     values["omega_in_base"] = humidity_base
     values["omega_in_amp"] = humidity_amplitude
@@ -358,20 +384,8 @@ def _condition_operation_values(
     width_bounds = bounds[width_name]
     width_lower = float(width_bounds["lower"])
     duration_lower = max(float(duration_bounds["lower"]), 2.0 * width_lower)
-    duration = _remap_interval(
-        registry[duration_name],
-        coordinates[duration_name],
-        lower=duration_lower,
-        upper=float(duration_bounds["upper"]),
-        label=duration_name,
-    )
-    width = _remap_interval(
-        registry[width_name],
-        coordinates[width_name],
-        lower=width_lower,
-        upper=min(float(width_bounds["upper"]), 0.5 * duration),
-        label=width_name,
-    )
+    duration = choose(duration_name, duration_lower, float(duration_bounds["upper"]))
+    width = choose(width_name, width_lower, min(float(width_bounds["upper"]), 0.5 * duration))
     values[duration_name] = duration
     values[width_name] = width
 
@@ -379,8 +393,7 @@ def _condition_operation_values(
 def _condition_initial_moisture_values(
     values: dict[str, Any],
     *,
-    registry: Mapping[str, Mapping[str, Any]],
-    coordinates: Mapping[str, float],
+    choose: _Choose,
     bounds: Mapping[str, Mapping[str, Any]],
     family_bounds: Mapping[str, float],
     field_constraint: Mapping[str, Any],
@@ -401,13 +414,7 @@ def _condition_initial_moisture_values(
         field_lower = float(family_bounds["lower"])
         field_upper = float(family_bounds["upper"])
         mean_upper = min(float(mean_bounds["upper"]), field_upper - amplitude_lower)
-    mean = _remap_interval(
-        registry[mean_name],
-        coordinates[mean_name],
-        lower=max(float(mean_bounds["lower"]), field_lower + amplitude_lower),
-        upper=mean_upper,
-        label=mean_name,
-    )
+    mean = choose(mean_name, max(float(mean_bounds["lower"]), field_lower + amplitude_lower), mean_upper)
     if natural_support_departure_allowed:
         amplitude_upper = min(float(amplitude_bounds["upper"]), mean - field_lower)
     else:
@@ -415,13 +422,7 @@ def _condition_initial_moisture_values(
             message = "Natural initial-moisture support requires a finite upper bound."
             raise RuntimeError(message)
         amplitude_upper = min(float(amplitude_bounds["upper"]), mean - field_lower, field_upper - mean)
-    amplitude = _remap_interval(
-        registry[amplitude_name],
-        coordinates[amplitude_name],
-        lower=amplitude_lower,
-        upper=amplitude_upper,
-        label=amplitude_name,
-    )
+    amplitude = choose(amplitude_name, amplitude_lower, amplitude_upper)
     values[mean_name] = mean
     values[amplitude_name] = amplitude
 
@@ -691,16 +692,14 @@ def _block_values(
     if block == "operation":
         _condition_operation_values(
             values,
-            registry=registry,
-            coordinates=coordinates_by_name,
+            choose=_remap_chooser(registry, coordinates_by_name),
             bounds=bounds_by_name,
             fixed=fixed,
         )
     elif block == "initial_moisture":
         _condition_initial_moisture_values(
             values,
-            registry=registry,
-            coordinates=coordinates_by_name,
+            choose=_remap_chooser(registry, coordinates_by_name),
             bounds=bounds_by_name,
             family_bounds=family_bounds,
             field_constraint=initial_moisture_field_constraint,
@@ -807,8 +806,207 @@ def _design_row(sampling: Mapping[str, Any], *, point_index: int) -> np.ndarray:
     return points[point_index]
 
 
-def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
-    """Resolve one deterministic case from point ``design_index`` of its batch's design."""
+def _within(value: float, lower: float, upper: float) -> bool:
+    """Return whether one value lies in a closed support up to floating-point slack at its edges."""
+    slack = _SUPPORT_RELATIVE_TOLERANCE * max(1.0, abs(lower), abs(upper))
+    return lower - slack <= value <= upper + slack
+
+
+def _canonical_intervention_value(name: str, entry: Mapping[str, Any], value: Any) -> Any:
+    """Validate one intervention value against its registry ID support and return its canonical JSON form."""
+    if entry["kind"] == "simplex":
+        components = tuple(str(component) for component in entry["components"])
+        if not isinstance(value, dict) or set(value) != set(components):
+            message = f"Simplex intervention {name!r} must set exactly the components {list(components)}."
+            raise InterventionError(message)
+        weights = {component: float(value[component]) for component in components}
+        lower, upper = float(entry["minimum_each"]), float(entry["maximum_each"])
+        if not all(math.isfinite(weight) and _within(weight, lower, upper) for weight in weights.values()) or (
+            abs(sum(weights.values()) - 1.0) > _SIMPLEX_SUM_TOLERANCE
+        ):
+            message = f"Simplex intervention {name!r}={weights} leaves its support [{lower}, {upper}] per component with unit sum."
+            raise InfeasibleInterventionError(message)
+        return weights
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or (entry["kind"] == "integer" and not isinstance(value, int)):
+        message = f"Intervention {name!r} needs a {'integer' if entry['kind'] == 'integer' else 'real'} value, got {value!r}."
+        raise InterventionError(message)
+    number = int(value) if entry["kind"] == "integer" else float(value)
+    if not math.isfinite(number) or not _within(number, float(entry["lower"]), float(entry["upper"])):
+        message = f"Intervention {name}={number!r} lies outside its registry support [{entry['lower']}, {entry['upper']}]."
+        raise InfeasibleInterventionError(message)
+    return number
+
+
+def _require_conditional_support(values: Mapping[str, Any], *, scientific_values: Mapping[str, Any]) -> None:
+    """Replay the sampling conditioning chains on resolved values and refuse any value outside its conditional interval."""
+    family_contract = scientific_values["material"]
+    blocks = scientific_values["sampling"]["blocks"]
+
+    def check(name: str, lower: float, upper: float) -> float:
+        value = float(values[name])
+        if lower > upper or not _within(value, lower, upper):
+            message = f"{name}={value!r} lies outside its conditional support [{lower}, {upper}] at fixed companions."
+            raise InfeasibleInterventionError(message)
+        return value
+
+    replay: dict[str, Any] = {}
+    if "operation" in blocks:
+        _condition_operation_values(
+            replay, choose=check, bounds=family_contract["parameter_registry"], fixed=scientific_values["scientific_fixed_values"]
+        )
+    if "initial_moisture" in blocks:
+        _condition_initial_moisture_values(
+            replay,
+            choose=check,
+            bounds=family_contract["parameter_registry"],
+            family_bounds=family_contract.get("initial_moisture_bounds", {}),
+            field_constraint=family_contract.get("initial_moisture_field_constraint", {}),
+            natural_support_departure_allowed=False,
+        )
+
+
+def canonical_intervention(intervention: Mapping[str, Any], *, scientific_values: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Return one intervention in canonical JSON form after the registry ID-support check of every declared primitive.
+
+    Raises
+    ------
+    UnknownInterventionParameterError
+        If a name is no sampled primitive of the batch's active blocks.
+    InterventionError
+        If a value has the wrong type; ``InfeasibleInterventionError`` if it leaves its registry support.
+
+    """
+    registry = scientific_values["material"]["parameter_registry"]
+    active = {str(name) for plan in scientific_values["sampling"]["blocks"].values() for name in plan["parameters"]}
+    canonical: dict[str, Any] = {}
+    for name in sorted(intervention):
+        entry = registry.get(name)
+        if entry is None or name not in active or entry["kind"] not in _INTERVENABLE_KINDS:
+            message = f"Intervention names {name!r}, which is no sampled primitive of this batch's active blocks."
+            raise UnknownInterventionParameterError(message)
+        canonical[name] = _canonical_intervention_value(name, entry, copy.deepcopy(intervention[name]))
+    return canonical
+
+
+def _apply_intervention(
+    values: Mapping[str, Any],
+    intervention: Mapping[str, Any],
+    *,
+    scientific_values: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the resolved values with every declared primitive replaced after support and conditional-support checks."""
+    merged = {**values, **canonical_intervention(intervention, scientific_values=scientific_values)}
+    _require_conditional_support(merged, scientific_values=scientific_values)
+    return merged
+
+
+def require_intervention_scope(
+    registry: Mapping[str, Mapping[str, Any]],
+    base: Mapping[str, Any],
+    intervened: Mapping[str, Any],
+    *,
+    declared: frozenset[str],
+) -> None:
+    """Refuse resolved values whose differences from the base reach beyond the declared primitives and their derived dependents."""
+    allowed = set(declared)
+    grown = True
+    while grown:
+        dependents = {
+            name for name, entry in registry.items() if entry["kind"] == "derived" and name not in allowed and allowed.intersection(entry["sources"])
+        }
+        allowed.update(dependents)
+        grown = bool(dependents)
+    changed = sorted(name for name in set(base) | set(intervened) if name not in allowed and base.get(name) != intervened.get(name))
+    if changed:
+        message = f"Intervention {sorted(declared)} also changed {changed}, which are neither declared nor derived from it."
+        raise InterventionScopeError(message)
+
+
+def _support_edge(feasible: Callable[[float], bool], *, inside: float, outside: float) -> float:
+    """Return the feasible value closest to ``outside`` on the segment from the feasible ``inside`` by bisection."""
+    if feasible(outside):
+        return outside
+    for _ in range(_RANGE_BISECTION_STEPS):
+        middle = 0.5 * (inside + outside)
+        if middle in {inside, outside}:
+            break
+        if feasible(middle):
+            inside = middle
+        else:
+            outside = middle
+    return inside
+
+
+def feasible_range(
+    config: _SamplingConfig,
+    case_index: int,
+    name: str,
+    *,
+    background: Mapping[str, Any] | None = None,
+) -> tuple[float, float]:
+    """
+    Return the lowest and highest feasible value of one interval or integer primitive for one case, at fixed companions.
+
+    Parameters
+    ----------
+    config, case_index
+        The batch and member whose resolved values are the companions.
+    name : str
+        Sampled interval or integer primitive of an active block.
+    background : Mapping[str, Any] | None, optional
+        Intervention applied before the range is taken, for example a reference whose other rows sit at their nominal.
+
+    Returns
+    -------
+    tuple[float, float]
+        The feasible edges inside the registry ID support; integers return their registry bounds, which no chain conditions.
+
+    Raises
+    ------
+    InterventionError
+        If ``background`` is refused or ``name`` is no interval or integer primitive of the batch.
+
+    Notes
+    -----
+    The edges are found by bisection between the case's own value and each registry edge, accepting a value exactly when the
+    intervention itself would be accepted, so they assume the feasible set at fixed companions is one interval, which holds for
+    the monotone chain bounds.
+
+    """
+    sample = sample_case(config, case_index, intervention=background)
+    scientific = config.scientific_values
+    registry = scientific["material"]["parameter_registry"]
+    active = {str(item) for plan in scientific["sampling"]["blocks"].values() for item in plan["parameters"]}
+    entry = registry.get(name)
+    if entry is None or name not in active or entry["kind"] not in {"interval", "integer"}:
+        message = f"Feasible ranges exist for interval and integer primitives only, not {name!r}."
+        raise UnknownInterventionParameterError(message)
+    if entry["kind"] == "integer":
+        return float(entry["lower"]), float(entry["upper"])
+
+    # The predicate is the full intervention path, so an edge also satisfies the initial-moisture generation bounds.
+    def feasible(value: float) -> bool:
+        try:
+            sample_case(config, case_index, intervention={**(background or {}), name: value})
+        except InfeasibleInterventionError:
+            return False
+        return True
+
+    start = float(sample.values[name])
+    return (
+        _support_edge(feasible, inside=start, outside=float(entry["lower"])),
+        _support_edge(feasible, inside=start, outside=float(entry["upper"])),
+    )
+
+
+def sample_case(config: _SamplingConfig, case_index: int, *, intervention: Mapping[str, Any] | None = None) -> CaseSample:
+    """
+    Resolve one deterministic case from point ``design_index`` of its batch's design.
+
+    A non-empty ``intervention`` (primitive name to value) replaces those primitives after the base values and coupled
+    records are resolved and before derived values are, keeping the case seed and every other value; see ``InterventionError``.
+    """
     config.case_id(case_index)
     assignment = config.case_assignment(case_index)
     if config.seed_base is None:
@@ -884,17 +1082,31 @@ def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
         if not isinstance(simplex, dict):
             message = "schedule.component_weights did not resolve to a complete simplex mapping."
             raise TypeError(message)
+    if intervention:
+        if selected:
+            message = "Interventions apply to natural-support cases only."
+            raise InterventionError(message)
+        base_values = registry_service.resolve_derived_values(registry, values, defer_missing=True)
+        values = _apply_intervention(values, intervention, scientific_values=config.scientific_values)
     values = registry_service.resolve_derived_values(
         registry,
         values,
         defer_missing=True,
     )
+    if intervention:
+        require_intervention_scope(registry, base_values, values, declared=frozenset(intervention))
     if "initial_moisture_bounds" in family_contract:
-        materials.initial_moisture_generation_bounds(
-            family_contract,
-            values,
-            active_ood_unit=next(iter(selected), None),
-        )
+        try:
+            materials.initial_moisture_generation_bounds(
+                family_contract,
+                values,
+                active_ood_unit=next(iter(selected), None),
+            )
+        except ValueError as error:
+            if not intervention:
+                raise
+            message = f"Intervention leaves the initial-moisture generation bounds: {error}"
+            raise InfeasibleInterventionError(message) from error
     selected_units = sorted(selected)
     if selected_units:
         if len(selected_units) != 1:

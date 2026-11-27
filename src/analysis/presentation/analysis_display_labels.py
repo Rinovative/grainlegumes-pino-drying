@@ -1,16 +1,20 @@
 """Own concise scientific display labels while preserving canonical identities separately.
 
 Responsibilities:
-  - Humanize maintained task, material, physical domain, and run role identifiers
+  - Humanize maintained task, material, physical domain, run role, evaluation protocol and rollout mode identifiers
   - Hold the authoritative metadata required for one visible dataset label
   - Disambiguate colliding dataset labels with the shortest stable identity prefix
   - Make short run and Dataset labels unique with one separating facet, shortened by common affixes and a middle ellipsis
+  - Write table column keys as headings, record tokens and qualified metric labels in sentence case, generation case ids as
+    ``case 48`` and an exact identity shortened in place
   - Preserve canonical identities as metadata rather than parsing presentation text
 
 Design principles:
   - Presentation labels never become storage, scientific, or persistence identities
   - Source domains and Experiment evaluation roles remain distinct visible concepts
   - Collision suffixes are deterministic and appear only when required for uniqueness
+  - A field key inside a table key keeps its plain symbol and a water density names its stored basis (``w_surf (water density)``);
+    a normalized or relative metric heading carries ``[-]``
 
 This module does NOT:
   - Discover datasets, infer metadata, or validate persisted artifacts
@@ -25,6 +29,8 @@ from typing import TYPE_CHECKING, cast
 
 from src.analysis import generation_inputs
 
+from . import analysis_field_labels as field_labels
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
@@ -38,14 +44,41 @@ _TASK_LABELS = {
 }
 _EVALUATION_ROLE_LABELS = {
     "id": "ID",
+    "eval": "ID",  # the split role a steady artifact stores for its ID set
     "ood": "OOD",
     "material_ood": "Material OOD",
     "parameter_ood": "Parameter OOD",
 }
 _EVALUATION_PROTOCOL_LABELS = {
     "normalized_drying_group_macro_rmse": "Drying group macro RMSE",
+    "normalized_group_macro_rmse": "Normalized group macro RMSE",
 }
-_ACRONYMS = frozenset({"id", "ood"})
+_EVALUATION_MODE_LABELS = {
+    "autonomous_full": "Full rollout",
+    "rolling_origin": "Rolling origin",
+    "teacher_forced_one_step": "Teacher-forced one step",
+}
+# Table headings of keys whose words read poorly; every other key reads as its words (``table_heading``).
+_TABLE_HEADINGS = {
+    "frame": "Artifact",
+    "dataset_role": "Role",
+    "material_family": "Material",
+    "architecture_family": "Model family",
+    "model_kind": "Model family",
+    "physics_enabled": "Physics loss",
+    "requested_horizon": "Horizon",
+    "contributing_record_count": "Records",
+    "sample_count": "Cases",
+    "optimisation_seconds": "Optimization time [s]",  # the stored key keeps its spelling; the headings read as the configuration's
+    "total_seconds": "Total time [s]",
+    "attempted_seconds": "Attempted time [s]",
+    "inference_seconds_per_case": "Inference time per case [s]",
+}
+_FIELD_KEY_PARTS = (4, 3, 2, 1)  # the most underscore-separated parts a field key spans (``X_0_db_field``), longest first
+_DIMENSIONLESS_PREFIXES = ("normalized_", "physical_relative_")  # table keys of dimensionless metrics
+_ACRONYMS = frozenset({"comsol", "cuda", "cpu", "fno", "h1", "id", "l2", "mae", "mse", "ood", "rmse", "rno"})
+_TOKEN_SPELLINGS = {"adamw": "AdamW"}  # tokens whose name is neither lower case nor an acronym
+_CASE_ID = re.compile(r"case_(\d+)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,9 +152,9 @@ def task_display_label(task_id: str) -> str:
 
 
 def material_display_label(material_family: str) -> str:
-    """Return the shared Generation-input human-readable material label."""
+    """Return the one human-readable label of a material family that every view writes (``field_pea`` reads ``Field pea``)."""
     _require_identifier(material_family, label="material_family")
-    return generation_inputs.labels.material_display_label(material_family)
+    return material_family.replace("_", " ").capitalize()
 
 
 def regime_display_label(sampling_regime: str) -> str:
@@ -136,14 +169,83 @@ def evaluation_role_display_label(dataset_role: str) -> str:
 
 
 def material_role_display_label(material_family: str, dataset_role: str) -> str:
-    """Return one material-first label with run-relative Evaluation role."""
-    return f"{material_display_label(material_family)} · {evaluation_role_display_label(dataset_role)}"
+    """Return one dataset as its material and run-relative Evaluation role, one unit inside a dotted run label (``Chickpea, ID``)."""
+    return f"{material_display_label(material_family)}, {evaluation_role_display_label(dataset_role)}"
 
 
 def evaluation_protocol_display_label(protocol: str) -> str:
     """Return the shared human-facing label for one exact Evaluation objective."""
     _require_identifier(protocol, label="protocol")
     return _EVALUATION_PROTOCOL_LABELS.get(protocol, humanize_identifier(protocol))
+
+
+def evaluation_mode_display_label(mode: str) -> str:
+    """Return the display name of one transient evaluation mode (``autonomous_full`` reads ``Full rollout``)."""
+    _require_identifier(mode, label="mode")
+    return _EVALUATION_MODE_LABELS.get(mode, humanize_identifier(mode))
+
+
+def qualified_label(qualifier: str, label: str) -> str:
+    """Return ``label`` after a prose ``qualifier`` as one sentence-case label (``Cumulative drying group macro RMSE``)."""
+    first, _, rest = label.partition(" ")
+    return " ".join(part for part in (qualifier, first if first.isupper() else first.lower(), rest) if part)
+
+
+def token_display_label(token: str) -> str:
+    """Return one lower-case record token as words in sentence case with acronyms upper case (``no_eligible_checkpoint``)."""
+    _require_identifier(token, label="token")
+    text = " ".join(_TOKEN_SPELLINGS.get(word) or (word.upper() if word in _ACRONYMS else word) for word in token.split("_"))
+    return text[:1].upper() + text[1:]
+
+
+def compact_identity_label(identity: str) -> str:
+    """Return an exact identity as a view shows it in place, ``head…tail`` beyond 24 characters; the exact identity stands elsewhere."""
+    _require_identity(identity)
+    return _ellipsized(identity, _FACET_MINIMUM_WIDTH)
+
+
+def case_display_label(case_id: str) -> str:
+    """Return a generation case id as the views write it (``case_0048`` reads ``case 48``); another id stays as it is."""
+    match = _CASE_ID.fullmatch(case_id)
+    return f"case {int(match.group(1))}" if match else case_id
+
+
+def table_heading(key: str) -> str:
+    """
+    Return the display heading of one table column key with its unit: a declared heading, else the key in words.
+
+    The words read in sentence case with acronyms upper case; a field key inside the key stays one word in its plain symbol,
+    a water density with its basis (``normalized_rmse_w_surf`` reads ``Normalized RMSE w_surf (water density) [-]``). A
+    bracketed unit reads as ``field_labels.display_unit`` gives it (``kg/m^3`` as ``kg/m³``), a trailing seconds token ``s``
+    as ``[s]``; a normalized or relative metric without one is dimensionless ``[-]``, its case counts stay without a unit.
+    """
+    base, _, unit = key.partition(" [")
+    unit = field_labels.display_unit(unit.removesuffix("]")) if unit else ""
+    heading = _TABLE_HEADINGS.get(base) or _EVALUATION_PROTOCOL_LABELS.get(base)
+    if heading is None:
+        parts, words = [part for part in re.split(r"[_ ]", base) if part], []
+        while parts:
+            size = next(size for size in _FIELD_KEY_PARTS if size == 1 or _is_field_key("_".join(parts[:size])))
+            word, parts = "_".join(parts[:size]), parts[size:]
+            words.append(_field_word(word) if _is_field_key(word) else word.upper() if word in _ACRONYMS else word)
+        if words[-1:] == ["s"] and not unit:  # a component clock name such as ``comsol_solver_s`` ends in its unit
+            words, unit = words[:-1], "s"
+        heading = " ".join(words)
+        heading = heading[:1].upper() + heading[1:]
+    if not unit and base.startswith(_DIMENSIONLESS_PREFIXES) and not base.endswith("_cases"):
+        unit = field_labels.display_unit("1")
+    return f"{heading} [{unit}]" if unit else heading
+
+
+def _field_word(field: str) -> str:
+    """Return a field key of a table key as its plain symbol, a water density with its basis (``w_surf (water density)``)."""
+    symbol = field_labels.field_label(field, control=True)
+    return f"{symbol} (water density)" if field_labels.field_display_metadata(field).wet_basis is not None else symbol
+
+
+def _is_field_key(text: str) -> bool:
+    """Return whether ``text`` is a field key with a declared presentation (``w_surf``, ``T``)."""
+    return bool(text) and text == text.strip() and field_labels.has_declared_field_metadata(text)
 
 
 def dataset_display_label(metadata: DatasetDisplayMetadata) -> str:
@@ -266,7 +368,7 @@ def dataset_display_labels(datasets: Iterable[DatasetDisplayMetadata]) -> tuple[
 
 def unique_display_labels(bases: Sequence[str], facets: Sequence[Sequence[str | None]]) -> tuple[str, ...]:
     """
-    Make equal base labels unique by appending the first separating facet.
+    Make equal base labels unique by appending the first separating facet, again while a separated label meets another.
 
     Parameters
     ----------
@@ -294,6 +396,18 @@ def unique_display_labels(bases: Sequence[str], facets: Sequence[Sequence[str | 
     if len(bases) != len(facets):
         message = "bases and facets must have one entry per item."
         raise ValueError(message)
+    labels = tuple(bases)
+    # Each round separates every group of equal labels or raises; one round per item bounds rare chains of new meetings.
+    for _round in range(len(labels) + 1):
+        if len(set(labels)) == len(labels):
+            return labels
+        labels = _separated_once(labels, facets)
+    message = "The facets could not make the labels unique."
+    raise ValueError(message)
+
+
+def _separated_once(bases: tuple[str, ...], facets: Sequence[Sequence[str | None]]) -> tuple[str, ...]:
+    """Append the first separating facet to every group of equal ``bases``; raise if no facet separates one."""
     labels = list(bases)
     for base in dict.fromkeys(bases):
         group = tuple(index for index, candidate in enumerate(bases) if candidate == base)
@@ -322,11 +436,16 @@ def _shorten_facet_values(values: tuple[str, ...]) -> tuple[str, ...] | None:
     if len(set(cores)) != len(cores):
         return None
     for width in range(_FACET_MINIMUM_WIDTH, max(len(core) for core in cores) + 1):
-        head = width // 2
-        shown = tuple(core if len(core) <= width else f"{core[:head]}…{core[len(core) - (width - head - 1) :]}" for core in cores)
+        shown = tuple(_ellipsized(core, width) for core in cores)
         if len(set(shown)) == len(shown):
             return shown
     return cores
+
+
+def _ellipsized(text: str, width: int) -> str:
+    """Return ``text`` whole up to ``width`` characters, else as ``head…tail`` of that width."""
+    head = width // 2
+    return text if len(text) <= width else f"{text[:head]}…{text[len(text) - (width - head - 1) :]}"
 
 
 def _unique_identity_prefixes(identities: tuple[str, ...]) -> tuple[str, ...]:

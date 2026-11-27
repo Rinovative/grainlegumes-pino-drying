@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Write the config, summary and placeholder files that read-only run admission inspects
+  - Build a complete checkpoint identity that a summary records for its producer
   - Replace one task's training projection, as if its training code had changed after a run recorded it
 
 Design principles:
@@ -14,11 +15,13 @@ This module does NOT:
 
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING, Any
 
 from src import common, experiments, learning
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     import pytest
@@ -29,6 +32,28 @@ def drift_training_code(monkeypatch: pytest.MonkeyPatch, task: str) -> None:
     projections = learning.training.checkpoint.TRAINING_PROJECTIONS
     drifted = common.code_identity.CodeProjection(name=projections[task].name, files=("common/common_names.py",))
     monkeypatch.setitem(projections, task, drifted)
+
+
+def producer_identity(task: str = "steady_flow", *, numerical_environment: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Return a complete checkpoint identity of one synthetic run, produced in ``numerical_environment`` or else the running one."""
+
+    def digest(label: str) -> str:
+        return hashlib.sha256(f"{task}:{label}".encode()).hexdigest()
+
+    roles = ("train", "validation", "id_test", "material_ood", "parameter_ood")
+    return {
+        "identity_contract_sha256": learning.training.checkpoint.TRAINING_IDENTITY_CONTRACT_DIGEST,
+        "task": task,
+        "task_contract_digest": digest("task"),
+        "effective_config_digest": digest("config"),
+        "dataset_ids": {"train": "train-dataset", "material_ood": digest("material-ood-ids"), "parameter_ood": digest("parameter-ood-ids")},
+        "dataset_fingerprints": {role: digest(f"{role}-dataset") for role in ("train", "material_ood", "parameter_ood")},
+        "split_contract_digest": digest("split"),
+        "split_membership_digests": {role: digest(f"{role}-membership") for role in roles},
+        "normalizer_sha256": digest("normalizer"),
+        "numerical_environment": dict(numerical_environment or learning.training.checkpoint.numerical_environment_identity()),
+        "objective": {"id": "mse", "kind": "mse", "space": "normalized", "fields": ["p"], "reduction": "element_mean", "direction": "minimize"},
+    }
 
 
 def write_lightweight_run_state(

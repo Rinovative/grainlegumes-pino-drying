@@ -6,15 +6,17 @@ Responsibilities:
   - Aggregate complete-dataset endpoint and cumulative error statistics
   - Rank frames by the selection objective of their complete autonomous rollouts
   - Reduce the relative norms of complete rollouts per physical time, or per drying-phase point of ``time_ui.phase_cohort``,
-    with their supported case counts, and classify each full rollout's reference completion from its persisted target evidence
-  - Expose bounded case and dataset views
+    of all a frame's cases or one dataset choice's, with their supported and non-finite case counts, and classify each full
+    rollout's reference completion from its persisted target evidence
+  - Expose bounded case and dataset views; a case's shown label is its generation case number (``case 48``)
   - Resolve the series styles of the comparison once over all loaded frames, for every transient view
 
 Design principles:
   - Persisted scaling is reconstructed exactly and never refitted
   - Origin states are excluded from every error reduction over hours; a drying-phase point may resolve to the origin
   - Fixed horizons remain exact semantic values, not display labels
-  - A group with any non-finite prediction value reports support counts instead of error metrics
+  - A group with any non-finite prediction value reports support counts instead of error metrics; over time a non-finite
+    predicted field voids that field's relative norm at that time only
   - The objective and the per-field RMSE, MAE and relative norms of every table, ranking, and B/A pipeline error come from
     learning.metrics.metrics and weigh the cases of a material and the materials equally, as checkpoint selection does;
     a horizon relative norm sums each case's energies over its states first; grain-water and bulk errors follow the
@@ -28,7 +30,7 @@ This module does NOT:
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from numbers import Real
 from pathlib import Path
@@ -40,6 +42,7 @@ import pandas as pd
 
 from src import common, datasets, domain, learning
 from src.analysis.artifacts import contracts
+from src.analysis.presentation import analysis_display_labels as display_labels
 from src.analysis.ui import analysis_ui_time as time_ui
 
 from . import evaluation_prediction_validity as validity_contract
@@ -427,8 +430,12 @@ class TransientEvaluationSession:
                 raise ValueError(msg)
             _validate_sequence_source(frame)
             admitted[name] = (frame, _scale(frame))
-        # Every session view compares its frames, so they must come from one recorded analysis implementation.
-        contracts.require_common_analysis_producer({name: frame.attrs.get("artifact_provenance") for name, frame in frames.items()})
+        # Every session view compares its frames, so they must come from one recorded analysis implementation; a scoped root's
+        # remedy is to delete and generate it again, since it takes no --rebuild.
+        contracts.require_common_analysis_producer(
+            {name: frame.attrs.get("artifact_provenance") for name, frame in frames.items()},
+            scoped=[name for name, frame in frames.items() if frame.attrs.get("artifact_scope") == "scoped_partial"],
+        )
         self._frames = MappingProxyType(admitted)
         self._case_dataframe_cache: dict[tuple[str, ...], pd.DataFrame] = {}
         self._summary_cache: dict[tuple[str, ...], tuple[TransientSessionSummary, ...]] = {}
@@ -441,9 +448,13 @@ class TransientEvaluationSession:
         return tuple(self._frames)
 
     def require_common_comparison_grids(self) -> None:
-        """Compare every matched case's persisted exact grid without loading arrays."""
-        baseline: dict[tuple[str, str], Mapping[str, Any]] | None = None
-        baseline_name = ""
+        """
+        Compare every matched case's persisted exact grid without loading arrays, among the frames of one dataset role.
+
+        A run has one frame per role (ID, material OOD), whose cases differ by design; frames of the same roles must hold the
+        same exact cases on the same grids.
+        """
+        baselines: dict[frozenset[str], tuple[str, dict[tuple[str, str], Mapping[str, Any]]]] = {}
         for name, (frame, _artifact) in self._frames.items():
             grids: dict[tuple[str, str], Mapping[str, Any]] = {}
             for record in _sequence_records(frame):
@@ -456,9 +467,11 @@ class TransientEvaluationSession:
                     msg = f"Transient model {name!r} changes Evaluation grid within case {key!r}."
                     raise ValueError(msg)
                 grids[key] = spatial
-            if baseline is None:
-                baseline, baseline_name = grids, name
+            roles = frozenset(role for role, _case_id in grids)
+            if roles not in baselines:
+                baselines[roles] = (name, grids)
                 continue
+            baseline_name, baseline = baselines[roles]
             if grids.keys() != baseline.keys():
                 msg = f"Transient models {baseline_name!r} and {name!r} have different exact case memberships."
                 raise ValueError(msg)
@@ -597,7 +610,7 @@ class TransientEvaluationSession:
                     TransientCaseInventoryEntry(
                         frame_name=frame_name,
                         case_id=case_id,
-                        case_label=compact_case_id,
+                        case_label=display_labels.case_display_label(compact_case_id),
                         material_family=_material_family(summary),
                         dataset_role=self.dataset_role(frame_name),
                         dataset_name=dataset_name,
@@ -1029,25 +1042,27 @@ class TransientEvaluationSession:
         styles.update(series.select_styles(members, styles))
         return styles
 
-    def relative_norm_curve(self, frame_name: str, *, time_axis: str = "hours") -> pd.DataFrame:
+    def relative_norm_curve(self, frame_name: str, *, time_axis: str = "hours", case_ids: Collection[str] | None = None) -> pd.DataFrame:
         """
         Return the relative L2 and H1 of one frame's complete autonomous rollouts at every exact physical time or phase point.
 
-        At each post-origin time every case present enters the material-case mean of its
-        per-case norm, as the horizon value does. A case whose predicted state at that time
-        is non-finite, or whose reference lies below the field's floor, stays in ``cases``
-        and only lowers ``supported_cases``; its other times count. Columns:
-        ``physical_time``, ``metric_id``, ``value`` (NaN when a material has no supported
-        case), ``cases`` and ``supported_cases``. With ``time_axis="phase"`` the clock column is
-        ``phase``, every grid point of ``time_ui.phase_cohort``, and ``attrs["phase_label"]`` names the cohort.
+        At each post-origin time every case present enters the material-case mean of its per-case norm, as the horizon value
+        does; ``case_ids`` restricts the cases to one dataset choice (one material, or a pooled role). A case whose predicted
+        field at that time is non-finite voids that field's value there (NaN) and is counted in ``nonfinite_cases``; a case
+        whose reference lies below the field's floor only lowers ``supported_cases``; both stay in ``cases`` and their other
+        times and fields count. Columns: ``physical_time``, ``metric_id``, ``value`` (also NaN when a material has no
+        supported case), ``cases``, ``supported_cases`` and ``nonfinite_cases``. ``attrs["members"]`` holds the entity facts
+        (``series.ENTITY_COLUMNS``) of every material of the drawn cases, by which a view looks up the curve's style. With
+        ``time_axis="phase"`` the clock column is ``phase``, every grid point of ``time_ui.phase_cohort``, and
+        ``attrs["phase_label"]`` names the cohort.
         """
         phase = time_ui.is_phase(time_axis)
         reduction = learning.metrics.metrics
         floors = {field: domain.tasks.registry.get_task("transient_drying").reference_floor(field) for field in sequence_artifact.STATE_ORDER}
-        # Per exact time or phase point: (material, field statistics of the state, or None when the predicted state is non-finite).
-        by_time: dict[float, list[tuple[str, np.ndarray | None]]] = {}
+        # Per exact time or phase point: (material, field statistics of the state, which fields of the predicted state are finite).
+        by_time: dict[float, list[tuple[str, np.ndarray, np.ndarray]]] = {}
         # Loaded artifacts hold array-free summaries; the full records carry the states.
-        records = self.full_autonomous_records(frame_name)
+        records = [record for record in self.full_autonomous_records(frame_name) if case_ids is None or _record_value(record, "case_id") in case_ids]
         # Each pooled record with the states it contributes: every post-origin state, or its phase states (the origin a candidate).
         pooled: list[tuple[Any, np.ndarray | slice]] = [(record, slice(1, None)) for record in records]
         attrs: dict[str, str] = {}
@@ -1064,17 +1079,16 @@ class TransientEvaluationSession:
             times = time_ui.PHASE_GRID if phase else np.asarray(_record_value(record, "physical_times"), dtype=np.float64)[states]
             material = _material_family(record)
             for time, state, sums in zip(times, prediction, rows, strict=True):
-                by_time.setdefault(float(time), []).append((material, sums if np.isfinite(state).all() else None))
+                by_time.setdefault(float(time), []).append((material, sums, np.isfinite(state).all(axis=(-2, -1))))
         clock = "phase" if phase else "physical_time"
         result: list[dict[str, Any]] = []
         for time, cases in sorted(by_time.items()):
             for norm in reduction.RELATIVE_NORMS:
                 for index, field in enumerate(sequence_artifact.STATE_ORDER):
-                    per_case = [
-                        (material, None if sums is None else reduction.case_relative_norm(sums[index], norm=norm, floor=floors[field]))
-                        for material, sums in cases
-                    ]
-                    value = reduction.material_case_mean(per_case) if per_case else None  # a phase point of a frame without a reached case
+                    finite = [(material, sums) for material, sums, fields in cases if fields[index]]
+                    per_case = [(material, reduction.case_relative_norm(sums[index], norm=norm, floor=floors[field])) for material, sums in finite]
+                    # A phase point of a frame without a reached case, or a field a case predicts non-finite there, has no value.
+                    value = reduction.material_case_mean(per_case) if per_case and len(finite) == len(cases) else None
                     result.append(
                         {
                             clock: time,
@@ -1082,10 +1096,15 @@ class TransientEvaluationSession:
                             "value": math.nan if value is None else value,
                             "cases": len(cases),
                             "supported_cases": sum(case_value is not None for _material, case_value in per_case),
+                            "nonfinite_cases": len(cases) - len(finite),
                         }
                     )
-        curve = pd.DataFrame.from_records(result, columns=[clock, "metric_id", "value", "cases", "supported_cases"])
-        curve.attrs.update(attrs)
+        curve = pd.DataFrame.from_records(result, columns=[clock, "metric_id", "value", "cases", "supported_cases", "nonfinite_cases"])
+        provenance = self._frame_provenance(frame_name)
+        facts = (provenance.get("model_kind"), provenance.get("dataset_role"), provenance.get("checkpoint_sha256"))
+        curve.attrs.update(
+            attrs, members=[(facts[0], facts[1], material, facts[2]) for material in sorted({_material_family(record) for record in records})]
+        )
         return curve
 
     def _reduce_summaries(self, *, modes: tuple[str, ...]) -> tuple[TransientSessionSummary, ...]:

@@ -5,6 +5,7 @@ Responsibilities:
     with the model-code guard first, and that the split-aware loader still refuses a split before building a model
   - Check that the service predicts a steady case exactly as the steady artifact generator does, on the full grid
     whatever the training stride
+  - Check that a batch of picks is admitted and Train-checked once and yields the one-pick results in pick order
   - Check the relative L2 per field against an independent formula, including a reference below its floor
   - Check that a transient case yields CPU float32 u, v, p arrays whose reference is the case's own COMSOL airflow
   - Check that another grid of the same shape, other stationary conditioning, a changed Train manifest and a
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 import h5py
@@ -308,6 +310,46 @@ def test_steady_case_prediction_equals_the_artifact_generator_on_the_full_grid(
     assert torch.equal(result.prediction, case["prediction"][0][order])
     assert torch.equal(result.reference, case["y"][0][order])
     assert torch.equal(result.error, result.prediction - result.reference)
+
+
+@pytest.mark.integration
+def test_case_batch_is_admitted_once_and_predicts_like_single_cases(airflow_storage: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two picks run one exact selection, one planner admission and one Train check, and yield the one-pick results in pick order."""
+    monkeypatch.setenv("PROJECT_ROOT", str(airflow_storage["steady_project"]))
+    steady = _steady_context(airflow_storage["train_dataset"])
+    storage = airflow_storage["storage"]
+    case_ids = airflow_storage["train_case_ids"][:2]
+    picks = [{"source_name": airflow_storage["train_source"], "material_family": "lentil", "case_id": case_id} for case_id in case_ids]
+    counts: Counter[str] = Counter()
+
+    def counted(name: str, original: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            counts[name] += 1
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    for module, name in (
+        (datasets.packages, "select_exact_cases"),
+        (datasets.packages, "load_package_manifest_evidence"),
+        (datasets.packages.planning, "prepare_dataset_selection"),
+    ):
+        monkeypatch.setattr(module, name, counted(name, getattr(module, name)))
+
+    batch = list(_AIRFLOW.predict_cases_airflow(steady, task="steady_flow", picks=picks, storage_root=storage))
+    batch_counts = dict(counts)
+    counts.clear()
+    singles = [_predict(airflow_storage, steady, case_id=case_id) for case_id in case_ids]
+
+    # The planner admits the picks once and the Train reference once; one-pick calls repeat all three per case.
+    assert batch_counts == {"select_exact_cases": 1, "load_package_manifest_evidence": 1, "prepare_dataset_selection": 2}
+    assert dict(counts) == {"select_exact_cases": 2, "load_package_manifest_evidence": 2, "prepare_dataset_selection": 4}
+    assert [result.source_identity["case_id"] for result in batch] == case_ids
+    for result, single in zip(batch, singles, strict=True):
+        assert result.package_case_id == single.package_case_id
+        assert (result.source_identity, result.relative_l2) == (single.source_identity, single.relative_l2)
+        for name in ("reference", "prediction", "error"):
+            assert torch.equal(getattr(result, name), getattr(single, name))
 
 
 @pytest.mark.integration

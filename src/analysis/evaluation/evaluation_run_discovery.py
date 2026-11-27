@@ -10,8 +10,8 @@ Responsibilities:
   - Carry the run name of the A0 that a B or A1 run starts from, as its saved config records it
   - Read one completed stage's work quantities (time, runtime, work, units, budget) from its summary
   - Name the distinct completed runs of labelled frames by their first frame, a run being its name and end time
-  - Read one completed stage's training history through its run admission and the history's own validator, with the
-    stage's start epoch and its selected validation point; a missing or unusable history is unavailable with its reason
+  - Read one completed stage's training history as its run admission admitted it, with the stage's start epoch and its
+    selected validation point; the admission refuses a missing or unusable history
   - Read the keys of an Optuna study summary that the study curve draws
 
 Design principles:
@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 import yaml
 
-from src import common, datasets, experiments, learning
+from src import common, datasets, experiments
 from src.analysis.artifacts import analysis_artifact_contracts as artifact_contracts
 from src.experiments import experiments_run_identity as run_identity
 from src.experiments.config import experiments_config_naming as config_naming
@@ -88,14 +88,6 @@ class StageHistory:
     selected_point: int
     epochs: tuple[Mapping[str, float], ...]
     validations: tuple[Mapping[str, float], ...]
-
-
-@dataclass(frozen=True, slots=True)
-class UnavailableHistory:
-    """Name a completed run whose training history cannot be shown and why."""
-
-    run_dir: Path
-    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -915,22 +907,19 @@ def _selected_point(best: Mapping[str, Any], last: Mapping[str, Any]) -> int:
     raise ValueError(message)
 
 
-def stage_history(run_dir: Path | str, *, expected_checkpoint_sha256: str) -> StageHistory | UnavailableHistory:
+def stage_history(run_dir: Path | str, *, expected_checkpoint_sha256: str) -> StageHistory:
     """
-    Read one completed stage's training history, or say why it is unavailable.
+    Read one completed stage's training history.
 
     The run is admitted first (``experiments.run.saved_artifact_run_lease``: completed, digests, identities and checkpoints, with
     the numerical environment its checkpoints recorded). Under that same lease its selected checkpoint's digest must be
-    ``expected_checkpoint_sha256`` (the one the loaded artifact records), so a replaced run is refused, not read. The history is
-    read under the lease by its own validator,
-    bound to the run's task, name and checkpoint identity, to the completed epochs of its last checkpoint and to every entry of
-    that checkpoint's objective history (point, epoch, eligibility, value), with ordered steps. The selected point is the
-    first entry at the best checkpoint's epoch and value; B and A1 start at their A0 handoff epoch.
+    ``expected_checkpoint_sha256`` (the one the loaded artifact records), so a replaced run is refused, not read. The history
+    is the one that admission read under the lease, bound to the run's task, name and checkpoint identity, to the completed
+    epochs of its last checkpoint and to every entry of that checkpoint's objective history (point, epoch, eligibility,
+    value), with ordered steps ending at the checkpoint's global step. The selected point is the first entry at the best
+    checkpoint's epoch and value; B and A1 start at their A0 handoff epoch.
 
-    The two tasks differ at admission. A transient run's admission already validates its history, so a transient stage
-    without ``history.json`` or with a refused one fails the lease and raises ``RunLifecycleError``. A steady run is
-    admitted without its history, so a steady run without one (trained before the durable history) or with one the
-    validator refuses returns ``UnavailableHistory`` with the reason.
+    A stage without ``history.json`` or with a refused one fails the lease and raises ``RunLifecycleError``.
 
     Parameters
     ----------
@@ -941,13 +930,13 @@ def stage_history(run_dir: Path | str, *, expected_checkpoint_sha256: str) -> St
 
     Returns
     -------
-    StageHistory | UnavailableHistory
+    StageHistory
         The admitted records with the stage, its pipeline and start epoch, the objective and the selected validation point.
 
     Raises
     ------
     experiments.run.RunLifecycleError
-        If the run is not an admitted completed run, also when a transient stage's history is missing or refused.
+        If the run is not an admitted completed run, also when its history is missing or refused.
     RuntimeError
         If the admitted run's selected checkpoint digest is not ``expected_checkpoint_sha256``.
 
@@ -959,21 +948,8 @@ def stage_history(run_dir: Path | str, *, expected_checkpoint_sha256: str) -> St
                 f"not the expected {expected_checkpoint_sha256}; load the run again."
             )
             raise RuntimeError(message)
-        path, config, last = Path(admitted["run_dir"]), admitted["config"], admitted["last_checkpoint"]
+        config, last, history = admitted["config"], admitted["last_checkpoint"], admitted["history"]
         identity, best = admitted["checkpoint_identity"], admitted["best_checkpoint"]
-        try:
-            history = learning.training.history.validate_completed_history(
-                path,
-                task=str(config["task"]),
-                run_name=str(config["run"]["name"]),
-                checkpoint_identity=identity,
-                completed_epoch=int(last["completed_epoch"]),
-                validations=last["objective_history"],
-            )
-        except FileNotFoundError as error:
-            return UnavailableHistory(path, f"{error} Runs trained before the durable training history have none.")
-        except (TypeError, ValueError) as error:
-            return UnavailableHistory(path, f"Training history refused: {error}")
     stage, pipeline, start_epoch = _stage_placement(config, admitted["summary"])
     return StageHistory(
         run_name=str(config["run"]["name"]),

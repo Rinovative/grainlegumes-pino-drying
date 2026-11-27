@@ -341,7 +341,7 @@ def _draw_line_relationship_03() -> object:
     return analysis.evaluation.plots.error_behavior.plot_error_vs_target_magnitude(datasets=_shown())
 
 
-def _draw_line_relationship_04() -> object:
+def _draw_scatter_parity_10() -> object:
     return analysis.evaluation.plots.sensitivity_capacity.plot_metadata_error_trends(datasets=_shown())
 
 
@@ -372,7 +372,7 @@ def _draw_bar_compare_03() -> object:
     return analysis.evaluation.plots.error_behavior.plot_boundary_error_decomposition(datasets=_shown(), channels=("p",))
 
 
-def _draw_bar_compare_04() -> object:
+def _draw_scatter_parity_11() -> object:
     return analysis.evaluation.plots.physical_consistency.plot_pressure_boundary_summary(datasets=_shown())
 
 
@@ -413,9 +413,6 @@ ENTRIES: Final[tuple[CatalogPlot, ...]] = (
         (f"{_PLOTS}error_behavior.plot_error_vs_target_magnitude",),
         _draw_line_relationship_03,
     ),
-    CatalogPlot(
-        "line-relationship_04", "Metadata sensitivity", (f"{_PLOTS}sensitivity_capacity.plot_metadata_error_trends",), _draw_line_relationship_04
-    ),
     CatalogPlot("distribution_04", "Global error distributions", (f"{_PLOTS}error_behavior.plot_global_error_metrics",), _draw_distribution_04),
     CatalogPlot(
         "distribution_05",
@@ -430,12 +427,17 @@ ENTRIES: Final[tuple[CatalogPlot, ...]] = (
         _draw_scatter_parity_04,
     ),
     CatalogPlot("scatter-parity_05", "Mean field bias", (f"{_PLOTS}error_behavior.plot_mean_field_bias",), _draw_scatter_parity_05),
+    # The dot plots: a point per category and model, on categories without an order.
+    CatalogPlot("scatter-parity_10", "Metadata sensitivity", (f"{_PLOTS}sensitivity_capacity.plot_metadata_error_trends",), _draw_scatter_parity_10),
+    CatalogPlot(
+        "scatter-parity_11",
+        "Pressure boundary summary",
+        (f"{_PLOTS}physical_consistency.plot_pressure_boundary_summary",),
+        _draw_scatter_parity_11,
+    ),
     CatalogPlot("bar-compare_02", "Relative model scoreboard", (f"{_PLOTS}run_summary.plot_relative_comparison_scoreboard",), _draw_bar_compare_02),
     CatalogPlot(
         "bar-compare_03", "Boundary error decomposition", (f"{_PLOTS}error_behavior.plot_boundary_error_decomposition",), _draw_bar_compare_03
-    ),
-    CatalogPlot(
-        "bar-compare_04", "Pressure boundary summary", (f"{_PLOTS}physical_consistency.plot_pressure_boundary_summary",), _draw_bar_compare_04
     ),
     CatalogPlot("matrix_01", "Metadata correlation", (f"{_PLOTS}sensitivity_capacity.plot_metadata_error_heatmap",), _draw_matrix_01),
     CatalogPlot(

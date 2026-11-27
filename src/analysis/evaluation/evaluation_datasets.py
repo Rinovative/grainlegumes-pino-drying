@@ -2,15 +2,17 @@
 
 Responsibilities:
   - Build the dataset inventory of steady role frames, of comparison role frames per model, and of a transient session
-  - Cut a steady or comparison frame to the materials of a choice and recompute its objective material-balanced like the artifact objective
+  - Cut a steady or comparison frame to each material of a choice and recompute that cut's objective through the artifact contract
   - Return cuts as ``DisplayFrames`` that label each frame with the dataset panel and the model series it is drawn under
   - Resolve transient choices to their frame names and case identities
   - Keep roles the workflow refused, and materials without shared cases, visible as unavailable with their reason
-  - Name the steady views that read the recomputed objective and the reason the pooling switch stays off elsewhere
+  - Name the steady views that pool materials equally and the reason the pooling switch stays off elsewhere
 
 Design principles:
   - The role of a steady frame comes from its explicit saved split role, never from names or paths
-  - The objective of a cut is finalized by the artifact contract (equal weight per material, roots after the means), never by a row mean
+  - The objective of a cut is finalized by the artifact contract on that cut's rows alone
+  - A pooled choice is never one cut of appended rows: it yields one cut per material under the choice's label, and the pooling views
+    reduce them material-weighted (``evaluation_plot_series.material_mean``)
   - A comparison cut keeps exactly the cases every model shares, so the compared frames stay case-matched
   - A cut takes its attrs from the session's one cut derivation: the run-level attributes of its source, the source provenance as
     ``attrs["source_artifact_provenance"]``, and the membership, materials, aggregate and prediction validity of its own rows, so cuts
@@ -22,6 +24,7 @@ This module does NOT:
   - Load artifacts, admit runs, or decide which role the workflow refuses
   - Construct widgets, choose colors, or draw
   - Pool transient datasets, because no material-balanced transient view reduction exists
+  - Reduce the cuts of a pooled choice to one value
 """
 
 from __future__ import annotations
@@ -39,23 +42,17 @@ from src.analysis.presentation import dataset_selection, display_labels
 from . import evaluation_session
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Collection, Iterable, Iterator, Sequence
 
     import pandas as pd
 
     from .evaluation_transient_session import TransientCaseInventoryEntry, TransientEvaluationSession
 
-# Steady views whose reduction is the artifact objective's material-balanced one (run summary table, relative scoreboard,
-# accuracy-physics Pareto, capacity), so a pooled cut stays correct there.
-POOLABLE_STEADY_VIEWS: Final = frozenset(
-    {
-        "overview_summary_table",
-        "overview_global_comparison_summary",
-        "overview_accuracy_physics_pareto",
-        "architecture_capacity_accuracy",
-    }
-)
-POOL_DISABLED_REASON: Final = f"Zusammenfassen hier noch nicht materialausgeglichen (folgt mit P2{chr(0x2013)}P4)"
+# Steady views that reduce one value per model from the objective of each material's cut and weight the materials equally
+# (relative scoreboard, capacity). Every other view shows per-case quantiles or row-weighted reductions, which would weight a
+# pooled role by its case counts, so it never pools.
+POOLABLE_STEADY_VIEWS: Final = frozenset({"overview_global_comparison_summary", "architecture_capacity_accuracy"})
+POOL_DISABLED_REASON: Final = "Only in the overview and capacity views, where every material counts equally"
 EVALUATION_GROUP_LABELS: Final[Mapping[str, str]] = MappingProxyType(
     {role: display_labels.evaluation_role_display_label(role) for role in dataset_selection.EVALUATION_GROUP_ORDER}
 )
@@ -84,8 +81,9 @@ def _role_label(role: str) -> str:
 
 
 def _item(material: str, role: str) -> dataset_selection.DatasetItem:
-    """Return the dataset item of one material in one role, keyed ``(material, role)``."""
-    return dataset_selection.DatasetItem((material, role), material, role, dataset_selection.dataset_label(material, _role_label(role)))
+    """Return the dataset item of one known material in one known role, keyed ``(material, role)``."""
+    _role_label(role)
+    return dataset_selection.DatasetItem((material, role), material, role, dataset_selection.dataset_label(material, role))
 
 
 def _inventory(
@@ -142,7 +140,7 @@ def _cases_by_material(frame: pd.DataFrame) -> dict[str, set[str]]:
 
 def _cut(frame: pd.DataFrame, keep: Sequence[bool]) -> pd.DataFrame:
     """
-    Return the kept rows with the attrs of a cut, whose objective is recomputed material-balanced on them.
+    Return the kept rows with the attrs of a cut, whose objective is recomputed on them.
 
     A cut of a frame bound to a live session is bound once in that session, so every redraw returns the same frame and hits its caches.
     """
@@ -157,16 +155,19 @@ class DisplayFrames(Mapping[str, "pd.DataFrame"]):
     Frames by key with the panel and series label each one is drawn under (rule 17: datasets are panels, models are series).
 
     The frames are the (possibly session-bound) cuts themselves; the labels belong to this call's result, never to a shared frame.
-    ``labels`` maps each key to ``(dataset label, model label)``.
+    ``labels`` maps each key to ``(dataset label, model label)``; the frames of a pooled choice, one per material, share one pair
+    (``evaluation_plot_series.panel_series`` groups them). ``unnamed`` holds the model labels that are no explicit short
+    label (a run's storage alias): the legend shows them, a title names none (``title_labels``).
     """
 
-    def __init__(self, frames: Mapping[str, pd.DataFrame], labels: Mapping[str, tuple[str, str]]) -> None:
-        """Hold ``frames`` and the ``labels`` of the same keys, copied."""
+    def __init__(self, frames: Mapping[str, pd.DataFrame], labels: Mapping[str, tuple[str, str]], *, unnamed: Collection[str] = ()) -> None:
+        """Hold ``frames`` and the ``labels`` of the same keys, copied, and the ``unnamed`` model labels."""
         if frames.keys() != labels.keys():
             message = f"Display labels name keys {sorted(labels)} but the frames hold {sorted(frames)}."
             raise ValueError(message)
         self._frames = dict(frames)
         self.labels: Mapping[str, tuple[str, str]] = MappingProxyType(dict(labels))
+        self.unnamed = frozenset(unnamed)
 
     def __getitem__(self, key: str) -> pd.DataFrame:
         """Return the frame of ``key``."""
@@ -180,9 +181,14 @@ class DisplayFrames(Mapping[str, "pd.DataFrame"]):
         """Return the number of frames."""
         return len(self._frames)
 
+    @property
+    def title_labels(self) -> dict[str, str]:
+        """Return each key's model label for a title (``layout.models_suffix``); the key of an ``unnamed`` model gets ``""``, which names none."""
+        return {key: "" if model in self.unnamed else model for key, (_dataset, model) in self.labels.items()}
+
     def only(self, key: str) -> DisplayFrames:
         """Return the one frame ``key`` with its label."""
-        return DisplayFrames({key: self._frames[key]}, {key: self.labels[key]})
+        return DisplayFrames({key: self._frames[key]}, {key: self.labels[key]}, unnamed=self.unnamed)
 
 
 def _require_available(choice: dataset_selection.DatasetChoice) -> None:
@@ -238,22 +244,23 @@ def steady_inventory(
 
 def steady_frames(frames: Mapping[str, pd.DataFrame], choices: Iterable[dataset_selection.DatasetChoice], *, model: str = "") -> DisplayFrames:
     """
-    Cut the steady role frames to the materials of each choice, keyed by the choice label.
+    Cut the steady role frames to each material of each choice, keyed by the item label.
 
-    The result labels every cut with its choice label and ``model``, the label of the one model the frames belong to.
+    The result labels every cut with its choice label and ``model``, the label of the one model the frames belong to. A pooled
+    choice gives one cut per material under its one label, never one cut of appended rows.
 
     Each cut keeps the run-level attributes and carries ``attrs["normalized_group_macro_rmse"]`` recomputed
-    on its rows through the artifact contract: the mean over cases per material, the equal-weight mean over
-    the materials, then the roots. A pooled choice is therefore never a row mean.
+    on its rows through the artifact contract: the mean over cases, the roots after it.
 
     Raises
     ------
     ValueError
-        If two frames hold one role, a choice is unavailable, names a role or material no frame holds, or two choices share a label.
+        If two frames hold one role, a choice is unavailable, names a role or material no frame holds, or two items share a label.
 
     """
     by_role = _frames_by_role(frames)
     drawn: dict[str, pd.DataFrame] = {}
+    labels: dict[str, tuple[str, str]] = {}
     for choice in choices:
         _require_available(choice)
         if choice.group not in by_role:
@@ -261,17 +268,17 @@ def steady_frames(frames: Mapping[str, pd.DataFrame], choices: Iterable[dataset_
             raise ValueError(message)
         frame = by_role[choice.group]
         membership = contracts.artifact_case_membership(frame)
-        materials = {item.material for item in choice.items}
-        missing = materials - {material for _case_id, material in membership}
+        missing = {item.material for item in choice.items} - {material for _case_id, material in membership}
         if missing:
             message = f"Steady frame of role {choice.group!r} holds no cases of materials {sorted(missing)}."
             raise ValueError(message)
-        if choice.label in drawn:
-            message = f"Dataset choice label {choice.label!r} is not unique."
-            raise ValueError(message)
-        keep = [material in materials for _case_id, material in membership]
-        drawn[choice.label] = _cut(frame, keep)
-    return DisplayFrames(drawn, {label: (label, model) for label in drawn})
+        for item in choice.items:
+            if item.label in drawn:
+                message = f"Dataset item label {item.label!r} is not unique."
+                raise ValueError(message)
+            drawn[item.label] = _cut(frame, [material == item.material for _case_id, material in membership])
+            labels[item.label] = (choice.label, model)
+    return DisplayFrames(drawn, labels)
 
 
 def comparison_inventory(
@@ -283,7 +290,7 @@ def comparison_inventory(
     Build the poolable inventory of a model comparison from the frames of every model per role.
 
     A ``(material, role)`` item is available when the material has cases that every model of that role shares.
-    Otherwise it is unavailable with «keine gemeinsamen Fälle in <runs>», naming the models that lack the
+    Otherwise it is unavailable with «no shared cases in <runs>», naming the models that lack the
     material or, when all hold it, every model. A role the workflow refused is one unavailable role-level item.
 
     Parameters
@@ -314,16 +321,17 @@ def comparison_inventory(
                 items.append(_item(material, role))
             else:
                 runs = ", ".join(lacking or cases)
-                unavailable.append((_item(material, role), f"keine gemeinsamen Fälle in {runs}"))
+                unavailable.append((_item(material, role), f"no shared cases in {runs}"))
     return _inventory(items, unavailable, poolable=True)
 
 
 def comparison_frames(frames_by_model: Mapping[str, pd.DataFrame], choice: dataset_selection.DatasetChoice) -> DisplayFrames:
     """
-    Cut the frames of every model of one role to a choice, keyed by model label.
+    Cut the frames of every model of one role to each material of a choice, keyed by model label.
 
+    A pooled choice is one cut per material and model, keyed ``model · item label``, never one cut of appended rows.
     Per material of the choice, only the cases every model holds stay, so the cut frames are case-matched;
-    each carries the objective recomputed material-balanced on its rows. The result labels every frame with the choice label
+    each carries the objective recomputed on its rows. The result labels every frame with the choice label
     and its model label. ``frames_by_model`` holds the frames of the role ``choice.group``, as in :func:`comparison_inventory`.
 
     Raises
@@ -343,11 +351,14 @@ def comparison_frames(frames_by_model: Mapping[str, pd.DataFrame], choice: datas
         if not shared[material]:
             message = f"Material {material!r} has no case shared by all models of role {choice.group!r}."
             raise ValueError(message)
-    cuts = {
-        model: _cut(frames_by_model[model], [case_id in shared.get(material, ()) for case_id, material in rows])
-        for model, rows in memberships.items()
-    }
-    return DisplayFrames(cuts, {model: (choice.label, model) for model in cuts})
+    cuts: dict[str, pd.DataFrame] = {}
+    labels: dict[str, tuple[str, str]] = {}
+    for model, rows in memberships.items():
+        for item in choice.items:
+            key = model if len(choice.items) == 1 else f"{model} · {item.label}"
+            cuts[key] = _cut(frames_by_model[model], [held == item.material and case_id in shared[held] for case_id, held in rows])
+            labels[key] = (choice.label, model)
+    return DisplayFrames(cuts, labels)
 
 
 def transient_inventory(session: TransientEvaluationSession, *, refused: Mapping[str, str] = _NO_REFUSED) -> dataset_selection.DatasetInventory:

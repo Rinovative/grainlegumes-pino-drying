@@ -3,7 +3,7 @@
 Responsibilities:
   - Resolve repository, replaceable runtime, and scientific-storage root contracts
   - Detect source-tree mode and require its explicit repository, storage, and runtime roots
-  - Derive generation, dataset, experiment, and coordination-state paths
+  - Derive generation, dataset, experiment, field-test, and coordination-state paths
   - Resolve Dataset bundles, config-named runs, Optuna studies and trials, and artifacts
   - Compose and invert run directories from the saved ``run.layout`` contract
   - Identify completed and evaluable saved-run directories by required local files
@@ -27,7 +27,8 @@ Notes:
   Root and lifecycle navigation:
     Explicit storage/runtime roots take precedence over their environment overrides;
     otherwise the defaults are siblings of the resolved repository root. Scientific
-    areas are 01_generation, 02_datasets, and 03_experiments beneath storage;
+    areas are 01_generation, 02_datasets, 03_experiments and 04_field_tests (per-parameter
+    Generation field-test records, outside every Source namespace) beneath storage;
     source_snapshots/ (exact source evidence shared by all three areas) sits
     directly beneath storage, and runtime/sources/ holds the frozen read-only
     execution copies restored from those snapshots.
@@ -144,6 +145,10 @@ _GENERATION_CASE_ID = re.compile(r"case_[0-9]{4,}")
 _GENERATION_ATTEMPT_RUN = re.compile(r"run_[0-9]{4,}")
 DATASETS_AREA_NAME = "02_datasets"
 EXPERIMENTS_AREA_NAME = "03_experiments"
+FIELD_TESTS_AREA_NAME = "04_field_tests"
+_FIELD_TEST_TASK = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
+_FIELD_TEST_ID = re.compile(r"[a-z0-9]+(?:[-_][a-z0-9]+)*")
+_FIELD_TEST_ID_MAX_LENGTH = 96
 OPTUNA_FAMILY = "optuna"
 STUDY_TRIALS_DIRNAME = "trials"
 EXPERIMENT_RECORD_FILENAME = "experiment.json"
@@ -956,6 +961,39 @@ def storage_root_for_datasets_root(datasets_root: Path | str) -> Path:
 def get_experiments_root(*, storage_root: Path | str | None = None) -> Path:
     """Return the run, study, log, and analysis lifecycle area."""
     return get_storage_root(storage_root=storage_root) / EXPERIMENTS_AREA_NAME
+
+
+def resolve_field_test_dir(task: str, test_id: str, *, storage_root: Path | str | None = None) -> Path:
+    """
+    Resolve one Generation field test's record directory ``STORAGE_ROOT/04_field_tests/<task>/<test_id>/``.
+
+    Field tests sit beside, never below, the Generation area, so Source discovery, Dataset admission and EDA never see them.
+    The field-test area, the task directory and the test directory must not be symbolic links (checked with lstat), because
+    a link redirects both sides of the containment check.
+
+    Raises
+    ------
+    ValueError
+        If ``task`` or ``test_id`` is not a lowercase slug, a component from the area down is a symbolic link, or the
+        resolved directory escapes the field-test area.
+
+    """
+    if not isinstance(task, str) or _FIELD_TEST_TASK.fullmatch(task) is None:
+        message = f"Field-test task must be a lowercase task slug, got {task!r}."
+        raise ValueError(message)
+    if not isinstance(test_id, str) or len(test_id) > _FIELD_TEST_ID_MAX_LENGTH or _FIELD_TEST_ID.fullmatch(test_id) is None:
+        message = f"Field-test id must be a lowercase slug of at most {_FIELD_TEST_ID_MAX_LENGTH} characters, got {test_id!r}."
+        raise ValueError(message)
+    area = (get_storage_root(storage_root=storage_root) / FIELD_TESTS_AREA_NAME).expanduser()
+    directory = area / task / test_id
+    linked = [component for component in (area, area / task, directory) if component.is_symlink()]
+    if linked:
+        message = f"Field-test path component is a symbolic link: {linked[0]}"
+        raise ValueError(message)
+    if not directory.resolve(strict=False).is_relative_to(area.resolve(strict=False)):
+        message = f"Field-test directory escapes {FIELD_TESTS_AREA_NAME}/: {directory}"
+        raise ValueError(message)
+    return directory
 
 
 def get_generation_state_root(*, storage_root: Path | str | None = None) -> Path:

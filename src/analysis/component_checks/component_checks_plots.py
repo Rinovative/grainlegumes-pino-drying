@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     import pandas as pd
+    from matplotlib.artist import Artist
     from matplotlib.figure import Figure
 
 _LOSS_TERMS: Final = ("momentum", "flux_balance", "boundary")
@@ -75,8 +76,10 @@ def _case_style(position: int, count: int, label: str) -> dict[str, object]:
     return {"color": "0.35", "alpha": 0.5, "label": None}
 
 
-def _legend(figure: Figure, axes: np.ndarray, *, extra: Sequence[tuple[Line2D, str]] = (), groups: Mapping[str, Sequence[str]] | None = None) -> None:
-    """Write the one legend of every labelled artist of ``axes`` plus the ``extra`` key entries; no entries, no legend."""
+def _legend(
+    figure: Figure, axes: np.ndarray, *, extra: Sequence[tuple[Line2D, str]] = (), groups: Mapping[str, Sequence[Artist]] | None = None
+) -> None:
+    """Write the one legend of every labelled artist of ``axes`` plus the ``extra`` key entries, ``groups`` by handle; no entries, no legend."""
     handles, labels = figure_layout.legend_entries(axes.flat)
     handles += [handle for handle, _label in extra]
     labels += [label for _handle, label in extra]
@@ -85,7 +88,7 @@ def _legend(figure: Figure, axes: np.ndarray, *, extra: Sequence[tuple[Line2D, s
 
 
 def _case_legend(
-    figure: Figure, axes: np.ndarray, count: int, *, extra: Sequence[tuple[Line2D, str]] = (), groups: Mapping[str, Sequence[str]] | None = None
+    figure: Figure, axes: np.ndarray, count: int, *, extra: Sequence[tuple[Line2D, str]] = (), groups: Mapping[str, Sequence[Artist]] | None = None
 ) -> None:
     """Write the legend of the cases when they carry categorical colours, otherwise name their count in the first panel title."""
     if count > len(SERIES_COLORS):
@@ -410,7 +413,8 @@ def plot_mode_curves(errors: pd.DataFrame, settings: pd.DataFrame, *, title: str
     keys = [(Line2D([], [], color=series_color(position), marker="o", markersize=3), name) for position, name in enumerate(field_names)]
     for padding, name in zip(paddings, padding_names, strict=True):
         keys.append((Line2D([], [], color="0.35", linestyle="-" if padding == 0 else "--"), name))
-    _legend(figure, axes, extra=keys, groups={"Field": field_names, "Domain padding": padding_names})
+    handles = [handle for handle, _name in keys]
+    _legend(figure, axes, extra=keys, groups={"Field": handles[: len(field_names)], "Domain padding": handles[len(field_names) :]})
     figure_layout.set_figure_title(figure, axes, title)
     return figure
 
@@ -490,6 +494,7 @@ def plot_sorption_residuals(residuals: Mapping[str, pd.DataFrame]) -> Figure:
         axis.grid(visible=True, which="major", color="0.9")
     figure_layout.label_rows_once(axes, "RMS residual / RMS storage rate")
     keys = [(Line2D([], [], color="0.35", linestyle=line), name) for _rule, line, name in _QUADRATURE_RULES]
-    groups = {"Case": list(residuals), "Quadrature rule": [name for _rule, _line, name in _QUADRATURE_RULES]}
+    cases, _labels = figure_layout.legend_entries(axes.flat)  # each case's labelled trapezoid line, owned by handle: a case may share a rule's name
+    groups: dict[str, Sequence[Artist]] = {"Case": cases, "Quadrature rule": [handle for handle, _name in keys]}
     _case_legend(figure, axes, len(residuals), extra=keys, groups=groups)
     return figure

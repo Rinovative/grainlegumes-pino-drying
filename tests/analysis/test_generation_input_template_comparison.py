@@ -5,6 +5,9 @@ Responsibilities:
     that a shared key bound to other sampled values or another case id is a conflict
   - Check the Newcombe hybrid-score interval and the exact McNemar test against hand-computed values and their degenerate cases
   - Check that quantities use pairs both campaigns completed successfully, and the parity figure, controls and view gating
+  - Check that zero pairs give a status instead of empty frames, that a pair successful in both campaigns but without both
+    values is named as such, never as a failed pairing, that the table titles name the campaigns by the captions the
+    campaign choice shows, never by their Source names, and that Campaign A opens on the task of Dataset A
 
 Design principles:
   - Pairs are tiny synthetic candidate rows; expected values are hand-computed, the Newcombe ones with exact decimal arithmetic
@@ -20,13 +23,16 @@ from fractions import Fraction
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
+import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 from matplotlib.colors import to_rgba
 from matplotlib.figure import Figure
+from matplotlib.text import Text
 
 from src.analysis.generation_inputs import generation_input_controls as controls
+from src.analysis.generation_inputs import generation_input_labels as labels
 from src.analysis.generation_inputs import generation_input_panel as panel
 from src.analysis.generation_inputs import generation_input_presentation as presentation
 from src.analysis.generation_inputs import generation_input_sources as sources
@@ -36,7 +42,7 @@ from src.analysis.presentation import analysis_visual_semantics as visual_semant
 from src.analysis.ui import analysis_ui_panel as ui_panel
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
 _TASK = "transient_drying"
 _A = (_TASK, "campaign_a")
@@ -67,6 +73,23 @@ def _row(
         "parameter_units": {"kappa": "m^2", "zeta": "1"},
         **extra,
     }
+
+
+def _selection_state(task: str) -> Any:
+    """Return a stand-in selection state whose Dataset A belongs to ``task``; the template view reads only that."""
+    return SimpleNamespace(selection=SimpleNamespace(dataset_a_key=(task, "batch")))
+
+
+def _widgets(roots: Iterable[widgets.Widget]) -> Iterator[widgets.Widget]:
+    """Yield ``roots`` and every widget nested in them."""
+    for root in roots:
+        yield root
+        yield from _widgets(getattr(root, "children", ()))
+
+
+def _html_texts(root: widgets.Widget) -> list[str]:
+    """Return the values of every HTML widget in ``root``."""
+    return [widget.value for widget in _widgets((root,)) if isinstance(widget, widgets.HTML)]
 
 
 def _paired_rows() -> list[dict[str, Any]]:
@@ -153,7 +176,7 @@ def test_the_same_design_under_another_case_id_is_an_identity_conflict_not_two_o
     assert template.comparable_campaigns(rows) == {}
 
 
-def test_pairs_without_sampled_values_are_unverified_left_out_and_named_in_the_context_line() -> None:
+def test_pairs_without_sampled_values_are_unverified_left_out_and_named_in_the_pairing_note() -> None:
     """A candidate that carries no sampled values cannot show it is the same design: its pair is counted and excluded, no conflict."""
     rows = _replace_in(_paired_rows(), _A, "lentil", 1, parameters=None)
     rows = _replace_in(rows, _B, "chickpea", 1, parameter_units=None)
@@ -162,7 +185,7 @@ def test_pairs_without_sampled_values_are_unverified_left_out_and_named_in_the_c
     assert (comparison.unverified, comparison.pending, comparison.unmatched) == (2, 1, 2)
     assert len(comparison.pairs) == 5
     assert comparison.success.pairs == 5
-    assert "2 unverified" in template.context_line(comparison)
+    assert "2 unverified" in plot_template._pairing_note(comparison)
     assert len(template.quantity_pairs(comparison, "duration_seconds")) == 1  # only lentil 2 remains with both durations
     assert template.comparable_campaigns(rows)[_A] == (_B,)  # the other shared designs are verified
 
@@ -217,8 +240,12 @@ def test_exact_mcnemar_p_of_thousands_of_discordant_pairs_equals_the_exact_integ
 
 
 def test_zero_pairs_leave_every_statistic_undefined_and_the_quantity_table_empty() -> None:
-    """Campaigns without a common design give no decided pair: statistics are ``None``, the table has zero pairs and NaN medians."""
-    rows = [_row(_A, "lentil", 1, "successful", 1.0), _row(_B, "lentil", 2, "successful", 2.0)]
+    """
+    Campaigns without a common design give no decided pair: statistics are ``None``, the table has zero pairs and NaN medians.
+
+    Both table titles name the campaigns by their captions, which the sampling regimes tell apart, never by their Source names.
+    """
+    rows = [_row(_A, "lentil", 1, "successful", 1.0, sampling_regime="train"), _row(_B, "lentil", 2, "successful", 2.0, sampling_regime="test")]
     comparison = template.compare_templates(rows, _A, _B, quantities=_QUANTITIES)
 
     success = comparison.success
@@ -230,6 +257,31 @@ def test_zero_pairs_leave_every_statistic_undefined_and_the_quantity_table_empty
     figure = plot_template.parity_figure(comparison)
     try:
         assert len(figure.axes) == 1
+    finally:
+        plt.close(figure)
+    captions = labels.campaign_display_labels(rows, (_A, _B))
+    status, success_table, quantity_table = plot_template.template_comparison(comparison, captions)  # no figure of empty frames
+    assert isinstance(status, widgets.HTML)
+    assert "No pair successful in both campaigns" in status.value
+    for table in (success_table, quantity_table):
+        titles = " ".join(_html_texts(table))
+        assert f"A: {captions[_A]}; B: {captions[_B]}" in titles
+        assert "campaign_" not in titles
+
+
+def test_a_pair_successful_in_both_campaigns_without_both_durations_is_not_reported_as_unsuccessful() -> None:
+    """The status and the empty panel count the one pair successful in both campaigns and name the duration it lacks."""
+    rows = [_row(campaign, "lentil", 1, "successful") for campaign in (_A, _B)]
+    comparison = template.compare_templates(rows, _A, _B, quantities=_QUANTITIES)
+    assert comparison.success.both == 1
+    status = plot_template.template_comparison(comparison, labels.campaign_display_labels(rows, (_A, _B)))[0]
+    figure = plot_template.parity_figure(comparison)
+    try:
+        assert isinstance(status, widgets.HTML)
+        for text in (status.value, *(text.get_text() for text in figure.axes[0].texts)):
+            assert "No pair successful" not in text
+            assert "successful in both campaigns: 1" in text
+            assert "Duration [s]" in text
     finally:
         plt.close(figure)
 
@@ -303,6 +355,20 @@ def test_campaign_b_follows_campaign_a_and_a_change_reports_once() -> None:
     assert (local.comparison().campaign_a, local.comparison().campaign_b) == ((_TASK, "b"), (_TASK, "c"))
 
 
+def test_campaign_a_opens_on_a_campaign_of_the_task_of_dataset_a_when_that_task_has_a_pair() -> None:
+    """Pairs in two tasks, the transient one listed first: a steady Dataset A opens on the steady pair, an unpaired task on the first."""
+    rows = [_row(campaign, "lentil", 1, "successful") for campaign in ((_TASK, "a"), (_TASK, "b"), ("steady_flow", "x"), ("steady_flow", "y"))]
+    partners = template.comparable_campaigns(rows)
+    assert next(iter(partners)) == (_TASK, "a")
+    for task, expected in (("steady_flow", ("steady_flow", "x")), (_TASK, (_TASK, "a")), ("other_profile", (_TASK, "a"))):
+        view = panel._template_factory(sources.CampaignOutcomeCatalog(tuple(rows)), partners, _selection_state(task))()
+        try:
+            (campaign_a,) = (widget for widget in _widgets(view.rows) if isinstance(widget, widgets.Dropdown) and widget.description == "Campaign A")
+            assert campaign_a.value == expected
+        finally:
+            plt.close("all")
+
+
 def test_the_parity_figure_has_one_panel_per_quantity_with_one_point_per_pair_on_a_shared_diagonal() -> None:
     """Each panel draws A on x and B on y per material with the fixed material colour, the identity line and equal limits."""
     rows = [{**row, "wall_seconds": None if row["duration_seconds"] is None else 2.0 * row["duration_seconds"]} for row in _paired_rows()]
@@ -317,21 +383,30 @@ def test_the_parity_figure_has_one_panel_per_quantity_with_one_point_per_pair_on
             assert axis.get_xlim() == axis.get_ylim()
             assert len(axis.lines) == 1  # the identity line
         colours = {collection.get_label(): collection.get_facecolor()[0] for collection in panels[0].collections}
-        assert colours["lentil"] == pytest.approx(to_rgba(visual_semantics.material_color("lentil")))
-        assert {text.get_text() for text in figure.legends[0].get_texts()} == {"chickpea", "lentil", "A = B"}
+        assert colours["Lentil"] == pytest.approx(to_rgba(visual_semantics.material_color("lentil")))
+        assert {text.get_text() for text in figure.legends[0].get_texts()} == {"Chickpea", "Lentil", "A = B"}
+        assert not any("campaign_" in text.get_text() for text in figure.findobj(Text))  # the names stand in the table titles
     finally:
         plt.close(figure)
 
 
 def test_the_view_publishes_the_figure_with_the_success_and_quantity_tables() -> None:
-    """The cached view renders the selected pair into one figure and two tables without failure."""
-    factory = panel._template_factory(sources.CampaignOutcomeCatalog(tuple(_paired_rows())), template.comparable_campaigns(_paired_rows()))
+    """The cached view renders the selected pair into one figure and two tables titled with the captions the campaign choice shows."""
+    rows = [{**row, "sampling_regime": "train" if row["source_name"] == "campaign_a" else "test"} for row in _paired_rows()]
+    factory = panel._template_factory(sources.CampaignOutcomeCatalog(tuple(rows)), template.comparable_campaigns(rows), _selection_state(_TASK))
     export: dict[str, Any] = {"fig": None, "figures": (), "plot_name": "template", "title": "Template"}
     view = factory(export_state=export, export_plot_name="template", export_title="Template")
     try:
         assert isinstance(view, ui_panel.ViewPanel)
+        assert view.slot is not None
         assert not view.failure.shown
         assert isinstance(export["fig"], Figure)
-        assert len(plot_template.template_comparison(template.compare_templates(_paired_rows(), _A, _B, quantities=_QUANTITIES))) == 3
+        chosen = {widget.description: widget.label for widget in _widgets(view.rows) if isinstance(widget, widgets.Dropdown)}
+        _figure, *published = view.slot.widget.children
+        assert len(published) == 2
+        for table in published:
+            titles = " ".join(_html_texts(table))
+            assert f"A: {chosen['Campaign A']}; B: {chosen['Campaign B']}" in titles
+            assert "campaign_" not in titles
     finally:
         plt.close("all")

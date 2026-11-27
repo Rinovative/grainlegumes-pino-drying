@@ -274,6 +274,20 @@ def test_one_validator_refuses_a_corrupted_steady_payload(monkeypatch: pytest.Mo
         assert (target.parent / ".id.stage").is_dir()
 
 
+def test_an_incompatible_scoped_output_is_never_offered_a_rebuild(tmp_path: Path) -> None:
+    """A bounded build never replaces an output, so its incompatibility says to delete and generate again; a canonical one names the rebuild."""
+
+    def incompatible(*, scoped: bool) -> str:
+        error = loader._incompatible(
+            task="transient_drying", run_name="run", run_dir=tmp_path / "run", role="eval", root=tmp_path / "out", reason="bad", scoped=scoped
+        )
+        return str(error)
+
+    assert "--rebuild" in incompatible(scoped=False)
+    assert "--rebuild" not in incompatible(scoped=True)
+    assert "delete" in incompatible(scoped=True)
+
+
 _OTHER_ROLE = SimpleNamespace(dataset_name="other", split="material_ood", dataset_role="material_ood")
 
 

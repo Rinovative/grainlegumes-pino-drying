@@ -259,7 +259,8 @@ def test_cases_follow_the_selected_dataset_cases() -> None:
 def test_batches_of_one_material_share_a_color_and_differ_in_line_style_with_one_outside_legend() -> None:
     """Bar outlines carry the batch line style in the material color, and the one legend sits right of the panels."""
     frames = {label: _frame((True, False)) for label in ("A", "B")}
-    figure = plots.plot_completion_target_analysis(datasets=frames, styles=plots.batch_styles({"A": "chickpea", "B": "chickpea"}))
+    styles = plots.batch_styles({"A": "chickpea", "B": "chickpea"}, roles={"A": "id", "B": "material_ood"})
+    figure = plots.plot_completion_target_analysis(datasets=frames, styles=styles)
     try:
         outcome, times, moisture, wet = figure.axes[:4]
         bars = outcome.patches

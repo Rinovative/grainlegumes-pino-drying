@@ -26,7 +26,8 @@ permeability:
     evidence: literature_transfer
     source_refs:
     - chickpea_airflow_masoumi_tabil_2008
-    method: Clean chickpea like the density and porosity record. Masoumi and Tabil (2008, Table 2) give 2.4-6.2e-08 m^2 at 0.14 m/s, and the Kozeny-Carman estimate at the reference porosity 0.403 is 3.1e-08 m^2; the farm-bed value 1.43e-08 m^2 of the thesis, measured with fines, is not used.
+    - ba
+    method: Clean chickpea like the density and porosity record. Masoumi and Tabil (2008, Table 2) give 2.4-6.2e-08 m^2 at 0.14 m/s, and the Kozeny-Carman estimate at the reference porosity 0.403 is 3.1e-08 m^2. The thesis farm bulk with fines (apparent geometric mean 6.1e-09 m^2 at 0.14 m/s, Tab. 13) is the separate material chickpea_farm with the nominal 6.0e-09 m^2.
     applicability:
       packing: Only for packing bands in each complete density record; generated mean
         eps must pass the material band.
@@ -39,24 +40,23 @@ permeability:
 # Granular-phase thermal values: k_gr is conductivity and cp_gr_dry is dry-solid specific heat. Natural and OOD supports are design ranges.
 thermal_properties:
   k_gr:
-    nominal: 0.3
+    nominal: 0.24
     support:
-      lower: 0.24
-      upper: 0.38
+      lower: 0.18
+      upper: 0.32
     transform: log
     distribution: uniform_in_log_space
     ood_supports:
-    - lower: 0.16
-      upper: 0.2
-    - lower: 0.46
-      upper: 0.58
+    - lower: 0.13
+      upper: 0.16
+    - lower: 0.36
+      upper: 0.45
     provenance:
-      evidence: literature_transfer
+      evidence: engineering_inversion
       source_refs:
-      - matouk_thermal
-      - lentil_thermal_gharibzahedi_2014
+      - oke_thesis_2021
       - pulse_thermal_oke_baik_2022
-      method: Transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover. Oke and Baik (2022) chickpea packed-bed values converted with the Maxwell-Eucken relation give 0.29-0.42 W/(m*K) against 0.30, and Gharibzahedi et al. (2014) check the lentil value used for the transfer; the value is unchanged.
+      method: Inversion of measured bed conductivities with the Maxwell-Eucken relation of the model. Oke (2021, Table 4.7) measures whole chickpea seeds at 12-18 % wb, 0.116-0.150 W/(m*K); with the bulk porosity 0.38-0.39 that Oke (2021, Table 4.2) reports for the same seeds, taken as an assumed proxy because the conductivity samples were prepared separately, this gives 0.19-0.26 W/(m*K). The ranges 0.160-0.227 W/(m*K) in the abstract of Oke and Baik (2022) are compressed flour values and are not used. The earlier value 0.30 was transferred from lentil and faba bean and lay above the only chickpea bed data.
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -79,7 +79,8 @@ thermal_properties:
       evidence: literature_transfer
       source_refs:
       - matouk_thermal
-      method: Transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover; the value is unchanged.
+      - oke_thesis_2021
+      method: Value unchanged, transferred from lentil and faba bean, the only grains Matouk et al. (2018) cover. The Choi-Okos prediction for chickpea (Oke 2021, Table 4.6) gives 1.77 kJ/(kg*K) dry basis, inside the support; the DSC values of Oke on flour are implausibly low near 30 degC and are not used. The drying time depends only weakly on it (about 2 % for a change of 15 %).
     ood_provenance:
       evidence: synthetic_design
       source_refs: []
@@ -101,7 +102,9 @@ initial_moisture:
     provenance:
       evidence: engineering_estimate
       source_refs:
-      - ba
+      - saskpulse_storage
+      - hatzendorf_chickpea_2025
+      method: Values and OOD range unchanged. Chickpea combining starts at about 18 % wb (SaskPulse 2025, section Seed Moisture Content at Harvest); a late Central European harvest reached 25-30 % wb for most varieties (Hatzendorf 2025), so the OOD range 23.1-25.9 % wb is realistic.
       note: Natural material-dependent starting moisture in dry basis; range is an
         explicit engineering envelope around project or product-compatible drying
         evidence, not a market-target transfer.
@@ -138,8 +141,8 @@ initial_moisture:
     provenance:
       evidence: derived
       source_refs:
-      - ba
-      method: X_db=X_wb/(1-X_wb); lower bound is the target 0.135/0.865 plus margin_above_target_db 0.01, upper bound is the upper mean_db 0.22/0.78 plus the upper amplitude_db 0.04.
+      - swiss_crops
+      method: X_db=X_wb/(1-X_wb); lower bound is the target 0.135/0.865 (swiss granum) plus the synthetic design margin margin_above_target_db 0.01, upper bound is the upper mean_db 0.22/0.78 plus the upper amplitude_db 0.04.
       verification: mathematically_reproduced
   margin_above_target_db: 0.01
 # Dimensionless support for generated bed-mean porosity; density calibration stores a compatible paired reference state.
@@ -151,12 +154,18 @@ packing_porosity_mean_support:
     evidence: coupled_record
     source_refs:
     - chickpea_physical
+    - oke_thesis_2021
+    - chickpea_airflow_masoumi_tabil_2008
+    - ba
     method: Select a complete record atomically. Never combine rho from one source/record
       with eps from another.
     verification: mathematically_reproduced
     applicability:
       packing: Whole black-Kabuli density/porosity relation evaluated near 13% db;
         range widened for Kabuli cultivar and packing transfer.
+    note: Oke (2021, Table 4.2) with 0.377-0.387 and Masoumi and Tabil (2008) with 0.42-0.44 lie in the band. The
+      clean chickpea of the thesis reads about 0.466 in the 41.5 mm tube, about five kernel diameters wide, where the
+      wall loosens the packing; it lies above the band and is not used to widen it.
 # Dry bulk-density calibration and paired bed porosity define the material reference used for packing/density consistency. OOD records are complete alternatives selected atomically.
 density_calibration:
   record_id: chickpea_density_calibration_v1
@@ -228,18 +237,17 @@ target_moisture:
     evidence: official_industry_target
     source_refs:
     - swiss_crops
-    method: swiss granum (2026-03-12) chapter 1.1 lists 13.5 % wb for chickpeas.
-    note: Single practical safe-storage drying target; market acceptance is not
-      an operational target.
+    method: swiss granum (2026-03-12) chapter 1.1 lists 13.5 % wb for chickpeas, lupins and lentils in one merged table cell; chapter 2.3 applies no weight deduction up to 13.5 % wb.
+    note: Acceptance moisture without weight deduction, used as the single operational drying target.
 # Surface/internal moisture-transfer prior: r_surf_0 is a rate, r_int_surf a rate ratio, f_surf a fraction; the loader derives the two OOD records from the nominals.
 two_compartment_kinetics:
   record_id: chickpea_two_compartment_kinetics_v1
   components:
     r_surf_0:
-      nominal: 5.5e-05
+      nominal: 1.1e-04
       support:
-        lower: 2.75e-05
-        upper: 9.9e-05
+        lower: 5.5e-05
+        upper: 1.98e-04
       transform: log
     r_int_surf:
       nominal: 0.15
@@ -258,12 +266,12 @@ two_compartment_kinetics:
     evidence: calibration_prior
     source_refs:
     - chickpea_drying
-    - lentil_drying_tahmasebi_2025
-    method: r_surf_0 and its support are the earlier design values multiplied by 5.5, the factor of lentil (Tahmasebi et al. 2025, calibrated at 35 degC and 20 % relative humidity), as a fallback until a comparable literature end point exists. Cavalcanti-Mata et al. (2020) report about 20 h at 40 degC but only the abstract was read and the end moisture is unknown, so chickpea_drying serves only as a plausibility check; r_int_surf and f_surf are unchanged.
+    - bean_drying_afonso_correa_1999
+    method: No chickpea drying curve is available. r_surf_0 is taken from a Phaseolus analogue of the same Sauter diameter (fresh black bean, 35 degC, Afonso Junior and Correa 1999, Table 1; chickpea d32 5.38 mm against about 5.2 mm), matched at the moisture ratio of the target at the pilot air (35 degC, relative humidity 0.215), 1.04-1.18e-04. The abstract of Cavalcanti-Mata et al. (2020), thin layer at 40-80 degC with drying times of 72000 s to 39600 s, is only a plausibility check (it implies a rate of at least about 0.9e-04 only if the reported times end at a moisture ratio of 0.3 or below) because the full text and the end moisture were not available. The support 5.5e-05 to 1.98e-04 is the nominal value times 0.5 and 1.8 and reaches down to the value 5e-05 that a pure size scaling from lentil would give. The thin-layer time to the target at pilot air is 4.9 h. r_int_surf and f_surf are unchanged.
     applicability:
       evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
         at known T, RH/omega, airflow and product state; T(t) if available
-      limitation: The rate prior is the lentil factor used as a fallback pending a comparable chickpea drying end point; it is not fitted to experiments of this bed, and the drying times were not validated as real predictions.
+      limitation: Transfer from a different genus (Phaseolus) with the same kernel size, not a chickpea curve; the testa differs (kabuli thinner, desi thicker) and no correction is applied. The rate prior is not fitted to experiments of this bed, and the drying times were not validated as real predictions.
   ood_provenance:
     evidence: synthetic_design
     source_refs: []

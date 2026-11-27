@@ -2,14 +2,16 @@
 
 Responsibilities:
   - Map maintained simulation profiles to compact presentation labels
-  - Format material, regime, and campaign-purpose label components
+  - Abbreviate campaign purposes
   - Build complete profile-qualified dataset labels
+  - Name campaigns by task, materials and regime, told apart by their Source names only where they read alike
   - Disambiguate genuine visible-label collisions with stable identities
 
 Design principles:
   - Canonical metadata remains authoritative over storage or filename parsing
   - Presentation labels never replace scientific or persisted identities
   - Identity suffixes appear only for otherwise identical complete labels
+  - The material and regime words are the shared ones of ``analysis_display_labels``, as in every other view
 
 This module does NOT:
   - Discover datasets, admit persisted inputs, or render notebook controls
@@ -20,13 +22,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from src import common
+from src.analysis.presentation import analysis_display_labels as display_labels
 from src.generation.contracts import generation_contracts_profiles as profiles
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
 
 _COLLISION_IDENTITY_MINIMUM_WIDTH: Final = 8
 _COLLISION_MINIMUM_SIZE: Final = 2
@@ -53,18 +56,6 @@ def profile_display_label(profile_id: str) -> str:
     """Return the compact maintained label for one canonical profile."""
     profiles.resolve_profile(profile_id)
     return _PROFILE_LABELS[profile_id]
-
-
-def material_display_label(material_family: str) -> str:
-    """Return one human-readable material-family label."""
-    common.paths.validate_logical_name(material_family, label="material_family")
-    return material_family.replace("_", " ").capitalize()
-
-
-def regime_display_label(sampling_regime: str) -> str:
-    """Return one canonical sampling-regime display label."""
-    common.paths.validate_logical_name(sampling_regime, label="sampling_regime")
-    return sampling_regime
 
 
 def campaign_purpose_abbreviation(campaign_purpose: str) -> str:
@@ -121,8 +112,8 @@ def dataset_display_label(metadata: DatasetLabelMetadata) -> str:
     return " · ".join(
         (
             profile_display_label(metadata.profile_id),
-            material_display_label(metadata.material_family),
-            regime_display_label(metadata.sampling_regime),
+            display_labels.material_display_label(metadata.material_family),
+            display_labels.regime_display_label(metadata.sampling_regime),
             campaign_purpose_abbreviation(metadata.campaign_purpose),
         )
     )
@@ -150,3 +141,26 @@ def dataset_display_labels(
             message = f"Colliding dataset label has no unique batch identity: {base!r}."
             raise ValueError(message)
     return tuple(resolved)
+
+
+def campaign_display_labels(rows: Iterable[Mapping[str, Any]], campaigns: Iterable[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """
+    Return the display name of every (task, Source name) campaign: its task and the materials and regimes of its candidate ``rows``.
+
+    A row's regime is its sampling regime, else its domain profile. Campaigns that read alike are told apart by the tokens of
+    their Source names they do not share (``display_labels.unique_display_labels``); a campaign without rows names its Source,
+    shortened in place, instead of its materials.
+    """
+    facts: dict[tuple[str, str], tuple[dict[str, None], dict[str, None]]] = {campaign: ({}, {}) for campaign in campaigns}
+    for row in rows:
+        found = facts.get((str(row["task"]), str(row["source_name"])))
+        if found is not None:
+            found[0][str(row["material_family"])] = None
+            if regime := row.get("sampling_regime") or row.get("domain_profile"):
+                found[1][str(regime)] = None
+    bases = []
+    for (task, name), (materials, regimes) in facts.items():
+        named = ", ".join(map(display_labels.material_display_label, materials)) or display_labels.compact_identity_label(name)
+        parts = (display_labels.task_display_label(task), named, ", ".join(map(display_labels.regime_display_label, regimes)))
+        bases.append(" · ".join(part for part in parts if part))
+    return dict(zip(facts, display_labels.unique_display_labels(bases, [(name,) for _task, name in facts]), strict=True))

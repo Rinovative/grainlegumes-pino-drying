@@ -201,7 +201,6 @@ def test_model_subseed_is_applied_immediately_before_construction(
         experiments.run.execute_prepared_run(
             config,
             run_dir=run_dir,
-            persisted_config=config,
             device_resolution=learning.device.resolve_device("cpu"),
         )
 

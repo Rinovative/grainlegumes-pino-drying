@@ -6,6 +6,7 @@ Responsibilities:
     label leaves it to the symbol
   - Convert water densities with the dry bulk density to wet-basis percent, masking unphysical cells
   - Reduce the cells valid in a given mask to one bulk wet-basis percent
+  - Name the basis of metrics computed on water densities, which keep the symbols w_*, beside the wet-basis states
 
 Design principles:
   - The domain moisture conversions stay the only formulas; this module only scales them to percent and masks
@@ -71,6 +72,13 @@ def field_display_unit(field: str, unit: str, *, difference: bool = False, contr
 def channel_label(field: str, label: str, unit: str) -> str:
     """Return a channel control's text: the plain moisture words or ``label``, with the displayed unit of the field's values."""
     return f"{display_name(field, control=True) if is_moisture_field(field) else label} [{field_display_unit(field, unit, control=True)}]"
+
+
+def density_basis_note(fields: Sequence[str]) -> str | None:
+    """Return the note naming the basis of metrics over water densities when ``fields`` hold one, else ``None``."""
+    if not any(is_moisture_field(field) for field in fields):
+        return None
+    return "w: errors of the stored water density [kg/m³]; the state views show it as wet-basis moisture X_wb [% w.b.]"
 
 
 def wet_basis_percent(water: Sequence[float] | np.ndarray, rho_bu_dry: np.ndarray) -> np.ndarray:

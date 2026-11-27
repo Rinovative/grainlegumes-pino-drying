@@ -1,16 +1,17 @@
-"""Select runs and datasets through one collapsed line, «<noun>: k von n gewählt», whose body lists the choices by group.
+"""Select runs and datasets through one collapsed line, «<noun>: k of n selected», whose body lists the choices by group.
 
 Responsibilities:
   - Show grouped choices as checkboxes (several) or one-of buttons (one), with a summary line that counts the selection
   - List unavailable choices in disabled groups with each item's reason
-  - Group runs by architecture in the fixed run-selector order, full names one per line, left-aligned, a continuing run indented below its parent run
-  - Keep runs without valid architecture metadata visible and disabled under «Metadaten fehlen»
-  - Group datasets by role or sampling regime and offer the switch «Materialien je Rolle zusammenfassen» where pooling is valid
+  - Group runs by architecture in the fixed run-selector order, one per line, left-aligned, each under the name its caller gives
+    (the Evaluation workspace gives its short label), a continuing run indented below its parent run
+  - Keep runs without valid architecture metadata visible and disabled under «Missing metadata»
+  - Group datasets by role or sampling regime and offer the switch «Pool materials per role» where pooling is valid
 
 Design principles:
-  - The summary counts selectable items only and reads «k von n gewählt» for single and multiple choice alike (F3); the single run
-    selector is the exception and reads «Lauf: <short label of the selected run>» (Rino 16.11.)
-  - No «alle» or «keine» buttons
+  - The summary counts selectable items only and reads «k of n selected» for single and multiple choice alike (F3); the single run
+    selector is the exception and reads «Run: <name of the selected run>», in the Evaluation workspace its short label (Rino 16.11.)
+  - No «all» or «none» buttons
   - Every body starts closed (Q20, Q22), except the Evaluation workspace run selector, which opens at the start (Rino 16.11.)
   - The pooling switch is enabled only where the view's reduction is material-balanced; elsewhere it is disabled with its reason
   - Selection changes notify observers once, programmatic state changes can stay silent
@@ -42,9 +43,9 @@ if TYPE_CHECKING:
     Group = tuple[str, Sequence[tuple[str, Hashable]]]
     DisabledGroup = tuple[str, Sequence[tuple[str, str]]]
 
-MISSING_METADATA_GROUP: Final = "Metadaten fehlen"
-UNAVAILABLE_GROUP: Final = "Nicht verfügbar"
-POOL_LABEL: Final = "Materialien je Rolle zusammenfassen"
+MISSING_METADATA_GROUP: Final = "Missing metadata"
+UNAVAILABLE_GROUP: Final = "Unavailable"
+POOL_LABEL: Final = "Pool materials per role"
 _ONE_OF_ALLOWANCE_CH: Final = 4
 _INDENT_PX: Final = 3 * style.CH_PX  # indent of a run below its parent run
 
@@ -80,7 +81,7 @@ def _disabled_item(label: str, reason: str, *, multiple: bool) -> widgets.Widget
 
 class ChoiceBlock:
     """
-    The collapsed line «<noun>: k von n gewählt» whose body lists grouped choices.
+    The collapsed line «<noun>: k of n selected» whose body lists grouped choices.
 
     ``header`` is one element of a panel row and ``body`` its popover; pass ``(header, body)`` to the panel's
     ``popovers``. Several choices use checkboxes, one choice uses one-of buttons. ``boxes`` maps each selectable key
@@ -162,9 +163,10 @@ class ChoiceBlock:
                 self.boxes[key] = box
                 group_boxes.append(box)
                 if per_line:
-                    rows.append(panel.row(box))
+                    line = panel.row(box)
                     if shift:
-                        rows[-1].layout.margin = f"0 0 0 {_INDENT_PX}px"
+                        line.layout.margin = f"0 0 0 {_INDENT_PX}px"
+                    rows.append(line)
             if not per_line:
                 rows.append(panel.row(*group_boxes))
         for heading, disabled_items in disabled_groups:
@@ -205,7 +207,7 @@ class ChoiceBlock:
 
     def _summary(self) -> str:
         count = sum(bool(box.value) for box in self.boxes.values()) if self.boxes else 0
-        return f"{self.noun}: {count} von {len(self.boxes)} gewählt"
+        return f"{self.noun}: {count} of {len(self.boxes)} selected"
 
     def _changed(self, key: Hashable, change: dict[str, object]) -> None:
         if self._silent:
@@ -243,35 +245,35 @@ class ChoiceBlock:
 @dataclass(frozen=True, slots=True)
 class RunOption:
     """
-    One selectable run: its full name, its architecture family from the saved config, its key, and a metadata issue.
+    One selectable run: the name its option shows, its architecture family from the saved config, its key, and a metadata issue.
 
-    ``label`` is the short label a single-choice header shows (the name when None); ``parent`` is the key of the run this
-    one continues (a B or A1 run its A0), which it stands indented below when that run is listed in the same group.
+    ``name`` is what the caller lists the run as and what a single-choice header shows (the Evaluation workspace: its short
+    label, the full name stays in its details); ``parent`` is the key of the run this one continues (a B or A1 run its A0),
+    which it stands indented below when that run is listed in the same group.
     """
 
     name: str
     family: str | None
     key: Hashable
     issue: str | None = None
-    label: str | None = None
     parent: Hashable | None = None
 
 
 class RunSelector(ChoiceBlock):
     """
-    «Läufe: k von n gewählt» (single choice: «Lauf: <label>») with one heading per architecture in the order FNO, U-NO, RNO, PI-FNO, PI-U-NO.
+    «Runs: k of n selected» (single choice: «Run: <name>») with one heading per architecture in the order FNO, U-NO, RNO, PI-FNO, PI-U-NO.
 
-    Run names stand in full, one per line, left-aligned, in name order, because they carry the key parameters. A run with
-    a listed ``parent`` stands indented directly below it; one whose parent is not listed stands in the name order
-    unindented. A run whose family is missing or unknown stays visible and disabled under «Metadaten fehlen» with its
-    issue; it never makes the selector fail.
+    Each run stands under the name its caller gives (the Evaluation workspace: its unique short label), one per line,
+    left-aligned, in name order. A run with a listed ``parent`` stands indented directly below it; one whose parent is
+    not listed stands in the name order unindented. A run whose family is missing or unknown stays visible and disabled
+    under «Missing metadata» with its issue; it never makes the selector fail.
     """
 
     def __init__(
         self, runs: Sequence[RunOption], *, multiple: bool, selected: Iterable[Hashable] = (), opened: bool = False, close_on_pick: bool = False
     ) -> None:
         """Create the selector over ``runs`` with ``selected`` chosen (a single choice defaults to its first run); see ``ChoiceBlock``."""
-        self._labels = {run.key: run.label or run.name for run in runs}  # read by ``_summary``, which the base constructor calls
+        self._labels = {run.key: run.name for run in runs}  # read by ``_summary``, which the base constructor calls
         known = {spec.family: spec.label for spec in presentation.visual_semantics.ARCHITECTURES}
         groups: list[Group] = []
         indented: list[Hashable] = []
@@ -286,12 +288,12 @@ class RunSelector(ChoiceBlock):
             if placed:
                 groups.append((spec.label, [(run.name, run.key) for run in placed]))
         missing = [
-            (run.name, run.issue or ("Architektur fehlt" if run.family is None else f"unbekannte Architektur {run.family!r}"))
+            (run.name, run.issue or ("architecture missing" if run.family is None else f"unknown architecture {run.family!r}"))
             for run in runs
             if run.family not in known
         ]
         super().__init__(
-            "Läufe",
+            "Runs",
             groups,
             multiple=multiple,
             selected=selected,
@@ -304,15 +306,15 @@ class RunSelector(ChoiceBlock):
 
     def _summary(self) -> str:
         chosen = self.selected()
-        return super()._summary() if self.multiple or not chosen else f"Lauf: {self._labels[chosen[0]]}"
+        return super()._summary() if self.multiple or not chosen else f"Run: {self._labels[chosen[0]]}"
 
 
 class DatasetSelector(ChoiceBlock):
     """
-    «Datensätze: k von n gewählt» with one heading per group of the inventory (form 2, by role).
+    «Datasets: k of n selected» with one heading per group of the inventory (form 2, by role).
 
-    Unavailable items stand disabled under «Nicht verfügbar» with their reason. A poolable inventory gets the switch
-    «Materialien je Rolle zusammenfassen» as the last body row: enabled when ``pool_reason`` is None, else disabled
+    Unavailable items stand disabled under «Unavailable» with their reason. A poolable inventory gets the switch
+    «Pool materials per role» as the last body row: enabled when ``pool_reason`` is None, else disabled
     with that one-line reason. ``choices()`` resolves the selection into the datasets the view draws.
     """
 
@@ -343,7 +345,7 @@ class DatasetSelector(ChoiceBlock):
         ]
         unavailable = [(item.label, reason) for item, reason in inventory.unavailable]
         super().__init__(
-            "Datensätze",
+            "Datasets",
             [group for group in groups if group[1]],
             multiple=multiple,
             selected=selected,

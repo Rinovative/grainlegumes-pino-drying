@@ -14,7 +14,10 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import errno
+import functools
 import json
+import pickle
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -32,6 +35,7 @@ from support.synthetic_task import build_synthetic_selection_provenance, save_st
 
 from src import analysis, common, datasets, domain, experiments, learning
 from src.experiments import experiments_wandb_schema as wandb_schema
+from src.experiments.cli import cli_train
 
 pytestmark = pytest.mark.integration
 
@@ -392,7 +396,6 @@ def completed_lifecycle(tmp_path_factory: pytest.TempPathFactory) -> CompletedLi
         experiments.run.execute_prepared_run(
             config,
             run_dir=run_dir,
-            persisted_config=config,
             event_callback=lambda _step, metrics: epoch_metrics.append(dict(metrics)),
             device_resolution=learning.device.resolve_device("cpu"),
         )
@@ -871,7 +874,9 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
         )
         assert analysis.evaluation.artifact_loader.load_run_artifacts(moved).selected_checkpoint_sha256 == checkpoint_digest
         # Exercise the same continuation service used by ordinary resolved launches.
-        with pytest.raises(ValueError, match="A completed run, also one that diverged before its budget end, is never extended"):
+        with pytest.raises(
+            experiments.run.ContinuationRefusedError, match="A completed run, also one that diverged before its budget end, is never extended"
+        ):
             experiments.run._run_resolved_experiment(
                 copy.deepcopy(completed_lifecycle.config),
                 config_path=common.paths.resolve_run_config_path(moved),
@@ -883,7 +888,8 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
     with monkeypatch.context() as drift:
         environment = learning.training.checkpoint.numerical_environment_identity()
         drift.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda: {**environment, "torch": "0.0.0"})
-        with pytest.raises(ValueError, match="Checkpoint run identity"):
+        # Another numerical environment is the reader's environment, not the run's state.
+        with pytest.raises(learning.training.checkpoint.ResumeEnvironmentError, match="differs in torch"):
             experiments.run.validate_evaluable_run(moved)
         before_read = _artifact_inventory((moved,))
         reread = analysis.evaluation.artifact_loader.load_run_artifacts(moved)
@@ -954,11 +960,17 @@ def _rewrite_as_optuna_trial(run_dir: Path) -> dict[str, Any]:
         payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         payload["identity"] = copy.deepcopy(identity)
         common.serialization.atomic_torch_save(payload, checkpoint_path)
+    # The history is bound to the run name and checkpoint identity like the checkpoints.
+    history_path = learning.training.history.history_path(run_dir)
+    history = json.loads(history_path.read_text(encoding="utf-8"))
+    history.update(run_name=config["run"]["name"], checkpoint_identity_digest=common.serialization.canonical_json_sha256(identity))
+    common.serialization.atomic_write_json(history_path, history)
     summary = experiments.run.read_run_summary(run_dir)
     summary.update(
         {
             "run_name": config["run"]["name"],
             "effective_config_digest": identity["effective_config_digest"],
+            "checkpoint_identity": copy.deepcopy(identity),
             "config_sha256": common.serialization.file_sha256(config_path),
             "best_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_best_checkpoint_file(run_dir)),
             "last_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_last_checkpoint_file(run_dir)),
@@ -994,6 +1006,27 @@ def test_completed_optuna_trial_moved_outside_its_study_stays_a_trial_without_ar
     with pytest.raises(ValueError, match="is an Optuna trial"):
         analysis.artifacts.service.build_artifacts(runs_root=moved, dataset_root=completed_lifecycle.dataset_root, device_policy="cpu", roles=("id",))
     assert not common.paths.resolve_analysis_root(moved).exists()
+
+
+def test_a_finished_trial_without_checkpoints_is_admitted_in_another_numerical_environment(
+    completed_lifecycle: CompletedLifecycle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trial's history stays bound to the producer identity its summary records, not to the reading container's."""
+    trial_dir = _copy_without_analysis(completed_lifecycle.run_dir, tmp_path / "study" / "trials" / "trial_000007")
+    _rewrite_as_optuna_trial(trial_dir)
+    # A finished trial writes no last checkpoint and deletes its best; its summary keeps the best digest.
+    common.paths.resolve_last_checkpoint_file(trial_dir).unlink()
+    common.paths.resolve_best_checkpoint_file(trial_dir).unlink()
+    environment = learning.training.checkpoint.numerical_environment_identity()
+    monkeypatch.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda: {**environment, "sif_sha256": "0" * 64})
+
+    completed = experiments.run.validate_completed_run(trial_dir)
+
+    recorded = completed["summary"]["checkpoint_identity"]
+    assert recorded["numerical_environment"] == environment
+    assert completed["history"]["checkpoint_identity_digest"] == common.serialization.canonical_json_sha256(recorded)
 
 
 def test_optuna_trial_records_the_dry_run_signature_and_validates_without_patches(
@@ -1036,20 +1069,9 @@ def _interrupted_copy(completed: CompletedLifecycle, destination: Path) -> Path:
     return run_dir
 
 
-@pytest.mark.parametrize("status", ["interrupted", "completed"])
-def test_rerunning_an_authored_request_finishes_the_run_in_place(
-    completed_lifecycle: CompletedLifecycle,
-    tmp_path: Path,
-    status: str,
-) -> None:
-    """The same command finalizes an interrupted run whose budget is spent, or returns a completed one, in its own directory."""
-    output_root = tmp_path / "processed"
-    destination = common.paths.resolve_config_run_dir(completed_lifecycle.config, output_root=output_root)
-    if status == "interrupted":
-        _interrupted_copy(completed_lifecycle, destination)
-    else:
-        _copy_without_analysis(completed_lifecycle.run_dir, destination)
-    saved = experiments.config.loader.load_yaml(common.paths.resolve_run_config_path(destination))
+def _authored_request(run_dir: Path, tmp_path: Path) -> Path:
+    """Write the authored request whose resolution names ``run_dir``: its saved config without the resolved fields."""
+    saved = experiments.config.loader.load_yaml(common.paths.resolve_run_config_path(run_dir))
     raw = copy.deepcopy(saved)
     for key in ("task_contract", "paths", "producer"):
         raw.pop(key)
@@ -1060,7 +1082,35 @@ def test_rerunning_an_authored_request_finishes_the_run_in_place(
     raw["model"]["params"].pop("in_channels")
     raw["model"]["params"].pop("out_channels")
     raw["evaluation"] = {"objective": {"id": saved["evaluation"]["objective"]["id"]}}
-    request_path = configs.write_config(tmp_path, raw, canonical_root=tmp_path)
+    return configs.write_config(tmp_path, raw, canonical_root=tmp_path)
+
+
+@pytest.mark.parametrize("status", ["interrupted", "completed", "completed_without_history"])
+def test_rerunning_an_authored_request_finishes_the_run_in_place(
+    completed_lifecycle: CompletedLifecycle,
+    tmp_path: Path,
+    status: str,
+) -> None:
+    """The same command finalizes an interrupted run whose budget is spent, or returns a completed one, in its own directory.
+
+    A completed run without its history fails the completed-run admission: it is neither reported complete nor bound.
+    """
+    output_root = tmp_path / "processed"
+    destination = common.paths.resolve_config_run_dir(completed_lifecycle.config, output_root=output_root)
+    if status == "interrupted":
+        _interrupted_copy(completed_lifecycle, destination)
+    else:
+        _copy_without_analysis(completed_lifecycle.run_dir, destination)
+    saved = experiments.config.loader.load_yaml(common.paths.resolve_run_config_path(destination))
+    request_path = _authored_request(destination, tmp_path)
+    if status == "completed_without_history":
+        learning.training.history.history_path(destination).unlink()
+        before = _artifact_inventory((tmp_path,))
+        with pytest.raises(experiments.run.RunLifecycleError, match="history"):
+            experiments.run.run_experiment(request_path, device="cpu", output_root=output_root)
+        # Neither the identity binding below the output root nor a writer lock below the storage root was written.
+        assert _artifact_inventory((tmp_path,)) == before
+        return
 
     continued = experiments.run.run_experiment(request_path, device="cpu", output_root=output_root)
 
@@ -1081,7 +1131,7 @@ def test_saved_config_resume_continues_a_renamed_interrupted_bundle(
     """Resume one interrupted bundle by its exact renamed path from its own saved config; another budget is refused."""
     renamed = _interrupted_copy(completed_lifecycle, tmp_path / "renamed_resume_bundle")
     saved_name = experiments.config.loader.load_yaml(common.paths.resolve_run_config_path(renamed))["run"]["name"]
-    with pytest.raises(ValueError, match="cannot override scientific"):
+    with pytest.raises(experiments.run.ContinuationRefusedError, match="cannot override scientific"):
         experiments.run.run_experiment(common.paths.resolve_run_config_path(renamed), resume=renamed, device="cpu", epochs=2)
 
     resumed = experiments.run.run_experiment(common.paths.resolve_run_config_path(renamed), resume=renamed, device="cpu")
@@ -1134,22 +1184,266 @@ def test_steady_resume_reconciles_its_history_with_the_restored_last_checkpoint(
         experiments.run.run_experiment(config_path, resume=run_dir, device="cpu")
         assert json.loads(path.read_text(encoding="utf-8")) == exact
         return
-    with pytest.raises(FileNotFoundError if change == "missing" else ValueError, match="history"):
+    with pytest.raises(experiments.run.ContinuationRefusedError, match="history") as refused:
         experiments.run.run_experiment(config_path, resume=run_dir, device="cpu")
+    assert isinstance(refused.value.__cause__, FileNotFoundError if change == "missing" else ValueError)
 
 
-def test_completed_steady_run_without_history_stays_evaluable(completed_lifecycle: CompletedLifecycle, tmp_path: Path) -> None:
-    """A completed steady run trained before its history existed is still admitted; its training curves are unavailable, not refused."""
-    run_dir = _copy_without_analysis(completed_lifecycle.run_dir, tmp_path / "run_without_history")
+def test_a_resume_whose_last_checkpoint_does_not_restore_is_refused_before_its_first_write(
+    completed_lifecycle: CompletedLifecycle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A last checkpoint whose loss state holds an unexpected key fails the full restore, which runs before the attempt writes.
+
+    Its ``--resume`` and a start that names the run are refused and leave everything below the output root byte-identical:
+    the run still interrupted, its history record ahead of the checkpoint kept (an admitted resume truncates it), no
+    identity bound, and no job-log owner named, so no job log is linked into it. The same start from the run's own
+    checkpoint continues the run in place, binds its identity and names the run as job-log owner.
+    """
+    output_root = tmp_path / "processed"
+    run_dir = _interrupted_copy(completed_lifecycle, common.paths.resolve_config_run_dir(completed_lifecycle.config, output_root=output_root))
+    request_path = _authored_request(run_dir, tmp_path)
+    last_path = common.paths.resolve_last_checkpoint_file(run_dir)
+    original = last_path.read_bytes()
+    payload = torch.load(last_path, map_location="cpu", weights_only=False)
+    payload["loss_state_dict"] = {**payload["loss_state_dict"], "unexpected": torch.zeros(1)}
+    common.serialization.atomic_torch_save(payload, last_path)
+    _refresh_summary_digest(run_dir, summary_key="last_checkpoint_sha256", artifact_path=last_path)
+    path = learning.training.history.history_path(run_dir)
+    exact = json.loads(path.read_text(encoding="utf-8"))
+    ahead = {**exact["epochs"][-1], "epoch": 2.0, "global_step": exact["epochs"][-1]["global_step"] + 1.0}
+    path.write_text(json.dumps({**exact, "epochs": [*exact["epochs"], ahead]}), encoding="utf-8")
+    owners = tmp_path / "job_log_owners.txt"
+    monkeypatch.setenv("JOB_LOG_OWNERS_FILE", str(owners))
+    before = _artifact_inventory((output_root,))
+    starts = (
+        lambda: experiments.run.run_experiment(common.paths.resolve_run_config_path(run_dir), resume=run_dir, device="cpu"),
+        lambda: experiments.run.run_experiment(request_path, device="cpu", output_root=output_root),
+    )
+
+    for start in starts:
+        with pytest.raises(RuntimeError, match="Unexpected key"):
+            start()
+        assert _artifact_inventory((output_root,)) == before
+    assert experiments.run.read_run_summary(run_dir)["status"] == "interrupted"
+    assert not owners.exists()
+
+    last_path.write_bytes(original)
+    _refresh_summary_digest(run_dir, summary_key="last_checkpoint_sha256", artifact_path=last_path)
+    starts[1]()
+    assert owners.read_text(encoding="utf-8").splitlines() == [str(run_dir.resolve())]
+    assert json.loads(path.read_text(encoding="utf-8")) == exact
+    assert len(list((output_root / ".state" / "identities").glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize("payload", [b"", b"not a checkpoint"], ids=["empty", "garbage"])
+def test_a_resume_whose_last_checkpoint_is_unreadable_is_refused_by_its_state(
+    completed_lifecycle: CompletedLifecycle, tmp_path: Path, payload: bytes
+) -> None:
+    """An empty or partly copied last checkpoint is the run's persisted state: its resume is refused, names the file and changes nothing."""
+    run_dir = _interrupted_copy(completed_lifecycle, tmp_path / "unreadable_resume_bundle")
+    last_path = common.paths.resolve_last_checkpoint_file(run_dir)
+    last_path.write_bytes(payload)
+    before = _artifact_inventory((run_dir,))
+
+    with pytest.raises(experiments.run.ContinuationRefusedError, match="Checkpoint is unreadable") as refused:
+        experiments.run.run_experiment(common.paths.resolve_run_config_path(run_dir), resume=run_dir, device="cpu")
+    assert str(last_path) in str(refused.value)
+    unreadable = refused.value.__cause__
+    assert unreadable is not None
+    # torch.load raises these for an empty file and for bytes that are no checkpoint.
+    assert isinstance(unreadable.__cause__, EOFError if not payload else pickle.UnpicklingError)
+    assert _artifact_inventory((run_dir,)) == before
+
+
+def test_a_resume_in_another_numerical_environment_is_offered_the_rerun_and_another_dataset_is_refused(
+    completed_lifecycle: CompletedLifecycle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    A resume in another numerical environment ends by the job's environment; another Dataset fingerprint is the run's state.
+
+    A last checkpoint that differs from the run's identity only in its numerical environment is offered the rerun, which
+    continues it in the producing environment; another Dataset fingerprint refuses it, in that environment as well.
+    Neither changes the run or prints a traceback.
+    """
+    run_dir = _interrupted_copy(completed_lifecycle, tmp_path / "environment_resume_bundle")
+    environment = learning.training.checkpoint.numerical_environment_identity()
+    monkeypatch.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda: {**environment, "numpy": "0.0.0"})
+    before = _artifact_inventory((run_dir,))
+    assert cli_train.main(["--resume", str(run_dir), "--device", "cpu"]) == 1
+    reason, step = capsys.readouterr().err.splitlines()
+    assert reason.startswith("Run not started: ResumeEnvironmentError: Exact resume requires the producing numerical environment")
+    assert "differs in numpy" in reason
+    assert step == "  next: rerun the same command in a matching allocation, the run is unchanged"
+    assert _artifact_inventory((run_dir,)) == before
+
+    last_path = common.paths.resolve_last_checkpoint_file(run_dir)
+    last = torch.load(last_path, map_location="cpu", weights_only=False)
+    last["identity"]["dataset_fingerprints"]["train"] = "0" * 64
+    common.serialization.atomic_torch_save(last, last_path)
+    before = _artifact_inventory((run_dir,))
+    assert cli_train.main(["--resume", str(run_dir), "--device", "cpu"]) == 1
+    refusal = capsys.readouterr().err
+    assert refusal.startswith("Run continuation refused: ")
+    assert "Checkpoint run identity is incompatible" in refusal
+    assert "Traceback" not in refusal
+    assert _artifact_inventory((run_dir,)) == before
+
+
+def _unmounted_dataset(*_args: Any, **_kwargs: Any) -> Any:
+    """Stand in for a Dataset whose storage mount the job cannot reach."""
+    message = "Dataset manifest is missing or unsafe: /unmounted/tiny_steady_id/manifest.json."
+    raise FileNotFoundError(message)
+
+
+def _unreadable_dataset(*_args: Any, **_kwargs: Any) -> Any:
+    """Stand in for a Dataset manifest whose read fails with an I/O error, which its reader reports as unreadable."""
+    message = "Dataset manifest is unreadable: /unmounted/tiny_steady_id/manifest.json."
+    cause = OSError(errno.EIO, "Input/output error")
+    raise ValueError(message) from cause
+
+
+def _contradicted_split(*_args: Any, **_kwargs: Any) -> Any:
+    """Stand in for the split resolution of a Dataset that changed since the run saved its split."""
+    message = "Saved split does not match the current Dataset manifests, partition, evaluation membership or item expansion."
+    raise ValueError(message)
+
+
+@pytest.mark.parametrize("dataset", ["unmounted", "unreadable", "contradicted_split"])
+def test_a_resume_whose_datasets_the_job_cannot_read_is_offered_the_rerun_and_a_contradicted_split_is_refused(
+    completed_lifecycle: CompletedLifecycle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dataset: str,
+) -> None:
+    """
+    Datasets the job cannot read end a resume by the job's environment; Datasets that contradict its saved split refuse it.
+
+    A Dataset whose mount the job cannot reach, or whose manifest read fails with an I/O error, keeps its error and is
+    offered the rerun in a matching allocation. One that contradicts the run's saved split is refused by the resume
+    admission before the attempt: the command reports the refused continuation with that reason and no rerun, which would
+    be refused again. Neither changes the run.
+    """
+    run_dir = _interrupted_copy(completed_lifecycle, tmp_path / "dataset_resume_bundle")
+    before = _artifact_inventory((run_dir,))
+    capsys.readouterr()
+
+    if dataset == "contradicted_split":
+        monkeypatch.setattr(datasets.preprocessing.splits, "resolve_split", _contradicted_split)
+        assert cli_train.main(["--resume", str(run_dir), "--device", "cpu"]) == 1
+        refusal = capsys.readouterr().err
+        assert refusal.startswith("Run continuation refused: ")
+        assert "Saved split does not match the current Dataset manifests" in refusal
+        for advice in ("rerun", "Rerun", "Traceback"):
+            assert advice not in refusal
+    else:
+        monkeypatch.setattr(datasets.runtime.factory, "create_dataset", _unmounted_dataset if dataset == "unmounted" else _unreadable_dataset)
+        with pytest.raises(FileNotFoundError if dataset == "unmounted" else ValueError):
+            experiments.run.run_experiment(common.paths.resolve_run_config_path(run_dir), resume=run_dir, device="cpu")
+        assert "next: rerun the same command in a matching allocation, the run is unchanged" in capsys.readouterr().err
+    assert _artifact_inventory((run_dir,)) == before
+
+
+@pytest.mark.parametrize("environment", ["numerical_environment", "device"])
+def test_a_completed_run_is_rerun_in_a_matching_allocation_and_its_resume_refused_whatever_the_environment(
+    completed_lifecycle: CompletedLifecycle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], environment: str
+) -> None:
+    """
+    A start that names a completed run ends by the job's environment, its ``--resume`` by the run's completed state.
+
+    The start reads the run's checkpoints, which needs their numerical environment, and admits the job's device: either
+    failing prints the rerun in a matching allocation without a traceback. Its ``--resume`` is refused before any check of
+    that environment, because a completed run is never resumed. Neither writes anything, an identity binding included.
+    """
+    output_root = tmp_path / "processed"
+    destination = common.paths.resolve_config_run_dir(completed_lifecycle.config, output_root=output_root)
+    run_dir = _copy_without_analysis(completed_lifecycle.run_dir, destination)
+    request_path = _authored_request(run_dir, tmp_path)
+
+    def unusable(*_args: Any, **_kwargs: Any) -> None:
+        message = "CUDA is not usable"
+        raise learning.device.DeviceResolutionError(message)
+
+    if environment == "numerical_environment":
+        identity = learning.training.checkpoint.numerical_environment_identity()
+        monkeypatch.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda: {**identity, "numpy": "0.0.0"})
+    else:
+        monkeypatch.setattr(learning.device, "resolve_device", unusable)
+    before = _artifact_inventory((tmp_path,))
+    capsys.readouterr()
+
+    with monkeypatch.context() as start:
+        # The command has no output-root option; the start names the copy below this test's output root.
+        start.setattr(experiments.run, "run_experiment", functools.partial(experiments.run.run_experiment, output_root=output_root))
+        assert cli_train.main([str(request_path), "--device", "cpu"]) == 1
+    reason, step = capsys.readouterr().err.splitlines()
+    ended = "ResumeEnvironmentError: Reading requires" if environment == "numerical_environment" else "DeviceResolutionError: CUDA"
+    assert reason.startswith(f"Run not started: {ended}")
+    assert step == "  next: rerun the same command in a matching allocation, the run is unchanged"
+
+    assert cli_train.main(["--resume", str(run_dir)]) == 1
+    refusal = capsys.readouterr().err
+    assert refusal.startswith("Run continuation refused: ")
+    assert "never extended" in refusal
+    assert "Traceback" not in refusal
+    assert _artifact_inventory((tmp_path,)) == before
+
+
+def test_a_start_that_names_an_interrupted_run_binds_its_identity_only_after_its_start_entry_is_admitted(
+    completed_lifecycle: CompletedLifecycle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A continuation in place whose attempt's start entry fails, after the full restore admitted it, binds no identity.
+
+    The start entry fails by the job's environment, its CUDA driver query; its Slurm provenance cannot fail it, because the
+    command reads that before any check of the run (the allocation test). The binding is the last step before the attempt's
+    first write, so everything below the output root stays byte-identical.
+    """
+    output_root = tmp_path / "processed"
+    run_dir = _interrupted_copy(completed_lifecycle, common.paths.resolve_config_run_dir(completed_lifecycle.config, output_root=output_root))
+    request_path = _authored_request(run_dir, tmp_path)
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> None:
+        message = "CUDA driver query failed"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(learning.device, "cuda_driver_version", unavailable)
+    before = _artifact_inventory((output_root,))
+
+    with pytest.raises(RuntimeError, match="CUDA driver query failed"):
+        experiments.run.run_experiment(request_path, device="cpu", output_root=output_root)
+    assert _artifact_inventory((output_root,)) == before
+    assert not list((output_root / ".state" / "identities").glob("*.json"))
+
+
+@pytest.mark.parametrize("change", ["missing", "behind", "beyond_its_step"])
+def test_a_completed_steady_run_is_admitted_only_with_its_valid_history(completed_lifecycle: CompletedLifecycle, tmp_path: Path, change: str) -> None:
+    """A completed steady run, like a transient one, is admitted only with exactly the history its last checkpoint counts.
+
+    It is refused when the history is missing, counts other records, or ends after the checkpoint's global step.
+    """
+    run_dir = _copy_without_analysis(completed_lifecycle.run_dir, tmp_path / "run_history")
     selected = experiments.run.validate_evaluable_run(run_dir)["selected_checkpoint_sha256"]
     history = analysis.evaluation.run_discovery.stage_history(run_dir, expected_checkpoint_sha256=selected)
     assert isinstance(history, analysis.evaluation.run_discovery.StageHistory)
     assert (history.stage, history.start_epoch, history.selected_point) == ("steady", 0, 20)
-    learning.training.history.history_path(run_dir).unlink()
+    path = learning.training.history.history_path(run_dir)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if change == "missing":
+        path.unlink()
+    elif change == "behind":
+        path.write_text(json.dumps({**payload, "epochs": []}), encoding="utf-8")
+    else:
+        # The records still count the checkpoint's epoch and validation, but its epoch ends one optimizer step later.
+        payload["epochs"][-1]["global_step"] += 1.0
+        path.write_text(json.dumps(payload), encoding="utf-8")
 
-    assert experiments.run.validate_completed_run(run_dir)["summary"]["status"] == "completed"
-    unavailable = analysis.evaluation.run_discovery.stage_history(run_dir, expected_checkpoint_sha256=selected)
-    assert isinstance(unavailable, analysis.evaluation.run_discovery.UnavailableHistory)
+    for admit in (experiments.run.validate_completed_run, experiments.run.validate_evaluable_run):
+        with pytest.raises(experiments.run.RunLifecycleError, match="history"):
+            admit(run_dir)
 
 
 def _mutate_task_identity(run_dir: Path, dataset_root: Path) -> None:

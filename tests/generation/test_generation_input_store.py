@@ -44,16 +44,16 @@ case_service = generation.cases.case
 # Generated maps and schedules differ in the last digits between ICE CPU types (numpy SIMD loops, OpenBLAS kernels), so the
 # identity pins below are only the CPU-independent ones: the config digests and the transient scalars.csv, both recorded with
 # the CSV-storing writer that preceded the input store. The CPU-dependent CSVs are checked against a frozen copy of that writer.
-_SCALARS_CSV = {"sha256": "840afa3510f5a8eddafa103002240d58a34972b1bd79629e51e0f74ff4dda4d6", "size_bytes": 388}
+_SCALARS_CSV = {"sha256": "f951ea5064de394da09b9703ef76b06cea4f5b4c00cbfc584b670d21e1c666dc", "size_bytes": 401}
 # (case_input_config_digest, scientific_config_digest) per profile.
 _CONFIG_DIGESTS: dict[str, tuple[str, str]] = {
     "steady_flow": (
-        "6eb659f0f162b583bbceb7ba9d4b1456a4a7d9936e534028268b24a36d6284a4",
-        "624fdd0b6c312837a622ff984327e866080fa35e99344c660bd1c304893e0b9f",
+        "5aa5d22fa9ad2275899e96205bf5c2bebf3d2cc6754fa8ad089b96ee1c632532",
+        "94ee25b0d764fec3cdf41418304c97fd56c6a5b07864a22d95db4fe64376e56f",
     ),
     "transient_drying": (
-        "51f615e958547e5329698d838a1b76f4da31ea0579c844be9c12cf6c12c89858",
-        "60a630fc4d2919c8d0d7483aeb1cabacf4d6ebfef701e0d5dd6bb2ed547fcbdc",
+        "6def8700e3ce5d9695529d7955fe3fd360c96e7c8f30de5f4ca702d3725cfd5c",
+        "6c4cb2a3f9f6299029e298b3ca96ada3d03ad9b5441f4c21ceeeda5ce628591e",
     ),
 }
 _REGENERATE = r"no regular inputs\.h5.*regenerate"

@@ -3,6 +3,7 @@
 Responsibilities:
   - Check grid validation, exact unions, and latest-snapshot terminal holds
   - Check the choice of time windows by run length and the placement of time numbers and label on a window's axis
+  - Check that an hour axis of a day or more ticks in a step that follows its span
   - Check the drying-phase cohort: the 20-point τ grid, nearest stored states with ties to the earlier, a constant cohort
     over cases of different length, censored and unknown cases counted and not pooled, the refusal of a reached case without
     a stored hour after its origin, the t_end summary in fractional hours, the clock and note helpers and the τ axis
@@ -207,6 +208,19 @@ def _ticks(axis: Any) -> np.ndarray:
     """Return the major ticks of one axis inside its limits."""
     lower, upper = axis.get_xlim()
     return np.asarray([tick for tick in axis.xaxis.get_major_locator()() if lower - 1e-9 <= tick <= upper + 1e-9])
+
+
+@pytest.mark.parametrize(("end", "step"), [(24.0, 3.0), (48.0, 6.0), (70.0, 12.0)])
+def test_an_hour_axis_of_a_day_or_more_ticks_in_a_step_that_follows_its_span(end: float, step: float) -> None:
+    """A 24 h, 48 h and 70 h hour axis tick every 3, 6 and 12 h, at least four ticks each, never only every 24 h."""
+    figure, axis = plt.subplots()
+    try:
+        time_ui.physical_time_display((0.0, end), preferred_unit="h").configure(axis)
+        ticks = _ticks(axis)
+        np.testing.assert_allclose(np.diff(ticks), step)
+        assert len(ticks) >= 4
+    finally:
+        plt.close(figure)
 
 
 def test_hour_windows_tick_every_six_hours_from_their_start() -> None:

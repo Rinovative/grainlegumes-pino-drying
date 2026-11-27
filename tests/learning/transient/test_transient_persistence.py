@@ -289,15 +289,13 @@ def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monke
     assert restored["source_global_step"] == 1
     assert restored["restored_common_state"]["global_step"] == 1
 
-    # Another runtime is refused, and so is another container: the handoff runs only where the teacher was produced.
-    for key, value, refusal in (
-        ("numpy", "different-producing-runtime", "identity is incompatible"),
-        ("sif_sha256", "a" * 64, "producing SIF identity"),
-    ):
+    # Another runtime is refused, and so is another container: the handoff runs only where the teacher was produced, so
+    # either is the training environment's error, which a rerun in the producing environment passes.
+    for key, value in (("numpy", "different-producing-runtime"), ("sif_sha256", "a" * 64)):
         incompatible_runtime = {**identity["numerical_environment"], key: value}
         before = copy.deepcopy(model.state_dict())
         monkeypatch.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda runtime=incompatible_runtime: runtime)
-        with pytest.raises(ValueError, match=refusal):
+        with pytest.raises(learning.training.checkpoint.ResumeEnvironmentError, match=f"differs in {key}"):
             learning.training.checkpoint.restore_handoff_checkpoint(
                 payload,
                 expected_source_identity=identity,

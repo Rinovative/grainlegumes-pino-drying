@@ -46,7 +46,7 @@ from src.analysis.evaluation import evaluation_prediction_validity as validity_c
 from src.domain.tasks.domain_task_spec import OutputGroupSpec
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Collection, Iterable
 
     import pandas as pd
 
@@ -435,15 +435,25 @@ def validate_analysis_producer(value: object) -> dict[str, str]:
     return {"analysis_sha256": digest}
 
 
-def require_current_analysis(provenance: object, *, task_id: str, unit: str) -> None:
-    """Refuse to reuse or continue an artifact or stage whose recorded analysis implementation is not the running one."""
+def require_current_analysis(provenance: object, *, task_id: str, unit: str, remedy: str = _REBUILD_REMEDY) -> None:
+    """
+    Refuse to reuse or continue an artifact or stage whose recorded analysis implementation is not the running one.
+
+    ``remedy`` names the action that resolves the refusal: a full build is rerun with ``--rebuild``, a bounded one (which takes no
+    ``--rebuild``) names its own.
+    """
     producer = provenance.get("producer") if isinstance(provenance, Mapping) else None
     recorded = producer.get("analysis_sha256") if isinstance(producer, Mapping) else None
-    common.code_identity.require_current_implementation(ANALYSIS_PROJECTIONS[task_id], recorded, unit=unit, remedy=_REBUILD_REMEDY)
+    common.code_identity.require_current_implementation(ANALYSIS_PROJECTIONS[task_id], recorded, unit=unit, remedy=remedy)
 
 
-def require_common_analysis_producer(provenances: Mapping[str, object]) -> None:
-    """Refuse a comparison of artifacts whose recorded analysis implementations differ, or are missing or malformed."""
+def require_common_analysis_producer(provenances: Mapping[str, object], *, scoped: Collection[str] = ()) -> None:
+    """
+    Refuse a comparison of artifacts whose recorded analysis implementations differ, or are missing or malformed.
+
+    A mismatch names each artifact's remedy: a canonical one is rebuilt with ``--rebuild``; a ``scoped`` one (a bounded root, which
+    takes no ``--rebuild``) is deleted and generated again.
+    """
     digests: dict[str, str] = {}
     for label, provenance in provenances.items():
         try:
@@ -453,7 +463,12 @@ def require_common_analysis_producer(provenances: Mapping[str, object]) -> None:
             raise ValueError(msg) from error
     if len(set(digests.values())) > 1:
         recorded = ", ".join(f"{label}={digest[:12]}" for label, digest in digests.items())
-        msg = f"Artifacts were produced by different analysis implementations ({recorded}); rebuild them with one analysis code using --rebuild."
+        remedies: list[str] = []
+        if canonical := [label for label in digests if label not in scoped]:
+            remedies.append(f"rebuild {', '.join(canonical)} using --rebuild")
+        if bounded := [label for label in digests if label in scoped]:
+            remedies.append(f"delete the scoped artifacts {', '.join(bounded)} and generate them again")
+        msg = f"Artifacts were produced by different analysis implementations ({recorded}); give them one analysis code: {'; '.join(remedies)}."
         raise ValueError(msg)
 
 

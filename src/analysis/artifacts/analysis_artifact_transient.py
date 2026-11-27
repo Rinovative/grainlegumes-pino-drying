@@ -5,7 +5,8 @@ Responsibilities:
   - Generate bounded case inference, metric and timing evidence through maintained owners
   - Delegate sequence staging and validate canonical or explicit selected-case artifacts
   - Bind role-level prediction-validity evidence to exact role membership
-  - Stamp the running analysis producer and resume a partial stage only under the analysis code that started it
+  - Stamp the running analysis producer and resume a partial stage only under the analysis code and on the timing
+    hardware that started it, never on an unknown CPU model
 
 Design principles:
   - Saved membership order and training identity bind every artifact role
@@ -41,6 +42,7 @@ from src.analysis.evaluation import evaluation_transient_validity as transient_v
 from src.datasets.packages import dataset_packages_generated_batch as generated_batch
 from src.experiments import experiments_matched_budget as matched_budget
 from src.experiments import experiments_run_identity as run_identity
+from src.generation.runtime import generation_runtime_node as runtime_node
 from src.learning.transient import learning_transient_handoff as transient_handoff
 
 from . import analysis_artifact_contracts as contracts
@@ -241,7 +243,7 @@ def _load_role_datasets(
 
 
 @dataclass(frozen=True, slots=True)
-class _TransientCaseMaterialization:
+class TransientCaseMaterialization:
     """Bind one compact selected-case plan to its lazy Dataset positions."""
 
     dataset: TransientPhysicalDataset
@@ -252,11 +254,11 @@ class _TransientCaseMaterialization:
     pt_identity: str
 
 
-def _case_materialization_specs(
+def case_materialization_specs(
     sources: Sequence[TransientPhysicalDataset],
-) -> tuple[_TransientCaseMaterialization, ...]:
+) -> tuple[TransientCaseMaterialization, ...]:
     """Build exact selected-case plans without loading numerical item payloads."""
-    result: list[_TransientCaseMaterialization] = []
+    result: list[TransientCaseMaterialization] = []
     for dataset in sources:
         positions: dict[str, list[int]] = defaultdict(list)
         case_records = {str(case_record["package_case_id"]): case_record for case_record in dataset.payload["cases"]}
@@ -284,7 +286,7 @@ def _case_materialization_specs(
                 message = f"Transient package case {package_case_id!r} lacks material_family."
                 raise TypeError(message)
             result.append(
-                _TransientCaseMaterialization(
+                TransientCaseMaterialization(
                     dataset=dataset,
                     package_case_id=package_case_id,
                     case_record=case_record,
@@ -299,8 +301,8 @@ def _case_materialization_specs(
     return tuple(result)
 
 
-def _materialize_case(
-    spec: _TransientCaseMaterialization,
+def materialize_case(
+    spec: TransientCaseMaterialization,
     *,
     dataset_role: sequence_artifact.DatasetRole,
 ) -> tuple[str, Mapping[str, Any], rollout.TransientEvaluationCase, str]:
@@ -1300,6 +1302,7 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
         if len(expected_case_ids) != sum(len(case_ids) for case_ids in role.case_ids_by_source):
             message = "Transient artifact saved role contains duplicate case identities."
             raise ValueError(message)
+        cpu_model = runtime_node.read_cpu_model()
         resume_identity = {
             "run_name": admitted_completed["scientific_run_name"],
             "resolved_config_sha256": run_identity.resolved_config_digest(config),
@@ -1333,27 +1336,44 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                 )
             ),
             "evaluation_spatial_representation": (evaluation_representation.as_dict()),
-            # Kept cases carry their timing, so a resumed stage must run on the same hardware and PyTorch build.
+            # Kept cases carry their timing, in a CUDA build too with host-side materialization and wall-clock seconds,
+            # so a resumed stage must run on the same CPU and GPU models and PyTorch build.
             "timing_hardware": {
                 "device_type": device_resolution.metadata.device_type,
+                "cpu_model": cpu_model,
                 "cuda_device_name": device_resolution.metadata.cuda_device_name,
                 "pytorch_version": device_resolution.metadata.pytorch_version,
             },
             # Kept cases were computed by one analysis implementation; a stage started by other analysis code is not resumed.
             "producer": contracts.analysis_producer("transient_drying"),
         }
+        # A bounded (scoped) build takes no --rebuild, so its stage is deleted by hand instead.
+        resume_remedy = f"delete the bounded stage {staging_root} by hand, then rerun" if saved_role is not None else "rerun with --rebuild"
         recorded_identity = sequence_artifact.recorded_resume_identity(staging_root)
         if recorded_identity is not None:
-            contracts.require_current_analysis(recorded_identity, task_id="transient_drying", unit=f"Partial transient artifact stage {staging_root}")
+            contracts.require_current_analysis(
+                recorded_identity, task_id="transient_drying", unit=f"Partial transient artifact stage {staging_root}", remedy=resume_remedy
+            )
+            recorded_hardware = recorded_identity.get("timing_hardware")
+            recorded_cpu_model = recorded_hardware.get("cpu_model") if isinstance(recorded_hardware, Mapping) else None
+            if recorded_cpu_model is None or cpu_model is None:
+                # Two unreadable /proc/cpuinfo files would compare equal, so an unknown model never matches any model.
+                message = (
+                    f"Partial transient artifact stage {staging_root} is not resumed: an unknown CPU model never matches "
+                    f"(recorded {recorded_cpu_model!r}, current {cpu_model!r}), so its kept timings may come from other hardware; "
+                    f"{resume_remedy}."
+                )
+                raise sequence_artifact.TransientSequenceArtifactError(message)
         stager = sequence_artifact.TransientSequenceArtifactStager(
             staging_root,
             dataset_name=role.dataset_name,
             dataset_role=role.dataset_role,
             resume_identity=resume_identity,
+            resume_remedy=resume_remedy,
         )
         completed_case_ids = stager.completed_case_ids
         if not completed_case_ids.issubset(expected_case_ids):
-            message = "Transient resume manifests contain cases outside the exact saved role; rerun with --rebuild."
+            message = f"Transient resume manifests contain cases outside the exact saved role; {resume_remedy}."
             raise ValueError(message)
         all_cases_resumed = completed_case_ids == expected_case_ids
         resumed_cases: dict[str, _ResumedCaseEvidence] = {}
@@ -1368,7 +1388,7 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                 )
                 resumed_cases[case_id] = resumed
             planned_membership = [(case_id, resumed_cases[case_id].material) for case_id in sorted(expected_case_ids)]
-            specs: tuple[_TransientCaseMaterialization, ...] = ()
+            specs: tuple[TransientCaseMaterialization, ...] = ()
         else:
             model_phase = nullcontext() if progress_reporter is None else progress_reporter.phase("model_setup")
             with model_phase:
@@ -1393,7 +1413,7 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                     model_parameter = next(context.model.parameters(), None)
                     model_device = context.device if model_parameter is None else model_parameter.device
                     progress_reporter.device_summary(model_device=model_device, scaler_device=context.scaling.device)
-            specs = _case_materialization_specs(datasets_for_role)
+            specs = case_materialization_specs(datasets_for_role)
             planned_membership = [(spec.package_case_id, spec.material_family) for spec in specs]
         admitted_planned = _qualified_case_membership(planned=planned_membership)
         if {case_id for case_id, _material in admitted_planned} != expected_case_ids:
@@ -1463,7 +1483,7 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                     case_record,
                     case,
                     pt_identity,
-                ) = _materialize_case(
+                ) = materialize_case(
                     spec,
                     dataset_role=role.dataset_role,
                 )
@@ -1910,8 +1930,9 @@ def _validate_transient_role_evidence(
     *,
     completed: Mapping[str, Any],
     role: artifact_plan.ArtifactRolePlan,
+    bounded: bool = False,
 ) -> None:
-    """Bind eager or indexed sequence evidence to one exact completed run role."""
+    """Bind eager or indexed sequence evidence to one exact completed run role; ``bounded`` names a scoped artifact in its refusals."""
     _reject_trial(completed)
     loaded_role = (loaded.dataset_name, loaded.dataset_role)
     if loaded.provenance["dataset"] != role.dataset_provenance() or loaded_role != (role.dataset_name, role.dataset_role):
@@ -2028,7 +2049,7 @@ def _validate_transient_role_evidence(
     if contracts.validate_runtime_provenance(loaded.provenance.get("runtime")) != 1:
         message = "Transient artifacts are generated one rollout case at a time (inference_batch_size 1)."
         raise ValueError(message)
-    timing_block = artifact_timing.timing_block(loaded.provenance, records=frozenset({"report", "component_availability"}))
+    timing_block = artifact_timing.timing_block(loaded.provenance, records=frozenset({"report", "component_availability"}), bounded=bounded)
     _validate_role_timing_evidence(
         timing_block,
         expected_cases=expected_cases,
@@ -2103,7 +2124,7 @@ def validate_scoped_transient_role_artifact_index(
         selected_case_ids,
     )
     sequence_artifact.validate_transient_sequence_payload_inventory(loaded)
-    _validate_transient_role_evidence(loaded, completed=completed, role=selected_role)
+    _validate_transient_role_evidence(loaded, completed=completed, role=selected_role, bounded=True)
     return loaded
 
 

@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Create one marked case workspace beneath approved scratch storage
-  - Copy one admitted raw case.json and render its verified stored inputs into the COMSOL CSV files
+  - Copy one admitted raw case.json, or one explicit generated bundle's, and render its verified stored inputs into the COMSOL CSV files
   - Copy a digest-verified COMSOL model
   - Preserve cleanup boundaries when preparation fails
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from src import common
@@ -33,7 +34,7 @@ from . import generation_runtime_comsol as comsol_service
 from . import generation_runtime_workspace as workspace_service
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Callable
 
     from src.generation.cases import generation_cases_admission as admission_service
 
@@ -121,43 +122,52 @@ def _materialize_raw_bundle(
     input_generation_id: str | None,
 ) -> tuple[case_service.CaseBundle, str, Path]:
     """Copy one admitted raw case.json into isolated scratch and render its verified COMSOL CSV files beside it."""
-    case_id = config.case_id(case_index)
     reference = _resolve_raw_source(
         config,
         case_index,
         storage_root=storage_root,
         input_generation_id=input_generation_id,
     )
-    source_directory = reference.case_directory
+    bundle = _materialize_bundle(
+        config, config.case_id(case_index), reference.case_directory, work_directory, store_identity=reference.store_identity
+    )
+    return bundle, reference.source_id, reference.case_directory.resolve()
+
+
+def _materialize_bundle(
+    config: config_contract.GenerationConfig,
+    case_id: str,
+    source_directory: Path,
+    work_directory: Path,
+    *,
+    store_identity: case_service.InputStoreIdentity,
+) -> case_service.CaseBundle:
+    """Copy one case.json of ``case_id`` into isolated scratch and render its verified COMSOL CSV files beside it."""
     source_case_json = source_directory / "case.json"
     payload = json.loads(source_case_json.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        message = f"Raw case payload is invalid: {source_directory}"
+        message = f"Case payload is invalid: {source_directory}"
         raise TypeError(message)
     case_service.validate_case_payload_schema(payload)
     if payload["case_id"] != case_id:
-        message = f"Raw case payload belongs to {payload['case_id']!r}, not {case_id}: {source_directory}"
+        message = f"Case payload belongs to {payload['case_id']!r}, not {case_id}: {source_directory}"
         raise ValueError(message)
     target_case_json = work_directory / "case.json"
     shutil.copy2(source_case_json, target_case_json)
     if source_case_json.read_bytes() != target_case_json.read_bytes():
-        message = f"Raw case.json changed during scratch materialization: {source_case_json}"
+        message = f"Case.json changed during scratch materialization: {source_case_json}"
         raise RuntimeError(message)
-    case_service.materialize_case_inputs(source_directory, work_directory, payload, store_identity=reference.store_identity)
+    case_service.materialize_case_inputs(source_directory, work_directory, payload, store_identity=store_identity)
     scalar_handoff = (
         None if config.profile.id != profiles.TRANSIENT_DRYING_PROFILE else scalar_handoff_contract.admit_case_scalar_handoff(payload, work_directory)
     )
-    return (
-        case_service.CaseBundle(
-            directory=work_directory,
-            case_id=case_id,
-            case_input_id=str(payload["case_input_id"]),
-            simulation_case_id=str(payload["simulation_case_id"]),
-            case_payload=payload,
-            scalar_handoff=scalar_handoff,
-        ),
-        reference.source_id,
-        source_directory.resolve(),
+    return case_service.CaseBundle(
+        directory=work_directory,
+        case_id=case_id,
+        case_input_id=str(payload["case_input_id"]),
+        simulation_case_id=str(payload["simulation_case_id"]),
+        case_payload=payload,
+        scalar_handoff=scalar_handoff,
     )
 
 
@@ -176,7 +186,64 @@ def prepare_case_work_directory(
     input source, as campaign cases do. Without it the case is bound to the
     exact active source commit.
     """
-    case_id = config.case_id(case_index)
+    return _prepare_work_directory(
+        config,
+        config.case_id(case_index),
+        lambda work_directory, storage: _materialize_raw_bundle(
+            config,
+            case_index,
+            work_directory,
+            storage_root=storage,
+            input_generation_id=input_generation_id,
+        ),
+        storage_root=storage_root,
+        work_root=work_root,
+    )
+
+
+def prepare_bundle_work_directory(
+    config: config_contract.GenerationConfig,
+    bundle_directory: Path | str,
+    *,
+    storage_root: Path | str | None = None,
+    work_root: Path | str | None = None,
+) -> PreparedCase:
+    """
+    Prepare a fresh case directory from one explicit generated bundle (case.json and inputs.h5) instead of an admitted Source input.
+
+    The bundle must belong to ``config``'s batch and its rendered CSV files must match its case identities. The returned
+    case's ``input_generation_id`` is the bundle's ``case_input_id`` and its ``canonical_raw_directory`` is the bundle
+    directory, because no input generation or raw Source publication exists for it.
+    """
+    directory = Path(bundle_directory).expanduser().resolve()
+    case_json = directory / "case.json"
+    if case_json.is_symlink() or not case_json.is_file():
+        message = f"Explicit case bundle has no regular case.json: {directory}"
+        raise FileNotFoundError(message)
+    payload = json.loads(case_json.read_text(encoding="utf-8"))
+    if payload.get("batch_id") != config.batch_id:
+        message = f"Explicit case bundle belongs to batch {payload.get('batch_id')!r}, not {config.batch_id}: {directory}"
+        raise ValueError(message)
+    case_id = config.case_id(int(payload["case_index"]))
+
+    def materialize(work_directory: Path, _storage: Path) -> tuple[case_service.CaseBundle, str, Path]:
+        # Generated in this step, the bundle has no recorded store identity; its rendered CSV identities still bind it.
+        identity = case_service.measure_input_store(directory)
+        bundle = _materialize_bundle(config, case_id, directory, work_directory, store_identity=identity)
+        return bundle, bundle.case_input_id, directory
+
+    return _prepare_work_directory(config, case_id, materialize, storage_root=storage_root, work_root=work_root)
+
+
+def _prepare_work_directory(
+    config: config_contract.GenerationConfig,
+    case_id: str,
+    materialize: Callable[[Path, Path], tuple[case_service.CaseBundle, str, Path]],
+    *,
+    storage_root: Path | str | None,
+    work_root: Path | str | None,
+) -> PreparedCase:
+    """Create the marked workspace, materialize the case through ``materialize``, and copy the digest-verified model beside it."""
     _require_template_digest(
         config.template_path,
         config.template_sha256,
@@ -192,17 +259,7 @@ def prepare_case_work_directory(
     run_id = workspace_service.workspace_run_id(config)
     model_path = work_directory / comsol_service.WORK_MODEL_FILENAME
     try:
-        (
-            bundle,
-            admitted_input_generation_id,
-            canonical_raw_directory,
-        ) = _materialize_raw_bundle(
-            config,
-            case_index,
-            work_directory,
-            storage_root=storage,
-            input_generation_id=input_generation_id,
-        )
+        bundle, admitted_input_generation_id, canonical_raw_directory = materialize(work_directory, storage)
         shutil.copyfile(config.template_path, model_path)
         _require_template_digest(
             model_path,

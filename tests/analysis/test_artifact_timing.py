@@ -209,6 +209,9 @@ def test_stage_timing_stays_outside_payloads_and_its_block_is_closed(tmp_path: P
     partial = json.loads(marker.read_text(encoding="utf-8"))
     with pytest.raises(ValueError, match="--rebuild"):
         analysis.artifacts.timing.timing_block(partial, records=frozenset({"report"}))
+    with pytest.raises(ValueError, match="bounded output") as bounded:  # a bounded build takes no --rebuild
+        analysis.artifacts.timing.timing_block(partial, records=frozenset({"report"}), bounded=True)
+    assert "--rebuild" not in str(bounded.value)
     analysis.artifacts.timing.write_stage_timing(artifact_root, {"operational_performance": snapshot})
 
     document = json.loads(marker.read_text(encoding="utf-8"))

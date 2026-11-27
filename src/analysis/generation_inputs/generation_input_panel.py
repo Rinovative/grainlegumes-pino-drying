@@ -1,10 +1,18 @@
 """Compose the compact input-generated EDA panel.
 
 Responsibilities:
-  - Bind the four-section registry to A/B comparison and dataset views, and the paired template comparison when two campaigns share a design
+  - Bind the four-section registry to A/B comparison and dataset views, and the paired template comparison when two campaigns share a design,
+    opened on the campaigns of Dataset A's task when that task has a pair
   - Place each view's local Dataset A/Case A and Dataset B/Case B controls in its panel rows
+  - Open the dataset overviews on the panel's Dataset A and the campaign outcomes on the campaign its batch locator names,
+    which says when it has no candidates; a local choice stays
+  - Show campaign candidates, their rates per material, role and origin, and failure reasons in display names and headers,
+    the rates and reasons in their campaign's material order under every filter, sampled parameters headed by their table
+    row labels, and pass the atlas the Dataset its case belongs to
+  - Write the case context's input directories from the storage root the catalog was discovered from
   - Preserve automatic first rendering, lazy tabs, and current-figure PDF export
-  - Keep transient capability filtering and notebook output ownership explicit
+  - Keep transient capability filtering and notebook output ownership explicit: a transient Dataset or campaign offers the
+    transient-only views, which say when no transient Dataset can be selected
 
 Design principles:
   - Every case-level view uses one common comparison selection model
@@ -22,24 +30,31 @@ from __future__ import annotations
 import json
 from collections import Counter
 from html import escape
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol, cast
 
 import ipywidgets as widgets
 
 from src.analysis import ui
 from src.analysis.generation_inputs import generation_input_controls as controls
+from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
 from src.analysis.generation_inputs import generation_input_presentation as presentation
 from src.analysis.generation_inputs import generation_input_selection as selection_service
 from src.analysis.generation_inputs import generation_input_sources as source_service
+from src.analysis.generation_inputs import generation_input_table_schema as table_schema
 from src.analysis.generation_inputs import generation_input_template_comparison as template_service
 from src.analysis.generation_inputs import plots
 from src.analysis.presentation import analysis_display_grid as display_grid
+from src.analysis.presentation import analysis_display_labels as display_labels
 from src.analysis.presentation import registry as shared_presentation
+from src.generation.contracts import generation_contracts_profiles as profiles
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
+    import pandas as pd
     from matplotlib.figure import Figure
+
+_CANDIDATE_PREVIEW_ROWS: Final = 200  # the candidate table is a bounded preview; the rates count every candidate
 
 
 class _LocalControls(Protocol):
@@ -134,12 +149,13 @@ def _pair_factory(
 
 def _dataset_factory(
     catalog: source_service.GenerationInputDatasetCatalog,
+    selection_state: selection_service.GenerationInputSelectionState,
     render: Callable[[Any], Any],
 ) -> Callable[..., Any]:
-    """Return one cached dataset-overview view factory."""
+    """Return one cached dataset-overview view factory that opens on the panel's Dataset A; its own choice stays afterwards."""
 
     def build() -> tuple[_LocalControls, Callable[[], Any]]:
-        local = controls.DatasetControls(catalog)
+        local = controls.DatasetControls(catalog, selected=selection_state.selection.dataset_a_key)
         return local, lambda: render(local.selected_diagnostics())
 
     return _factory(build)
@@ -171,41 +187,69 @@ def _view_factories(
         """Bind a comparison renderer to the common A/B selection."""
         return _pair_factory(catalog, selection_state, render, include_scale_lock=lock)
 
+    def case_context(selection: controls.SelectedComparison) -> Any:
+        """Render the case context with its input directories written from the root the catalog was discovered from."""
+        return plots.overview.case_context(selection.case_a, selection.mean_a, selection.case_b, selection.mean_b, storage_root=catalog.storage_root)
+
     def transient_schedules(selection: controls.SelectedComparison) -> Figure:
         """Render all schedule channels, means, and exact supports."""
         return plots.boundaries.schedule_comparison(
             selection.case_a, selection.mean_a, selection.case_b, selection.mean_b, same_dataset=selection.same_dataset
         )
 
+    def transient_only(name: str, render: Callable[[controls.SelectedComparison], Any]) -> Callable[[controls.SelectedComparison], Any]:
+        """Explain steady inputs in the plot's place: the catalog offers the view when any Dataset or campaign is transient, not per selection."""
+
+        def guarded(selection: controls.SelectedComparison) -> Any:
+            # Datasets A and B always share one simulation profile (generation_input_selection.py:244), so both are steady here.
+            if diagnostics.is_transient(selection.case_a) and diagnostics.is_transient(selection.case_b):
+                return render(selection)
+            if profiles.TRANSIENT_DRYING_PROFILE in catalog.profiles:
+                return f"{name} needs transient-drying inputs, but Datasets A and B are steady flow; select a transient campaign."
+            return f"{name} needs transient-drying inputs, but no transient Dataset can be selected yet: no transient campaign has admitted inputs."
+
+        return guarded
+
     factories: dict[str, Callable[..., Any]] = {
-        "campaign_outcomes": _outcome_factory(catalog.outcomes),
+        "campaign_outcomes": _outcome_factory(
+            catalog.outcomes, preferred=lambda: source_service.dataset_campaign(catalog.dataset(selection_state.selection.dataset_a_key))
+        ),
         "field_atlas": _atlas_factory(catalog, selection_state, display_spatial_stride=display_spatial_stride),
-        "case_context": pair(comparison(plots.overview.case_context)),
+        "case_context": pair(case_context),
         "parameters": pair(comparison(plots.overview.parameters)),
         "field_summaries": pair(comparison(plots.overview.field_summaries)),
         "boundary_conditions": pair(comparison(plots.boundaries.boundary_comparison_table)),
-        "transient_schedules": pair(transient_schedules),
+        "transient_schedules": pair(transient_only("Transient schedules", transient_schedules)),
         "basic_spatial_inputs": pair(maps(plots.spatial.basic_comparison), lock=True),
         "permeability_tensor": pair(maps(plots.permeability.tensor_comparison), lock=True),
         "derived_permeability": pair(maps(plots.permeability.derived_comparison), lock=True),
-        "moisture_sorption": pair(maps(plots.moisture.moisture_comparison), lock=True),
-        "dataset_cases_parameters": _dataset_factory(catalog, plots.overview.dataset_cases_parameters),
-        "dataset_field_summaries": _dataset_factory(catalog, plots.overview.dataset_field_summaries),
+        "moisture_sorption": pair(transient_only("Moisture and sorption", maps(plots.moisture.moisture_comparison)), lock=True),
+        "dataset_cases_parameters": _dataset_factory(catalog, selection_state, plots.overview.dataset_cases_parameters),
+        "dataset_field_summaries": _dataset_factory(catalog, selection_state, plots.overview.dataset_field_summaries),
     }
     partners = template_service.comparable_campaigns(catalog.outcomes.rows)
     if partners:
-        factories["template_comparison"] = _template_factory(catalog.outcomes, partners)
+        factories["template_comparison"] = _template_factory(catalog.outcomes, partners, selection_state)
     return factories
 
 
 def _template_factory(
-    catalog: source_service.CampaignOutcomeCatalog, partners: Mapping[template_service.Campaign, tuple[template_service.Campaign, ...]]
+    catalog: source_service.CampaignOutcomeCatalog,
+    partners: Mapping[template_service.Campaign, tuple[template_service.Campaign, ...]],
+    selection_state: selection_service.GenerationInputSelectionState,
 ) -> Callable[..., Any]:
-    """Bind one cached paired template comparison of the campaigns in ``partners``."""
+    """
+    Bind one cached paired template comparison of the campaigns in ``partners``.
+
+    Campaign A starts on a campaign of the task (simulation profile) of the common Dataset A when that task has partners,
+    so the view opens on the campaigns of the panel's own task; otherwise on the first campaign with a partner.
+    """
 
     def build() -> tuple[_LocalControls, Callable[[], Any]]:
-        local = controls.TemplateComparisonControls(catalog, partners)
-        return local, lambda: plots.template.template_comparison(local.comparison())
+        task = selection_state.selection.dataset_a_key[0]
+        own_task_first = dict(sorted(partners.items(), key=lambda item: item[0][0] != task))  # a stable sort keeps the order within each group
+        local = controls.TemplateComparisonControls(catalog, own_task_first)
+        return local, lambda: plots.template.template_comparison(local.comparison(), local.captions)
 
     return _factory(build)
 
@@ -226,9 +270,9 @@ def _atlas_factory(
             notes = " ".join(atlas.notes)
             if not local.fields.selected:
                 notes = "Select a spatial field. " + notes
-            return plots.atlas.field_atlas(atlas, local.fields.selected, display_spatial_stride=display_spatial_stride), widgets.HTML(
-                f"<p>{escape(notes)}</p>"
-            )
+            dataset = catalog.dataset(selection_state.selection.dataset_a_key)
+            figure = plots.atlas.field_atlas(atlas, local.fields.selected, dataset=dataset, display_spatial_stride=display_spatial_stride)
+            return figure, widgets.HTML(f"<p>{escape(notes)}</p>")
 
         return local, render
 
@@ -264,7 +308,9 @@ def build_generation_input_eda_panel(
     export_state: dict[str, Any] = {"fig": None, "figures": (), "plot_name": None, "title": None}
     sections: list[ui.notebook.ViewSection] = []
     titles: list[str] = []
-    sections_for_view = presentation.sections_for_profiles(datasets.profiles, template_comparison="template_comparison" in factories)
+    # A transient campaign offers the transient-only views before it has an admitted Dataset; they then say why none can be selected.
+    tasks = {*datasets.profiles, *(str(row["task"]) for row in datasets.outcomes.rows)}
+    sections_for_view = presentation.sections_for_profiles(tasks, template_comparison="template_comparison" in factories)
     for _section, section_label, numbered_views in shared_presentation.numbered_registry(sections_for_view):
         entries = []
         for view, view_label in numbered_views:
@@ -279,21 +325,62 @@ def build_generation_input_eda_panel(
     return ui.notebook.LazyPanel(sections, titles, open_label=f"{title} - Open", export_state=export_state).widget
 
 
-def _outcome_factory(catalog: source_service.CampaignOutcomeCatalog) -> Callable[..., Any]:
-    """Bind one cached candidate outcome table, evidence record, and optional plot."""
+def _parameter_header(name: str) -> str:
+    """Return the display header of a sampled parameter or boundary column from the shared row specs: its category and label."""
+    spec = table_schema.boundary_row_spec(name) if name in table_schema.BOUNDARY_ORDER else table_schema.parameter_row_spec(name)
+    return spec.label if spec.section == table_schema.UNCATEGORIZED_SECTION else f"{spec.category} · {spec.label}"
+
+
+def _display_candidates(table: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a candidate, rate or failure-reason table with display values and headers; sampled parameters read as their table row labels.
+
+    Failure stages, classes and reasons read as display text here; the evidence details of a candidate keep the exact codes and
+    parameter names.
+    """
+    shown = table.copy()
+    for column, display in (
+        ("material_family", display_labels.material_display_label),
+        ("sampling_regime", display_labels.regime_display_label),
+        ("domain_profile", display_labels.humanize_identifier),
+        ("origin", display_labels.humanize_identifier),
+        ("outcome", display_labels.token_display_label),  # record tokens as the EDA figures write them
+        ("failure_stage", display_labels.token_display_label),
+        ("failure_class", display_labels.token_display_label),
+        ("reason_code", display_labels.token_display_label),
+    ):
+        if column in shown:
+            shown[column] = shown[column].map(display, na_action="ignore")  # a candidate that did not fail has no failure codes
+    names = [str(column) for column in shown]
+    return shown.rename(columns={name: table_schema.CANDIDATE_COLUMN_LABELS.get(name) or _parameter_header(name) for name in names})
+
+
+def _outcome_factory(
+    catalog: source_service.CampaignOutcomeCatalog,
+    *,
+    preferred: Callable[[], template_service.Campaign] | None = None,
+) -> Callable[..., Any]:
+    """Bind one cached candidate outcome table, evidence record, and optional plot, opened on the ``preferred`` campaign if one is given."""
 
     def build() -> tuple[_LocalControls, Callable[[], Any]]:
-        local = controls.CampaignOutcomeControls(catalog)
+        local = controls.CampaignOutcomeControls(catalog, preferred=None if preferred is None else preferred())
 
-        def render() -> tuple[object, ...]:
+        def render() -> object:
+            if all((row["task"], row["source_name"]) != local.campaign.value for row in catalog.rows):  # only a preferred campaign can be empty
+                return f"Campaign {local.campaign.label} has no candidate records at this discovery checkpoint: its evidence is unavailable."
             rows = local.candidates()
             scope = local.candidates(all_outcomes=True)
+            # The frozen plan's material order: no filter and no partial checkpoint that leaves an ID material test designs only reorders it.
+            campaign = cast("tuple[str, str]", local.campaign.value)  # the guard above matched it to a row's (task, source name)
+            materials = source_service.campaign_material_order(catalog.designs.get(campaign, {}))
             table = source_service.campaign_outcome_table(rows)
-            rates = source_service.campaign_outcome_rates(scope)
-            failure_rates = source_service.campaign_failure_rates(scope)
+            rates = source_service.campaign_outcome_rates(scope, materials=materials)
+            failure_rates = source_service.campaign_failure_rates(scope, materials=materials)
+            shown = min(len(rows), _CANDIDATE_PREVIEW_ROWS)
             message = widgets.HTML(
-                f"<p>{len(rows)} matching candidates; showing the first 200 rows. "
-                "Rates use all terminal outcomes in the selected campaign/material/origin scope. "
+                f"<p>{len(rows)} matching candidates; the candidate table shows the first {shown}. "
+                "Rates count every candidate in the selected campaign/material/origin scope, per material, role and origin; "
+                "their denominator is the group's terminal candidates. "
                 "Pending and technical attempts remain separate. Failed candidates never satisfy supervised success counts. "
                 "Parameter plots draw, for every chosen parameter, the candidates of the selected campaign/material/origin scope with "
                 "an admitted finite scalar value in the chosen unit; the legend counts are those of the whole scope, "
@@ -301,12 +388,18 @@ def _outcome_factory(catalog: source_service.CampaignOutcomeCatalog) -> Callable
             )
             result: list[object] = [
                 message,
-                ui.tables.styled_dataframe(table.head(200), title="Candidate outcomes", shade_constant=False),
-                ui.tables.styled_dataframe(rates, title="Rates by material / role / origin / design", shade_constant=False),
+                ui.tables.styled_dataframe(
+                    _display_candidates(table.head(_CANDIDATE_PREVIEW_ROWS)),
+                    title=f"Candidate outcomes — first {shown} of {len(rows)}",
+                    shade_constant=False,
+                ),
+                ui.tables.styled_dataframe(_display_candidates(rates), title="Outcome rates by material, role and origin", shade_constant=False),
             ]
             if not failure_rates.empty:
                 result.append(
-                    ui.tables.styled_dataframe(failure_rates, title="Terminal failure reasons / all terminal candidates", shade_constant=False)
+                    ui.tables.styled_dataframe(
+                        _display_candidates(failure_rates), title="Terminal failure reasons by material, role and origin", shade_constant=False
+                    )
                 )
             selected = next((row for row in rows if (row["material_family"], row["case_id"]) == local.case.value), None)
             if selected is not None:

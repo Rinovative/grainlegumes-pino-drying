@@ -444,11 +444,13 @@ def test_the_continuation_path_refuses_an_implicit_tree_switch_before_any_write(
     before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
     _job_environment(monkeypatch, "b")
 
-    with pytest.raises(experiments.run.SourceBindingError, match="bound to source tree"):
+    with pytest.raises(experiments.run.ContinuationRefusedError, match="bound to source tree") as rerun:
         experiments.run.run_experiment(path)
-    with pytest.raises(experiments.run.SourceBindingError, match="bound to source tree"):
+    with pytest.raises(experiments.run.ContinuationRefusedError, match="bound to source tree") as resume:
         experiments.run.run_experiment(run_dir / "config.yaml", resume=run_dir)
 
+    assert isinstance(rerun.value.__cause__, experiments.run.SourceBindingError)
+    assert isinstance(resume.value.__cause__, experiments.run.SourceBindingError)
     assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
 
 

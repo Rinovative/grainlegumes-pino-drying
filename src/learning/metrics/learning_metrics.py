@@ -770,7 +770,7 @@ def group_objective(
 
 
 # ============================================================================
-# Explicit-space dataset metric accumulators
+# Physical-view dataset metric accumulators
 # ============================================================================
 
 
@@ -782,10 +782,9 @@ class ResolvedMetric:
     Attributes
     ----------
     id, kind : str
-        Stable config identifier and registered implementation kind.
-    space : {"normalized", "physical"}
-        Tensor representation required by accumulation; a normalized RMSE or MAE accumulates physical
-        statistics and divides by its Train scale, the definition of :func:`field_metric_values`.
+        Stable config identifier and registered implementation kind. Every metric accumulates physical
+        tensors; a configured normalized RMSE or MAE divides its physical value by its Train scale, the
+        definition of :func:`field_metric_values`.
     fields : tuple[str, ...]
         Exact TaskSpec metric fields included in declared order.
     field_indices : tuple[int, ...]
@@ -807,7 +806,6 @@ class ResolvedMetric:
 
     id: str
     kind: str
-    space: MetricSpace
     fields: tuple[str, ...]
     field_indices: tuple[int, ...]
     reduction: MetricReduction
@@ -873,17 +871,17 @@ class CaseMembership:
 
 class DatasetMetric:
     """
-    Accumulate one explicit-space dataset metric over complete evaluation populations.
+    Accumulate one dataset metric over complete evaluation populations from physical tensors.
 
-    Implementations validate tensor space, shape ``(batch, channel, *spatial)``,
-    concrete device, finiteness, and TaskSpec field selection on every update.
+    Implementations validate shape ``(batch, channel, *spatial)``, concrete
+    device, finiteness, and TaskSpec field selection on every update.
     Callers must reset once, update with every evaluation batch, and compute only
     after the complete dataset. Batching must not change the final value.
 
     Parameters
     ----------
     definition : ResolvedMetric
-        Immutable semantic fields, space, reduction, direction, and unit.
+        Immutable semantic fields, reduction, direction, and unit.
     device : torch.device
         Concrete device on which every update tensor must reside.
 
@@ -918,11 +916,6 @@ class DatasetMetric:
         return self.definition.id
 
     @property
-    def space(self) -> MetricSpace:
-        """Return the tensor space this metric requires."""
-        return self.definition.space
-
-    @property
     def fields(self) -> tuple[str, ...]:
         """Return exact selected task output fields."""
         return self.definition.fields
@@ -941,19 +934,14 @@ class DatasetMetric:
         pred: torch.Tensor,
         target: torch.Tensor,
         *,
-        space: str,
         batch_index: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Validate one batch view and select the declared task channels.
+        Validate one physical batch view and select the declared task channels.
 
         Prediction and target must share shape ``(batch, channel, Y, X)``, concrete
-        device, requested tensor space, and finite values. Failures include metric
-        and batch identity.
+        device, and finite values. Failures include metric and batch identity.
         """
-        if space != self.space:
-            msg = f"Metric {self.id!r} expects {self.space!r} tensors, got {space!r}."
-            raise ValueError(msg)
         if pred.shape != target.shape:
             msg = f"Metric {self.id!r} prediction/target shapes differ: {tuple(pred.shape)} != {tuple(target.shape)}."
             raise ValueError(msg)
@@ -978,12 +966,11 @@ class DatasetMetric:
         pred: torch.Tensor,
         target: torch.Tensor,
         *,
-        space: str,
         batch_index: int,
         cases: CaseMembership | None = None,
     ) -> None:
-        """Add the field statistics of every row to its case; ``cases`` is required."""
-        selected_pred, selected_target = self._validate_update(pred, target, space=space, batch_index=batch_index)
+        """Add the physical field statistics of every row to its case; ``cases`` is required."""
+        selected_pred, selected_target = self._validate_update(pred, target, batch_index=batch_index)
         if not isinstance(cases, CaseMembership) or len(cases.case_ids) != selected_pred.shape[0]:
             msg = f"Metric {self.id!r} requires one case membership per batch row."
             raise ValueError(msg)
@@ -1229,7 +1216,7 @@ def build_evaluation_metrics(
     grid_spacing: Sequence[float] | None = None,
 ) -> dict[str, DatasetMetric]:
     """
-    Build explicit-space dataset accumulators from semantic config.
+    Build physical-view dataset accumulators from semantic config.
 
     Metric implementations do not receive or own normalizers. Group-aware
     metrics receive only the Train state scales max(sigma, floor) and consume
@@ -1303,7 +1290,6 @@ def build_evaluation_metrics(
         definition = ResolvedMetric(
             id=metric_id,
             kind=kind,
-            space="physical" if rescaled else cast("MetricSpace", space),
             fields=fields,
             field_indices=tuple(task.metric_names.index(field) for field in fields),
             reduction="material_case_mean",

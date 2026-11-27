@@ -3,6 +3,29 @@
 Responsibilities:
   - Check matched branches, immutable receipts, exact group cursors, caps, and recovery reporting
   - Check B's K x N and A1's receipt budgets, corrupted receipts, and the one GPU model of a B/A1 pair
+  - Check that another GPU model or an unusable device ends a continuation by the job's environment, with the rerun,
+    and that malformed device evidence of B's first attempt is B's state, which refuses it
+  - Check that a plan reading a finished leaf, or A1's prerequisite A0, in another numerical environment ends with the rerun
+  - Check that a failed or interrupted stage is advised by its admission's state checks alone: the rerun for a finished
+    leaf or an environment end of the check, a failed stat of the leaf included, which keeps an interrupt's exit 130,
+    and the reason alone for a stage whose state refuses, such as an A1 whose copy differs or whose summary has an
+    earlier schema, or a B whose A0 refuses, also when another GPU model or Ctrl-C ended its admission first
+  - Check that a leaf whose summary records a finished status is refused by its finished admission's reason, never
+    handed to the continuation admission, and that the recovery check refuses B's malformed, several-model or, for a
+    B with its checkpoint, absent device evidence as its resume admission does, and a finished B's as its receipt does
+  - Check that an OSError of a started attempt's own checkpoint write interrupts it, also one torch reports from inside
+    its archive, keeps the last checkpoint intact and continues from it, and that a plan reports such an A1 interrupted
+    without a traceback; a failed rename of the last after the new best's fails the attempt with that reason
+  - Check that only B publishes its receipt, at its plan step in every plan that selects it and once its saved config
+    continued it to its end, and that an A1 whose B lacks it is refused, naming B's step, without writing or a retry
+  - Check that a receipt B cannot publish leaves B finished, in its plan and on its resume: another one in its leaf, or
+    a built one that fails the receipt's rules, is refused as its state, a write the job's environment fails names B's
+    step, neither with a traceback
+  - Check that a receipt copy is compared without ever writing: other bytes, a symlink or a vanishing copy refuse it,
+    also the copy of a finished A1 that a plan accepts and of an A1 that a failed stage's recovery check offers a rerun
+  - Check that an A1 whose receipt copy write failed before its first checkpoint, leaving the copy's temporary, is offered
+    its rerun, which replaces the leaf in place and finishes it without touching B, unless another directory took its
+    identity, which refuses the stage in its recovery check and its rerun alike
   - Check that a receipt's validation schedule holds the point each count reached and B's checkpoint work at each step
   - Check that A1 cuts its last group to commit exactly B's transitions and validates at exactly the points B reached,
     also after a resume inside its stretch, and that only an A1 finishes with a replay or checkpoints a sampler stop
@@ -22,6 +45,7 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import re
@@ -31,7 +55,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
-from support import configs
+from support import configs, run_state
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -50,7 +74,7 @@ from src.learning.transient import learning_transient_curriculum as curriculum
 from src.learning.transient.learning_transient_handoff import HANDOFF_DIRECTORY
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
 
 
 class _Clock:
@@ -143,11 +167,8 @@ class _LoopAdapter(_Adapter):
         prediction = model(batch).reshape(-1, 1, 1, 1, 1)
         target = torch.zeros_like(prediction)
         return adapter_contract.AdapterEvaluationViews(
-            normalized_prediction=prediction,
-            normalized_target=target,
             physical_prediction=prediction,
             physical_target=target,
-            one_step_normalized_prediction=prediction,
             one_step_physical_prediction=prediction,
             sample_count=len(batch),
             processed_target_transitions=len(batch),
@@ -189,13 +210,12 @@ class _ScaledMSELoss(torch.nn.MSELoss):
 
 class _Metric:
     id = "mse"
-    space = "physical"
 
     def reset(self) -> None:
         self.values: list[float] = []
 
-    def update(self, pred: torch.Tensor, target: torch.Tensor, *, space: str, batch_index: int) -> None:
-        del space, batch_index
+    def update(self, pred: torch.Tensor, target: torch.Tensor, *, batch_index: int) -> None:
+        del batch_index
         self.values.extend((pred - target).square().flatten().tolist())
 
     def compute(self) -> float:
@@ -255,8 +275,8 @@ def test_parent_identity_binds_the_b_budget(tmp_path: Path) -> None:
 # The full Train set's supervised transitions N of these synthetic B summaries, and the one GPU model of their pair.
 _N = 5
 _PAIR_GPU = {"device_type": "cuda", "cuda_device_name": "NVIDIA RTX 6000 Ada Generation"}
-# A stand-in receipt of a B that trained on the CPU the synthetic plans run on, which A1's device check reads.
-_CPU_RECEIPT = {"test": "receipt", "device": {"device_type": "cpu", "cuda_device_name": None}}
+# The runtime session of a native CPU attempt outside Slurm: no image and no CUDA build bind its numerical environment.
+_NATIVE_CPU_SESSION = {"device_type": "cpu"}
 
 
 def _b_total() -> int:
@@ -321,6 +341,26 @@ def _receipt(summary: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     return budget.build_b_receipt(
         parent_identity_sha256="a" * 64, a0_handoff_sha256="b" * 64, b_config=b_config, finished_b=_finished(summary, run_dir)
     )
+
+
+def _cpu_b_receipt(run_dir: Path) -> dict[str, Any]:
+    """Return the valid receipt of a hand-made B that trained on the CPU the synthetic plans run on; ``run_dir`` gets its history."""
+    return _receipt({**_completed_b_summary(total=20, spent=21), "runtime_sessions": [{"device_type": "cpu", "cuda_device_name": None}]}, run_dir)
+
+
+def _published_receipt(run_dir: Path, _receipt: dict[str, Any]) -> None:
+    """Stand in for B's receipt publication by creating its file, which A1's prerequisite admission then compares (stubbed)."""
+    (Path(run_dir) / budget.RECEIPT_NAME).touch()
+
+
+def _present_receipt(run_dir: Path, _receipt: dict[str, Any]) -> bool:
+    """Stand in for the read-only comparison of a receipt copy with a fake receipt: any file passes, none is reported absent."""
+    return (Path(run_dir) / budget.RECEIPT_NAME).is_file()
+
+
+def _tree(root: Path) -> dict[Path, bytes | None]:
+    """Return every directory and file below ``root`` with each file's bytes, so a check can show that nothing was written."""
+    return {path: path.read_bytes() if path.is_file() else None for path in sorted(root.rglob("*"))}
 
 
 @pytest.mark.parametrize(
@@ -492,7 +532,8 @@ def test_a_b_a1_pair_trains_on_one_gpu_model_while_a0_may_use_any(tmp_path: Path
     """
     A1 runs on its receipt's GPU model and a resumed B on its first attempt's; a fresh B and every A0 bind none.
 
-    The receipt names one model only: a B whose attempts ran on several is refused before its receipt exists.
+    The receipt names one model only: a B whose attempts ran on several is refused before its receipt exists, and a B
+    continuation, which has a checkpoint, without any recorded attempt is refused as its state.
     """
     other_gpu = {"device_type": "cuda", "cuda_device_name": "NVIDIA RTX A6000"}
 
@@ -502,7 +543,9 @@ def test_a_b_a1_pair_trains_on_one_gpu_model_while_a0_may_use_any(tmp_path: Path
     plan = configs.resolve_plan(configs.transient_matched_config())
     receipt = _receipt(_completed_b_summary(total=20, spent=21), tmp_path)
     run_service._require_pair_device(plan.a1, on(_PAIR_GPU), sessions=[], matched_receipt=receipt)
-    run_service._require_pair_device(plan.b, on(other_gpu), sessions=[], matched_receipt=None)
+    run_service._require_pair_device(plan.b, on(other_gpu), sessions=None, matched_receipt=None)
+    with pytest.raises(run_service.ContinuationRefusedError, match="no runtime session"):
+        run_service._require_pair_device(plan.b, on(_PAIR_GPU), sessions=[], matched_receipt=None)
     run_service._require_pair_device(plan.b, on(_PAIR_GPU), sessions=[{**_PAIR_GPU, "cuda_index": 0}], matched_receipt=None)
     run_service._require_pair_device(plan.a0, on(other_gpu), sessions=[dict(_PAIR_GPU)], matched_receipt=None)
     for config, sessions, matched in ((plan.a1, [], receipt), (plan.b, [dict(_PAIR_GPU)], None)):
@@ -514,11 +557,15 @@ def test_a_b_a1_pair_trains_on_one_gpu_model_while_a0_may_use_any(tmp_path: Path
         budget.pair_device([dict(_PAIR_GPU), other_gpu])
 
 
-def test_an_a1_refused_on_another_gpu_model_publishes_no_b_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A0 and B finished without B's receipt; an A1 on another GPU model is refused before that receipt is published."""
+def _finished_plan_without_bs_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, bytes]:
+    """
+    Train a synthetic plan's A0 and B, then remove the receipt B's step published; return the plan, B's leaf and those bytes.
+
+    Leaf execution and the finished state of every leaf are fakes; B's receipt is the valid one of a CPU B, bound to the
+    parent, handoff and B its build is given, and published for real.
+    """
     config_path = configs.write_config(tmp_path, configs.transient_matched_config(), canonical_root=tmp_path)
     stages: dict[str, dict[str, Any]] = {}
-    published: list[Path] = []
 
     def fake_execute(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         name = config["training"]["comparison_arm"]
@@ -533,33 +580,658 @@ def test_an_a1_refused_on_another_gpu_model_publishes_no_b_receipt(tmp_path: Pat
         result = {"status": "completed", "best_epoch": 1, "best_metric": 0.5}
         return {"run_dir": run_dir, "result": result, "device_resolution": kwargs["device_resolution"]}
 
-    receipt = {"test": "receipt", "device": {"device_type": "cuda", "cuda_device_name": "NVIDIA RTX A6000"}}
+    receipt = _cpu_b_receipt(tmp_path / "b_history")
+
+    def bound_receipt(**kwargs: Any) -> dict[str, Any]:
+        bound = {"parent_identity_sha256": kwargs["parent_identity_sha256"], "a0_handoff_sha256": kwargs["a0_handoff_sha256"]}
+        return _redigested(receipt, **bound, b_run_name=kwargs["b_config"]["run"]["name"])
+
+    # A finished leaf as the plan reads it; its config is read only for B's receipt.
+    finished = {"training_outcome": {"status": "completed"}, "best_epoch": 1, "best_metric": 0.5}
     monkeypatch.setattr(run_service, "_run_resolved_experiment", fake_execute)
     monkeypatch.setattr(run_service, "_validate_reusable_stage_a", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(run_service, "validate_finished_run", lambda _run_dir: {"config": stages["b"], "summary": {}})
-    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: dict(receipt))
-    monkeypatch.setattr(budget, "publish_b_receipt", lambda run_dir, _receipt: published.append(run_dir))
-    monkeypatch.setattr(budget, "load_b_receipt", lambda *_args, **_kwargs: dict(receipt))
+    monkeypatch.setattr(run_service, "validate_finished_run", lambda _run_dir: {"config": stages["b"], "summary": finished})
+    monkeypatch.setattr(budget, "build_b_receipt", bound_receipt)
     assert cli_train.main([str(config_path), "--train-stages", "a0,b"]) == 0
-    published.clear()  # B ended without its receipt, as after an interruption between B's end and its publication.
+    b_dir = run_service._stage_destination(stages["b"])
+    published = (b_dir / budget.RECEIPT_NAME).read_bytes()
+    # As for a B whose receipt write failed, or that an earlier version continued to its end without one.
+    (b_dir / budget.RECEIPT_NAME).unlink()
+    return config_path, b_dir, published
+
+
+@pytest.mark.parametrize("selection", [["--train-stages", "b"], []], ids=("b", "all"))
+def test_bs_step_publishes_the_receipt_of_a_finished_b_in_every_plan_that_selects_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selection: list[str]
+) -> None:
+    """
+    B owns its receipt, its completion record: B's step publishes it whether B trained now or finished before without it.
+
+    A rerun publishes nothing new: the receipt keeps its bytes and its file.
+    """
+    config_path, b_dir, published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    receipt = b_dir / budget.RECEIPT_NAME
+
+    assert cli_train.main([str(config_path), *selection]) == 0
+    assert receipt.read_bytes() == published
+    first = receipt.stat()
+    assert cli_train.main([str(config_path), *selection]) == 0
+    assert (receipt.stat().st_ino, receipt.stat().st_mtime_ns) == (first.st_ino, first.st_mtime_ns)
+
+
+def test_an_a1_plan_whose_b_lacks_its_receipt_is_refused_naming_bs_step_and_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A1 never writes B's leaf: an A1-only plan whose finished B lacks its receipt is refused by that state, naming B's step."""
+    config_path, b_dir, _published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    before = _tree(b_dir.parent)  # B's leaf and the place of A1's
+
+    with pytest.raises(run_service.MatchedStageExecutionError) as refused:
+        run_service.run_experiment(config_path, train_stages=("a1",))
+    assert isinstance(refused.value.__cause__, run_service.ContinuationRefusedError)
+    assert "--train-stages b" in str(refused.value.__cause__)
+    assert _tree(b_dir.parent) == before
+
+
+def test_a_plan_accepts_a_finished_a1_only_on_a_byte_identical_copy_of_bs_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A finished A1 whose copy is B's receipt reformatted, still valid with its digest, is refused by that state, unchanged."""
+    config_path, _b_dir, published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    a1_dir = run_service.run_experiment(config_path, train_stages=("b", "a1"))["stage_runs"]["a1"]
+    (a1_dir / budget.RECEIPT_NAME).write_text(json.dumps(json.loads(published), indent=2), encoding="utf-8")
+    before = _tree(a1_dir)
+
+    with pytest.raises(run_service.MatchedStageExecutionError) as refused:
+        run_service.run_experiment(config_path, train_stages=("a1",))
+    assert refused.value.recovery == "refused"
+    assert isinstance(refused.value.__cause__, run_service.ContinuationRefusedError)
+    assert "Immutable B budget receipt differs" in str(refused.value.__cause__)
+    assert _tree(a1_dir) == before
+
+
+def _assert_rerun_advised(stderr: str) -> None:
+    """Require the rerun of the same command with the run unchanged, and neither a refusal, a repair nor a traceback."""
+    assert "Rerun the same command inside a matching Slurm allocation; the run is unchanged" in stderr
+    for advice in ("not eligible", "Inspect or repair", "Traceback"):
+        assert advice not in stderr
+
+
+def test_a_finished_a1_whose_copy_the_jobs_environment_cannot_reread_is_advised_the_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An I/O error re-reading a finished A1's copy is the job's environment, also in the recovery check: the rerun."""
+    config_path, _b_dir, published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    a1_dir = run_service.run_experiment(config_path, train_stages=("b", "a1"))["stage_runs"]["a1"]
+    (a1_dir / budget.RECEIPT_NAME).write_bytes(published)
+    compare = budget.verify_b_receipt_copy
+
+    def unreadable_a1_copy(run_dir: Path, receipt: dict[str, Any]) -> bool:
+        if Path(run_dir) == a1_dir:
+            raise OSError(errno.EIO, "Input/output error")
+        return compare(run_dir, receipt)
+
+    monkeypatch.setattr(budget, "verify_b_receipt_copy", unreadable_a1_copy)
+    capsys.readouterr()
+    assert cli_train.main([str(config_path), "--train-stages", "a1"]) == 1
+    stderr = capsys.readouterr().err
+    assert "Run not started: OSError: [Errno 5] Input/output error" in stderr
+    assert f"Matched stage a1 failed. Run directory: {a1_dir}" in stderr
+    _assert_rerun_advised(stderr)
+
+
+@pytest.mark.parametrize("identity", ["own", "owned_elsewhere"])
+def test_an_a1_whose_receipt_copy_write_failed_before_its_first_checkpoint_is_advised_by_its_replacement_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], identity: str
+) -> None:
+    """
+    A fresh A1 that a full file system ended at its receipt copy, before its first checkpoint, has no work to continue.
+
+    The temporary a killed copy write leaves is A1's own. Its recovery check runs the replacement admission of the
+    plan: it offers the rerun, and the same plan command replaces the leaf; the attempt starts on a fresh summary with
+    the request's config alone, publishes its copy and finishes, and B's leaf and receipt stay untouched. When another
+    directory took A1's identity meanwhile, the check refuses the stage by that state, and so does the rerun, which
+    changes nothing. Leaf execution is a fake, its admission, replacement and recovery check are real.
+    """
+    run_resolved = run_service._run_resolved_experiment
+    config_path, b_dir, published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    (b_dir / budget.RECEIPT_NAME).write_bytes(published)
+    a1_dir = b_dir.parent / "a1"
+    finished_b = run_service.validate_finished_run
+
+    def finished_leaf(run_dir: Path) -> dict[str, Any]:
+        if Path(run_dir) == a1_dir:
+            msg = "A1 has not finished"
+            raise run_service.RunLifecycleError(msg)
+        return finished_b(run_dir)
+
+    starts: list[tuple[dict[str, Any], set[str]]] = []
+
+    def attempt(
+        config: dict[str, Any], *, run_dir: Path, matched_receipt: dict[str, Any], resume_from: Path | None = None, **_kwargs: Any
+    ) -> dict[str, Any]:
+        assert resume_from is None  # a fresh start, also in a replaced leaf
+        starts.append((run_service.read_run_summary(run_dir), {entry.name for entry in run_dir.iterdir()}))
+        run_service.transition_run_status(run_dir, "running")
+        if len(starts) == 1:
+            for name in ("split_indices.pt", "normalizer.pt", "teacher_handoff_manifest.json", f"{budget.RECEIPT_TEMPORARY_PREFIX}k1ll3d00"):
+                (run_dir / name).touch()
+            if identity == "owned_elsewhere":
+                # Another directory takes A1's identity, as a start of the identical experiment elsewhere would.
+                owner = Path(config["paths"]["output_root"]) / "owner"
+                owner.mkdir()
+                common.paths.resolve_identity_registry_entry(owner.parent, run_service.config_loader.allocation_digest(config)).unlink()
+                run_service.run_registry.ensure_bound(config, owner)
+            # As the attempt's own persistence marks a failed write of A1's receipt copy: interrupted by the job's environment.
+            error = OSError(errno.ENOSPC, "No space left on device", str(run_dir / budget.RECEIPT_NAME))
+            error.interrupted_by_environment = True  # type: ignore[attr-defined]
+            run_service.transition_run_status(run_dir, "interrupted")
+            raise error
+        budget.publish_b_receipt(run_dir, matched_receipt)
+        run_service.transition_run_status(run_dir, "completed")
+        return {"status": "completed", "best_epoch": 1, "best_metric": 0.5}
+
+    monkeypatch.setattr(run_service, "_run_resolved_experiment", run_resolved)
+    monkeypatch.setattr(run_service, "validate_finished_run", finished_leaf)
+    monkeypatch.setattr(run_service, "_execute_prepared_run_locked", attempt)
+    b_before = _tree(b_dir)
+    capsys.readouterr()
 
     assert cli_train.main([str(config_path), "--train-stages", "a1"]) == 1
-    assert (published, list(stages)) == ([], ["a0", "b"])
+    stderr = capsys.readouterr().err
+    assert f"Matched stage a1 interrupted. Run directory: {a1_dir}" in stderr
+    if identity == "owned_elsewhere":
+        _assert_refusal_advised(stderr, "The identical experiment already exists")
+        a1_before = _tree(a1_dir)
+        assert cli_train.main([str(config_path), "--train-stages", "a1"]) == 1
+        _assert_refusal_advised(capsys.readouterr().err, "The identical experiment already exists")
+        assert (_tree(a1_dir), len(starts)) == (a1_before, 1)
+        return
+    assert "The stage can continue: The leaf ended before its first checkpoint, so its rerun replaces it" in stderr
+    assert "it continues this stage" in stderr
+    assert "not eligible" not in stderr
+
+    assert cli_train.main([str(config_path), "--train-stages", "a1"]) == 0
+    assert "run replaced: previous_status interrupted  run_dir " in capsys.readouterr().out
+    summary, names = starts[1]
+    assert [entry["status"] for entry in summary["status_history"]] == ["initializing"]
+    assert names == {"config.yaml", "summary.json"}
+    assert (a1_dir / budget.RECEIPT_NAME).read_bytes() == published
+    assert run_service.read_run_summary(a1_dir)["status"] == "completed"
+    assert _tree(b_dir) == b_before
+
+
+def _assert_refusal_advised(stderr: str, reason: str) -> None:
+    """Require the leaf's refusal with ``reason`` as its only advice: no rerun, retry or traceback."""
+    assert "not eligible for checkpoint resume" in stderr
+    assert reason in stderr
+    for advice in ("Rerun", "Retry", "Traceback"):
+        assert advice not in stderr
+
+
+@pytest.mark.parametrize("a0", ["sound", "damaged"])
+def test_an_interrupt_in_the_admission_of_a_finished_b_is_advised_by_the_state_of_b_and_its_a0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], a0: str
+) -> None:
+    """
+    Ctrl-C while a plan admits its finished B: the recovery check runs B's state checks, its prerequisite A0's included.
+
+    With a sound A0, B is finished, with nothing to resume and nothing broken: the rerun, never a repair. A damaged A0
+    handoff refuses B on every rerun: its reason only.
+    """
+    config_path, b_dir, _published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(b_dir), {"status": "completed", "completed_epoch": 1})
+    # The plan's prerequisite check of A0 passes, B's own admission is interrupted while it reads A0, and the recovery
+    # check reads A0 again.
+    damage = "Stage-A handoff manifest digest mismatch"
+    ends: list[BaseException | None] = [
+        None,
+        KeyboardInterrupt("synthetic interrupt in B's admission"),
+        ValueError(damage) if a0 == "damaged" else None,
+    ]
+
+    def interrupted_admission(*_args: Any, **_kwargs: Any) -> None:
+        end = ends.pop(0)
+        if end is not None:
+            raise end
+
+    monkeypatch.setattr(run_service, "_validate_reusable_stage_a", interrupted_admission)
+    capsys.readouterr()
+    assert cli_train.main([str(config_path), "--train-stages", "b"]) == 130
+    stderr = capsys.readouterr().err
+    assert f"Matched stage b interrupted. Run directory: {b_dir}" in stderr
+    if a0 == "sound":
+        _assert_rerun_advised(stderr)
+    else:
+        _assert_refusal_advised(stderr, damage)
+
+
+def test_a_failed_stat_of_an_interrupted_stages_leaf_keeps_the_interrupt_and_advises_the_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    An I/O error on the leaf's stat after Ctrl-C is the job's environment, in the recovery check and in the command's advice.
+
+    The interrupt keeps its exit 130 and its stage line, and gets the rerun of the same command.
+    """
+    config_path, b_dir, _published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    ends: list[BaseException | None] = [None, KeyboardInterrupt("synthetic interrupt in B's admission")]
+    unmounted: list[Path] = []
+    stat = Path.stat
+
+    def interrupted_admission(*_args: Any, **_kwargs: Any) -> None:
+        # The plan's prerequisite check of A0 passes; B's own admission is interrupted, and from then on B's mount fails.
+        end = ends.pop(0)
+        if end is not None:
+            unmounted.append(b_dir)
+            raise end
+
+    def failing_stat(path: Path, *, follow_symlinks: bool = True) -> Any:
+        if path in unmounted:
+            raise OSError(errno.EIO, "Input/output error", str(path))
+        return stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(run_service, "_validate_reusable_stage_a", interrupted_admission)
+    monkeypatch.setattr(Path, "stat", failing_stat)
+    capsys.readouterr()
+    assert cli_train.main([str(config_path), "--train-stages", "b"]) == 130
+    stderr = capsys.readouterr().err
+    assert f"Matched stage b interrupted. Run directory: {b_dir}" in stderr
+    assert "OSError: [Errno 5] Input/output error" in stderr
+    _assert_rerun_advised(stderr)
+
+
+def _interrupted_leaf(run_dir: Path, **summary: Any) -> None:
+    """Give a fake leaf an interrupted summary, updated by ``summary``, and the other files a continuation requires, as placeholders."""
+    for path in (common.paths.resolve_split_indices_path(run_dir), common.paths.resolve_normalizer_path(run_dir), run_dir / "last_checkpoint.pt"):
+        path.touch()
+    interrupted = {"status": "interrupted", "runtime_sessions": [], **summary}
+    common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(run_dir), interrupted)
+
+
+@pytest.mark.parametrize("state", ["differing_copy", "earlier_schema"])
+def test_an_a1_whose_state_refuses_is_refused_when_another_gpu_model_ended_its_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], state: str
+) -> None:
+    """
+    Another GPU model ends A1's admission before A1's own; the recovery check runs A1's state checks all the same.
+
+    A copy that differs from B's receipt, which the check rebuilds itself, or a summary of an earlier attempt schema is
+    A1's state, which refuses every rerun: its reason, never a rerun or a retry.
+    """
+    config_path, _b_dir, published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    a1_dir = run_service.run_experiment(config_path, train_stages=("b", "a1"))["stage_runs"]["a1"]
+    if state == "differing_copy":
+        _interrupted_leaf(a1_dir, duration_contract=run_service.RUN_DURATION_CONTRACT)
+        (a1_dir / budget.RECEIPT_NAME).write_text(json.dumps(json.loads(published), indent=2), encoding="utf-8")
+        reason = "Immutable B budget receipt differs"
+    else:
+        _interrupted_leaf(a1_dir)
+        reason = "earlier summary schema"
+    # A1's saved data, checkpoints and history would pass: only the state above refuses it.
+    monkeypatch.setattr(run_service, "_read_saved_data_artifacts", lambda *_args: (SimpleNamespace(as_payload=dict), {}))
+    monkeypatch.setattr(run_service, "_validate_saved_data_contract", lambda *_args: None)
+    monkeypatch.setattr(run_service, "_admit_resume_checkpoints", lambda *_args, **_kwargs: None)
+    finished = run_service.validate_finished_run
+
+    def unfinished_a1(run_dir: Path) -> dict[str, Any]:
+        if Path(run_dir) == a1_dir:
+            msg = "A1 was interrupted."
+            raise run_service.RunLifecycleError(msg)
+        return finished(run_dir)
+
+    def other_gpu_model(*_args: Any, **_kwargs: Any) -> None:
+        msg = "A B/A1 pair trains on one GPU model, the receipt's; this a1 attempt resolved another. Run it on that GPU type."
+        raise run_service.RunLifecycleError(msg)
+
+    monkeypatch.setattr(run_service, "validate_finished_run", unfinished_a1)
+    monkeypatch.setattr(run_service, "_require_pair_device", other_gpu_model)
+    before = _tree(a1_dir)
+    capsys.readouterr()
+    assert cli_train.main([str(config_path), "--train-stages", "b,a1"]) == 1
+    _assert_refusal_advised(capsys.readouterr().err, reason)
+    assert _tree(a1_dir) == before
+
+
+@pytest.mark.parametrize("status", ["completed", "unsuccessful"])
+def test_a_finished_leaf_whose_admission_refuses_is_refused_by_its_damage_never_as_a_continuation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], status: str
+) -> None:
+    """
+    A leaf whose summary records a finished status is admitted as finished alone: the plan refuses its damage by name.
+
+    It never falls through to the continuation admission, which would refuse a finished status instead of naming the
+    damage; the recovery check of a later end classifies it alike. Nothing is written, nor a rerun or traceback printed.
+    """
+    config_path, b_dir, _published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(b_dir), {"status": status, "completed_epoch": 1})
+    damage = "Unsuccessful run last checkpoint digest mismatch"
+    finished = run_service.validate_finished_run
+
+    def damaged_b(run_dir: Path) -> dict[str, Any]:
+        if Path(run_dir) == b_dir:
+            raise run_service.RunLifecycleError(damage)
+        return finished(run_dir)
+
+    monkeypatch.setattr(run_service, "validate_finished_run", damaged_b)
+    monkeypatch.setattr(run_service, "_run_resolved_experiment", lambda *_args, **_kwargs: pytest.fail("a finished leaf is never continued"))
+    before = _tree(b_dir)
+    capsys.readouterr()
+    assert cli_train.main([str(config_path), "--train-stages", "b"]) == 1
+    _assert_refusal_advised(capsys.readouterr().err, damage)
+    b_config = configs.resolve_plan(configs.transient_matched_config()).b
+    recovery, reason = run_service._matched_failed_stage_recovery(b_dir, b_config, prerequisites=lambda _finished: None)
+    assert (recovery, damage in reason) == ("refused", True)
+    assert _tree(b_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("devices", "reason"),
+    [
+        ([{"device_type": "cuda", "cuda_device_name": None}], "Device evidence must be CPU or CUDA"),
+        ([_PAIR_GPU, {"device_type": "cuda", "cuda_device_name": "NVIDIA RTX A6000"}], "B trained on several devices"),
+        ([], "B records no runtime session"),
+    ],
+    ids=("malformed", "several-models", "empty"),
+)
+def test_the_recovery_check_refuses_bs_device_evidence_that_its_resume_admission_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], devices: list[dict[str, Any]], reason: str
+) -> None:
+    """
+    The persisted device evidence of B's attempts is B's state, checked in every admission, the read-only recovery check's too.
+
+    An I/O error ends an interrupted B's admission; the recovery check, which compares no running device, still refuses
+    malformed evidence, attempts on several GPU models or, for a B with its checkpoint, no recorded attempt at all, as the
+    resume admission of every rerun does: its reason only.
+    """
+    config_path, b_dir, _published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    sessions = [{**device, "attempt": dict.fromkeys(run_service._ATTEMPT_KEYS)} for device in devices]
+    _interrupted_leaf(b_dir, duration_contract=run_service.RUN_DURATION_CONTRACT, runtime_sessions=sessions)
+    # B's saved data, checkpoints and history would pass: only its device evidence refuses it.
+    monkeypatch.setattr(run_service, "_read_saved_data_artifacts", lambda *_args: (SimpleNamespace(as_payload=dict), {}))
+    monkeypatch.setattr(run_service, "_validate_saved_data_contract", lambda *_args: None)
+    monkeypatch.setattr(run_service, "_admit_resume_checkpoints", lambda *_args, **_kwargs: None)
+    finished = run_service.validate_finished_run
+
+    def unfinished_b(run_dir: Path) -> dict[str, Any]:
+        if Path(run_dir) == b_dir:
+            msg = "B was interrupted."
+            raise run_service.RunLifecycleError(msg)
+        return finished(run_dir)
+
+    # The plan's prerequisite check of A0 passes, B's own admission ends by an I/O error, and the recovery check reads A0 again.
+    ends: list[BaseException | None] = [None, OSError(errno.EIO, "Input/output error"), None]
+
+    def admission(*_args: Any, **_kwargs: Any) -> None:
+        end = ends.pop(0)
+        if end is not None:
+            raise end
+
+    monkeypatch.setattr(run_service, "validate_finished_run", unfinished_b)
+    monkeypatch.setattr(run_service, "_validate_reusable_stage_a", admission)
+    before = _tree(b_dir)
+    capsys.readouterr()
+    assert cli_train.main([str(config_path), "--train-stages", "b"]) == 1
+    _assert_refusal_advised(capsys.readouterr().err, reason)
+    assert _tree(b_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("evidence", "reason"),
+    [
+        ("malformed_device", "Device evidence must be CPU or CUDA"),
+        ("invalid_receipt", "train_seconds must be finite and non-negative"),
+        ("differing_copy", "Immutable B budget receipt differs"),
+    ],
+)
+def test_the_recovery_check_of_a_finished_b_runs_the_receipt_admission_of_its_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], evidence: str, reason: str
+) -> None:
+    """
+    A finished B is admitted with the receipt it publishes, rebuilt read-only and validated, in its plan and in its recovery check alike.
+
+    B's malformed device evidence refuses that receipt (``pair_device``), and so do a built receipt that fails the
+    receipt's own rules and another receipt already in B's leaf. An I/O error ends B's admission at its A0 check; the
+    recovery check, which reads A0 again, refuses B by that evidence instead of calling it finished, and so does the
+    rerun, before B's step publishes anything: its reason only, and nothing written.
+    """
+    config_path, b_dir, published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    finished, build = run_service.validate_finished_run, budget.build_b_receipt
+
+    def malformed_b(run_dir: Path) -> dict[str, Any]:
+        admitted = finished(run_dir)
+        if Path(run_dir) != b_dir:
+            return admitted
+        return {**admitted, "summary": {**admitted["summary"], "runtime_sessions": [{"device_type": "cuda", "cuda_device_name": None}]}}
+
+    def device_bound(**kwargs: Any) -> dict[str, Any]:
+        # The fake receipt binds no device; the real one reads the one GPU model of B's attempts.
+        budget.pair_device(kwargs["finished_b"]["summary"].get("runtime_sessions"))
+        return build(**kwargs)
+
+    # The plan's prerequisite check of A0 passes, B's own admission ends by an I/O error and the recovery check reads A0
+    # again; the rerun's two checks of A0 pass.
+    ends: list[BaseException | None] = [None, OSError(errno.EIO, "Input/output error"), None, None, None]
+
+    def admission(*_args: Any, **_kwargs: Any) -> None:
+        end = ends.pop(0)
+        if end is not None:
+            raise end
+
+    if evidence == "malformed_device":
+        monkeypatch.setattr(run_service, "validate_finished_run", malformed_b)
+        monkeypatch.setattr(budget, "build_b_receipt", device_bound)
+    elif evidence == "invalid_receipt":
+        monkeypatch.setattr(budget, "build_b_receipt", lambda **kwargs: _redigested(build(**kwargs), train_seconds=-1.0))
+    else:
+        (b_dir / budget.RECEIPT_NAME).write_text(json.dumps(json.loads(published), indent=2), encoding="utf-8")
+    monkeypatch.setattr(run_service, "_validate_reusable_stage_a", admission)
+    before = _tree(b_dir)
+    for _command in ("first", "rerun"):
+        capsys.readouterr()
+        assert cli_train.main([str(config_path), "--train-stages", "b"]) == 1
+        _assert_refusal_advised(capsys.readouterr().err, reason)
+    assert ends == []
+    assert _tree(b_dir) == before
+
+
+def _unwritable_receipt(run_dir: Path, _receipt: dict[str, Any]) -> Path:
+    """Stand in for a receipt publication whose write the job's environment fails, so nothing is written."""
+    raise OSError(errno.ENOSPC, "No space left on device", str(Path(run_dir) / budget.RECEIPT_NAME))
+
+
+# What ends B's receipt: B's state (another receipt in its leaf, a finished state its receipt refuses, a receipt built from
+# it that fails the receipt's rules), or the job's environment, which fails the receipt's write or, while B's step builds
+# it, the read or decode of B's finished state.
+_RECEIPT_FAILURES = {
+    "differing": "Immutable B budget receipt differs",
+    "refused": "Finished training history disagrees",
+    "invalid": "train_seconds must be finite and non-negative",
+    "unwritable": "No space left on device",
+    "unreadable": "Input/output error",
+    "undecodable": "MemoryError",
+}
+_STATE_RECEIPT_FAILURES = frozenset({"differing", "refused", "invalid"})
+
+
+def _failing_finished_b(failure: str) -> Callable[..., Any]:
+    """Stand in for the read of B's finished state while B's step builds its receipt, ended by ``failure``."""
+
+    def read(*_args: Any, **_kwargs: Any) -> Any:
+        if failure == "unreadable":
+            raise OSError(errno.EIO, "Input/output error")
+        if failure == "undecodable":
+            message = "DefaultCPUAllocator: can't allocate memory"
+            raise MemoryError(message)
+        message = "Finished training history disagrees with the number of epochs and validations its checkpoint counts."
+        raise ValueError(message)
+
+    return read
+
+
+def _assert_unpublished_receipt_reported(stderr: str, failure: str) -> None:
+    """Require B's receipt failure reported without a traceback, a rerun, a retry or a resume: B's state, or B's step to publish it."""
+    assert _RECEIPT_FAILURES[failure] in stderr
+    assert ("--train-stages b" in stderr) is (failure not in _STATE_RECEIPT_FAILURES)
+    for advice in ("Traceback", "Rerun", "Retry", "--resume"):
+        assert advice not in stderr
+
+
+@pytest.mark.parametrize("failure", ["differing", "invalid", "unwritable", "undecodable"])
+def test_bs_step_reports_a_receipt_it_cannot_publish_by_its_cause_and_b_stays_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], failure: str
+) -> None:
+    """
+    Another receipt in B's leaf, or one B's step builds that fails its rules, is B's state; the job's environment names B's step.
+
+    B's state refuses B without a resume. The job's environment is a failed write of the receipt, or host memory exhausted
+    while B's step decodes B's finished state to build it after B's admission passed. Neither writes into B's leaf, which
+    stays finished, and the command prints no traceback.
+    """
+    config_path, b_dir, published = _finished_plan_without_bs_receipt(tmp_path, monkeypatch)
+    if failure == "differing":
+        (b_dir / budget.RECEIPT_NAME).write_text(json.dumps(json.loads(published), indent=2), encoding="utf-8")
+    elif failure == "unwritable":
+        monkeypatch.setattr(budget, "publish_b_receipt", _unwritable_receipt)
+    else:
+        build, build_receipt = run_service._finished_b_receipt, budget.build_b_receipt
+
+        def ended_at_bs_step(leaf: Path, *, finished_b: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+            # B's admission builds the receipt from the leaf it admitted; only B's step reads B's finished state again.
+            if finished_b is not None:
+                return build(leaf, finished_b=finished_b, **kwargs)
+            if failure == "invalid":
+                # B's step runs the one build, its validation included, on a receipt that fails the receipt's rules.
+                with monkeypatch.context() as step:
+                    step.setattr(budget, "build_b_receipt", lambda **receipt: _redigested(build_receipt(**receipt), train_seconds=-1.0))
+                    return build(leaf, **kwargs)
+            return _failing_finished_b(failure)()
+
+        monkeypatch.setattr(run_service, "_finished_b_receipt", ended_at_bs_step)
+    before = _tree(b_dir)
+
+    capsys.readouterr()
+    assert cli_train.main([str(config_path), "--train-stages", "b"]) == 1
+    _assert_unpublished_receipt_reported(capsys.readouterr().err, failure)
+    expected = run_service.MatchedStageExecutionError if failure in _STATE_RECEIPT_FAILURES else run_service.UnpublishedReceiptError
+    with pytest.raises(expected) as ended:
+        run_service.run_experiment(config_path, train_stages=("b",))
+    if isinstance(ended.value, run_service.MatchedStageExecutionError):
+        assert ended.value.recovery == "refused"
+        assert isinstance(ended.value.__cause__, run_service.ContinuationRefusedError)
+    assert _tree(b_dir) == before
 
 
 def test_a_resumed_b_on_another_gpu_model_is_refused_before_its_writer_lock_exists() -> None:
-    """A resumed B is checked against its first attempt's GPU model by a read before the writer lease creates its lock file."""
+    """
+    A resumed B is checked against its first attempt's GPU model by a read before the writer lease creates its lock file.
+
+    Another GPU model is the job's environment, which a rerun in a matching allocation passes; malformed evidence of that
+    first attempt is B's persisted state, which refuses the continuation again on every rerun.
+    """
     plan = configs.resolve_plan(configs.transient_matched_config())
     run_dir = run_service.prepare_fresh_run(plan.b)
     lock = run_service._run_writer_lock_path(run_dir)
     lock.unlink()
+    # Placeholder resume files: the admission requires them to exist and refuses the device before it reads them.
+    for path in (common.paths.resolve_split_indices_path(run_dir), common.paths.resolve_normalizer_path(run_dir), run_dir / "last_checkpoint.pt"):
+        path.touch()
     attempt = dict.fromkeys(run_service._ATTEMPT_KEYS)
     summary = {**run_service.read_run_summary(run_dir), "status": "interrupted", "runtime_sessions": [{**_PAIR_GPU, "attempt": attempt}]}
     common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(run_dir), summary)
 
-    with pytest.raises(run_service.RunLifecycleError, match="one GPU model"):
+    with pytest.raises(run_service.RunLifecycleError, match="one GPU model") as other_model:
+        run_service._run_resolved_experiment(dict(plan.b), config_path="b.yaml", resume=run_dir)
+    assert not isinstance(other_model.value, run_service.ContinuationRefusedError)
+    assert run_service.unstarted_by_environment(other_model.value)
+    summary["runtime_sessions"][0]["cuda_device_name"] = None
+    common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(run_dir), summary)
+    with pytest.raises(run_service.ContinuationRefusedError, match="Device evidence must be CPU or CUDA"):
         run_service._run_resolved_experiment(dict(plan.b), config_path="b.yaml", resume=run_dir)
     assert not lock.exists()
+
+
+@pytest.mark.parametrize("copy", ["differing", "symlink"])
+def test_a_resumed_a1_whose_receipt_copy_is_not_bs_is_refused_before_its_writer_lock_exists(tmp_path: Path, copy: str) -> None:
+    """
+    A resumed A1 compares its own receipt copy with B's receipt read-only, before the writer lease creates its lock file.
+
+    A copy holds exactly the published bytes in a regular file: other bytes, or a symlink even to the right bytes, are
+    A1's state, so the continuation is refused and A1 stays unchanged and interrupted, never ended as failed by its attempt.
+    """
+    plan = configs.resolve_plan(configs.transient_matched_config())
+    run_dir = run_service.prepare_fresh_run(plan.a1)
+    lock = run_service._run_writer_lock_path(run_dir)
+    lock.unlink()
+    # Placeholder resume files: the admission requires them to exist and refuses the copy before it reads them.
+    for path in (common.paths.resolve_split_indices_path(run_dir), common.paths.resolve_normalizer_path(run_dir), run_dir / "last_checkpoint.pt"):
+        path.touch()
+    attempt = dict.fromkeys(run_service._ATTEMPT_KEYS)
+    session = {"device_type": "cpu", "cuda_device_name": None, "attempt": attempt}
+    summary = {**run_service.read_run_summary(run_dir), "status": "interrupted", "runtime_sessions": [session]}
+    common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(run_dir), summary)
+    receipt = _cpu_b_receipt(tmp_path / "b_history")
+    if copy == "differing":
+        budget.publish_b_receipt(run_dir, _redigested(receipt, train_seconds=0.75))
+    else:
+        (run_dir / budget.RECEIPT_NAME).symlink_to(budget.publish_b_receipt(tmp_path / "b_history", receipt))
+    before = _tree(run_dir)
+
+    with pytest.raises(run_service.ContinuationRefusedError, match="Immutable B budget receipt differs"):
+        run_service._run_resolved_experiment(dict(plan.a1), config_path="a1.yaml", resume=run_dir, matched_receipt=receipt)
+    assert not lock.exists()
+    assert _tree(run_dir) == before
+
+
+def test_a_plan_that_continues_a_leaf_on_an_unusable_device_ends_with_the_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A plan that continues an existing leaf on a device the job cannot use ends by its environment: the rerun, no traceback."""
+    raw = configs.transient_matched_config()
+    config_path = configs.write_config(tmp_path, raw, canonical_root=tmp_path)
+    b_dir = run_service._stage_destination(configs.resolve_plan(raw).b)
+    b_dir.mkdir(parents=True)
+
+    def unusable(*_args: Any, **_kwargs: Any) -> None:
+        msg = "CUDA is not usable"
+        raise run_service.learning.device.DeviceResolutionError(msg)
+
+    monkeypatch.setattr(run_service.learning.device, "resolve_device", unusable)
+    assert cli_train.main([str(config_path), "--train-stages", "b"]) == 1
+    assert capsys.readouterr().err.splitlines() == [
+        "Run not started: DeviceResolutionError: CUDA is not usable",
+        "  next: rerun the same command in a matching allocation, the run is unchanged",
+    ]
+    assert list(b_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("stage", ["a0", "a1"])
+def test_a_plan_that_reads_a_finished_leaf_in_another_numerical_environment_ends_with_the_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], stage: str
+) -> None:
+    """
+    A plan that reads a finished leaf in another numerical environment than its checkpoints' ends like a completed run's rerun.
+
+    Reading a checkpoint requires its producing environment: the admission of a selected finished A0, or of A1's prerequisite
+    A0, which a finished A1 meets first, ends by the job's environment. The plan prints the reason and the rerun in a
+    matching allocation, without a traceback or a stage's resume advice, and leaves the leaf unchanged.
+    """
+    raw = configs.transient_matched_config()
+    config_path = configs.write_config(tmp_path, raw, canonical_root=tmp_path)
+    plan = configs.resolve_plan(raw)
+    a0_dir = run_service._stage_destination(plan.a0)
+    a0_dir.mkdir(parents=True)
+    run_service.config_loader.save_yaml(dict(plan.a0), common.paths.resolve_run_config_path(a0_dir))
+    reason = "Reading requires the producing numerical environment, which differs in numpy; a native and a container run read alike."
+
+    def drifted(*_args: Any, **_kwargs: Any) -> None:
+        raise checkpoint_service.ResumeEnvironmentError(reason)
+
+    monkeypatch.setattr(run_service, "validate_finished_run" if stage == "a0" else "_validate_reusable_stage_a", drifted)
+    before = {path: path.read_bytes() for path in sorted(a0_dir.rglob("*")) if path.is_file()}
+
+    assert cli_train.main([str(config_path), "--train-stages", stage]) == 1
+    assert capsys.readouterr().err.splitlines() == [
+        f"Run not started: ResumeEnvironmentError: {reason}",
+        "  next: rerun the same command in a matching allocation, the run is unchanged",
+    ]
+    assert {path: path.read_bytes() for path in sorted(a0_dir.rglob("*")) if path.is_file()} == before
 
 
 def test_one_outcome_rule_admits_an_unspent_budget_only_for_a_divergence() -> None:
@@ -605,11 +1277,14 @@ def _no_group_evidence(stage: str) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("total", ["configured", "zero", "other-n"])
-def test_a_finished_b_is_admitted_only_with_its_configured_budget_total(total: str) -> None:
+def test_a_finished_b_is_admitted_only_with_its_configured_budget_total(monkeypatch: pytest.MonkeyPatch, total: str) -> None:
     """B diverged in its first group: its terminal total is K x N of its own Train set; zero or another N is refused."""
     totals = {"configured": _b_total(), "zero": 0, "other-n": _b_total() + 1}
     summary = _completed_b_summary(total=totals[total], spent=0, outcome="diverged", eligible=False)
-    run_dir = _finished_b_leaf({**summary, **_no_group_evidence("b")})
+    # The producer's identity, which the summary of a stage without a group records too, beside its native CPU attempt.
+    identity = run_state.producer_identity("transient_drying")
+    run_dir = _finished_b_leaf({**summary, **_no_group_evidence("b"), "checkpoint_identity": identity, "runtime_sessions": [_NATIVE_CPU_SESSION]})
+    monkeypatch.setattr(run_service, "_saved_run_identity", lambda *_args, **_kwargs: ({}, None, identity))
 
     if total == "configured":
         assert run_service.validate_finished_run(run_dir)["terminal_budget"].total == _b_total()
@@ -643,10 +1318,16 @@ def test_an_unsuccessful_run_binds_its_last_checkpoint_and_its_budget_to_its_sum
         {**run_service.read_run_summary(run_dir), "last_checkpoint_sha256": common.serialization.file_sha256(last)},
     )
     history = [{"point": 1, "epoch": 1, "objective_id": "objective", "value": None, "bound_violations": {}}]
-    saved_identity = {"effective_config_digest": "e" * 64}
+    saved_identity = {"effective_config_digest": "e" * 64, "numerical_environment": {"sif_sha256": None}}
+    # The summary records the producer's identity, the last checkpoint's.
+    common.serialization.atomic_write_json(
+        common.paths.resolve_run_summary_path(run_dir), {**run_service.read_run_summary(run_dir), "checkpoint_identity": saved_identity}
+    )
     admitted = {
         "identity": saved_identity,
         "completed_epoch": 1,
+        # The validation record at step 1 and the partial epoch's record at step 2, the terminal global step.
+        "global_step": 2,
         "train_sampler_state_dict": {"cursor": 1, "size": 3},
         "budget_state_dict": dict(summary["terminal_budget"]),
         "divergence": "loss is non-finite",
@@ -668,7 +1349,7 @@ def test_an_unsuccessful_run_binds_its_last_checkpoint_and_its_budget_to_its_sum
     finished = run_service.validate_finished_run(run_dir)
     # B's receipt reads the admitted last checkpoint's committed work, also for a B that ended unsuccessful.
     assert (finished["terminal_budget"].supervised_transitions, finished["last_checkpoint"]) == (6, admitted)
-    assert (loads[0]["path"], loads[0]["expected_role"], loads[0]["expected_identity"]) == (last, "last", {"effective_config_digest": "e" * 64})
+    assert (loads[0]["path"], loads[0]["expected_role"], loads[0]["expected_identity"]) == (last, "last", saved_identity)
     for changed, match in (
         ({"budget_state_dict": {**admitted["budget_state_dict"], "supervised_transitions": 5}}, "disagrees with its last checkpoint"),
         ({"divergence": None}, "divergence"),
@@ -710,8 +1391,12 @@ def test_an_unsuccessful_run_without_a_checkpoint_holds_no_history_record(monkey
     Its history is absent, or empty after a restart reset a record of an attempt that crashed before its
     first checkpoint; a record is refused.
     """
-    run_dir = _finished_b_leaf({**_completed_b_summary(total=_b_total(), spent=0, outcome="diverged", eligible=False), **_no_group_evidence("b")})
-    identity = {"effective_config_digest": "e" * 64}
+    identity = run_state.producer_identity("transient_drying")
+    # The terminal summary of a stage without a group: epoch and step 0, and the producer's identity that binds its history.
+    terminal = {"completed_epoch": 0, "global_step": 0, "checkpoint_identity": identity, "runtime_sessions": [_NATIVE_CPU_SESSION]}
+    run_dir = _finished_b_leaf(
+        {**_completed_b_summary(total=_b_total(), spent=0, outcome="diverged", eligible=False), **_no_group_evidence("b"), **terminal}
+    )
     monkeypatch.setattr(run_service, "_saved_run_identity", lambda *_args, **_kwargs: ({}, None, identity))
     if records is not None:
         _write_history(run_dir, identity, epochs=records)
@@ -738,6 +1423,46 @@ def test_budget_receipt_is_immutable_and_binds_exact_a0_origin(tmp_path: Path) -
         budget.load_b_receipt(path, parent_identity_sha256="e" * 64, a0_handoff_sha256=digest_b, b_run_name=b_config["run"]["name"])
     with pytest.raises(FileExistsError, match="differs"):
         budget.publish_b_receipt(tmp_path, _redigested(receipt, train_seconds=0.75))
+
+
+@pytest.mark.parametrize(
+    ("copy", "outcome"),
+    [("absent", False), ("identical", True), ("differing", FileExistsError), ("symlink", FileExistsError), ("vanishing", FileNotFoundError)],
+)
+def test_a_receipt_copy_is_compared_without_ever_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, copy: str, outcome: bool | type[Exception]
+) -> None:
+    """
+    A copy must hold exactly the bytes its publication writes, in a regular file; the comparison only reads.
+
+    An absent copy is reported as absent. Other bytes or a symlink, even to identical bytes, raise ``FileExistsError``, and
+    a copy that vanishes between the check and its read raises ``FileNotFoundError``. No outcome writes the copy.
+    """
+    receipt = _cpu_b_receipt(tmp_path / "b")
+    source = budget.publish_b_receipt(tmp_path / "b", receipt)
+    leaf = tmp_path / "leaf"
+    leaf.mkdir()
+    if copy == "differing":
+        budget.publish_b_receipt(leaf, _redigested(receipt, train_seconds=0.75))
+    elif copy == "symlink":
+        (leaf / budget.RECEIPT_NAME).symlink_to(source)
+    elif copy != "absent":
+        (leaf / budget.RECEIPT_NAME).write_bytes(source.read_bytes())
+    if copy == "vanishing":
+
+        class VanishingPath(Path):
+            def read_bytes(self) -> bytes:
+                self.unlink()
+                return super().read_bytes()
+
+        monkeypatch.setattr(budget, "Path", VanishingPath)
+
+    if isinstance(outcome, bool):
+        assert budget.verify_b_receipt_copy(leaf, receipt) is outcome
+    else:
+        with pytest.raises(outcome):
+            budget.verify_b_receipt_copy(leaf, receipt)
+    assert [path.name for path in leaf.iterdir()] == ([] if copy in {"absent", "vanishing"} else [budget.RECEIPT_NAME])
 
 
 def test_each_stage_starts_its_own_budget_a0_in_full_set_units_b_in_k_times_n_a1_in_the_receipt_transitions() -> None:
@@ -788,9 +1513,10 @@ def test_the_exit_code_follows_the_terminal_stage_of_a_matched_run(
     monkeypatch.setattr(run_service, "_run_resolved_experiment", fake_execute)
     monkeypatch.setattr(run_service, "_validate_reusable_stage_a", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_service, "validate_completed_run", lambda _run_dir: {"config": stages["b"], "summary": {"train_seconds": 1.0}})
-    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: dict(_CPU_RECEIPT))
-    monkeypatch.setattr(budget, "publish_b_receipt", lambda *_args: None)
-    monkeypatch.setattr(budget, "load_b_receipt", lambda *_args, **_kwargs: {"test": "receipt"})
+    receipt = _cpu_b_receipt(tmp_path / "b_history")
+    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: dict(receipt))
+    monkeypatch.setattr(budget, "publish_b_receipt", _published_receipt)
+    monkeypatch.setattr(budget, "verify_b_receipt_copy", _present_receipt)
 
     assert cli_train.main([str(config_path)]) == expected_exit
 
@@ -834,9 +1560,10 @@ def test_a_diverged_a0_with_an_eligible_checkpoint_is_the_branch_point_of_b_and_
         "validate_stage_a_handoff",
         lambda *_args, expected_source_run_name, **_kwargs: handoffs.append(expected_source_run_name),
     )
-    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: dict(_CPU_RECEIPT))
-    monkeypatch.setattr(budget, "publish_b_receipt", lambda *_args: None)
-    monkeypatch.setattr(budget, "load_b_receipt", lambda *_args, **_kwargs: {"test": "receipt"})
+    receipt = _cpu_b_receipt(tmp_path / "b_history")
+    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: dict(receipt))
+    monkeypatch.setattr(budget, "publish_b_receipt", _published_receipt)
+    monkeypatch.setattr(budget, "verify_b_receipt_copy", _present_receipt)
     plans: list[dict[str, Any]] = []
     run_plan = run_service.run_experiment
     monkeypatch.setattr(run_service, "run_experiment", lambda *args, **kwargs: plans.append(run_plan(*args, **kwargs)) or plans[-1])
@@ -879,19 +1606,35 @@ def test_an_a0_without_an_eligible_checkpoint_stops_the_plan_with_its_own_outcom
     assert (tuple(outcomes[0]["stage_outcomes"]), outcomes[0]["training_status"], outcomes[0]["unrun_stages"]) == (("a0",), a0_status, ("b", "a1"))
 
 
-@pytest.mark.parametrize("resumable", [True, False])
-@pytest.mark.parametrize("interrupted", [False, True])
+@pytest.mark.parametrize("recovery", ["resumable", "environment", "refused"])
+@pytest.mark.parametrize("end", ["failure", "interrupt", "environment"])
 def test_a1_failure_or_interrupt_reports_exact_leaf_and_only_verified_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    resumable: bool,
-    interrupted: bool,
+    recovery: str,
+    end: str,
 ) -> None:
+    """
+    A failed or interrupted A1 names its leaf and the advice of its recovery classification, never a resume of the run.
+
+    An attempt the job's environment interrupted, by an ``OSError`` of its own checkpoint write, is reported interrupted
+    like an interrupt, without a traceback, but keeps the exit status of an error.
+    """
     config_path = configs.write_config(tmp_path, configs.transient_matched_config(), canonical_root=tmp_path)
     executed: list[str] = []
     stages: dict[str, dict[str, Any]] = {}
-    failure = KeyboardInterrupt("A1 synthetic worker interrupt") if interrupted else ValueError("A1 synthetic worker failure")
+
+    def fail_a1() -> None:
+        if end == "interrupt":
+            message = "A1 synthetic worker interrupt"
+            raise KeyboardInterrupt(message)
+        if end == "failure":
+            message = "A1 synthetic worker failure"
+            raise ValueError(message)
+        # As the training loop annotates a checkpoint write of the attempt that the job's environment failed.
+        with loop._training_phase("last_checkpoint", 1):
+            raise OSError(errno.ENOSPC, "No space left on device")
 
     def fake_execute(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         name = config["training"]["comparison_arm"]
@@ -904,58 +1647,65 @@ def test_a1_failure_or_interrupt_reports_exact_leaf_and_only_verified_resume(
             manifest.parent.mkdir()
             manifest.write_text("{}", encoding="utf-8")
         if name == "a1":
-            raise failure
+            fail_a1()
         return {"run_dir": run_dir, "result": {"status": "completed", "best_epoch": 1}, "device_resolution": kwargs["device_resolution"]}
 
     monkeypatch.setattr(run_service, "_run_resolved_experiment", fake_execute)
     monkeypatch.setattr(run_service, "_validate_reusable_stage_a", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_service, "validate_completed_run", lambda _run_dir: {"config": stages["b"], "summary": {"train_seconds": 1.0}})
-    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: dict(_CPU_RECEIPT))
-    monkeypatch.setattr(budget, "publish_b_receipt", lambda *_args: None)
-    monkeypatch.setattr(budget, "load_b_receipt", lambda *_args, **_kwargs: {"test": "receipt"})
+    receipt = _cpu_b_receipt(tmp_path / "b_history")
+    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: dict(receipt))
+    monkeypatch.setattr(budget, "publish_b_receipt", _published_receipt)
+    monkeypatch.setattr(budget, "verify_b_receipt_copy", _present_receipt)
     inspected: list[Path] = []
 
-    def fake_recovery(run_dir: Path, _requested: dict[str, Any], *, config_path: Path | str) -> tuple[bool, str]:
-        assert Path(config_path) == config_path_outer
+    def fake_recovery(
+        run_dir: Path, _requested: dict[str, Any], *, prerequisites: Callable[[dict[str, Any] | None], dict[str, Any] | None]
+    ) -> tuple[str, str]:
+        # A1's prerequisites reach the check and return B's published receipt, which A1's copy is compared with.
+        assert prerequisites(None) == receipt
         inspected.append(run_dir)
-        return resumable, "validated saved checkpoint" if resumable else "no valid checkpoint"
+        return recovery, f"synthetic {recovery} leaf"
 
-    config_path_outer = config_path
     monkeypatch.setattr(run_service, "_matched_failed_stage_recovery", fake_recovery)
-    expected_exit = 130 if interrupted else 1
+    expected_exit = 130 if end == "interrupt" else 1
     assert cli_train.main([str(config_path)]) == expected_exit
     assert executed == ["a0", "b", "a1"]
     expected_leaf = run_service._stage_destination(stages["a1"])
     assert inspected == [expected_leaf]
     stderr = capsys.readouterr().err
-    status = "interrupted" if interrupted else "failed"
+    status = "failed" if end == "failure" else "interrupted"
     assert f"Matched stage a1 {status}. Run directory: {expected_leaf}" in stderr
-    if interrupted:
+    if end == "interrupt":
         assert "Training interrupted." in stderr
-    else:
+    elif end == "failure":
         assert "A1 synthetic worker failure" in stderr
+    else:
+        assert "Traceback" not in stderr
     expected_command = f"python -m src.experiments.cli.cli_train {config_path} --train-stages a1"
-    if resumable:
+    assert f"synthetic {recovery} leaf" in stderr
+    for advice in ("--resume", "Inspect or repair", "Retry"):
+        assert advice not in stderr
+    if recovery == "resumable":
         assert f"it continues this stage: {expected_command}" in stderr
-        assert "--resume" not in stderr
+    elif recovery == "environment":
+        assert f"Rerun the same command inside a matching Slurm allocation; the run is unchanged: {expected_command}" in stderr
     else:
         assert "not eligible for checkpoint resume" in stderr
-        assert "--resume" not in stderr
-        assert "Inspect or repair the persisted state" in stderr
+        assert "Rerun" not in stderr
 
 
 def test_failed_stage_recovery_checks_saved_checkpoint_and_rejects_missing_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config_path = configs.write_config(tmp_path, configs.transient_matched_config(), canonical_root=tmp_path)
     requested = run_service._with_output_root(configs.resolve_plan(configs.transient_matched_config()).a1, tmp_path / "outputs")
     run_dir = run_service._stage_destination(requested)
     run_dir.mkdir(parents=True)
     run_service.config_loader.save_yaml(requested, common.paths.resolve_run_config_path(run_dir))
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
-        {"status": "interrupted", "completed_epoch": 1},
+        {"status": "interrupted", "completed_epoch": 1, "duration_contract": run_service.RUN_DURATION_CONTRACT, "runtime_sessions": []},
     )
     for path in (
         common.paths.resolve_split_indices_path(run_dir),
@@ -966,6 +1716,7 @@ def test_failed_stage_recovery_checks_saved_checkpoint_and_rejects_missing_state
         path.touch()
     monkeypatch.setattr(run_service, "_read_saved_data_artifacts", lambda *_args: (SimpleNamespace(as_payload=dict), {}))
     monkeypatch.setattr(run_service, "_validate_saved_data_contract", lambda *_args: None)
+    monkeypatch.setattr(run_service.config_loader, "admit_pinned_datasets", lambda *_args: None)  # the synthetic plan publishes no Dataset
     monkeypatch.setattr(checkpoint_service, "build_checkpoint_identity", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(checkpoint_service, "recorded_history_epochs", lambda _payload: 1)
     validated: list[tuple[str, bool]] = []
@@ -980,18 +1731,30 @@ def test_failed_stage_recovery_checks_saved_checkpoint_and_rejects_missing_state
         binding: dict[str, Any] = {"task": "transient_drying", "run_name": str(requested["run"]["name"]), "checkpoint_identity": {}}
         epoch_history.make_epoch_state_callback(run_dir, **binding)(1, {"global_step": step, "train/loss_total": 0.5}, None)
 
+    def recover(receipt: dict[str, Any] | None = None) -> tuple[str, str]:
+        # A1's prerequisites as admitted: they return ``receipt``.
+        return run_service._matched_failed_stage_recovery(run_dir, requested, prerequisites=lambda _finished: receipt)
+
     monkeypatch.setattr(checkpoint_service, "load_checkpoint", load_valid_checkpoint)
     record_epoch_end(1.0)
-    assert run_service._matched_failed_stage_recovery(run_dir, requested, config_path=config_path)[0]
+    assert recover()[0] == "resumable"
     # The last is checked as the continuation source, the best only as evidence to read.
     assert validated == [("last", True), ("best", False)]
+    # A1's own receipt copy is compared read-only, as by its resume admission: one that differs is A1's state, never resumed.
+    receipt = _cpu_b_receipt(tmp_path / "b_history")
+    a1_copy = budget.publish_b_receipt(run_dir, _redigested(receipt, train_seconds=0.75))
+    before = _tree(run_dir)
+    recovery, reason = recover(receipt)
+    assert (recovery, _tree(run_dir)) == ("refused", before)
+    assert "Immutable B budget receipt differs" in reason
+    a1_copy.unlink()
     # A history whose counted epoch ends after the last's step would be refused by the resume, so it is not offered.
     record_epoch_end(2.0)
-    assert not run_service._matched_failed_stage_recovery(run_dir, requested, config_path=config_path)[0]
+    assert recover()[0] == "refused"
     common.paths.resolve_last_checkpoint_file(run_dir).unlink()
-    eligible, reason = run_service._matched_failed_stage_recovery(run_dir, requested, config_path=config_path)
-    assert not eligible
-    assert "Missing resume state" in reason
+    recovery, reason = recover()
+    assert recovery == "refused"
+    assert "Missing: last_checkpoint.pt" in reason
 
 
 def test_a1_prerequisite_failure_never_advises_checkpoint_resume(
@@ -1001,7 +1764,6 @@ def test_a1_prerequisite_failure_never_advises_checkpoint_resume(
 ) -> None:
     config_path = configs.write_config(tmp_path, configs.transient_matched_config(), canonical_root=tmp_path)
     stages: dict[str, dict[str, Any]] = {}
-    receipt_reads = 0
 
     def fake_execute(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         name = config["training"]["comparison_arm"]
@@ -1014,20 +1776,18 @@ def test_a1_prerequisite_failure_never_advises_checkpoint_resume(
             manifest.write_text("{}", encoding="utf-8")
         return {"run_dir": run_dir, "result": {"status": "completed", "best_epoch": 1}, "device_resolution": kwargs["device_resolution"]}
 
-    def fake_receipt(*_args: Any, **_kwargs: Any) -> dict[str, str]:
-        nonlocal receipt_reads
-        receipt_reads += 1
-        if receipt_reads == 2:
-            msg = "B receipt became invalid"
-            raise ValueError(msg)
-        return {"test": "receipt"}
+    def invalid_receipt(*_args: Any, **_kwargs: Any) -> bool:
+        msg = "B receipt became invalid"
+        raise ValueError(msg)
 
     monkeypatch.setattr(run_service, "_run_resolved_experiment", fake_execute)
     monkeypatch.setattr(run_service, "_validate_reusable_stage_a", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_service, "validate_completed_run", lambda _run_dir: {"config": stages["b"], "summary": {"train_seconds": 1.0}})
-    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: dict(_CPU_RECEIPT))
-    monkeypatch.setattr(budget, "publish_b_receipt", lambda *_args: None)
-    monkeypatch.setattr(budget, "load_b_receipt", fake_receipt)
+    receipt = _cpu_b_receipt(tmp_path / "b_history")
+    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: dict(receipt))
+    monkeypatch.setattr(budget, "publish_b_receipt", _published_receipt)
+    # B's step published the receipt; A1's prerequisite admission then finds it invalid.
+    monkeypatch.setattr(budget, "verify_b_receipt_copy", invalid_receipt)
     monkeypatch.setattr(
         run_service,
         "_matched_failed_stage_recovery",
@@ -1036,9 +1796,11 @@ def test_a1_prerequisite_failure_never_advises_checkpoint_resume(
     assert cli_train.main([str(config_path)]) == 1
     stderr = capsys.readouterr().err
     assert "Matched stage a1 failed" in stderr
-    assert "B receipt became invalid" in stderr
-    assert "Prerequisite admission failed before this stage executed" in stderr
-    assert "--resume" not in stderr
+    # B's persisted receipt refuses A1's continuation before its attempt: the same command is refused again.
+    assert "The continuation was refused before its attempt started, so the run is unchanged: ValueError: B receipt became invalid" in stderr
+    # A1 has no leaf yet, and an allocation resolves no refusal: the refusal is its own advice, without a retry.
+    for advice in ("Traceback", "--resume", "Rerun", "Retry"):
+        assert advice not in stderr
 
 
 def test_short_last_group_commits_once_and_excludes_loader_waits(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1205,6 +1967,117 @@ def test_train_loop_interrupted_inside_an_epoch_resumes_same_epoch_then_selects_
     assert best["payload_kind"] == "evaluation"
     assert {"next_epoch", "optimizer_state_dict", "train_sampler_state_dict"}.isdisjoint(best)
     assert (best["completed_epoch"], best["best_epoch"], best["global_step"]) == (1, 1, terminal["global_step"])
+
+
+class _FullDiskStream:
+    """Stand in for a checkpoint file whose third write, inside the archive torch writes, meets a full disk."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream, self._writes = stream, 0
+
+    def write(self, data: Any) -> int:
+        self._writes += 1
+        if self._writes == 3:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return self._stream.write(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+
+@pytest.mark.parametrize("fault", ["archive", "second_rename"])
+def test_a_checkpoint_write_the_jobs_environment_fails_interrupts_and_continues_from_the_intact_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    """
+    An ``OSError`` of the attempt's own checkpoint write is the job's environment: the run continues from its last checkpoint.
+
+    The budget end at point 20 writes its history records, then publishes its new best and last. A disk that fills inside
+    the archive torch writes, which torch reports as a ``RuntimeError`` whose context is that ``OSError``, keeps the pair of
+    point 10, so the attempt ends interrupted, while an Optuna trial's resolver keeps deciding its own status; the resume
+    admits the history records ahead of that last, truncates them and trains the event again to the budget end. A failed
+    rename of the last after the new best's leaves a best newer than the last, which no resume admits: the attempt fails
+    with that reason.
+    """
+    values = TensorDataset(torch.tensor([[1.0], [2.0], [3.0]]))
+    config = _matched_loop_config("a1")
+    identity = _loop_identity()
+    binding = {"task": "transient_drying", "run_name": "a1", "checkpoint_identity": identity}
+    last_path = tmp_path / "last_checkpoint.pt"
+    save, torch_save, replace = checkpoint_service.save_checkpoints, torch.save, type(tmp_path).replace
+    published: list[bytes] = []
+    shots = [fault]  # one fault, in the second publication
+
+    def recorded_publication(*publication: Any) -> None:
+        save(*publication)
+        published.append(last_path.read_bytes())
+
+    def full_disk_in_the_archive(payload: Any, stream: Any, *args: Any, **kwargs: Any) -> None:
+        if len(published) == 1 and shots:
+            shots.pop()
+            stream = _FullDiskStream(stream)
+        torch_save(payload, stream, *args, **kwargs)
+
+    def failing_last_rename(source: Path, target: Path | str) -> Path:
+        if len(published) == 1 and shots and Path(target).name == last_path.name:
+            shots.pop()
+            raise OSError(errno.EIO, "Input/output error")
+        return replace(source, target)
+
+    def run(initial_history: dict[str, Any] | None = None) -> dict[str, Any]:
+        model = torch.nn.Linear(1, 1)
+        with torch.no_grad():  # a fixed start: each group moves the output towards the zero target, so the terminal point is the best
+            model.weight.fill_(1.0)
+            model.bias.zero_()
+        return loop.train_loop(
+            config=config,
+            device=torch.device("cpu"),
+            model=model,
+            optimizer=SGD(model.parameters(), lr=0.001),
+            train_loader=_train_loader(values, seed=21),
+            eval_loader=DataLoader(values, batch_size=1, shuffle=False, num_workers=0),
+            train_loss=torch.nn.MSELoss(),
+            eval_metrics={"mse": _Metric()},
+            save_dir=tmp_path,
+            resume_from=None if initial_history is None else last_path,
+            checkpoint_identity=identity,
+            adapter=_LoopAdapter(),
+            epoch_state_callback=epoch_history.make_epoch_state_callback(tmp_path, **binding, initial_history=initial_history),
+            budget=stage_budget.StageBudget(unit="supervised_transitions", total=2),
+        )
+
+    monkeypatch.setattr(checkpoint_service, "save_checkpoints", recorded_publication)
+    if fault == "archive":
+        monkeypatch.setattr(torch, "save", full_disk_in_the_archive)
+    else:
+        monkeypatch.setattr(type(tmp_path), "replace", failing_last_rename)
+    with pytest.raises((OSError, RuntimeError)) as ended:
+        run()
+    assert (shots, last_path.read_bytes()) == ([], published[0])
+    if fault == "second_rename":
+        best = torch.load(tmp_path / "best_checkpoint.pt", map_location="cpu", weights_only=False)
+        assert best["global_step"] > torch.load(last_path, map_location="cpu", weights_only=False)["global_step"]
+        assert not isinstance(ended.value, OSError)
+        assert "last_checkpoint.pt" in str(ended.value)
+        assert run_service._failure_status(ended.value, None) == "failed"
+        return
+    assert isinstance(ended.value, OSError)
+    assert "No space left on device" in str(ended.value)
+    assert run_service.interrupted_by_environment(ended.value)
+    assert run_service._failure_status(ended.value, None) == "interrupted"
+    assert run_service._failure_status(ended.value, lambda _error: "failed") == "failed"
+    last = torch.load(last_path, map_location="cpu", weights_only=False)
+    counted = {
+        "completed_epoch": checkpoint_service.recorded_history_epochs(last),
+        "validations": last["objective_history"],
+        "global_step": last["global_step"],
+    }
+    ahead = epoch_history.validate_resume_history(tmp_path, **binding, **counted)
+    assert ([record["validation/point"] for record in ahead["validations"]], len(ahead["epochs"])) == ([10, 20], 1)
+    reconciled = epoch_history.reconcile_history(tmp_path, **binding, **counted)
+    assert ([record["validation/point"] for record in reconciled["validations"]], reconciled["epochs"]) == ([10], [])
+    resumed = run(initial_history=reconciled)
+    assert (resumed["status"], [entry["point"] for entry in resumed["objective_history"]]) == ("completed", [10, 20])
 
 
 @pytest.mark.parametrize(("mode", "kind"), [("matched_a1_b", "full"), ("stage_a_only", "evaluation")])
@@ -1692,18 +2565,24 @@ def test_attempts_record_their_seconds_and_committed_work_across_resume(
 
     def load_last(*_args: Any, expected_role: str, resume: bool = False, **_kwargs: Any) -> dict[str, Any]:
         resume_loads.append((expected_role, resume))
-        return {"objective_history": [], "global_step": 0}
+        # The touched best agrees with the last, so the resume admission admits the pair.
+        return {"objective_history": [], "global_step": 0, "best_metric": 0.1, "best_epoch": 1}
 
     stubs = (
         (run_service, "_grid_spacing", lambda *_args: (0.003, 0.003)),
         (run_service.config_loader, "create_dataloaders_from_config", lambda *_args, **_kwargs: loaders),
+        (run_service.config_loader, "admit_pinned_datasets", lambda *_args: None),  # the Datasets of the stubbed loaders
         (run_service.learning.models.factory, "build_model", lambda *_args, **_kwargs: torch.nn.Linear(1, 1)),
         (run_service.learning.losses.factory, "build_training_loss", lambda *_args, **_kwargs: _ScaledMSELoss()),
         (run_service.learning.metrics.metrics, "build_evaluation_metrics", lambda *_args, **_kwargs: {}),
         (run_service.learning.training.optim, "build_scheduler", lambda *_args, **_kwargs: None),
         (run_service.learning.training.checkpoint, "build_checkpoint_identity", lambda *_args, **_kwargs: checkpoint_identity),
-        # The touched checkpoints are placeholders and the stubbed loop writes no epoch record, so a resume restores none.
+        # The touched checkpoints and saved data are placeholders and the stubbed loop writes no epoch record, so a resume
+        # admits the saved data as it was loaded and restores no state and no record.
+        (run_service, "_read_saved_data_artifacts", lambda *_args: (SimpleNamespace(as_payload=dict), loaders["scaling_artifact"])),
+        (run_service, "_validate_saved_data_contract", lambda *_args: None),
         (run_service.learning.training.checkpoint, "load_checkpoint", load_last),
+        (run_service.learning.training.checkpoint, "restore_checkpoint", lambda *_args, **_kwargs: {}),
         (run_service.learning.training.checkpoint, "recorded_history_epochs", lambda _payload: 0),
         (run_service.tracking, "build_monitor_membership", lambda *_args: None),
     )
@@ -1811,29 +2690,24 @@ def test_attempts_record_their_seconds_and_committed_work_across_resume(
         "skipped_points": list(range(1, 20)),
     }
     error_type = RuntimeError if terminal_status == "failed" else KeyboardInterrupt
-    arguments = {
-        "run_dir": run_dir,
-        "resume_from": run_dir / "last_checkpoint.pt",
-        "restored_scaling_artifact": loaders["scaling_artifact"],
-        "saved_split_indices": {},
-        "device_resolution": resolution,
-    }
     resumed_config = copy.deepcopy(config)
     resumed_config["training"]["memory_batch"] = config["training"]["memory_batch"] + 1
+    arguments = {"config_path": common.paths.resolve_run_config_path(run_dir), "resume": run_dir, "device_resolution": resolution}
     ended = terminal_status in {"completed", "diverged", "unsuccessful"}
     run_status = "completed" if terminal_status == "diverged" else terminal_status
     if run_status == "completed":
-        returned = run_service.execute_prepared_run(resumed_config, **arguments)
-        assert returned["operational_timing"]["selected_checkpoint_evaluation_seconds"] == 2.0
+        returned = run_service._run_resolved_experiment(resumed_config, **arguments)
+        assert returned["result"]["operational_timing"]["selected_checkpoint_evaluation_seconds"] == 2.0
     elif terminal_status == "unsuccessful":
-        run_service.execute_prepared_run(resumed_config, **arguments)
+        run_service._run_resolved_experiment(resumed_config, **arguments)
     else:
         with pytest.raises(error_type):
-            run_service.execute_prepared_run(resumed_config, **arguments)
+            run_service._run_resolved_experiment(resumed_config, **arguments)
     summary = run_service.read_run_summary(run_dir)
     sessions = summary["runtime_sessions"]
-    # The resumed attempt loads its last checkpoint as continuation source before it reconciles the history.
-    assert resume_loads == [("last", True)]
+    # The resume admission reads the last and the best before the writer lease and again under it; the attempt loads the last
+    # as continuation source.
+    assert resume_loads == [("last", True), ("best", False)] * 2 + [("last", True)]
     assert [session["memory_batch"] for session in sessions[-2:]] == [config["training"]["memory_batch"], resumed_config["training"]["memory_batch"]]
     assert summary["status"] == run_status
     second = sessions[-1]["attempt"]
@@ -1933,34 +2807,26 @@ def test_completed_transient_terminal_values_are_admitted_against_their_final_hi
         "terminal_controller": {name: state[name] for name in run_service._TERMINAL_CONTROLLER_KEYS},
         "terminal_curriculum": {name: getattr(rollout, name) for name in run_service._TERMINAL_CURRICULUM_KEYS},
     }
-    arguments = {
-        "config": {"task": "transient_drying", "run": {"name": "b"}, "training": {"stage": "b"}, "task_contract": {"digest": "d" * 64}},
-        "normalizer_state": SimpleNamespace(digest="c" * 64),
-        "checkpoint_identity": checkpoint_identity,
-        "completed_epoch": 1,
-        "validations": (),
-    }
-    run_service._validate_transient_summary_evidence(tmp_path, summary=summary, **arguments)
+    config = {"task": "transient_drying", "run": {"name": "b"}, "training": {"stage": "b"}, "task_contract": {"digest": "d" * 64}}
+    history = run_service._admit_completed_history(
+        tmp_path, config, checkpoint_identity=checkpoint_identity, completed_epoch=1, validations=(), global_step=1
+    )
+    arguments = {"config": config, "normalizer_state": SimpleNamespace(digest="c" * 64), "history": history}
+    run_service._validate_transient_summary_evidence(summary=summary, **arguments)
 
     summary[section][key] = value
     with pytest.raises(run_service.RunLifecycleError, match="terminal evidence"):
-        run_service._validate_transient_summary_evidence(tmp_path, summary=summary, **arguments)
+        run_service._validate_transient_summary_evidence(summary=summary, **arguments)
 
 
-def test_a_stage_a_summary_that_records_a_curriculum_is_refused(tmp_path: Path) -> None:
+def test_a_stage_a_summary_that_records_a_curriculum_is_refused() -> None:
     """Teacher-forced A0 and A1 draw no rollout horizon, so their summaries record no terminal curriculum."""
     summary = {"checkpoint_identity": {}, "transient_scaling": {}, "terminal_controller": {}, "terminal_curriculum": {"draw_index": 0}}
     config = {"task": "transient_drying", "run": {"name": "a0"}, "training": {"stage": "a"}, "task_contract": {"digest": "d" * 64}}
 
     with pytest.raises(run_service.RunLifecycleError, match="records no curriculum"):
         run_service._validate_transient_summary_evidence(
-            tmp_path,
-            summary=summary,
-            config=config,
-            normalizer_state=SimpleNamespace(digest="c" * 64),
-            checkpoint_identity={},
-            completed_epoch=1,
-            validations=(),
+            summary=summary, config=config, normalizer_state=SimpleNamespace(digest="c" * 64), history={"epochs": [], "validations": []}
         )
 
 
@@ -2059,9 +2925,8 @@ def test_a_stopped_plan_exits_two_and_names_every_stage(tmp_path: Path, monkeypa
     assert "Post-training artifacts: none" in output
 
 
-@pytest.mark.parametrize("arm", ["b", "a1"])
-def test_saved_effective_resume_requires_full_a0_gate_before_execution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str) -> None:
-    """A saved-stage shortcut cannot bypass corrupt common checkpoint/handoff admission."""
+def _saved_matched_stages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str) -> tuple[Any, dict[str, Path]]:
+    """Write a plan's saved stage configs with ``arm`` interrupted, serve its parent record read-only, and return the plan and its leaves."""
     raw = configs.transient_matched_config()
     plan = configs.resolve_plan(raw, output_root=tmp_path)
     selected = {"a0": plan.a0, "b": plan.b, "a1": plan.a1}
@@ -2070,12 +2935,21 @@ def test_saved_effective_resume_requires_full_a0_gate_before_execution(tmp_path:
     record = identity.build_transient_experiment_record(plan.a0, plan.b, stage_a1=plan.a1, config_path=source)
     for name, config in selected.items():
         configs.write_yaml(dirs[name] / "config.yaml", dict(config))
+    # The stage's saved status is admitted first; an interrupted stage reaches its A0 gate.
+    common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(dirs[arm]), {"status": "interrupted"})
     monkeypatch.setattr(identity, "load_readonly_transient_experiment_record", lambda *_args, **_kwargs: {"record": record, "output_root": tmp_path})
     monkeypatch.setattr(
         identity,
         "resolve_readonly_experiment_child",
         lambda _record, child, **_kwargs: dirs[next(key.removeprefix("stage_") for key, value in record["children"].items() if value == child)],
     )
+    return plan, dirs
+
+
+@pytest.mark.parametrize("arm", ["b", "a1"])
+def test_saved_effective_resume_requires_full_a0_gate_before_execution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str) -> None:
+    """A saved-stage shortcut cannot bypass corrupt common checkpoint/handoff admission."""
+    plan, dirs = _saved_matched_stages(tmp_path, monkeypatch, arm)
     calls = []
 
     def gate(run_dir: Path, **kwargs: Any) -> None:
@@ -2088,3 +2962,83 @@ def test_saved_effective_resume_requires_full_a0_gate_before_execution(tmp_path:
     with pytest.raises(run_service.RunLifecycleError, match="common A0 checkpoint"):
         run_service.run_experiment(dirs[arm] / "config.yaml", resume=dirs[arm])
     assert calls == [(dirs["a0"], plan.b["run"]["name"])]
+
+
+def _saved_b_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plan: Any, a0_dir: Path) -> dict[str, Any]:
+    """Give the saved stages A0's handoff, admit A0 and serve B's finished state with the valid receipt of a CPU B; return it."""
+    manifest = a0_dir / HANDOFF_DIRECTORY / "manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text("{}", encoding="utf-8")
+    receipt = _cpu_b_receipt(tmp_path / "b_history")
+    monkeypatch.setattr(run_service, "_validate_reusable_stage_a", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run_service, "validate_finished_run", lambda _run_dir: {"config": dict(plan.b)})
+    monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: dict(receipt))
+    return receipt
+
+
+def test_a_saved_a1_resume_whose_b_lacks_its_receipt_is_refused_naming_bs_step_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A1's saved-config resume requires the receipt B published: without it the continuation is refused, naming B's step."""
+    plan, dirs = _saved_matched_stages(tmp_path, monkeypatch, "a1")
+    _saved_b_receipt(tmp_path, monkeypatch, plan, dirs["a0"])
+    monkeypatch.setattr(run_service, "_run_resolved_experiment", lambda *_args, **_kwargs: pytest.fail("A1 continued without B's receipt"))
+    before = _tree(tmp_path)
+
+    with pytest.raises(run_service.ContinuationRefusedError, match="--train-stages b"):
+        run_service.run_experiment(dirs["a1"] / "config.yaml", resume=dirs["a1"])
+    assert _tree(tmp_path) == before
+
+
+def test_a_saved_b_resume_publishes_bs_receipt_once_b_finished(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """B's saved-config resume publishes B's receipt once it continued B to its end, like its plan's B step; an interrupted B none."""
+    plan, dirs = _saved_matched_stages(tmp_path, monkeypatch, "b")
+    receipt = _saved_b_receipt(tmp_path, monkeypatch, plan, dirs["a0"])
+    ends: list[BaseException | None] = [KeyboardInterrupt("synthetic interruption"), None]
+
+    def continued_attempt(_requested: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        end = ends.pop(0)
+        if end is not None:
+            raise end
+        return {"run_dir": dirs["b"]}
+
+    monkeypatch.setattr(run_service, "_run_resolved_experiment", continued_attempt)
+    published = dirs["b"] / budget.RECEIPT_NAME
+    with pytest.raises(KeyboardInterrupt):
+        run_service.run_experiment(dirs["b"] / "config.yaml", resume=dirs["b"])
+    assert not published.exists()
+    run_service.run_experiment(dirs["b"] / "config.yaml", resume=dirs["b"])
+    assert json.loads(published.read_bytes()) == receipt
+
+
+@pytest.mark.parametrize("failure", ["differing", "refused", "invalid", "unwritable", "unreadable", "undecodable"])
+def test_a_saved_b_resume_reports_a_receipt_it_cannot_publish_by_its_cause_and_b_stays_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], failure: str
+) -> None:
+    """
+    B continued to its end by its saved config ends like its plan's B step when its receipt cannot be published.
+
+    Another receipt in its leaf, a finished state that refuses the receipt built from it, or a built receipt that fails the
+    receipt's rules refuses it as B's state. The job's environment, failing the receipt's write or the read or decode of
+    B's finished state that builds it, names B's step, never a second resume, which a finished B refuses.
+    """
+    plan, dirs = _saved_matched_stages(tmp_path, monkeypatch, "b")
+    receipt = _saved_b_receipt(tmp_path, monkeypatch, plan, dirs["a0"])
+    monkeypatch.setattr(run_service, "_run_resolved_experiment", lambda *_args, **_kwargs: {"run_dir": dirs["b"]})
+    if failure == "differing":
+        (dirs["b"] / budget.RECEIPT_NAME).write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+    elif failure == "invalid":
+        monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: _redigested(receipt, train_seconds=-1.0))
+    elif failure == "unwritable":
+        monkeypatch.setattr(budget, "publish_b_receipt", _unwritable_receipt)
+    else:
+        monkeypatch.setattr(run_service, "validate_finished_run", _failing_finished_b(failure))
+    before = _tree(dirs["b"])
+
+    capsys.readouterr()
+    assert cli_train.main(["--resume", str(dirs["b"])]) == 1
+    _assert_unpublished_receipt_reported(capsys.readouterr().err, failure)
+    expected = run_service.ContinuationRefusedError if failure in _STATE_RECEIPT_FAILURES else run_service.UnpublishedReceiptError
+    with pytest.raises(expected):
+        run_service.run_experiment(dirs["b"] / "config.yaml", resume=dirs["b"])
+    assert _tree(dirs["b"]) == before

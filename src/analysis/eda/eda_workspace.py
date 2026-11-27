@@ -3,7 +3,11 @@
 Responsibilities:
   - Discover current Generation campaign decisions once
   - Project successful candidates into lightweight profile-native views
-  - Bind lazy dataframe loaders, shared selection, summary, and one outer panel
+  - Order the material views of a published package as the evaluation does (role, then material), make equal «material, role»
+    labels unique by package name (by the exact package key where no token tells them apart), name each package alias once
+    in the summary, and open the first view in manifest order
+  - Bind lazy dataframe loaders, which also record each dataset's label without its package alias for the figures, shared
+    selection, summary, and one outer panel
   - Report selected, failed, pending, and invalid source accounting
 
 Design principles:
@@ -22,12 +26,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from src import domain
+from src.analysis.presentation import analysis_dataset_selection as dataset_selection
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_display_labels as display_labels
 
+from . import eda_capabilities as capabilities
 from . import eda_dataframe as dataframe
 from . import eda_panel as panel
 from . import eda_selection as selection
@@ -40,6 +46,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
 _MAXIMUM_DISPLAYED_ISSUES: Final = 5
+_ROLE_RANK: Final = {role: rank for rank, role in enumerate(dataset_selection.EVALUATION_GROUP_ORDER)}  # a view without one role last
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +133,18 @@ def _stride_note(display_spatial_stride: display_grid.DisplayStride) -> str:
     return f"Map display stride: {display_spatial_stride}; statistics and scale limits use complete source grids."
 
 
+def _recording_bare_label(load: Callable[[], pd.DataFrame], bare: str) -> Callable[[], pd.DataFrame]:
+    """Return ``load`` whose frame also records the dataset's ``bare`` label, which a figure shows where no other plotted label equals it."""
+
+    def load_labelled() -> pd.DataFrame:
+        """Load the frame and name its dataset without the alias that tells it from equal labels elsewhere in the catalog."""
+        frame = load()
+        frame.attrs[capabilities.DISPLAY_LABEL_ATTRIBUTE] = bare
+        return frame
+
+    return load_labelled
+
+
 def _view_loader(
     batch: sources.GeneratedOutputEDABatch,
     *,
@@ -144,7 +163,19 @@ def _view_loader(
         )
         return frame
 
-    return load
+    return _recording_bare_label(load, display_labels.dataset_display_label(_batch_label_metadata(batch)))
+
+
+def _published_view(
+    manifest: dict[str, Any], material: str | None, *, storage_root: Path, max_cases: int | None, label: str | None = None, bare: str | None = None
+) -> selection.PublishedDatasetEDAView:
+    """Bind one package, or one material of a mixed package, to its bounded authoritative loader; ``bare`` is its label without alias."""
+    loader: Callable[[], pd.DataFrame] = partial(
+        dataframe.load_published_dataset_frame, manifest, storage_root=storage_root, max_cases=max_cases, material=material
+    )
+    if bare is not None:
+        loader = _recording_bare_label(loader, bare)
+    return selection.PublishedDatasetEDAView(manifest=manifest, case_limit=max_cases, loader=loader, material=material, label=label)
 
 
 def prepare_generated_output_eda_workspace(
@@ -247,23 +278,35 @@ def prepare_published_dataset_eda_workspace(
         raise ValueError(message)
     root = Path(storage_root).expanduser().resolve()
     source_catalog = sources.discover_published_dataset_eda_catalog(storage_root=root)
+    # A mixed-material package shows as one view per material over its own cases, so no series pools materials; the views of a
+    # package follow the evaluation order (role, then material), and equal «material, role» labels take the package name.
+    specs = []
+    opening = ""  # the key of the first view in manifest order, which opens whatever the display order
+    for manifest in source_catalog.packages:
+        materials = (None,) if len(manifest["materials"]) == 1 else manifest["materials"]
+        package = [(manifest, material, _published_view(manifest, material, storage_root=root, max_cases=max_cases)) for material in materials]
+        opening = opening or package[0][2].key
+        specs += sorted(package, key=lambda spec: (_ROLE_RANK.get(spec[2].role or "", len(_ROLE_RANK)), spec[2].material_family or ""))
+    bases = [view.label for _manifest, _material, view in specs]
+    facets = [(str(manifest["dataset_name"]), view.package_key) for manifest, _material, view in specs]
+    try:
+        labels = display_labels.unique_display_labels(bases, facets)
+    except ValueError:  # no token of the names or keys tells the packages apart (a__b, b__a): their exact keys do
+        labels = tuple(f"{base} · {key}" if bases.count(base) > 1 else base for base, (_name, key) in zip(bases, facets, strict=True))
     views = tuple(
-        selection.PublishedDatasetEDAView(
-            manifest=manifest,
-            case_limit=max_cases,
-            loader=partial(
-                dataframe.load_published_dataset_frame,
-                manifest,
-                storage_root=root,
-                max_cases=max_cases,
-            ),
-        )
-        for manifest in source_catalog.packages
+        _published_view(manifest, material, storage_root=root, max_cases=max_cases, label=label, bare=base)
+        for (manifest, material, _view), label, base in zip(specs, labels, bases, strict=True)
     )
     catalog = selection.GeneratedOutputEDACatalog(views, source_catalog=source_catalog)
+    by_package: dict[str, list[selection.PublishedDatasetEDAView]] = {}
+    for view in views:
+        by_package.setdefault(view.package_key, []).append(view)
+    packages = "\n".join(f"- {'; '.join(view.label for view in group)}: {group[0].package_label}" for group in by_package.values())
     summary = (
-        f"Published Dataset EDA: {len(views)} admitted package manifests; {len(source_catalog.issues)} discovery issues.\n"
-        f"Case bound per package: {max_cases if max_cases is not None else 'all'}; scientific payloads opened during preparation: 0.\n"
+        f"Published Dataset EDA: {len(source_catalog.packages)} admitted package manifests as {len(views)} views "
+        f"(a mixed-material package as one view per material); {len(source_catalog.issues)} discovery issues.\n"
+        f"{packages}\n"
+        f"Case bound per view: {max_cases if max_cases is not None else 'all'}; scientific payloads opened during preparation: 0.\n"
         "Transient: complete selected cases from the canonical HDF5 backend; full index admission is required.\n"
         "Boundary inputs retain exact interval endpoints/startup support; "
         "full authored schedules and completion evidence are not part of the runtime view.\n"
@@ -275,6 +318,6 @@ def prepare_published_dataset_eda_workspace(
     if not views:
         return GeneratedOutputEDAWorkspace(summary, None, catalog, None)
     state = selection.GeneratedOutputSelectionState(catalog)
-    state.select_datasets((views[0].key,))
+    state.select_datasets((opening,))  # one view, so the tensor inspector opens on it
     interactive_panel = panel.build_eda_panel(catalog=catalog, selection_state=state, title=title, display_spatial_stride=display_spatial_stride)
     return GeneratedOutputEDAWorkspace(f"{summary}\n{_stride_note(display_spatial_stride)}", interactive_panel, catalog, state)

@@ -1,0 +1,284 @@
+# Role: reference data of the physical model. Edit: only with new physical evidence or a deliberate model change.
+# Material-specific physical design in edit order: sampled values, density, Oswin, target, kinetics. Nominals/supports are parameterization choices, not universal constants.
+# Farm bulk of the thesis lot Linsen, R: small-seeded lentils with fines. Bed structure (permeability, packing porosity,
+# density) comes from that lot. The grain-substance blocks below the density record are copied from lentil.yaml:
+# the fines are mostly the same plant material; their faster drying is not represented.
+schema_kind: generation_material
+material_family: lentil_farm
+material_scope:
+  common_name: Lentil, farm bulk
+  species: Lens culinaris Medik.
+  market_class: small_seeded_farm_lot
+  product_form: whole_seed
+  coat_or_hull_state: intact
+  description: Farm bulk of small-seeded lentils with fines (thesis lot Linsen, R)
+# The permeability scale kappa_mean is in m^2. Natural support and transform define sampling; ood_supports are separate synthetic stress intervals.
+permeability:
+  nominal: 3.5e-09
+  support:
+    lower: 1.75e-09
+    upper: 7.0e-09
+  transform: log
+  distribution: uniform_in_log_space
+  ood_supports:
+  - lower: 8.0e-10
+    upper: 1.35e-09
+  - lower: 9.1e-09
+    upper: 1.82e-08
+  provenance:
+    evidence: project_baseline
+    source_refs:
+    - ba
+    method: Thesis farm bulk Linsen, R (Tab. 15; four fills 70-180 mm in the 41.5 mm tube), apparent permeability
+      mu/(b + a*u) of the thesis Forchheimer fits at the nominal superficial velocity 0.14 m/s, geometric mean 3.5e-09 m^2
+      (fills 2.3-4.3e-09 m^2); no K_A correction. Support is the nominal times or divided by 2.
+    applicability:
+      packing: Only for packing bands in each complete density record; generated mean
+        eps must pass the material band.
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+      gap and width policy; permeability tails also satisfy fixed Kozeny-Carman guards.
+    verification: mathematically_reproduced
+# Granular-phase thermal values: k_gr is conductivity and cp_gr_dry is dry-solid specific heat. Natural and OOD supports are design ranges.
+thermal_properties:
+  k_gr:
+    nominal: 0.32
+    support:
+      lower: 0.23
+      upper: 0.45
+    transform: log
+    distribution: uniform_in_log_space
+    ood_supports:
+    - lower: 0.15
+      upper: 0.2
+    - lower: 0.51
+      upper: 0.65
+    provenance:
+      evidence: engineering_inversion
+      source_refs:
+      - oke_thesis_2021
+      - lentil_thermal_gharibzahedi_2014
+      - pulse_thermal_oke_baik_2022
+      method: Inversion of measured bed conductivities with the Maxwell-Eucken relation of the model. Oke (2021, Table 4.7) measures whole lentil seeds at 12-18 % wb, 0.129-0.151 W/(m*K); with the bulk porosity 0.41-0.42 that Oke (2021, Table 4.2) reports for the same seeds, taken as an assumed proxy because the conductivity samples were prepared separately, this gives 0.23-0.28 W/(m*K). Gharibzahedi et al. (2014) measure a lentil bed at 9.5-21.1 % wb, 0.191-0.241 W/(m*K), with unreported porosity, which gives 0.30-0.47 W/(m*K) for an assumed porosity 0.31-0.42. The support 0.23-0.45 W/(m*K) covers the Oke inversion and the Gharibzahedi range up to 0.45. The ranges 0.161-0.191 W/(m*K) in the abstract of Oke and Baik (2022) are compressed flour values and are not used. The earlier value 0.364 attributed to Matouk et al. (2018) could not be verified and is replaced.
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+  cp_gr_dry:
+    nominal: 2100.0
+    support:
+      lower: 1800.0
+      upper: 2300.0
+    transform: log
+    distribution: uniform_in_log_space
+    ood_supports:
+    - lower: 1300.0
+      upper: 1600.0
+    - lower: 2600.0
+      upper: 3000.0
+    provenance:
+      evidence: engineering_estimate
+      source_refs:
+      - matouk_thermal
+      - ba
+      - lentil_thermal_gharibzahedi_2014
+      - oke_thesis_2021
+      method: Value 2100 J/(kg*K) kept as an engineering estimate; no fit behind it could be identified. The dry-solid evidence spreads from 0.76 to 2.45 kJ/(kg*K) (Gharibzahedi et al. 2014 0.76-1.46; the Choi-Okos prediction of Oke 2021, Table 4.6, 1.78-1.80; the thesis value 2800 J/(kg*K) at 20 % wb, quoted from Matouk et al. 2018, gives (2800 - 0.2*4180)/0.8 = 2.45 kJ/(kg*K) on a dry basis), and the nominal lies at the high end of this evidence. The drying time depends only weakly on it (about 2 % for a change of 15 %).
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+# Initial moisture is dry basis (kg water/kg dry solids); amplitude controls field variation and field_support bounds generated values.
+initial_moisture:
+  mean_db:
+    nominal: 0.2345679012345679
+    support:
+      lower: 0.1904761904761905
+      upper: 0.28205128205128205
+    transform: linear
+    distribution: uniform
+    ood_supports:
+    - lower: 0.3
+      upper: 0.35
+    provenance:
+      evidence: engineering_estimate
+      source_refs:
+      - ba
+      - saskpulse_storage
+      method: Values unchanged. The lower end 16 % wb is the Canadian ideal combining moisture (16-18 %, SaskPulse 2025, section Seed Moisture Content at Harvest); the BA thermal simulation assumes 20 % wb as the upper end of the typical Swiss harvest range (Luetold and Suter 2021, cited in the BA, not available online); 22 % wb allows a wet year.
+      note: Natural material-dependent starting moisture in dry basis; range is an
+        explicit engineering envelope around project or product-compatible drying
+        evidence, not a market-target transfer.
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+  amplitude_db:
+    nominal: 0.02
+    support:
+      lower: 0.005
+      upper: 0.04
+    transform: linear
+    distribution: uniform
+    ood_supports:
+    - lower: 0.055
+      upper: 0.08
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+  field_support:
+    lower: 0.16606936416184973
+    upper: 0.32205128205128203
+    unit: kg/kg
+    provenance:
+      evidence: derived
+      source_refs:
+      - swiss_crops
+      method: X_db=X_wb/(1-X_wb); lower bound is the target 0.135/0.865 (swiss granum) plus the synthetic design margin margin_above_target_db 0.01, upper bound is the upper mean_db 0.22/0.78 plus the upper amplitude_db 0.04.
+      verification: mathematically_reproduced
+  margin_above_target_db: 0.01
+# Dimensionless support for generated bed-mean porosity; density calibration stores a compatible paired reference state.
+packing_porosity_mean_support:
+  lower: 0.48
+  upper: 0.56
+  unit: '1'
+  provenance:
+    evidence: project_baseline
+    source_refs:
+    - ba
+    method: One minus the wet bulk density 0.667 g/cm^3 (mean of the four fills, Tab. 15) over the lot's kernel
+      density 1.39 g/cm^3 gives 0.52, assuming that the whole lot has the solid density of the kernels. The thesis value
+      31.25 % is not used; it is most likely the same percent and fraction mix-up as for chickpea (the lentil spreadsheet
+      cells were not checked). The band covers the fills (0.63-0.69 g/cm^3).
+    verification: mathematically_reproduced
+    applicability:
+      packing: Air fraction of the farm bulk including its fines matrix, not a kernel packing porosity; the
+        Kozeny-Carman coupling serves only as the local variation model.
+# Dry bulk-density calibration and paired bed porosity define the material reference used for packing/density consistency. OOD records are complete alternatives selected atomically.
+density_calibration:
+  record_id: lentil_farm_density_calibration_v1
+  reference:
+    rho_bu_dry_ref: 580.0
+    eps_bed_ref: 0.52
+  rho_bu_dry_ref_support:
+    lower: 550.0
+    upper: 610.0
+    transform: log
+  ood_records:
+  - record_id: loose_low_density
+    rho_bu_dry_ref: 435.0
+    eps_bed_ref: 0.64
+    basis: same inferred dry particle density as reference; alternate complete packing
+      record
+  - record_id: dense_high_density
+    rho_bu_dry_ref: 725.0
+    eps_bed_ref: 0.4
+    basis: same inferred dry particle density as reference; alternate complete packing
+      record
+  selection_rule: complete_record_atomic
+  provenance:
+    evidence: project_baseline
+    source_refs:
+    - ba
+    method: Wet bulk density 0.667 g/cm^3 (mean of the four fills, Tab. 15) on a dry basis with an assumed
+      13 % wb, because the thesis does not report the sample moisture, gives 580 kg/m^3, paired with eps 0.52 of the same lot.
+    verification: mathematically_reproduced
+    applicability:
+      packing: Air fraction of the farm bulk including its fines matrix, not a kernel packing porosity; the
+        Kozeny-Carman coupling serves only as the local variation model.
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Complete loose and dense packing records derived at the fixed reference
+      inferred dry particle density.
+    verification: mathematically_reproduced
+# Coupled Oswin equilibrium-isotherm coefficients; preserve each material record and its stated units/evidence as one parameter set.
+oswin:
+  record_id: lentil_production_oswin_v1
+  components:
+    A_osw: 12.06202053
+    B_osw: -0.0573838
+    C_osw: 0.34338283
+  units:
+    A_osw: '1'
+    B_osw: 1/K
+    C_osw: '1'
+  equation: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
+  temperature_variable: T_C=T_K-273.15 K; numerical coefficient B is per kelvin or
+    per degree Celsius increment
+  provenance:
+    evidence: literature_fit
+    source_refs:
+    - lentil_oswin_source
+    method: 'Re-fit of 4637 reconstructed source-surface points: RMSE 0.6542 percentage
+      points db, MRE 3.867%, R2 0.96619. These statistics were calculated here, not
+      reported by the source.'
+    applicability:
+      moisture_basis: kg water/kg dry solids; source percent-db prefactor converted
+        by 0.01
+      evidence_scope: 5-30 degC, RH 0.27-0.90, approximately 8-22% db; pooled equal-weight
+        source-model surfaces of three whole red-lentil cultivars
+# Single operational drying target on a wet basis; it is a material target, not an initial-moisture support.
+target_moisture:
+  target_moisture_wb: 0.135
+  provenance:
+    evidence: official_industry_target
+    source_refs:
+    - swiss_crops
+    method: swiss granum (2026-03-12) chapter 1.1 lists 13.5 % wb for chickpeas, lupins and lentils in one merged table cell; chapter 2.3 applies no weight deduction up to 13.5 % wb for lentils.
+    note: Acceptance moisture without weight deduction, used as the single operational drying target.
+# Surface/internal moisture-transfer prior: r_surf_0 is a rate, r_int_surf a rate ratio, f_surf a fraction; the loader derives the two OOD records from the nominals.
+two_compartment_kinetics:
+  record_id: lentil_two_compartment_kinetics_v1
+  components:
+    r_surf_0:
+      nominal: 1.0e-04
+      support:
+        lower: 5.5e-05
+        upper: 1.6e-04
+      transform: log
+    r_int_surf:
+      nominal: 0.2
+      support:
+        lower: 0.12
+        upper: 0.35
+      transform: log
+    f_surf:
+      nominal: 0.5
+      support:
+        lower: 0.3
+        upper: 0.65
+      transform: logit
+  selection_rule: complete_record_atomic
+  provenance:
+    evidence: calibration_prior
+    source_refs:
+    - lentil_drying
+    - lentil_drying_tahmasebi_2025
+    - lentil_drying_tang_sokhansanj_1993
+    method: r_surf_0 is the geometric mean of the two fresh-seed anchors, Tang and Sokhansanj (1993, Table 3, fresh Laird lentils at 66-70 degC, 1.17e-04 at 35 degC) and Tahmasebi et al. (2025, Table 2, 380 min at 50 degC and 1 m/s, 0.84e-04 at 35 degC), each matched at the moisture ratio of the target at the pilot air (35 degC, relative humidity 0.215) and converted to 35 degC with an assumed activation energy of 25 kJ/mol. The support 5.5e-05 to 1.6e-04 is the nominal value times 0.55 and 1.6. The thin-layer time to the target at pilot air is 5.2 h. The rewetted-seed lot of Mangueira et al. (2021), 0.63e-04, is not used for the centre and lies inside the support. r_int_surf and f_surf are unchanged.
+    applicability:
+      evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
+        at known T, RH/omega, airflow and product state; T(t) if available
+      limitation: Only two fresh-seed anchors, neither at 35 degC; the activation energy of the temperature conversion is assumed (18 or 32 kJ/mol would move the nominal to 1.21e-04 or 0.84e-04), the kernel size of the anchors differs from the Beluga lentil of the BA, and the drying times are not validated as real predictions.
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Complete slow and fast records follow the common nominal-multiplier kinetics
+      stress design equation.
+    verification: mathematically_reproduced

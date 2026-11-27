@@ -2,14 +2,17 @@
 
 Responsibilities:
   - Check that a materialized tree is verified, read-only and byte-exact to its snapshot
+  - Check that materialization holds one shared tree lock across snapshot capture, restore and tree publication
   - Check that concurrent publication of one snapshot accepts identical content and fails closed on any other
   - Check that a changed, symlinked or missing tree is refused instead of repaired
   - Check lease validation and the deletion rules of pruning with explicit clocks
+  - Check that pruning never waits: a tree or quarantine whose lock another process holds is kept
 
 Design principles:
   - Tiny controlled Git responses retain real filesystem, patch and hash checks
   - Tree verification must work with neither a Git directory nor a Git executable
   - Pruning deletes only on positive scheduler evidence and never by sleeping
+  - Lock contention is probed from another process: under NFS a probe from the holding process proves nothing
 
 This module does NOT:
   - Run Slurm, initialize Git repositories or execute code from a materialized tree
@@ -22,13 +25,13 @@ import errno
 import fcntl
 import hashlib
 import io
+import json
 import os
 import runpy
 import stat
 import subprocess
 import sys
 import tarfile
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -36,7 +39,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts/source_fingerprint.py"
 _NOW = 10_000_000.0
@@ -116,6 +119,38 @@ def _lease(trees: Path, tree_id: str, job_id: str, *, age: float) -> None:
     os.utime(lease, (_NOW - age, _NOW - age))
 
 
+_EXCLUSIVE_PROBE = """
+import runpy, sys
+from pathlib import Path
+
+script = runpy.run_path(sys.argv[1])
+try:
+    with script["_tree_lock"](Path(sys.argv[2]), sys.argv[3], exclusive=True, blocking=False):
+        pass
+except script["_LockHeldError"]:
+    sys.exit(3)
+"""
+
+
+def _held_elsewhere(trees: Path, tree_id: str) -> bool:
+    """Probe the tree lock exclusively from a child process, as a prune does; under NFS a probe from its holder proves nothing."""
+    probe = subprocess.run([sys.executable, "-c", _EXCLUSIVE_PROBE, str(_SCRIPT), str(trees), tree_id], check=False)  # noqa: S603 -- test-owned argument vector
+    assert probe.returncode in {0, 3}, "the lock probe failed"
+    return probe.returncode == 3
+
+
+def _prune_from_another_process(trees: Path, tmp_path: Path) -> dict[str, list[str]]:
+    """Run ``--prune`` as a launcher does, against an empty fake queue; a prune that waited for a held lock would time out."""
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    (binary / "squeue").write_text("#!/bin/sh\n", encoding="utf-8")
+    (binary / "squeue").chmod(0o755)
+    environment = {**os.environ, "PATH": f"{binary}{os.pathsep}{os.environ['PATH']}"}
+    command = [sys.executable, str(_SCRIPT), "--prune", str(trees)]
+    pruned = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=20, check=True)  # noqa: S603 -- test-owned argument vector
+    return json.loads(pruned.stdout)
+
+
 def test_materialize_creates_verified_read_only_tree_with_recorded_modes(tree_fixture: tuple) -> None:
     module, repository, snapshots, trees = tree_fixture
     receipt = module["materialize_source_tree"](repository, snapshots, trees)
@@ -152,6 +187,29 @@ def test_second_materialize_reuses_the_existing_tree(tree_fixture: tuple) -> Non
     assert tree.stat().st_ino == inode
     assert tree.stat().st_mtime > _NOW  # reuse counts as recent use, so a concurrent prune keeps the tree
     assert [path.name for path in trees.iterdir() if not path.name.startswith(".")] == [first["tree_id"]]
+
+
+def test_materialization_holds_one_shared_lock_from_capture_through_tree_publication(tree_fixture: tuple, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A snapshot prune is refused while a launcher captures the snapshot and while either materialization restores its tree."""
+    module, repository, snapshots, trees = tree_fixture
+    live = module["materialize_source_tree"].__globals__  # run_path returns a copy; the functions resolve their names here
+    name = "a" * 12 + "-" + module["source_fingerprint"](repository)[:12]
+    held: list[str] = []
+
+    def under_the_lock(step: str, function: Callable[..., Any]) -> Callable[..., Any]:
+        def call(*arguments: Any) -> Any:
+            if _held_elsewhere(trees, name):
+                held.append(step)
+            return function(*arguments)
+
+        return call
+
+    monkeypatch.setitem(live, "capture_source_snapshot", under_the_lock("capture", live["capture_source_snapshot"]))
+    monkeypatch.setitem(live, "restore_source_snapshot", under_the_lock("restore", live["restore_source_snapshot"]))
+    receipt = module["materialize_source_tree"](repository, snapshots, trees)
+    module["_discard_directory"](Path(receipt["tree_path"]))  # a pruned tree, restored again from its recorded snapshot
+    module["materialize_snapshot_tree"](repository, Path(receipt["snapshot_path"]), trees)
+    assert held == ["capture", "restore", "restore"]
 
 
 def test_tampered_tree_is_refused_and_not_repaired(tree_fixture: tuple) -> None:
@@ -286,51 +344,42 @@ def test_an_interrupted_removal_leaves_no_partial_tree_and_the_next_prune_finish
     assert not leftover.exists()
 
 
-def test_staging_cleanup_waits_for_the_tree_lock_and_skips_a_quarantine_removed_meanwhile(tree_fixture: tuple) -> None:
-    """Two prunes started together: the second waits while the first discards its quarantine and must not fail on it."""
+def test_staging_cleanup_skips_a_quarantine_removed_between_listing_and_locking(tree_fixture: tuple, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Another prune may finish its quarantine after this one listed it; the cleanup must not fail on the vanished directory."""
     module, _repository, _snapshots, trees = tree_fixture
     quarantine = trees / f".staging-{_OLD_TREE}-cccccccc"
     (quarantine / "inner").mkdir(parents=True)
     os.utime(quarantine, (_NOW - 3 * _DAY, _NOW - 3 * _DAY))
-    started = threading.Event()
-    result: dict[str, Any] = {}
+    live = module["prune_source_trees"].__globals__
+    real_lock = live["_tree_lock"]
 
-    def prune() -> None:
-        started.set()
-        result.update(module["prune_source_trees"](trees, set(), now=_NOW))
+    def finish_then_lock(*arguments: Any, **options: Any) -> Any:
+        module["_discard_directory"](quarantine)  # the other prune finishes its quarantine first
+        return real_lock(*arguments, **options)
 
-    with module["_tree_lock"](trees, _OLD_TREE, exclusive=True):
-        worker = threading.Thread(target=prune)
-        worker.start()
-        started.wait(timeout=5)
-        worker.join(timeout=0.5)
-        assert worker.is_alive()  # the staging cleanup waits for the tree lock
-        module["_discard_directory"](quarantine)  # the first prune finishes its quarantine
-    worker.join(timeout=5)
-    assert result == {"removed": [], "kept": []}
+    monkeypatch.setitem(live, "_tree_lock", finish_then_lock)
+    assert module["prune_source_trees"](trees, set(), now=_NOW) == {"removed": [], "kept": []}
 
 
-def test_prune_rechecks_under_the_tree_lock_and_keeps_a_tree_reused_meanwhile(tree_fixture: tuple) -> None:
-    """A launcher holding the shared lock while it refreshes an old tree wins against a prune that started before."""
+def test_prune_returns_at_once_and_keeps_what_another_process_holds_locked(tree_fixture: tuple, tmp_path: Path) -> None:
+    """A launcher's shared lock keeps its old tree and another prune's exclusive lock its quarantine; the prune never waits.
+
+    An old tree and an old quarantine without a held lock are removed in the same run, so the prune read the fake queue
+    and skipped the held entries instead of keeping everything for want of scheduler evidence.
+    """
     module, _repository, _snapshots, trees = tree_fixture
-    tree = _plain_tree(trees, _OLD_TREE, age=3 * _DAY)
-    started = threading.Event()
-    result: dict[str, Any] = {}
-
-    def prune() -> None:
-        started.set()
-        result.update(module["prune_source_trees"](trees, set(), now=_NOW))
-
-    with module["_tree_lock"](trees, _OLD_TREE, exclusive=False):
-        worker = threading.Thread(target=prune)
-        worker.start()
-        started.wait(timeout=5)
-        worker.join(timeout=0.5)
-        assert worker.is_alive()  # prune waits for the shared lock before deciding
-        os.utime(tree, (_NOW, _NOW))  # the launcher reuses the tree
-    worker.join(timeout=5)
-    assert result == {"removed": [], "kept": [_OLD_TREE]}
-    assert tree.is_dir()
+    held_tree, free_tree = (_plain_tree(trees, tree_id, age=3 * _DAY) for tree_id in (_OLD_TREE, _STALE_LEASE_TREE))
+    held_quarantine, free_quarantine = (trees / f".staging-{tree_id}-cccccccc" for tree_id in (_RECENT_TREE, _LEASED_TREE))
+    for quarantine in (held_quarantine, free_quarantine):
+        (quarantine / "inner").mkdir(parents=True)
+        os.utime(quarantine, (_NOW - 3 * _DAY, _NOW - 3 * _DAY))
+    with module["_tree_lock"](trees, _OLD_TREE, exclusive=False), module["_tree_lock"](trees, _RECENT_TREE, exclusive=True):
+        pruned = _prune_from_another_process(trees, tmp_path)
+    assert pruned == {"removed": [free_quarantine.name, _STALE_LEASE_TREE], "kept": [_OLD_TREE]}
+    assert held_tree.is_dir()
+    assert held_quarantine.is_dir()
+    assert not free_tree.exists()
+    assert not free_quarantine.exists()
 
 
 @pytest.mark.parametrize("identical", [True, False])

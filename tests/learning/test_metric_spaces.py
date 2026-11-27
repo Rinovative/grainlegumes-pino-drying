@@ -222,8 +222,7 @@ def test_physical_units_and_named_channel_selection() -> None:
     """
     Give every task output a distinct constant physical error.
 
-    Each TaskSpec-derived field metric must select the matching channel and unit,
-    while a normalized-space update fails instead of mixing tensor spaces.
+    Each TaskSpec-derived field metric must select the matching channel and unit.
     """
     metrics = _metrics(*(metric.id for metric in _PHYSICAL_FIELD_METRICS))
     target = torch.zeros((1, _TASK.out_channels, 2, 2))
@@ -234,17 +233,13 @@ def test_physical_units_and_named_channel_selection() -> None:
     )
     cases = learning.metrics.metrics.CaseMembership(("case-a",), ("lentil",))
     for metric in metrics.values():
-        metric.update(pred, target, space="physical", batch_index=0, cases=cases)
+        metric.update(pred, target, batch_index=0, cases=cases)
 
     for definition in _PHYSICAL_FIELD_METRICS:
         field = definition.fields[0]
         metric = metrics[definition.id]
         assert metric.unit == _TASK.field(field).unit
         assert metric.compute() == pytest.approx(errors[field])
-
-    first_metric = metrics[_PHYSICAL_FIELD_METRICS[0].id]
-    with pytest.raises(ValueError, match="expects 'physical'"):
-        first_metric.update(pred, target, space="normalized", batch_index=1)
 
 
 def test_incompatible_physical_aggregate_is_rejected() -> None:

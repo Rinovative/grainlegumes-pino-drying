@@ -1,17 +1,18 @@
 """Present generation-input comparison and dataset overview tables.
 
 Responsibilities:
-  - Render compact A/B dataset, case, identity, and provenance context
+  - Render compact A/B dataset, case, identity, and provenance context of the prepared inputs, unshaded
   - Render parameter and field summaries as A, Mean A, B, and Mean B
   - Show every unique dataset case with raw parameter values
   - Show compact per-case field summaries without standardization
   - Group campaign parameters by table section and plot the chosen ones as grids of equal small panels: outcome histograms
-    and failures by material coloured by the typed failure reason
+    and failures by material coloured by the typed failure reason, materials, outcomes and reasons in their display names
 
 Design principles:
   - Units appear once inside row or column labels
-  - Four-value comparison tables normalize colors independently by row
-  - Dataset overview tables place parameters by row and actual cases by column
+  - Four-value comparison tables stay unshaded: a larger value ranks nothing
+  - Dataset overview tables are headed by the Dataset's task, material and regime and place actual cases by row and
+    parameters or statistics by column, unshaded: their columns rank nothing
   - Legend counts are those of the whole candidate scope; a panel that draws fewer candidates names its own n in its title
 
 This module does NOT:
@@ -31,12 +32,14 @@ import pandas as pd
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
 from src.analysis.generation_inputs import generation_input_sources as sources
 from src.analysis.generation_inputs import generation_input_table_schema as table_schema
+from src.analysis.presentation import analysis_display_labels as display_labels
 from src.analysis.presentation import analysis_histograms as histograms
 from src.analysis.ui import analysis_ui_figure_layout as figure_layout
 from src.analysis.ui import tables
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
+    from pathlib import Path
 
     import ipywidgets as widgets
     from matplotlib.axes import Axes
@@ -53,17 +56,15 @@ def case_context(
     mean_a: diagnostics.DatasetDiagnostics,
     second: diagnostics.GenerationInputDiagnostics,
     mean_b: diagnostics.DatasetDiagnostics,
+    *,
+    storage_root: Path | None = None,
 ) -> widgets.VBox:
-    """Render compact side-by-side scientific and technical context."""
+    """Render compact side-by-side scientific and technical context, input directories from ``storage_root``; nothing in it is shaded."""
     return tables.styled_dataframe(
-        diagnostics.case_context_table(
-            first,
-            mean_a,
-            second,
-            mean_b,
-        ),
-        title="Case context",
+        diagnostics.case_context_table(first, mean_a, second, mean_b, storage_root=storage_root),
+        title="Case context — prepared inputs",
         shade_constant=False,
+        shade_columns=(),
     )
 
 
@@ -84,8 +85,6 @@ def parameters(
         diagnostics.grouped_table_sections(table),
         title=(f"Parameters — Mean A n = {mean_a.case_count}; Mean B n = {mean_b.case_count}"),
         columns=2,
-        shade_constant=True,
-        row_local=True,
     )
 
 
@@ -106,36 +105,35 @@ def field_summaries(
         diagnostics.grouped_table_sections(table),
         title=(f"Field summaries — Mean A n = {mean_a.case_count}; Mean B n = {mean_b.case_count}"),
         columns=2,
-        shade_constant=True,
-        row_local=True,
     )
+
+
+def _cases_as_rows(table: pd.DataFrame) -> tuple[tuple[str, pd.DataFrame], ...]:
+    """Return the table sections of a per-case table with the actual cases as rows, under their categories' column groups."""
+    return tuple((section, frame.T) for section, frame in diagnostics.grouped_table_sections(table))
 
 
 def dataset_cases_parameters(
     dataset: diagnostics.DatasetDiagnostics,
 ) -> widgets.VBox:
-    """Render raw values for all unique cases in one canonical dataset."""
-    table = diagnostics.dataset_parameter_table(dataset)
+    """Render raw values for all unique cases in one canonical dataset, one row per case."""
     return tables.grouped_styled_dataframes(
-        diagnostics.grouped_table_sections(table),
-        title=(f"{dataset.material_family.replace('_', ' ').title()} · {dataset.sampling_regime} — {dataset.case_count} unique cases"),
+        _cases_as_rows(diagnostics.dataset_parameter_table(dataset)),
+        title=f"Case parameters — {diagnostics.dataset_caption(dataset)} — {dataset.case_count} unique cases",
         columns=1,
         shade_constant=True,
-        row_local=True,
     )
 
 
 def dataset_field_summaries(
     dataset: diagnostics.DatasetDiagnostics,
 ) -> widgets.VBox:
-    """Render independently colored field summaries for all dataset cases."""
-    table = diagnostics.dataset_field_summary_table(dataset)
+    """Render field summaries for all dataset cases, one row per case."""
     return tables.grouped_styled_dataframes(
-        diagnostics.grouped_table_sections(table),
-        title=(f"Dataset field summaries — {dataset.case_count} unique cases"),
+        _cases_as_rows(diagnostics.dataset_field_summary_table(dataset)),
+        title=f"Field summaries — {diagnostics.dataset_caption(dataset)} — {dataset.case_count} unique cases",
         columns=1,
         shade_constant=True,
-        row_local=True,
     )
 
 
@@ -184,7 +182,7 @@ def outcome_parameter_distributions(values: Mapping[table_schema.Parameter, Mapp
         for outcome, array in by_outcome.items():
             if not array.size:
                 continue
-            label = f"{outcome} (n={counts[outcome]})"
+            label = f"{display_labels.token_display_label(outcome)} (n={counts[outcome]})"
             artists = histograms.plot_histogram(axis, array, bins=bins, color=_OUTCOME_COLORS[outcome], alpha=0.45, label=label)
             if artists.constant_line is not None:
                 artists.constant_line.set_label(label)
@@ -231,10 +229,11 @@ def failures_by_parameter(candidates: Iterable[Mapping[str, Any]], parameters: I
         for label in ("successful", *reasons):
             chosen = labels == label
             offset = 0.0 if label == "successful" else 0.25
-            axis.scatter(values[chosen], rows[chosen] + offset, s=16, color=colors[label], label=f"{label} (n={int(chosen.sum())})")
+            shown = f"{display_labels.token_display_label(label)} (n={int(chosen.sum())})"
+            axis.scatter(values[chosen], rows[chosen] + offset, s=16, color=colors[label], label=shown)
         _parameter_title(axis, parameter[0], int(values.notna().sum()), len(terminal))
         axis.set_xlabel(f"[{diagnostics.display_unit(*parameter)}]")
-    axes[0, 0].set_yticks(range(len(materials)), materials)
+    axes[0, 0].set_yticks(range(len(materials)), [display_labels.material_display_label(material) for material in materials])
     handles, legend_labels = axes[0, 0].get_legend_handles_labels()
     figure_layout.set_figure_title(figure, axes, "Terminal candidates by parameter and material", note=_EVIDENCE_NOTE)
     figure_layout.add_legend(figure, axes, handles, legend_labels)

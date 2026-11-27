@@ -1,15 +1,18 @@
-"""Apply a completed steady run to one Generation case of either task and compare its airflow with COMSOL.
+"""Apply a completed steady run to Generation cases of either task and compare their airflow with COMSOL.
 
 Responsibilities:
-  - Admit one successful Generation case of either task by Source, material and case ID through the Dataset planner
-  - Convert it into steady model inputs and reference fields with the steady Dataset builder's own conversion
-  - Refuse a case whose coordinate grid or stationary conditioning differs from the run's Train Dataset
-  - Predict its airflow on the full canonical grid with the run's model and Train scaling, refusing non-finite values
+  - Admit successful Generation cases of either task by Source, material and case ID as one exact selection of the
+    Dataset planner, for one case or a batch
+  - Convert each into steady model inputs and reference fields with the steady Dataset builder's own conversion
+  - Refuse cases whose coordinate grid or stationary conditioning differs from the run's Train Dataset
+  - Predict each case's airflow on the full canonical grid with the run's model and Train scaling, refusing non-finite values
   - Return reference, prediction and error in u, v, p with the relative L2 per field of the shared case metric
 
 Design principles:
   - Admission, case ID, grid identity, conditioning check, field transforms, scaling, metric and floors are their
-    owners'; this module only wires them for one case
+    owners'; this module only wires them per case
+  - A batch is admitted and checked against the Train evidence once; the planner already requires one grid and one
+    stationary conditioning of every case of a selection, so the Train check of the batch covers each case
   - Inference follows the steady artifact generator: the full canonical grid whatever the training stride, encoded
     inputs, a forward in evaluation mode, decoded states
   - Channels are selected by field name, never by position
@@ -45,10 +48,11 @@ from src import datasets, domain, learning
 from src.datasets.packages import dataset_packages_selection as selection
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
     from pathlib import Path
 
     from src.datasets.packages.dataset_packages_planning import PreparedPackage
+    from src.generation.publication.generation_publication_catalog import AdmittedRawCase
 
     from .learning_inference import SteadyModelContext
 
@@ -102,12 +106,12 @@ def _admit_selection(task: str, references: Sequence[Mapping[str, str]], *, stor
 
 
 def _conditioning_digest(prepared: PreparedPackage) -> str:
-    """Return the stationary-conditioning digest the planner validated for the selection's first case."""
+    """Return the stationary-conditioning digest the planner validated for every case of the selection."""
     return str(prepared.cases[0].case.metadata_payload()["steady_flow_conditioning_digest"])
 
 
 def _require_train_evidence(steady: SteadyModelContext, case: PreparedPackage, *, storage_root: Path | str | None) -> None:
-    """Refuse a case whose grid or stationary conditioning is not that of the Train Dataset the run's scaling binds."""
+    """Refuse a selection whose grid or stationary conditioning is not that of the Train Dataset the run's scaling binds."""
     train = steady.scaling.dataset_identity
     manifest = datasets.packages.load_package_manifest_evidence(
         datasets.preprocessing.normalization.STEADY_TASK, str(train["dataset_id"]), storage_root=storage_root
@@ -124,51 +128,11 @@ def _require_train_evidence(steady: SteadyModelContext, case: PreparedPackage, *
         raise ValueError(msg)
 
 
-def predict_case_airflow(
-    steady: SteadyModelContext,
-    *,
-    task: str,
-    source_name: str,
-    material_family: str,
-    case_id: str,
-    storage_root: Path | str | None = None,
-) -> CaseAirflow:
-    """
-    Predict the steady airflow of one Generation case and compare it with the case's COMSOL airflow.
-
-    Parameters
-    ----------
-    steady : SteadyModelContext
-        Completed steady run from ``learning.inference.context.load_steady_model``.
-    task : str
-        Generation task of the case, ``"steady_flow"`` or ``"transient_drying"``.
-    source_name, material_family, case_id : str
-        The case's Generation Source, material and case folder.
-    storage_root : Path | str | None, optional
-        Storage root holding the Generation case, the run's Train Dataset and its Sources; defaults to the central
-        resolution.
-
-    Returns
-    -------
-    CaseAirflow
-        Reference, prediction, error and relative L2 in the order u, v, p on the full canonical grid.
-
-    Raises
-    ------
-    ValueError
-        If the case is not one successful case offering the steady view, its coordinate grid or stationary
-        conditioning differs from the run's Train Dataset, or the run predicts non-finite values for it.
-    RuntimeError
-        If the run's Train Dataset manifest changed since training.
-
-    """
+def _case_airflow(steady: SteadyModelContext, admitted: AdmittedRawCase, entry: Mapping[str, Any]) -> CaseAirflow:
+    """Predict one admitted case on its full canonical grid and compare it with its COMSOL airflow."""
     steady_task = domain.tasks.registry.get_task(datasets.preprocessing.normalization.STEADY_TASK)
-    pick = {"source_name": source_name, "material_family": material_family, "case_id": case_id}
-    prepared = _admit_selection(task, datasets.packages.select_exact_cases(task, [pick], storage_root=storage_root), storage_root=storage_root)
-    _require_train_evidence(steady, prepared, storage_root=storage_root)
-    entry = prepared.source_case_identities[0]
     _shape, inputs, outputs, _metadata, _source, _fingerprint = datasets.packages.generated_batch.interpret_admitted_source_case(
-        prepared.cases[0], package_case_id=entry["package_case_id"], task=steady_task
+        admitted, package_case_id=entry["package_case_id"], task=steady_task
     )
     model_inputs = inputs[[steady_task.input_names.index(name) for name in steady.input_names]].unsqueeze(0).to(steady.device)
     steady.model.eval()
@@ -196,3 +160,62 @@ def predict_case_airflow(
         error=prediction - reference,
         relative_l2=relative_l2,
     )
+
+
+def predict_cases_airflow(
+    steady: SteadyModelContext,
+    *,
+    task: str,
+    picks: Sequence[Mapping[str, str]],
+    storage_root: Path | str | None = None,
+) -> Iterator[CaseAirflow]:
+    """
+    Predict the steady airflow of Generation cases and compare each with the case's COMSOL airflow, in pick order.
+
+    All picks are admitted as one exact selection and checked against the run's Train evidence before the first
+    prediction; the forward pass and the non-finite refusal then run per case as the iterator advances.
+
+    Parameters
+    ----------
+    steady : SteadyModelContext
+        Completed steady run from ``learning.inference.context.load_steady_model``.
+    task : str
+        Generation task of the cases, ``"steady_flow"`` or ``"transient_drying"``.
+    picks : Sequence[Mapping[str, str]]
+        Each case's Generation Source, material and case folder as ``source_name``, ``material_family`` and ``case_id``.
+    storage_root : Path | str | None, optional
+        Storage root holding the Generation cases, the run's Train Dataset and its Sources; defaults to the central
+        resolution.
+
+    Returns
+    -------
+    Iterator[CaseAirflow]
+        Reference, prediction, error and relative L2 in the order u, v, p on the full canonical grid, per pick.
+
+    Raises
+    ------
+    ValueError
+        If a pick is not one successful case offering the steady view, the cases' coordinate grids or stationary
+        conditioning differ from each other or from the run's Train Dataset, or the run predicts non-finite values for a case.
+    RuntimeError
+        If the run's Train Dataset manifest changed since training.
+
+    """
+    prepared = _admit_selection(task, datasets.packages.select_exact_cases(task, picks, storage_root=storage_root), storage_root=storage_root)
+    _require_train_evidence(steady, prepared, storage_root=storage_root)
+    return (_case_airflow(steady, admitted, entry) for admitted, entry in zip(prepared.cases, prepared.source_case_identities, strict=True))
+
+
+def predict_case_airflow(
+    steady: SteadyModelContext,
+    *,
+    task: str,
+    source_name: str,
+    material_family: str,
+    case_id: str,
+    storage_root: Path | str | None = None,
+) -> CaseAirflow:
+    """Predict the steady airflow of one Generation case; ``predict_cases_airflow`` with one pick, with its errors."""
+    pick = {"source_name": source_name, "material_family": material_family, "case_id": case_id}
+    (airflow,) = predict_cases_airflow(steady, task=task, picks=[pick], storage_root=storage_root)
+    return airflow

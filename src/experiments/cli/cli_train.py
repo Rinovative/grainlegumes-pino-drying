@@ -3,6 +3,18 @@
 Responsibilities:
   - Parse config, resume, device, budget, dataset, seed, matched-plan, revision, and stage arguments
   - Report the training result and that training publishes no evaluation artifacts
+  - Report an admission refusal, also one that refused a continuation, as rejected, and any other refused continuation,
+    also of a matched stage, in its own sanitized lines, each without a traceback; a refused stage without a leaf gets no retry
+  - Report an end by the job's environment before a continuation's attempt reported, before the console reporter
+    exists, with the rerun in a matching allocation and without a traceback, and one that ended a replacement midway
+    with the leaf it may have partly replaced
+  - Leave an attempt the job's environment interrupted to its run's report, without a traceback, and report such a
+    matched stage interrupted
+  - Advise a failed or interrupted matched stage by its leaf's recovery classification: the continuing rerun for a
+    resumable leaf, the same command's rerun for a finished leaf or an environment end of the check, naming a leaf
+    that a replacement may have partly replaced, the reason alone for a leaf whose state refuses
+  - Report a finished B whose receipt the job's environment kept it from publishing with the step that publishes it,
+    without a traceback
   - Return a non-zero process result for training failures
 
 Design principles:
@@ -123,13 +135,15 @@ def _append_cli_overrides(command: list[str], args: argparse.Namespace) -> None:
 
 
 def _print_matched_stage_failure(error: object, args: argparse.Namespace) -> None:
-    """Give the exact failed leaf and a continuation only after saved-state admission."""
+    """Give the exact failed leaf and the advice of its read-only recovery classification, or of its absent leaf."""
     from src.experiments import experiments_run  # noqa: PLC0415
 
     if not isinstance(error, (experiments_run.MatchedStageExecutionError, experiments_run.MatchedStageInterrupted)):
         msg = "Matched stage recovery requires its structured execution error."
         raise TypeError(msg)
-    status = "interrupted" if isinstance(error, experiments_run.MatchedStageInterrupted) else "failed"
+    # An attempt the job's environment interrupted ended interrupted, like one an interrupt ended.
+    interrupted = isinstance(error, experiments_run.MatchedStageInterrupted) or experiments_run.interrupted_by_environment(error.__cause__)
+    status = "interrupted" if interrupted else "failed"
     print(f"Matched stage {error.stage} {status}. Run directory: {error.run_dir}", file=sys.stderr)
     command = [
         "python -m src.experiments.cli.cli_train",
@@ -138,19 +152,29 @@ def _print_matched_stage_failure(error: object, args: argparse.Namespace) -> Non
         error.stage,
     ]
     _append_cli_overrides(command, args)
-    if error.resumable:
-        print(f"Saved checkpoint can continue: {error.recovery_reason}", file=sys.stderr)
-        print(f"Rerun the same command inside a matching Slurm allocation; it continues this stage: {' '.join(command)}", file=sys.stderr)
-    elif not error.run_dir.exists():
+    try:
+        absent = not error.run_dir.exists()
+    except OSError:
+        # A failed stat is the job's environment, which the recovery check met as well: its classification advises.
+        absent = False
+    partly = error.__cause__ is not None and experiments_run.partly_replaced(error.__cause__)
+    if absent:
         print(f"No resumable leaf exists: {error.recovery_reason}", file=sys.stderr)
-        print(f"Retry this stage after fixing the cause, inside a matching Slurm allocation: {' '.join(command)}", file=sys.stderr)
-    else:
+        # A refusal by persisted state is refused again in any allocation, so its reason above is its only advice.
+        if not isinstance(error.__cause__, experiments_run.ContinuationRefusedError):
+            print(f"Retry this stage after fixing the cause, inside a matching Slurm allocation: {' '.join(command)}", file=sys.stderr)
+    elif error.recovery == "resumable":
+        print(f"The stage can continue: {error.recovery_reason}", file=sys.stderr)
+        step = "it replaces this stage's leaf, which may be partly replaced already" if partly else "it continues this stage"
+        print(f"Rerun the same command inside a matching Slurm allocation; {step}: {' '.join(command)}", file=sys.stderr)
+    elif error.recovery == "refused":
+        # The leaf's own state refuses, which every rerun meets again: its reason is the only advice.
         print(f"This leaf is not eligible for checkpoint resume: {error.recovery_reason}", file=sys.stderr)
-        print(
-            f"Inspect or repair the persisted state at {error.run_dir}, "
-            "or choose a scientifically distinct configuration before retrying this stage.",
-            file=sys.stderr,
-        )
+    else:
+        # A finished leaf, or a check the job's environment ended: nothing in the leaf refuses the same command.
+        print(f"Leaf check: {error.recovery_reason}", file=sys.stderr)
+        state = "it replaces this stage's leaf, which may be partly replaced already" if partly else "the run is unchanged"
+        print(f"Rerun the same command inside a matching Slurm allocation; {state}: {' '.join(command)}", file=sys.stderr)
 
 
 def _end_status(result: dict[str, Any]) -> str:
@@ -170,6 +194,50 @@ def _phase_seconds(outcome: dict[str, Any]) -> dict[str, float]:
         for name, seconds in result.get("phase_seconds", {}).items():
             totals[name] = totals.get(name, 0.0) + seconds
     return totals
+
+
+def _print_training_failure(error: Exception, args: argparse.Namespace) -> None:
+    """
+    Report a caught failure: a refusal or an end before a continuation's attempt in sanitized lines, any other with its traceback.
+
+    An attempt the job's environment interrupted is reported by its run's report alone, which named its reason and its rerun.
+    """
+    from src.experiments import experiments_console  # noqa: PLC0415
+    from src.experiments import experiments_run as run_service  # noqa: PLC0415
+    from src.experiments import experiments_run_registry as run_registry  # noqa: PLC0415
+
+    # A continuation refused before its start carries its cause, so an admission refusal is reported as one.
+    refusal = error.__cause__ if isinstance(error, run_service.ContinuationRefusedError) else error
+    if isinstance(refusal, run_service.ExistingRunAdmissionError):
+        _print_existing_run_admission(refusal.report)
+        return
+    if isinstance(refusal, (run_service.SourceBindingError, run_registry.IdenticalExperimentError)):
+        print(f"Run admission rejected: {experiments_console.sanitized_exception_message(refusal)}", file=sys.stderr)
+        return
+    if isinstance(error, run_service.UnpublishedReceiptError):
+        # B finished; the job's environment kept it from publishing its receipt, which the step it names publishes.
+        print(f"Receipt not published: {experiments_console.sanitized_exception_message(error)}", file=sys.stderr)
+        return
+    # Any other refusal by the run's persisted state is an expected outcome as well, never a crash: no traceback.
+    if isinstance(error, run_service.ContinuationRefusedError):
+        print(f"Run continuation refused: {experiments_console.sanitized_exception_message(error)}", file=sys.stderr)
+        return
+    stage = error if isinstance(error, run_service.MatchedStageExecutionError) else None
+    ended = error if stage is None else stage.__cause__
+    if ended is not None and run_service.unstarted_by_environment(ended):
+        # So is an end by the job's environment before a continuation's attempt reported, which leaves the run unchanged,
+        # unless it ended a replacement midway.
+        print(f"Run not started: {type(ended).__name__}: {experiments_console.sanitized_exception_message(ended)}", file=sys.stderr)
+        if stage is None:
+            experiments_console.unstarted_next_step(None, refused=False, partly_replaced=run_service.partly_replaced(ended))
+    elif run_service.interrupted_by_environment(ended):
+        # And so is an attempt the job's environment interrupted, whose report printed its reason and its rerun.
+        pass
+    elif stage is None or not isinstance(ended, run_service.ContinuationRefusedError):
+        print("Training failed. Sanitized traceback follows.", file=sys.stderr, flush=True)
+        experiments_console.print_sanitized_traceback(error)
+    if stage is not None:
+        _print_matched_stage_failure(stage, args)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -238,24 +306,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_matched_stage_failure(error, args)
         return 130
     except Exception as error:  # noqa: BLE001
-        from src.experiments import experiments_console  # noqa: PLC0415
-        from src.experiments import experiments_run as run_service  # noqa: PLC0415
-
-        if isinstance(error, run_service.ExistingRunAdmissionError):
-            _print_existing_run_admission(error.report)
-            return 1
-        if isinstance(error, run_service.SourceBindingError):
-            print(f"Run admission rejected: {error}", file=sys.stderr)
-            return 1
-        from src.experiments import experiments_run_registry as run_registry  # noqa: PLC0415
-
-        if isinstance(error, run_registry.IdenticalExperimentError):
-            print(f"Run admission rejected: {error}", file=sys.stderr)
-            return 1
-        print("Training failed. Sanitized traceback follows.", file=sys.stderr, flush=True)
-        experiments_console.print_sanitized_traceback(error)
-        if isinstance(error, run_service.MatchedStageExecutionError):
-            _print_matched_stage_failure(error, args)
+        _print_training_failure(error, args)
         return 1
 
     from src.experiments import experiments_console as console  # noqa: PLC0415

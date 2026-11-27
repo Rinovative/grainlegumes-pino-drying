@@ -12,6 +12,7 @@ Design principles:
   - Publication completes only after payload and manifest evidence agree
   - One staged folder holds manifest and complete payload; one rename publishes it, a failure publishes nothing
   - The shared identity registry binds a content digest to its one Dataset directory
+  - A live producer capture stays locked against snapshot pruning from the provenance through publication, reuse or failure
 
 This module does NOT:
   - Assign Train, validation, test or OOD membership
@@ -63,8 +64,7 @@ def _channel_contract(dataset_view: str) -> dict[str, Any]:
 def _provenance(
     prepared: planning.PreparedPackage,
     *,
-    storage_root: Path | str | None = None,
-    producer_evidence: Mapping[str, Any] | None = None,
+    producer_evidence: Mapping[str, Any],
     case_partition: Mapping[str, Any] | None = None,
     material_roles: Mapping[str, str] | None = None,
     plan_invocation: list[str] | None = None,
@@ -107,9 +107,7 @@ def _provenance(
             **identity.dataset_conversion_contract_identity(view.id),
             "implementation_sha256": reproduction.conversion_implementation_sha256(view.id),
         },
-        "producer_evidence": dict(producer_evidence)
-        if producer_evidence is not None
-        else reproduction.capture_producer_evidence(storage_root=storage_root),
+        "producer_evidence": dict(producer_evidence),
     }
 
 
@@ -317,74 +315,81 @@ def build_dataset_selection(
     material_roles: Mapping[str, str] | None = None,
     plan_invocation: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build one authored ordered Dataset selection from independent source cases."""
+    """Build one authored ordered Dataset selection from independent source cases.
+
+    A live producer capture stays held from the provenance until the manifest that names its snapshot is published, or
+    until the build reuses an existing Dataset or fails, so a snapshot prune cannot delete the snapshot in between.
+    """
     prepared = planning.prepare_dataset_selection(request, storage_root=storage_root)
-    producer_evidence = None
-    if reproduction_manifest is not None:
-        reproduction.verify_current_producer(reproduction_manifest["producer_evidence"], storage_root=storage_root)
-        producer_evidence = reproduction_manifest["producer_evidence"]
-    provenance = _provenance(
-        prepared,
-        storage_root=storage_root,
-        producer_evidence=producer_evidence,
-        material_roles=material_roles,
-        case_partition=reproduction_manifest["case_partition"] if reproduction_manifest is not None else None,
-        plan_invocation=reproduction_manifest["plan_invocation"] if reproduction_manifest is not None else plan_invocation,
-    )
-    dataset_id, dataset_digest = identity.package_identity_from_provenance(provenance)
-    if reproduction_manifest is not None and provenance["source_outcomes"] != reproduction_manifest["source_outcomes"]:
-        message = "Retained Source candidate outcomes differ from the reconstruction manifest."
-        raise ValueError(message)
-    if reproduction_manifest is not None and (
-        dataset_id != reproduction_manifest["dataset_id"]
-        or identity.package_semantic_identity_payload(provenance) != identity.package_semantic_identity_payload(reproduction_manifest)
-    ):
-        message = "Restored producing source or selected Source evidence differs from the reconstruction manifest."
-        raise ValueError(message)
-    dataset_view = prepared.request["dataset_view"]
-    if dataset_view == "steady_flow":
-
-        def build_payload(path: Path) -> Mapping[str, int]:
-            return _build_steady_payload(prepared, dataset_id=dataset_id, provenance=provenance, destination=path)
-
-    elif dataset_view == "transient_drying":
-
-        def build_payload(path: Path) -> Mapping[str, int]:
-            index = trajectory.build_transient_index(
-                _transient_sources(prepared),
-                None,
-                dataset_name=prepared.request["dataset_name"],
-                dataset_id=dataset_id,
-                source_root=common.paths.get_storage_root(storage_root=storage_root),
-            )
-            common.serialization.atomic_write_text(path, json.dumps(index, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
-            return {"sample_count": index["sample_count"], "transition_count": index["transition_count"]}
-
+    if reproduction_manifest is None:
+        producer: contextlib.AbstractContextManager[Mapping[str, Any]] = reproduction.held_producer_evidence(storage_root=storage_root)
     else:
-        msg = f"Unsupported Dataset view {dataset_view!r}."
-        raise ValueError(msg)
-    prefix = {
-        **provenance,
-        "dataset_id": dataset_id,
-        "dataset_digest": dataset_digest,
-        "payload_filename": common.paths.get_dataset_payload_filename(dataset_view),
-        "source_case_count": len(prepared.cases),
-    }
-    payload_path, manifest_path, reused, manifest = _publish(
-        task=dataset_view,
-        dataset_id=dataset_id,
-        prefix=prefix,
-        build_payload=build_payload,
-        selection_request=prepared.request,
-        storage_root=storage_root,
-        validate_ordered_claim=reproduction_manifest is None,
-        verify_producer=lambda: reproduction.verify_current_producer(provenance["producer_evidence"], storage_root=storage_root),
-        expected_payload_sha256=reproduction_manifest["payload_sha256"] if reproduction_manifest is not None else None,
-        output_directory=output_directory,
-        build_derived_payload=(lambda directory, manifest: transient_shards.write_transient_shards(directory, manifest, storage_root=storage_root))
-        if dataset_view == "transient_drying"
-        else None,
-    )
+        reproduction.verify_current_producer(reproduction_manifest["producer_evidence"], storage_root=storage_root)
+        producer = contextlib.nullcontext(reproduction_manifest["producer_evidence"])
+    with producer as producer_evidence:
+        provenance = _provenance(
+            prepared,
+            producer_evidence=producer_evidence,
+            material_roles=material_roles,
+            case_partition=reproduction_manifest["case_partition"] if reproduction_manifest is not None else None,
+            plan_invocation=reproduction_manifest["plan_invocation"] if reproduction_manifest is not None else plan_invocation,
+        )
+        dataset_id, dataset_digest = identity.package_identity_from_provenance(provenance)
+        if reproduction_manifest is not None and provenance["source_outcomes"] != reproduction_manifest["source_outcomes"]:
+            message = "Retained Source candidate outcomes differ from the reconstruction manifest."
+            raise ValueError(message)
+        if reproduction_manifest is not None and (
+            dataset_id != reproduction_manifest["dataset_id"]
+            or identity.package_semantic_identity_payload(provenance) != identity.package_semantic_identity_payload(reproduction_manifest)
+        ):
+            message = "Restored producing source or selected Source evidence differs from the reconstruction manifest."
+            raise ValueError(message)
+        dataset_view = prepared.request["dataset_view"]
+        if dataset_view == "steady_flow":
+
+            def build_payload(path: Path) -> Mapping[str, int]:
+                return _build_steady_payload(prepared, dataset_id=dataset_id, provenance=provenance, destination=path)
+
+        elif dataset_view == "transient_drying":
+
+            def build_payload(path: Path) -> Mapping[str, int]:
+                index = trajectory.build_transient_index(
+                    _transient_sources(prepared),
+                    None,
+                    dataset_name=prepared.request["dataset_name"],
+                    dataset_id=dataset_id,
+                    source_root=common.paths.get_storage_root(storage_root=storage_root),
+                )
+                common.serialization.atomic_write_text(path, json.dumps(index, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
+                return {"sample_count": index["sample_count"], "transition_count": index["transition_count"]}
+
+        else:
+            msg = f"Unsupported Dataset view {dataset_view!r}."
+            raise ValueError(msg)
+        prefix = {
+            **provenance,
+            "dataset_id": dataset_id,
+            "dataset_digest": dataset_digest,
+            "payload_filename": common.paths.get_dataset_payload_filename(dataset_view),
+            "source_case_count": len(prepared.cases),
+        }
+        payload_path, manifest_path, reused, manifest = _publish(
+            task=dataset_view,
+            dataset_id=dataset_id,
+            prefix=prefix,
+            build_payload=build_payload,
+            selection_request=prepared.request,
+            storage_root=storage_root,
+            validate_ordered_claim=reproduction_manifest is None,
+            verify_producer=lambda: reproduction.verify_current_producer(provenance["producer_evidence"], storage_root=storage_root),
+            expected_payload_sha256=reproduction_manifest["payload_sha256"] if reproduction_manifest is not None else None,
+            output_directory=output_directory,
+            build_derived_payload=(
+                lambda directory, manifest: transient_shards.write_transient_shards(directory, manifest, storage_root=storage_root)
+            )
+            if dataset_view == "transient_drying"
+            else None,
+        )
     return {
         "dataset_name": prepared.request["dataset_name"],
         "dataset_id": dataset_id,

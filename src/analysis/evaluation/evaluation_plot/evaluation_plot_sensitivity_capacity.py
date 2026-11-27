@@ -1,12 +1,17 @@
 """Separate exact model-capacity evidence from exploratory metadata sensitivity.
 
 Responsibilities:
-  - Compare authoritative accuracy with exact trainable parameter counts
-  - Compute Spearman associations for supported scientific metadata
-  - Plot quantile-binned metadata/error sensitivity in canonical parameter order
+  - Compare authoritative accuracy with exact trainable parameter counts, one shared count as a single centred tick
+  - Compute Spearman associations for supported scientific metadata, a heatmap per run and dataset with the parameters named on
+    each row's first shown panel, one colour bar as tall as the panel block
+  - Plot quantile-binned metadata/error sensitivity in canonical parameter order, a point per parameter and channel
 
 Design principles:
   - Capacity uses persisted provenance and never a proxy efficiency score
+  - Point series get marker entries in their legend, and no line joins categories without an order; a model whose points carry
+    several markers is a neutral circle beside a key of the material shapes
+  - A pooled dataset weights its materials equally and keeps each material visible as a marker beside the pooled value
+  - A pooled point is named the mean per-material error, never the artifact objective or the authoritative aggregate
   - Metadata filtering and labels come from one current-native presentation layer
   - Associations are exploratory and do not imply causality
   - Short, constant, missing, or non-finite evidence is disclosed or rejected
@@ -34,13 +39,13 @@ from src.analysis.evaluation import evaluation_presentation as presentation
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_series as series
 from src.analysis.presentation import analysis_field_labels as field_labels
-from src.analysis.presentation import analysis_visual_semantics as visual_semantics
 from src.analysis.ui import analysis_ui_figure_layout as figure_layout
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
     from src.analysis.evaluation import evaluation_datasets as dataset_cuts
+    from src.analysis.presentation import analysis_visual_semantics as visual_semantics
 
 _MINIMUM_SENSITIVITY_CASES = 20
 _VARIATION_FLOOR = 1e-12
@@ -49,6 +54,9 @@ _MINIMUM_BIN_CASES = 2
 _MINIMUM_SENSITIVITY_BINS = 3
 _HEATMAP_CELL_IN = (0.9, 0.3)  # inches per field column and per parameter row of a heatmap
 _HEATMAP_MARGIN_IN = 2.6  # tick labels and gap around the cells of one heatmap panel
+_COLORBAR_PAD_IN = 0.1  # the heatmaps' shared colour bar beside the panel block
+_CAPACITY_PAD = 2.0  # one shared capacity: the log x range reaches this factor below and above it
+_TREND_DODGE = 0.15  # the channels of one parameter row stand this far apart (in rows), so equal sensitivities stay visible
 
 
 def _trainable_count(frame: pd.DataFrame) -> int:
@@ -87,6 +95,45 @@ def _prefix_objective(frame: pd.DataFrame, max_cases: int) -> tuple[Mapping[str,
     return aggregate, selected_count
 
 
+def _capacity_legend(
+    figure: Figure,
+    axes: np.ndarray,
+    datasets: Mapping[str, pd.DataFrame],
+    groups: Mapping[str, Mapping[str, tuple[str, ...]]],
+    styles: Mapping[str, visual_semantics.SeriesStyle],
+    material_styles: Mapping[str, visual_semantics.SeriesStyle],
+) -> None:
+    """
+    Name the models, when several are drawn, and in a separate group the materials the markers show.
+
+    A model is its colour with the marker its points share, a neutral circle where they carry several. The material key names the
+    marker of an unpooled series and every small marker of a pooled one (grey shapes, or circles in the material colour where the
+    figure colours by material). A model named like a material keeps its own entry (``figure_layout.add_legend``).
+    """
+    models: dict[str, tuple[str, set[str]]] = {}
+    shapes: dict[str, Line2D] = {}
+    for by_model in groups.values():
+        for model, keys in by_model.items():
+            style = styles[keys[0]]
+            models.setdefault(model, (style.color, set()))[1].add(style.marker or "o")
+            marked = keys if len(keys) > 1 else keys[:1] if style.marker else ()  # a pooled series' small markers, else its own marker
+            for key in marked:
+                own = material_styles[key] if len(keys) > 1 else style
+                shape = Line2D([0], [0], color="0.35" if own.marker else own.color, marker=own.marker or "o", linestyle="", markersize=6)
+                shapes.setdefault(series.material_name(datasets[key]), shape)
+    entries = (
+        {
+            model: Line2D([0], [0], color=color, marker=next(iter(marks)) if len(marks) == 1 else "o", linestyle="", markersize=7)
+            for model, (color, marks) in models.items()
+        }
+        if len(models) > 1
+        else {}
+    )
+    named = {title: list(group.values()) for title, group in (("Model", entries), ("Material", shapes)) if group}
+    if named:
+        figure_layout.add_legend(figure, axes, [*entries.values(), *shapes.values()], [*entries, *shapes], groups=named)
+
+
 def plot_capacity_accuracy(
     *,
     datasets: dataset_cuts.DisplayFrames,
@@ -95,34 +142,61 @@ def plot_capacity_accuracy(
     """
     Plot exact capacity and accuracy, a panel per dataset with the models as points.
 
+    A pooled dataset (one frame per material) shows one point per model at the equal-weight mean of its materials' objectives
+    (``series.material_mean``), and each material's own objective as a small marker in its material style. That mean is not the
+    artifact objective of the pooled cases, so title and axis name it the mean per-material normalized group macro RMSE; the
+    materials of a pooled series must share one exact grid (``dataframe.validate_pooled_grids``).
+
     The declared configuration of each model is the Model-family configuration table (``plot_architecture_table``), not a
     second copy beside the panels.
     """
     dataframe.validate_comparison(datasets)
-    groups, styles = series.panel_groups(datasets.labels), series.series_styles(datasets)
-    figure_title, count_headings = layout.dataset_title_context(
-        "Capacity versus authoritative aggregate accuracy", groups, layout.effective_case_counts(datasets, max_cases=max_cases)
+    groups = series.panel_series(datasets.labels)
+    pools = [keys for models in groups.values() for keys in models.values() if len(keys) > 1]
+    dataframe.validate_pooled_grids(datasets, pools)
+    styles, material_styles = series.series_styles(datasets, pools), series.series_styles(datasets)
+    # A pooled point is the mean of its materials' objectives, which is no artifact objective, so the figure names it as that mean.
+    title, quantity = (
+        ("Capacity versus mean per-material normalized group macro RMSE", "Mean per-material normalized group macro RMSE")
+        if pools
+        else ("Capacity versus authoritative aggregate accuracy", "Normalized group macro RMSE")
     )
+    figure_title, count_headings = layout.dataset_title_context(title, datasets, layout.effective_case_counts(datasets, max_cases=max_cases))
     figure, axes = figure_layout.panel_figure(1, len(groups), sharey="row")
     unavailable: list[str] = []
     for axis, (dataset, models) in zip(axes[0], groups.items(), strict=True):
-        for model, key in models.items():
-            frame, style = datasets[key], styles[key]
-            trainable = _trainable_count(frame)
-            aggregate, _selected_count = _prefix_objective(frame, max_cases)
-            if aggregate["available"]:
-                axis.scatter(trainable, aggregate["value"], marker=style.marker or "o", s=90, color=style.color)
-            else:
-                # An unavailable objective is named with its support counts and never placed on the accuracy axis.
-                unavailable.append(f"{model} on {dataset}: {validity_contract.unavailable_text(aggregate)}")
+        drawn: set[int] = set()
+        for model, keys in models.items():
+            style = styles[keys[0]]
+            trainable = _trainable_count(datasets[keys[0]])
+            aggregates = {key: _prefix_objective(datasets[key], max_cases)[0] for key in keys}
+            values = {key: [aggregate["value"] if aggregate["available"] else np.nan] for key, aggregate in aggregates.items()}
+            pooled, per_material = series.material_mean(keys, values.__getitem__)
+            if np.isfinite(pooled[0]):
+                axis.scatter(trainable, pooled[0], marker=style.marker or "o", s=90, color=style.color)
+                drawn.add(trainable)
+            for key, (value,) in zip(keys, per_material, strict=True):
+                if len(keys) > 1 and np.isfinite(value):
+                    marker = material_styles[key]
+                    axis.scatter(trainable, value, marker=marker.marker or "o", s=30, color=marker.color, edgecolors="black", linewidths=0.5)
+                    drawn.add(trainable)  # a material drawn without its pooled point still sets the capacity range
+                if not aggregates[key]["available"]:
+                    # An unavailable objective is named with its support counts and never placed on the accuracy axis.
+                    material = f" ({series.material_name(datasets[key])})" if len(keys) > 1 else ""
+                    unavailable.append(f"{model} on {dataset}{material}: {validity_contract.unavailable_text(aggregates[key])}")
         figure_layout.set_log_scale(axis, "x")
-        axis.set_xlabel("exact trainable parameter count")
+        if len(drawn) == 1:  # one drawn capacity: its exact count as the one tick, centred on a log range padded alike on both sides
+            (count,) = drawn
+            axis.set_xlim(count / _CAPACITY_PAD, count * _CAPACITY_PAD)
+            axis.set_xticks([count], [f"{count:,}"])
+            axis.set_xticks([], minor=True)
+        axis.set_xlabel(f"Trainable parameter count [{field_labels.display_unit('1')}]")
         axis.grid(alpha=0.25, which="both")
         figure_layout.set_panel_title(axis, count_headings[dataset] or dataset)
-    figure_layout.label_rows_once(axes, f"Normalized group macro RMSE [{field_labels.display_unit('1')}]\n(lower is better)")
-    layout.add_series_legend(figure, axes, datasets, groups, styles, name_roles=False)  # one data panel keeps its legend inside
-    not_plotted = "Not plotted: " + "; ".join(unavailable) if unavailable else None
-    figure_layout.set_figure_title(figure, axes, figure_title, note=layout.series_note(styles, not_plotted))
+    figure_layout.label_rows_once(axes, f"{quantity} [{field_labels.display_unit('1')}]\n(lower is better)")
+    _capacity_legend(figure, axes, datasets, groups, styles, material_styles)  # one data panel keeps its legend inside
+    notes = ["Not plotted: " + "; ".join(unavailable)] if unavailable else []
+    figure_layout.set_figure_title(figure, axes, figure_title, note=layout.series_note(styles, *notes, layout.POOLED_NOTE if pools else None))
     return figure
 
 
@@ -168,7 +242,7 @@ def plot_metadata_error_heatmap(
     datasets: dataset_cuts.DisplayFrames,
     max_cases: int = 100,
 ) -> Figure:
-    """Render the all-channel metadata association heatmaps: datasets side by side, or underneath each other with a column per model."""
+    """Render the all-channel metadata association heatmaps: a column per dataset and a row per run (headed by its name when several)."""
     dataframe.validate_comparison(datasets)
     fields = presentation.shared_display_fields(tuple(datasets.values()))
     parameters = presentation.metadata_parameters(tuple(datasets.values()), max_cases=max_cases)
@@ -177,19 +251,19 @@ def plot_metadata_error_heatmap(
         raise ValueError(msg)
     groups = series.panel_groups(datasets.labels)
     figure_title, count_headings = layout.dataset_title_context(
-        "Parameter-error association", groups, layout.effective_case_counts(datasets, max_cases=max_cases)
+        "Parameter-error association", datasets, layout.effective_case_counts(datasets, max_cases=max_cases)
     )
-    side_by_side = all(len(models) == 1 for models in groups.values())
+    models = list(dict.fromkeys(model for by_model in groups.values() for model in by_model))
     figure, axes = figure_layout.panel_figure(
-        1 if side_by_side else len(groups),
-        len(groups) if side_by_side else max(len(models) for models in groups.values()),
+        len(models),
+        len(groups),
         panel_in=(_HEATMAP_CELL_IN[0] * len(fields) + _HEATMAP_MARGIN_IN, _HEATMAP_CELL_IN[1] * len(parameters) + _HEATMAP_MARGIN_IN),
         sharey="row",
     )
     parameter_labels = [presentation.metadata_label(parameter) for parameter in parameters]
-    for index, (dataset, models) in enumerate(groups.items()):
-        for slot, (model, key) in enumerate(models.items()):
-            axis = axes[0, index] if side_by_side else axes[index, slot]
+    for column, (_dataset, by_model) in enumerate(groups.items()):
+        for model, key in by_model.items():
+            axis = axes[models.index(model), column]
             matrix = np.empty((len(parameters), len(fields)), dtype=float)
             for parameter_index, parameter in enumerate(parameters):
                 for field_index, field in enumerate(fields):
@@ -198,16 +272,23 @@ def plot_metadata_error_heatmap(
             image = axis.imshow(matrix, cmap="coolwarm", vmin=-1.0, vmax=1.0, aspect="auto")
             axis.set_xticks(np.arange(len(fields)), [field.metric_label("RMSE") for field in fields])
             axis.set_yticks(np.arange(len(parameters)), parameter_labels)
-            figure_layout.set_panel_title(axis, (count_headings[dataset] or dataset) if side_by_side else model)
-            for row, column in np.ndindex(matrix.shape):
-                if np.isfinite(matrix[row, column]):
-                    axis.text(column, row, f"{matrix[row, column]:+.2f}", ha="center", va="center", fontsize=8)
+            for parameter_index, field_index in np.ndindex(matrix.shape):
+                if np.isfinite(matrix[parameter_index, field_index]):
+                    axis.text(field_index, parameter_index, f"{matrix[parameter_index, field_index]:+.2f}", ha="center", va="center", fontsize=8)
     for axis in axes.flat:
         axis.set_visible(bool(axis.images))
-    if not side_by_side:
-        figure_layout.set_row_headers(figure, axes, [count_headings[dataset] or dataset for dataset in groups])
+    for row in axes:  # a run without the first dataset names the parameters on its first shown panel, which the shared y hid
+        next(axis for axis in row if axis.get_visible()).tick_params(axis="y", labelleft=True)
+    for column, (dataset, by_model) in enumerate(groups.items()):  # the dataset heads its column on the top panel it has
+        figure_layout.set_panel_title(axes[min(models.index(model) for model in by_model), column], count_headings[dataset] or dataset)
+    if len(models) > 1:
+        figure_layout.set_row_headers(figure, axes, models)
+    # One bar as tall as the visible panel block, close beside it (its pad is a fraction of the block's width).
     figure.colorbar(
-        image, ax=[axis for axis in axes.flat if axis.get_visible()], shrink=0.85, label=f"Spearman correlation [{field_labels.display_unit('1')}]"
+        image,
+        ax=[axis for axis in axes.flat if axis.get_visible()],
+        pad=_COLORBAR_PAD_IN / figure.get_figwidth(),
+        label=f"Spearman correlation [{field_labels.display_unit('1')}]",
     )
     figure_layout.set_figure_title(figure, axes, figure_title)
     return figure
@@ -245,15 +326,11 @@ def plot_metadata_error_trends(
         msg = "Metadata trend analysis requires supported scientific parameters."
         raise ValueError(msg)
     groups = series.panel_groups(datasets.labels)
-    # Only the role's line style is needed (colour is the channel), so the figure never depends on the run-colour limit.
-    styles = {
-        key: visual_semantics.series_style(role="id" if (split := str(frame.attrs.get("dataset_role"))) == "eval" else split, pooled=True)
-        for key, frame in datasets.items()
-    }
     figure_title, count_headings = layout.dataset_title_context(
-        "Parameter sensitivity", groups, layout.effective_case_counts(datasets, max_cases=max_cases)
+        "Parameter sensitivity", datasets, layout.effective_case_counts(datasets, max_cases=max_cases)
     )
-    # A channel keeps its colour whichever channels are selected; the line style is the role.
+    # A channel keeps its colour whichever channels are selected, so the figure never depends on the run-colour limit. The
+    # parameters are categories without an order between them, so each sensitivity is a point and no line joins them.
     colors = layout.channel_colors(presentation.shared_display_fields(tuple(datasets.values())))
     models = list(dict.fromkeys(model for by_model in groups.values() for model in by_model))
     figure, axes = figure_layout.panel_figure(len(models), len(groups), panel_in=(5.0, max(3.0, 0.3 * len(parameters) + 1.8)), sharey="row")
@@ -262,13 +339,14 @@ def plot_metadata_error_trends(
         for model, key in by_model.items():
             axis = axes[models.index(model), column]
             plotted_values: list[float] = []
-            for field in fields:
+            for index, field in enumerate(fields):
                 values = []
                 for parameter in parameters:
                     explanatory, response = _case_pairs(datasets[key], parameter, field.metric_column, max_cases=max_cases)
                     values.append(_sensitivity(explanatory, response))
                 plotted_values.extend(values)
-                axis.plot(values, y_positions, color=colors[field.key], marker="o", linestyle=styles[key].linestyle, alpha=0.9)
+                dodge = (index - (len(fields) - 1) / 2.0) * _TREND_DODGE  # the channels of one parameter side by side
+                axis.plot(values, y_positions + dodge, color=colors[field.key], marker="o", linestyle="", alpha=0.9)
             positive = np.asarray(plotted_values, dtype=float)
             positive = positive[np.isfinite(positive) & (positive > 0.0)]
             if positive.size:
@@ -284,7 +362,8 @@ def plot_metadata_error_trends(
         row_axes[0].invert_yaxis()
     if len(models) > 1:
         figure_layout.set_row_headers(figure, axes, models)
-    channels_legend = {field.matplotlib_label: Line2D([0], [0], color=colors[field.key], linewidth=2.0) for field in fields}
-    layout.add_series_legend(figure, axes, datasets, groups, styles, extra={"Channel": channels_legend}, name_models=False)
+    # The column titles name each dataset and so its role; the key names the channels by their point colour.
+    channels_legend = {field.matplotlib_label: Line2D([0], [0], color=colors[field.key], marker="o", linestyle="") for field in fields}
+    figure_layout.add_legend(figure, axes, list(channels_legend.values()), list(channels_legend), title="Channel")
     figure_layout.set_figure_title(figure, axes, figure_title)
     return figure

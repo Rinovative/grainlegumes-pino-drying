@@ -444,18 +444,20 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:
     return payload
 
 
-def timing_block(provenance: Mapping[str, Any], *, records: frozenset[str]) -> dict[str, Any]:
+def timing_block(provenance: Mapping[str, Any], *, records: frozenset[str], bounded: bool = False) -> dict[str, Any]:
     """
-    Return the required non-identity timing block of one canonical artifact of either task.
+    Return the required non-identity timing block of one artifact of either task.
 
     The block holds the task's timing records (``records``) and the operational
-    performance snapshot; both stay outside the scientific artifact identity.
+    performance snapshot; both stay outside the scientific artifact identity. A refusal names the remedy of the build:
+    a full one is rerun with ``--rebuild``, a ``bounded`` one (which takes no ``--rebuild``) is deleted and generated again.
     """
     block = provenance.get(TIMING_KEY)
     expected = records | {"operational_performance"}
     if not isinstance(block, Mapping) or set(block) != expected:
         found = sorted(block) if isinstance(block, Mapping) else type(block).__name__
-        msg = f"Artifact timing block must hold exactly {sorted(expected)}, found {found}; rerun the exact target with --rebuild."
+        remedy = "delete the bounded output and generate it again" if bounded else "rerun the exact target with --rebuild"
+        msg = f"Artifact timing block must hold exactly {sorted(expected)}, found {found}; {remedy}."
         raise ValueError(msg)
     artifact_performance.validate_operational_performance(block["operational_performance"])
     return dict(block)

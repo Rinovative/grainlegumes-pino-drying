@@ -2,7 +2,7 @@
 Task-resolved training and evaluation metrics.
 
 Provides:
-- metrics: metric registry and explicit-space accumulation
+- metrics: metric registry and physical-view accumulation
 """
 
 from __future__ import annotations

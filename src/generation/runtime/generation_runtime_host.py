@@ -850,10 +850,14 @@ class GenerationHost:
         scheduled: bool | None = None,
         partition: str = "standard",
         wall_time: str = "02:00:00",
+        module: str = _CLI_MODULE,
     ) -> str:
-        """Invoke one existing Generation CLI command on the host or through Slurm."""
+        """Invoke one existing Generation CLI command on the host or through Slurm; another ``module`` runs on the host only."""
         layout, admission = self.layout, self.admission
         environment = _child_environment(layout, admission)
+        if scheduled and module != _CLI_MODULE:
+            message = f"Only {_CLI_MODULE} commands run through the scheduled node launcher, not {module}."
+            raise ValueError(message)
         if scheduled:
             if not admission.frozen:
                 message = "Scheduled Generation work runs only from a frozen source tree; this command was admitted read-only."
@@ -898,7 +902,7 @@ class GenerationHost:
         else:
             output_path = None
             error_path = None
-            command = (str(layout.python), "-m", _CLI_MODULE, operation, *arguments)
+            command = (str(layout.python), "-m", module, operation, *arguments)
         if output_path is not None:
             status, stdout, stderr = _run_scheduled(command, self.execution_root, environment, output_path, operation)
         else:

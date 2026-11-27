@@ -403,8 +403,8 @@ def _eda_datasets() -> dict[str, pd.DataFrame]:
 
 
 def _eda_styles() -> dict[str, Any]:
-    """Return the two batches' styles: one material, so the second batch tells itself apart by line style."""
-    return eda_plots.batch_styles(dict.fromkeys(_EDA_LABELS, "lentil"))
+    """Return the two batches' styles: one material, so they share its color and tell themselves apart by the line style of their roles."""
+    return eda_plots.batch_styles(dict.fromkeys(_EDA_LABELS, "lentil"), dict(zip(_EDA_LABELS, ("id", "parameter_ood"), strict=True)))
 
 
 def _draw_map_grid_02() -> object:
@@ -534,7 +534,7 @@ def _draw_bar_compare_05() -> object:
 
 
 def _draw_bar_compare_06() -> object:
-    """Draw the pipeline degradation bars and the duration-ratio bars."""
+    """Draw the pipeline degradation bars."""
     pipeline = comparison.AirflowDegradationMetrics(
         metric_id="synthetic",
         drying_surrogate_error=0.10,
@@ -546,7 +546,12 @@ def _draw_bar_compare_06() -> object:
         c_available=True,
         c_unavailable_reason=None,
     )
-    return plots.plot_pipeline_degradation((pipeline,)), plots.plot_timing_speedups(_session().timing_report("FNO run A"))
+    return plots.plot_pipeline_degradation((pipeline,))
+
+
+def _draw_scatter_parity_12() -> object:
+    """Draw the duration ratios of one run as points with whiskers on a log scale."""
+    return plots.plot_timing_speedups(_session().timing_report("FNO run A"))
 
 
 def _draw_table_06() -> object:
@@ -583,13 +588,14 @@ ENTRIES: Final[tuple[CatalogPlot, ...]] = (
         (f"{_EVALUATION}.plot_target_time", f"{_EVALUATION}.plot_accuracy_runtime_comparison"),
         _draw_scatter_parity_08,
     ),
-    CatalogPlot("bar-compare_05", "Transient channel error", (f"{_EVALUATION}.plot_channel_error",), _draw_bar_compare_05),
     CatalogPlot(
-        "bar-compare_06",
-        "Pipeline and speed-up bars",
-        (f"{_EVALUATION}.plot_pipeline_degradation", f"{_EVALUATION}.plot_timing_speedups"),
-        _draw_bar_compare_06,
+        "scatter-parity_12",
+        "Duration ratios, points with whiskers on a log scale",
+        (f"{_EVALUATION}.plot_timing_speedups",),
+        _draw_scatter_parity_12,
     ),
+    CatalogPlot("bar-compare_05", "Transient channel error", (f"{_EVALUATION}.plot_channel_error",), _draw_bar_compare_05),
+    CatalogPlot("bar-compare_06", "Pipeline degradation bars", (f"{_EVALUATION}.plot_pipeline_degradation",), _draw_bar_compare_06),
     CatalogPlot("table_06", "Transient evaluation summary", ("src.analysis.evaluation.evaluation_panel._transient_summary_table",), _draw_table_06),
     CatalogPlot("own_01", "Completion target", (f"{_EDA}.plot_completion_target_analysis",), _draw_own_01),
 )

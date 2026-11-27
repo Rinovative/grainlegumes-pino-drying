@@ -297,12 +297,3 @@ def success_table(comparison: TemplateComparison) -> pd.DataFrame:
             }
         ]
     )
-
-
-def context_line(comparison: TemplateComparison) -> str:
-    """Return the campaigns and what the pairing left out, for the figure note."""
-    return (
-        f"A: {comparison.campaign_a[1]}; B: {comparison.campaign_b[1]}; {comparison.success.pairs} decided pairs of primary designs; "
-        f"{comparison.unmatched} designs in one campaign only; {comparison.unverified} unverified pairs without sampled values; "
-        f"{comparison.pending} pairs with a pending candidate"
-    )

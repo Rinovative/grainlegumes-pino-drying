@@ -17,14 +17,14 @@ rules:  # Failure and wait policies.
     maximum_wait_seconds: 3600  # Cumulative wait per case, positive and never unbounded; the pipeline fixes the backoff and the in-allocation window.
   extra_arguments: []  # Additional COMSOL arguments; the pipeline owns the batch, parameter, log and licence arguments and rejects them here.
 node_job:  # Slurm resources of one node job (one whole node, concurrent case steps of run.cores_per_case cores each).
-  node_job_wall_time: "08:00:00"  # Slurm time of one node job, at most 24:00:00; must exceed run.timeout_seconds plus 600 s.
+  node_job_wall_time: "12:00:00"  # Slurm time of one node job, at most 24:00:00; must exceed run.timeout_seconds plus 600 s.
   memory_per_case: 20G  # Memory limit of one case step (<int>M|G|T).
   node_memory_overhead: 8G  # Node-job memory on top of the case steps for the worker and its shell.
   node_memory_limit: 500G  # Upper bound of one node job's memory; a larger need is rejected, the concurrency is never reduced.
   scheduler_options: []  # Extra long sbatch flags; memory, dependency, comment, node selection, GPUs and the allocation shape are pipeline-owned.
 site:  # The cluster; rarely changes.
   partition: standard  # Slurm partition of the node jobs.
-  cores_per_node: 16  # CPUs one node job requests (not exclusive); caps run.cores_per_case.
+  cores_per_node: 32  # CPUs one node job requests (not exclusive); caps run.cores_per_case.
   comsol_module: Comsol/v6.4  # Environment module loaded for COMSOL in the node jobs.
   comsol_executable: comsol  # COMSOL executable used in the node jobs.
   python_executable: /usr/bin/python3.12  # Python executable used in the node jobs.

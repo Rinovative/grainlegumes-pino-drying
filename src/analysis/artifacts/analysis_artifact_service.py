@@ -9,7 +9,9 @@ Responsibilities:
   - Rebuild only explicit exact targets and propagate every material failure
   - Build exactly the held-out roles the explicit artifact call names, through one build flow shared by both tasks
   - Load valid artifacts read-only for notebook preparation, which never builds
-  - Rebuild the named roles of one run all or nothing, and refuse a build beside the backup of an interrupted publication
+  - Replace the named targets of one run by renames, all or none when a rename fails, and refuse a build beside the
+    backup that a hard crash between renames left
+  - Admit a ``--run-dir`` selection only as one exact completed run, never as a parent whose leaves would be discovered
 
 Design principles:
   - Saved split membership is always required
@@ -206,10 +208,11 @@ def _refuse_optuna_trial(run_dir: Path) -> None:
 def iter_run_dirs(root: Path, *, run_names: Iterable[str] | None = None) -> Iterable[Path]:
     """Yield validated saved leaves, optionally selected by persisted scientific names.
 
-    Without a name selection, a leaf whose summary reports a status other than
-    ``completed`` is skipped with one printed line; a selected name is admitted
-    strictly and refused with the resume hint. Optuna trial leaves below the root
-    are skipped; a root that is itself a trial leaf is refused.
+    Without a name selection, a leaf below the root whose summary reports a status
+    other than ``completed`` is skipped with one printed line; a selected name, or a
+    root that is itself the run, is admitted strictly and refused with the resume
+    hint. Optuna trial leaves below the root are skipped; a root that is itself a
+    trial leaf is refused.
     """
     root = Path(root).expanduser()
     selected = {common.paths.validate_logical_name(name, label="run_name") for name in (run_names or ())}
@@ -234,19 +237,32 @@ def iter_run_dirs(root: Path, *, run_names: Iterable[str] | None = None) -> Iter
         name = run_section.get("name") if isinstance(run_section, Mapping) else None
         if selected and isinstance(name, str) and name not in selected:
             continue  # Select by name before admission so an unrelated run cannot block the selection.
-        if not selected and common.paths.resolve_run_summary_path(candidate).is_file():
+        if not selected and candidate != root and common.paths.resolve_run_summary_path(candidate).is_file():
             status = experiments.run.read_run_summary(candidate).get("status")
             if isinstance(status, str) and status != "completed":
                 # An unsuccessful run has no eligible checkpoint and is never resumed.
                 hint = "no eligible checkpoint to evaluate" if status == "unsuccessful" else "resume it to completion to evaluate it"
                 print(f"[SKIP] {name or candidate.name} | status {status} ({hint})")
-                continue  # A selected name is admitted below instead and refused with the same resume hint.
+                continue  # A selected name or a run root is admitted below instead and refused with the same resume hint.
         admitted = experiments.run.validate_evaluable_run(candidate)
         found.add(str(admitted["scientific_run_name"]))
         yield candidate.resolve()
     if selected - found:
         msg = f"Selected scientific run names were not found below {root}: {sorted(selected - found)}."
         raise FileNotFoundError(msg)
+
+
+def _require_run_directory(run_dir: Path) -> Path:
+    """Admit one directory that is itself a run, never a parent whose leaves discovery would select; refuse an Optuna trial."""
+    path = Path(run_dir).expanduser().resolve()
+    if not path.is_dir():
+        msg = f"Run directory not found: {path}"
+        raise FileNotFoundError(msg)
+    if not any(item.exists() for item in common.paths.resolve_current_run_required_paths(path)):
+        msg = f"--run-dir names one exact run directory, but {path} holds no run; select the runs below it with --runs-root."
+        raise ValueError(msg)
+    _refuse_optuna_trial(path)
+    return path
 
 
 def _load_run_config(run_dir: Path) -> Mapping[str, Any]:
@@ -1499,8 +1515,10 @@ def _rebuild_run_roles(
 
     The rebuild must name every published role of other analysis code (refused before any inference otherwise). Each
     named target is regenerated and validated in its stage; only when every stage is valid are they published together,
-    all or none, so a failed role never leaves a new artifact beside a stale sibling: its validated sibling stages stay
-    unpublished. A target a concurrent builder republished after this request was observed wins and is validated instead.
+    all or none when a rename fails and the rollback succeeds, so a failed role never leaves a new artifact beside a
+    stale sibling: its validated sibling stages stay unpublished. A failed rollback names the roles it could not
+    restore, and a hard crash between renames can leave some roles published. A target a concurrent builder
+    republished after this request was observed wins and is validated instead.
     """
     run_dir = plan.run_dir
     selected = [role for role in plan.roles if role.dataset_role in roles]
@@ -1757,9 +1775,10 @@ def build_scoped_transient_artifact(
 
 def build_artifacts(
     *,
-    runs_root: Path,
     dataset_root: Path,
     roles: Sequence[ArtifactDatasetRole],
+    runs_root: Path | None = None,
+    run_dir: Path | None = None,
     run_names: Iterable[str] | None = None,
     device_policy: str = "auto",
     rebuild: bool = False,
@@ -1769,21 +1788,27 @@ def build_artifacts(
 
     Parameters
     ----------
-    runs_root : Path
-        One evaluable run or a container of run directories.
     dataset_root : Path
         Derived raw root containing immutable final task datasets.
     roles : Sequence[{"id", "material_ood", "parameter_ood"}]
         The held-out roles this call releases (``id`` is the ID test). There is
         no default: every role is evaluated only when its caller names it.
+    runs_root : Path | None, optional
+        Discovery root: one run or a container of runs; a non-completed leaf below it is skipped with one line.
+    run_dir : Path | None, optional
+        One exact run, admitted strictly: a parent of runs, an Optuna trial or a non-completed run is refused.
+        Exactly one of ``runs_root`` and ``run_dir`` is required.
     run_names : Iterable[str] | None, optional
-        Persisted scientific run names below ``runs_root``.
+        Persisted scientific run names below ``runs_root``; refused with ``run_dir``.
     device_policy : {"auto", "cuda", "cpu"}, optional
         Runtime policy. Auto selects usable CUDA and then CPU. CUDA is strict.
         CPU avoids CUDA queries.
     rebuild : bool, optional
-        Stage and validate a replacement for each exact selected target and publish the run's replacements together,
-        all or none. It must name every published role of other analysis code, or the run is refused before
+        Stage and validate a replacement for each exact selected target and publish the run's replacements by renames,
+        all or none when a rename fails; a failed rollback names the roles it could not restore. A hard crash between
+        renames can leave some roles published: it leaves a backup, which the next build refuses, only where an existing
+        target was already renamed; after only new targets were published no backup remains, and readers refuse roles
+        of different producers. It must name every published role of other analysis code, or the run is refused before
         inference. A newer concurrent publication is preserved and validated instead.
 
     Returns
@@ -1809,7 +1834,14 @@ def build_artifacts(
     if not named or len(set(named)) != len(named) or set(named).difference(artifact_plan.ARTIFACT_DATASET_ROLES):
         msg = f"A canonical artifact build names no held-out role or repeats one; name roles from {list(artifact_plan.ARTIFACT_DATASET_ROLES)}."
         raise ValueError(msg)
-    plans = [load_run_artifact_plan(run_dir) for run_dir in iter_run_dirs(runs_root, run_names=run_names)]
+    if run_dir is not None and runs_root is None and run_names is None:
+        selected_dirs: Iterable[Path] = [_require_run_directory(run_dir)]
+    elif runs_root is not None and run_dir is None:
+        selected_dirs = iter_run_dirs(runs_root, run_names=run_names)
+    else:
+        msg = "A canonical artifact build selects either one exact run_dir or a runs_root with optional run_names."
+        raise ValueError(msg)
+    plans = [load_run_artifact_plan(path) for path in selected_dirs]
     # Every selected run must have every named role before the first inference; plan.role refuses one a run lacks.
     selected = [(plan, [role for role in plan.roles if role.dataset_role in named]) for plan in plans]
     for plan in plans:

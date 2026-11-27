@@ -63,12 +63,17 @@ def _export(export_state: dict[str, Any] | None, export_plot_name: str | None, e
 
 
 def _dataset_styles(catalog: selection.GeneratedOutputEDACatalog) -> dict[str, SeriesStyle]:
-    """Resolve line color, style and hatch of every dataset of the catalog, so a dataset keeps its style whatever the selection."""
+    """
+    Resolve line color, style and hatch of every dataset of the catalog, so a dataset keeps its style whatever the selection.
+
+    The color is the dataset's material, the line style and hatch its evaluation role; a source batch has no role and stays solid.
+    """
     materials = {
         view.label: view.batch.material_family if isinstance(view, selection.GeneratedOutputEDAView) else view.material_family
         for view in catalog.views
     }
-    return plots.transient.batch_styles(materials)
+    roles = {view.label: None if isinstance(view, selection.GeneratedOutputEDAView) else view.role for view in catalog.views}
+    return plots.transient.batch_styles(materials, roles)
 
 
 def _surface(
@@ -171,6 +176,7 @@ class _TimeAxis:
         self.timed = bool(times)
         ui.controls.set_visible(self.navigator.widget, self.timed)
         if not times:
+            self.navigator.clear_status()  # the previous selection's time goes; the controls' availability message on the line stays
             return
         preferred = self._state.physical_time_selection(self._key)
         self.navigator.rebind(times, preserve_time=times[0] if preferred is None else preferred, notify=False)
@@ -502,6 +508,7 @@ def make_spatial_case_view(
                 "fields": selected_fields,
                 "lock_scale": bool(scale_lock.value),
                 "physical_time_hours": time_axis.physical_time,
+                "case_number": local.selected_case_number,
             },
             **export,
         )
@@ -607,6 +614,7 @@ def _make_transient_snapshot_view(
                 "channels": selected_channels,
                 "styles": styles,
                 "lock_scale": bool(scale_lock.value),
+                "case_number": local.selected_case_number,
             },
             **export,
         )
@@ -668,7 +676,7 @@ def _make_transient_trajectory_view(
     scope = _scope_group(selection_state, "transient_trajectories")
     styles = _dataset_styles(catalog)
     channels = _Channels("Transient state channels", selection_state, "transient_trajectory_fields", local.status)
-    clock = ui.controls.choice_group((("Drying phase", "phase"), ("Hours", "hours")), value="phase")  # the aggregate state rows' clock
+    clock = ui.controls.clock_group("phase")  # the aggregate state rows' clock
     rows = [ui.panel.row(scope, count.control.widget, local.case.widget, clock), ui.panel.row(channels.checks.widget)]
     view, guarded = _surface(local, rows, export)
 
@@ -699,7 +707,13 @@ def _make_transient_trajectory_view(
                 ui.viewers.clear_view(view, "Selected transient datasets have no shared case number.", **export)
                 return
             plot_function = plots.transient.plot_state_trajectory_comparison
-            kwargs = {"datasets": frames, "case_ids": case_ids, "channels": selected_channels, "styles": styles}
+            kwargs = {
+                "datasets": frames,
+                "case_ids": case_ids,
+                "channels": selected_channels,
+                "styles": styles,
+                "case_number": local.selected_case_number,
+            }
         ui.viewers.render_view(view, plot_function, kwargs=kwargs, **export)
 
     def update_scope_row() -> None:

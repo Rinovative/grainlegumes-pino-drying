@@ -3,7 +3,8 @@
 Responsibilities:
   - Validate task, run selection, paths, rebuild intent, and device policy
   - Report material discovery, inference, or publication failures as exit 1
-  - Request atomic target replacement only through explicit ``--rebuild``
+  - Request the rename-based replacement of existing targets only through explicit ``--rebuild``
+  - Forward each ``--run-dir`` as one exact run and only ``--task``/``--runs-root`` as a discovery root
 
 Design principles:
   - This explicit call is the only evaluation of the held-out roles (ID test and OOD), and it evaluates only the roles
@@ -54,7 +55,10 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         type=Path,
         default=None,
-        help="Exact current training-run directory (an Optuna trial has no artifacts and is refused). May be repeated.",
+        help=(
+            "Exact current training-run directory, admitted strictly: a parent of runs (use --runs-root), a run that is not "
+            "completed, and an Optuna trial (it has no artifacts) are refused. May be repeated."
+        ),
     )
     parser.add_argument(
         "--dataset-root",
@@ -73,7 +77,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rebuild",
         action="store_true",
-        help="Deliberately regenerate and atomically replace existing selected artifact targets; not required for initial generation.",
+        help=(
+            "Deliberately regenerate existing selected artifact targets and replace each by renames: a run's selected roles "
+            "all or none when a rename fails, and a failed rollback names the roles it could not restore. A hard crash between "
+            "renames can leave some roles published: it leaves a backup, which the next build refuses, only where an existing "
+            "target was already renamed; after only new targets were published no backup remains, and readers refuse roles of "
+            "different producers. Not required for initial generation."
+        ),
     )
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument(
@@ -144,12 +154,6 @@ def main(argv: list[str] | None = None) -> int:
         dataset_root = args.dataset_root if args.dataset_root is not None else common.paths.get_datasets_root()
         if args.run_dirs is not None and args.run_names is not None:
             parser.error("--run-name selects storage aliases below --task/--runs-root and cannot accompany --run-dir")
-        if args.run_dirs is not None:
-            selected_roots = args.run_dirs
-        elif runs_root is not None:
-            selected_roots = [runs_root]
-        else:
-            parser.error("artifact selection unexpectedly lacks a run root")
         if not args.splits:
             parser.error(f"an artifact build evaluates a held-out role only when --split names it; choose from {', '.join(_HELD_OUT_ROLES)}")
         if len(set(args.splits)) != len(args.splits):
@@ -178,10 +182,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.output_root is not None:
             parser.error("--output-root requires --one-case or --case-id")
 
+        # A --run-dir is one exact run, admitted strictly; only --task and --runs-root discover the runs below a root.
+        selections: list[tuple[Path | None, Path | None]] = (
+            [(run_dir, None) for run_dir in args.run_dirs] if args.run_dirs is not None else [(None, runs_root)]
+        )
         result_count = 0
-        for selected_root in selected_roots:
+        for run_dir, discovery_root in selections:
             results = analysis.artifacts.service.build_artifacts(
-                runs_root=selected_root,
+                run_dir=run_dir,
+                runs_root=discovery_root,
                 dataset_root=dataset_root,
                 roles=tuple(args.splits),
                 run_names=args.run_names,

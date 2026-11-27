@@ -518,6 +518,17 @@ def test_balance_and_sorption_titles_name_the_quantity_of_their_equation_in_the_
     plt.close(figure)
 
 
+def test_a_case_named_like_a_quadrature_rule_keeps_its_own_entry_beside_the_rule() -> None:
+    """The groups own their entries by handle, so a case called «Trapezoidal rule» and the rule key are two entries, not a refusal."""
+    sorption = pd.DataFrame({"rule": ["trapezoid", "left"] * 2, "end_h": [1.0, 1.0, 2.0, 2.0]})
+    for name in ("internal", "surface", "grain"):
+        sorption[f"{name}_relative"] = 1e-3
+    figure = plots.plot_sorption_residuals({"Trapezoidal rule": sorption})
+    entries = {legend.get_title().get_text(): [text.get_text() for text in legend.get_texts()] for legend in figure.legends}
+    assert entries == {"Case": ["Trapezoidal rule"], "Quadrature rule": ["Trapezoidal rule", "Left-endpoint rule"]}
+    plt.close(figure)
+
+
 def test_mode_curves_colour_by_field_and_dash_by_padding_with_one_key_entry_each() -> None:
     """Every field keeps one colour in both paddings, the padding is the line style, and the key lists each once in two groups."""
     rows = [

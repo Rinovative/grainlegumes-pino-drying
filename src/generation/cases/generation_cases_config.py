@@ -380,6 +380,11 @@ class CampaignConfig:
     authored_value: Mapping[str, Any] | None = None
 
     @property
+    def execution_config_path(self) -> Path:
+        """Return the execution configuration file the campaign references (``source_files`` lists its own file first)."""
+        return self.source_files[1 + _CAMPAIGN_REFERENCES.index("execution_config")]
+
+    @property
     def source_name(self) -> str:
         """Return the readable Source folder without changing seed labels."""
         return campaign_identity.source_name(self.source_label or self.campaign_name, self.campaign_digest)

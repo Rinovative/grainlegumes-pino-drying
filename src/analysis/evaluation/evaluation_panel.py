@@ -5,21 +5,30 @@ Responsibilities:
   - Number the displayed tabs and views from their final position
   - Bind every view to its defined local controls and defaults
   - Accept caller-provided context labels and session-owned canonical frames
-  - Offer the datasets (material and role) of one panel in each view's own selector, kept in step through the selection state
+  - Offer the datasets (material and role) of one panel in each view's own selector, kept in step through the selection state;
+    a multi-dataset view opens on every selected dataset, also in a comparison and for maps
+  - Open a transient snapshot view (error maps, parity) at the latest stored time every shown case holds
   - List a comparison role the workflow refused, or a material without shared cases, as unavailable with its reason
   - Preserve lazy first rendering and panel-local figure export
   - Close a replaced panel together with every view it rendered
   - Export the selected transient sample case as a GIF over all stored times
   - Keep the transient sample viewer's state-map norms over all stored times for its last case and setting while any
     field is fixed over time
-  - Offer the break-even against COMSOL from each run's timing and training evidence, naming a run without it, the
-    transient training curves from a lazy history loader, and the pooled time views over the drying phase or in hours
+  - Offer the break-even against COMSOL from each run's timing and training evidence, naming a run without it with each
+    missing piece (a continued stage's A0 apart from its own seconds), the transient training curves from a lazy history
+    loader, and the pooled time views over the drying phase or in hours
+  - Show the tables with display headings and names, the run-level ones (configuration, work, break-even) one entry per run
 
 Design principles:
   - Strict artifact loading and EvaluationSession binding precede construction
   - Dataset, model, channel, case, and parameter controls remain view-specific
-  - Presentation labels never alter canonical identity or numerical cache keys
+  - Presentation labels never alter canonical identity or numerical cache keys; a transient series joins its scaler and
+    records by its frame, and runs of equal labels are told apart by their frame, never merged
+  - A run-level view names a run by its run label and colours it as every other view of the panel does, also a single run;
+    its clocks and hardware stand as plain text below the figure
   - Panel construction opens no case payloads and computes no plot mathematics
+  - Only a finite error ranks: the scoreboard numbers only runs with a finite selection objective, an outlier view without
+    any finite error titles its cases unranked, and the outlier table without one stays empty
   - Every render, clear, and failure of a view goes through the view panel's publication; a nested viewer is built with its view as host
 
 This module does NOT:
@@ -58,17 +67,19 @@ from src.analysis.presentation import analysis_error_diagnostics as error_diagno
 from src.learning.models import naming
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Hashable, Iterable
+    from collections.abc import Callable, Collection, Hashable, Iterable
     from typing import IO
 
     from matplotlib.figure import Figure
 
-    from src.analysis.evaluation.evaluation_run_discovery import StageHistory, UnavailableHistory
+    from src.analysis.evaluation.evaluation_plot.evaluation_plot_series import SeriesStyles
+    from src.analysis.evaluation.evaluation_run_discovery import StageHistory
     from src.analysis.evaluation.evaluation_selection import EvaluationSelectionState
     from src.analysis.evaluation.evaluation_session import EvaluationSession
-    from src.analysis.evaluation.evaluation_transient_comparison import LineageComparison
+    from src.analysis.evaluation.evaluation_transient_comparison import AirflowDegradationMetrics, LineageComparison
     from src.analysis.evaluation.evaluation_transient_session import TransientEvaluationSession
     from src.analysis.presentation.analysis_dataset_selection import DatasetChoice, DatasetInventory
+    from src.analysis.ui.analysis_ui_navigation import TimeNavigator, TimeStepSelection
     from src.analysis.ui.analysis_ui_notebook import LazyPanel, ViewSection, WidthScope
     from src.analysis.ui.analysis_ui_panel import ViewPanel
     from src.analysis.ui.analysis_ui_viewers import ViewControl
@@ -78,7 +89,9 @@ _MINIMUM_VELOCITY_COMPONENTS = 2
 _FRAME_MATERIAL_CONTEXT_SIZE = 2
 _OUTLIER_COUNT = 5
 _CASE_COUNT_STEP = 50
-_CLOCK_OPTIONS: Final = (("Drying phase", "phase"), ("Hours", "hours"))  # the clock of a pooled transient view
+_RANKING_CRITERION: Final = (  # the one criterion of every row of the comparison summary, named once in its title
+    "the selection objective of the cumulative full rollouts: case errors equal over the cases of a material and over the materials (lower is better)"
+)
 _DEFAULT_TRANSIENT_CHANNELS: Final = ("T", "phi", "w_gr")  # owner 14.11.: checked before any view chose, as in EDA
 _GIF_DPI = 100  # owner 14.11.: tick labels sharp; three states over 169 hourly frames stay under the memory limit
 _GIF_FPS = 3  # the default of the viewer's fps field, which is bounded to 1 to 10
@@ -178,7 +191,7 @@ class EvaluationContext:
 
 
 _NO_DATASET: Final = "No dataset is available for this view."
-_POOL_NOTE: Final = "Zusammenfassen gilt in dieser Ansicht nicht: die Datensätze erscheinen getrennt."
+_POOL_NOTE: Final = "Pooling does not apply in this view: the Datasets appear separately."
 _SELECTION_CONTROLS: Final = frozenset({"channel", "parameter"})  # sit beside the case navigator, the rest in the display row
 
 
@@ -277,14 +290,20 @@ class _SteadyScope:
     """
     The datasets of one steady panel: their inventory, the frames of every role, and the cuts the views draw.
 
-    ``frames_by_role`` maps a role to its models' frames; ``run_frames`` are the frames of the run-level views. A single-model
-    panel draws one cut per selected dataset; a comparison draws every selected dataset, cut for every model, keyed by model
-    label for one dataset and ``model · dataset`` for several. Every cut is a ``DisplayFrames`` whose ``labels`` give each key's
-    display dataset and model. A cut is made once per choice and shared by the views.
+    ``frames_by_role`` maps a role to its models' frames, each keyed by its run label; ``run_frames`` are the frames of the
+    per-artifact views (a single model's roles keyed by role), while the run-level views take the first role's frame of every
+    run under its run label. A single-model panel draws one cut per selected dataset; a comparison draws every selected
+    dataset, cut for every model, keyed by model label for one dataset and ``model · dataset`` for several; a pooled dataset
+    is one cut per material, whose key names the material. Every cut is a ``DisplayFrames`` whose ``labels`` give each key's
+    display dataset and model, and whose ``unnamed`` model labels (storage aliases) no title names. A cut is made once per
+    choice and shared by the views.
     """
 
-    def __init__(self, contexts: Sequence[EvaluationContext], *, comparison: bool, refused_roles: Mapping[str, str]) -> None:
+    def __init__(
+        self, contexts: Sequence[EvaluationContext], *, comparison: bool, refused_roles: Mapping[str, str], unnamed: Collection[str] = ()
+    ) -> None:
         """Build the scope from the role contexts of a steady panel."""
+        self.unnamed = frozenset(unnamed)
         self.frames_by_role = {context.key: dict(context.datasets) for context in contexts}
         if comparison:
             self.inventory = dataset_cuts.comparison_inventory(self.frames_by_role, refused=refused_roles)
@@ -301,7 +320,8 @@ class _SteadyScope:
         available = [choice for choice in choices if choice.available]
         key = tuple((choice.group, choice.members) for choice in available)
         if key not in self._cuts:
-            self._cuts[key] = self._cut(available)
+            cut = self._cut(available)
+            self._cuts[key] = dataset_cuts.DisplayFrames(cut, cut.labels, unnamed=self.unnamed)
         return self._cuts[key]
 
     def _cut(self, available: Sequence[DatasetChoice]) -> dataset_cuts.DisplayFrames:
@@ -314,8 +334,9 @@ class _SteadyScope:
             keyed: dict[str, pd.DataFrame] = {}
             labels: dict[str, tuple[str, str]] = {}
             for label, by_model in cuts.items():
-                for model, frame in by_model.items():
-                    key = f"{model} · {label}"
+                for inner, frame in by_model.items():
+                    model = by_model.labels[inner][1]
+                    key = f"{inner} · {label}"
                     if key in keyed:
                         message = f"Comparison key {key!r} names two frames (model {model!r} of dataset {label!r} and another pair)."
                         raise ValueError(message)
@@ -341,7 +362,6 @@ def _dataset_view(
     export: Mapping[str, Any],
     pooled: bool = False,
     single_model: bool = False,
-    single_dataset: bool = False,
     plot_kwargs: Mapping[str, Any] | None = None,
     count: tuple[int, int] | None = None,
     controls: Mapping[str, ViewControl] | None = None,
@@ -349,17 +369,17 @@ def _dataset_view(
     """
     Build one steady view over the datasets its selector offers.
 
-    A view offers several datasets, or one for a ``single_dataset`` view (maps) or a ``single_model`` view; in a comparison a
-    ``single_model`` view adds a model choice, and the other views draw the compared models as series of every selected
-    dataset. ``pooled`` allows the pooling switch where the view's reduction is
-    material-balanced. The plot is drawn directly, or with ``count`` (start, step) as a case-count viewer built inside
-    this view for the selected datasets, at the count the former one showed.
+    A view offers several datasets and opens on every selected one, maps included, or one for a ``single_model`` view; in a
+    comparison a ``single_model`` view adds a model choice, and the other views draw the compared models as series of every selected
+    dataset. ``pooled`` allows the pooling switch where the view weights every material equally, one model or several. The plot
+    is drawn directly, or with ``count`` (start, step) as a case-count viewer built inside this view for the selected datasets, at
+    the count the former one showed.
     """
     ui = analysis.ui
     choice = _SharedChoice(
         scope.inventory,
-        multiple=not (single_model or single_dataset),
-        pool_reason=None if pooled and not scope.comparison else dataset_cuts.POOL_DISABLED_REASON,
+        multiple=not single_model,
+        pool_reason=None if pooled else dataset_cuts.POOL_DISABLED_REASON,
         selection_state=selection_state,
     )
     model = ui.controls.dropdown(scope.models, description="Model") if single_model and scope.comparison else None
@@ -496,6 +516,14 @@ def _drawn_models(
     return {"models": chosen}
 
 
+def _generation_case_labels(frames: Mapping[str, pd.DataFrame], positions: Sequence[int], *, rows: bool) -> dict[int, str]:
+    """Return the generation case of each one-based row position of the first frame (the models are case-matched); none off ``rows``."""
+    first = next(iter(frames.values()), None)
+    if first is None or not rows:
+        return {}
+    return {position: f"generation case {int(first.iloc[position - 1]['case_index'])}" for position in positions if position <= len(first)}
+
+
 def _indexed_view(
     scope: _SteadyScope,
     *,
@@ -516,7 +544,8 @@ def _indexed_view(
 
     A comparison adds a model choice. The navigator steps the one-based positions the plot offers: the rows of the drawn
     frames, or, for a plot that resolves its own selection (ranked outliers and a reference, minimum and maximum),
-    ``offered(rows)`` positions that ``selection_name(index, offered)`` names in the export stem. With ``sync`` the case,
+    ``offered(rows)`` positions that ``selection_name(index, offered)`` names in the export stem; on rows, the navigator's status
+    line names the generation case of the shown position (of the first drawn frame, the models being case-matched). With ``sync`` the case,
     and the channel of a ``channel`` control, are shared with the other views through the selection state: a change is
     published, and the view takes the shared case and channel when it becomes active. ``choose_models`` offers the compared models as
     one multiple run choice (the first two selected) that the plot receives as ``models``, limited to the drawn role's models.
@@ -558,7 +587,9 @@ def _indexed_view(
         cast("ViewPanel", view).request(render)
 
     status = ui.controls.StatusLine()
-    navigator = ui.navigation.CaseNavigator(positions(), status=status, on_change=lambda _position: changed())
+    # The status line names each row's generation case; a plot that picks its cases itself (``offered``) gets none.
+    labels = _generation_case_labels(drawn(), positions(), rows=offered is None)
+    navigator = ui.navigation.CaseNavigator(positions(), labels=labels, status=status, on_change=lambda _position: changed())
     selection = [navigator.widget, *(control for name, control in controls.items() if name in _SELECTION_CONTROLS)]
     display = [control for name, control in controls.items() if name not in _SELECTION_CONTROLS]
     dataset_row = [choice.selector.header] if model is None else [choice.selector.header, model]
@@ -595,7 +626,7 @@ def _indexed_view(
             state_for_export["filename_stem"] = "__".join(part for part in parts if part is not None)
 
     def rebind_now() -> None:
-        navigator.rebind(positions(), preserve=True, notify=False)
+        navigator.rebind(positions(), preserve=True, notify=False, labels=_generation_case_labels(drawn(), positions(), rows=offered is None))
         publish()
         cast("ViewPanel", view).request(render)
 
@@ -607,7 +638,9 @@ def _indexed_view(
         try:
             with current.batch():
                 if choice.pull():
-                    navigator.rebind(positions(), preserve=True, notify=False)
+                    navigator.rebind(
+                        positions(), preserve=True, notify=False, labels=_generation_case_labels(drawn(), positions(), rows=offered is None)
+                    )
                 shared = None if state is None else state.selection
                 if shared is not None:
                     frames = drawn()
@@ -674,38 +707,52 @@ def _pressure_velocity_available(datasets: Mapping[str, pd.DataFrame]) -> bool:
     return True
 
 
-type _BreakEvenEvidence = tuple[bool, Mapping[str, float], Mapping[str, float], float | None, str]
+# Physics flag, COMSOL and surrogate seconds per case, training seconds before the run's own (or why they are missing), clocks, role.
+type _BreakEvenEvidence = tuple[bool, Mapping[str, float], Mapping[str, float], float | str, str, str]
 
 
 def _break_even_view(
     frames: Mapping[str, pd.DataFrame],
     evidence: Callable[[str, pd.DataFrame, Mapping[str, Any], Mapping[str, Any]], _BreakEvenEvidence],
-) -> Figure | widgets.HTML:
+    *,
+    styles: SeriesStyles,
+    labels: Mapping[str, str] | None = None,
+    models: Sequence[str] = (),
+) -> tuple[Figure, str] | widgets.HTML:
     """
     Draw the break-even against COMSOL of every run of ``frames`` that has its evidence, and name every run that lacks it.
 
-    A run is its first frame, as in the work table. ``evidence`` (given the label, frame, summary and work row) gives the
-    physics flag, the per-case COMSOL and surrogate seconds (the clocks of the speed-up view), the training seconds spent
-    before the run's own (``0.0``, or ``None`` when they cannot be told) and the text naming clocks and hardware. A run without
-    model kind, training seconds, train cases or a case with both clocks is named below the figure, or in a message when no
-    run has its evidence.
+    A run is its first frame, as in the work table, shown by its run label (``labels`` by frame, else the frame's key) in the
+    colour ``styles`` gives that frame in the other views. ``evidence`` (given the key, frame, summary and work row) gives the
+    physics flag, the per-case COMSOL and surrogate seconds (the clocks of the speed-up view), the training seconds spent before
+    the run's own (``0.0``, or the text naming why they cannot be told), the text naming clocks and hardware and the frame's
+    role. A run lacking model kind, its own training seconds, those before them, train cases or a case with both clocks is named
+    with each missing piece below the figure, or in a message when no run has its evidence. ``models`` end the title. The
+    figure comes with its runtime details, one plain line of clocks and hardware per drawn run, shown below it.
     """
     plots = analysis.evaluation.plots
     costs: list[Any] = []
     unavailable: list[str] = []
-    for label, summary in analysis.evaluation.run_discovery.distinct_runs(frames).items():
+    shown = plots.series.SeriesStyles()
+    shown.run_colours = styles.run_colours
+    for key, summary in analysis.evaluation.run_discovery.distinct_runs(frames).items():
+        label = (labels or {}).get(key, key)
         work = analysis.evaluation.run_discovery.stage_work_row(summary)
-        physics, comsol, surrogate, prior_seconds, clocks = evidence(label, frames[label], summary, work)
+        physics, comsol, surrogate, prior_seconds, clocks, role = evidence(key, frames[key], summary, work)
         present = {
             "model kind": work["model_kind"] is not None,
-            "training seconds": work["total_seconds"] is not None and prior_seconds is not None,
+            "training seconds": work["total_seconds"] is not None,
             "train cases": work["train_cases"] is not None,
-            "a case with both clocks": bool(comsol.keys() & surrogate.keys()),
+            "case with both clocks": bool(comsol.keys() & surrogate.keys()),
         }
-        if missing := [name for name, available in present.items() if not available]:
-            unavailable.append(f"{label} (no {', '.join(missing)})")
+        missing = [f"no {name}" for name, available in present.items() if not available]
+        if isinstance(prior_seconds, str):  # the seconds a continued stage needs from its A0, apart from its own
+            missing.append(prior_seconds)
+        if missing:
+            unavailable.append(f"{label} ({'; '.join(missing)})")
             continue
-        entity = plots.series.SeriesEntity(label, work["model_kind"], physics, "id", (), label)
+        shown[label] = styles[key]
+        entity = plots.series.SeriesEntity(label, work["model_kind"], physics, role, (), key)
         costs.append(
             plots.training.break_even_cost(
                 entity,
@@ -718,14 +765,25 @@ def _break_even_view(
         )
     if not costs:
         return widgets.HTML(f"<b>Break-even unavailable.</b> No run has its training and timing evidence: {escape('; '.join(unavailable))}.")
-    figure = plots.training.plot_break_even(costs)
-    if unavailable:
-        figure.supxlabel("Without break-even evidence: " + "; ".join(unavailable), fontsize=analysis.ui.figure_layout.NOTE_PT)
-    return figure
+    figure = plots.training.plot_break_even(costs, styles=shown, unavailable=unavailable, models=models)
+    return figure, "\n".join(f"{cost.entity.label}: {cost.clocks}" for cost in costs)
 
 
-def _steady_break_even(*, datasets: Mapping[str, pd.DataFrame]) -> Figure | widgets.HTML:
-    """Show the break-even of the steady runs with the clocks of the solver speed-up: COMSOL solver time against the batch-amortized forward."""
+def _device_text(device: object, name: object = None) -> str:
+    """Return a recorded compute device as its readable kind with its model name: ``cuda:0`` reads «GPU 0», ``cpu`` «CPU»."""
+    kind, _separator, index = str(device).partition(":")
+    shown = {"cuda": "GPU", "cpu": "CPU"}.get(kind, kind)
+    shown = f"{shown} {index}" if index else shown
+    return f"{shown} ({name})" if name else shown
+
+
+def _steady_break_even(*, datasets: Mapping[str, pd.DataFrame], models: Sequence[str] = ()) -> tuple[Figure, str] | widgets.HTML:
+    """
+    Show the break-even of the steady runs with the clocks of the solver speed-up: COMSOL solver time against the batch-amortized forward.
+
+    Each run takes its architecture colour (``series.series_styles`` by run), a single run too; its clocks read as names and
+    readable devices, never as storage keys.
+    """
     component = analysis.artifacts.timing.STEADY_SPEEDUPS["solver_speedup"][0]
 
     def evidence(_label: str, frame: pd.DataFrame, _summary: Mapping[str, Any], _work: Mapping[str, Any]) -> _BreakEvenEvidence:
@@ -733,11 +791,14 @@ def _steady_break_even(*, datasets: Mapping[str, pd.DataFrame]) -> Figure | widg
         report = analysis.evaluation.dataframe.require_complete_provenance(frame)["timing"]["report"]
         comsol = {case["case_id"]: case[component] for case in report["cases"] if case[component] is not None}
         surrogate = {case["case_id"]: case["batch_amortized_neural_operator_forward_s"] for case in report["cases"]}
-        surrogate_hardware, solver_hardware = analysis.evaluation.plots.run_summary.runtime_hardware(report)
-        clocks = f"COMSOL solver time ({component}) on {solver_hardware}; surrogate batch-amortized forward on {surrogate_hardware}"
-        return physics, comsol, surrogate, 0.0, clocks
+        _surrogate, solver_hardware = analysis.evaluation.plots.run_summary.runtime_hardware(report)
+        runtime = report["neural_runtime"]
+        device = _device_text(runtime["resolved_device"], runtime.get("cuda_device_name") or runtime["processor"])
+        clocks = f"COMSOL solver time on {solver_hardware}; surrogate batch-amortized forward on {device}"
+        role = str(frame.attrs.get("dataset_role"))
+        return physics, comsol, surrogate, 0.0, clocks, "id" if role == "eval" else role
 
-    return _break_even_view(datasets, evidence)
+    return _break_even_view(datasets, evidence, styles=analysis.evaluation.plots.series.series_styles(datasets, by_run=True), models=models)
 
 
 def _build_sections(
@@ -757,6 +818,9 @@ def _build_sections(
     parameters = analysis.evaluation.presentation.metadata_parameters(frames)
     parameter_options = tuple((analysis.evaluation.presentation.metadata_label(parameter), parameter) for parameter in parameters)
     toggle = analysis.ui.notebook.make_toggle_shortcut(dataset_map)
+    # The run-level views take each run's first role frame under its run label, so a single model is never named by its role.
+    runs = dict(next(iter(scope.frames_by_role.values())))
+    run_toggle = analysis.ui.notebook.make_toggle_shortcut(runs)
 
     def dataset(
         title: str,
@@ -764,14 +828,13 @@ def _build_sections(
         *,
         view: str | None = None,
         single_model: bool = False,
-        single_dataset: bool = False,
         start: int | None = None,
         extra: Mapping[str, ViewControl] | None = None,
         **plot_kwargs: Any,
     ) -> tuple[str, Callable[..., Any], str]:
         """Return a plot of the selected datasets, as a case-count viewer from ``start`` with its own controls ``extra``.
 
-        ``view`` names one of ``POOLABLE_STEADY_VIEWS``, whose views stay material-balanced when pooled.
+        ``view`` names one of ``POOLABLE_STEADY_VIEWS``, whose views pool the materials of a role with equal weight.
         """
         if view is not None and view not in dataset_cuts.POOLABLE_STEADY_VIEWS:
             msg = f"Steady view {view!r} is not in POOLABLE_STEADY_VIEWS."
@@ -785,7 +848,6 @@ def _build_sections(
                 export=export,
                 pooled=view in dataset_cuts.POOLABLE_STEADY_VIEWS,
                 single_model=single_model,
-                single_dataset=single_dataset,
                 plot_kwargs=plot_kwargs,
                 count=None if start is None else (start, _CASE_COUNT_STEP),
                 controls=extra,
@@ -803,12 +865,12 @@ def _build_sections(
             ),
         )
 
-    configuration_entry = toggle(
+    configuration_entry = run_toggle(
         "Model-family configuration",
         plots.run_summary.plot_architecture_table,
         plot_name="Model-family configuration",
     )
-    overview_entries = [dataset("Summary table", plots.run_summary.plot_run_summary_table, view="overview_summary_table")]
+    overview_entries = [dataset("Summary table", plots.run_summary.plot_run_summary_table)]
     if comparison:
         overview_entries.extend(
             (
@@ -817,7 +879,7 @@ def _build_sections(
                     plots.run_summary.plot_relative_comparison_scoreboard,
                     view="overview_global_comparison_summary",
                 ),
-                dataset("Pareto (Error vs Physics)", plots.run_summary.plot_accuracy_physics_pareto, view="overview_accuracy_physics_pareto"),
+                dataset("Pareto (Error vs Physics)", plots.run_summary.plot_accuracy_physics_pareto),
             )
         )
     else:
@@ -829,14 +891,12 @@ def _build_sections(
         dataset(
             "Mean error maps",
             plots.error_behavior.plot_mean_error_maps,
-            single_dataset=True,
             start=100,
             extra={"error_mode": controls.error_mode_group("steady"), "display_spatial_stride": controls.display_stride_dropdown()},
         ),
         dataset(
             "Std error maps",
             plots.error_behavior.plot_std_error_maps,
-            single_dataset=True,
             start=100,
             extra={"display_spatial_stride": controls.display_stride_dropdown()},
         ),
@@ -869,10 +929,10 @@ def _build_sections(
             dataset("Physical consistency summary table", physical.plot_physical_consistency_summary_table),
             dataset("Physical consistency CDFs", physical.plot_physical_consistency_cdf_grid, start=100),
             dataset("Cross-section flux balance", physical.plot_flux_balance, start=100),
-            dataset("Darcy–Brinkman operator residual", physical.plot_brinkman_residual, single_dataset=True, start=100),  # noqa: RUF001
+            dataset("Darcy–Brinkman operator residual", physical.plot_brinkman_residual, start=100),  # noqa: RUF001
             dataset("Pressure and boundary-condition consistency", physical.plot_pressure_consistency, start=100),
             dataset("Pressure-boundary summary", physical.plot_pressure_boundary_summary, start=100),
-            dataset("Spatial residuals", physical.plot_spatial_residuals, single_dataset=True, start=100),
+            dataset("Spatial residuals", physical.plot_spatial_residuals, start=100),
         ]
 
     spectral_entries = [
@@ -980,8 +1040,10 @@ def _build_sections(
         "runtime": (
             [
                 toggle("Runtime and speed-up", plots.run_summary.plot_runtime_table, plot_name="Runtime and speed-up"),
-                toggle("Work per stage", plots.run_summary.plot_work_table, plot_name="Work per stage"),
-                toggle("Break-even", _steady_break_even, plot_name="Break-even"),
+                run_toggle("Work per stage", plots.run_summary.plot_work_table, plot_name="Work per stage"),
+                run_toggle(
+                    "Break-even", _steady_break_even, plot_name="Break-even", models=tuple("" if run in scope.unnamed else run for run in runs)
+                ),
             ],
             EVALUATION_SECTION_TITLES["runtime"],
         ),
@@ -1104,10 +1166,11 @@ def _build_panel(
     selection_state: EvaluationSelectionState | None = None,
     widths: WidthScope | None = None,
     refused_roles: Mapping[str, str] | None = None,
+    unnamed_models: Collection[str] = (),
 ) -> widgets.Widget:
-    """Build one lazy panel whose views offer the datasets of every context in their own selectors."""
+    """Build one lazy panel whose views offer the datasets of every context in their own selectors; ``unnamed_models`` titles name none."""
     registry = _build_sections(
-        _SteadyScope(contexts, comparison=comparison, refused_roles=refused_roles or {}),
+        _SteadyScope(contexts, comparison=comparison, refused_roles=refused_roles or {}, unnamed=unnamed_models),
         comparison=comparison,
         selection_state=selection_state,
     )
@@ -1187,14 +1250,17 @@ def build_single_model_panel(
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
     widths: WidthScope | None = None,
+    unnamed_models: Collection[str] = (),
 ) -> widgets.Widget:
-    """Build one single-model panel containing every supplied dataset."""
+    """Build one single-model panel containing every supplied dataset; a model label in ``unnamed_models`` (an alias) no title names."""
     normalized = _normalize_contexts(session, contexts, comparison=False)
     model_labels = tuple(next(iter(context.datasets)) for context in normalized)
     if len(set(model_labels)) != 1:
         msg = "Single-model contexts must all refer to the same presentation model label."
         raise ValueError(msg)
-    return _build_panel(contexts=normalized, comparison=False, sections=sections, selection_state=selection_state, widths=widths)
+    return _build_panel(
+        contexts=normalized, comparison=False, sections=sections, selection_state=selection_state, widths=widths, unnamed_models=unnamed_models
+    )
 
 
 def build_comparison_panel(
@@ -1205,8 +1271,13 @@ def build_comparison_panel(
     selection_state: EvaluationSelectionState | None = None,
     widths: WidthScope | None = None,
     refused_roles: Mapping[str, str] | None = None,
+    unnamed_models: Collection[str] = (),
 ) -> widgets.Widget:
-    """Build one comparison panel; its views choose among the datasets of every role, the refused roles listed as unavailable."""
+    """
+    Build one comparison panel; its views choose among the datasets of every role, the refused roles listed as unavailable.
+
+    A model label in ``unnamed_models`` is no explicit short label (a storage alias): the legend shows it, no title names a model then.
+    """
     normalized = _normalize_contexts(session, contexts, comparison=True)
     return _build_panel(
         contexts=normalized,
@@ -1215,6 +1286,7 @@ def build_comparison_panel(
         selection_state=selection_state,
         widths=widths,
         refused_roles=refused_roles,
+        unnamed_models=unnamed_models,
     )
 
 
@@ -1366,6 +1438,28 @@ class _Channels:
         return checks
 
 
+class _PooledClock:
+    """The clock of a pooled time view: hours while every drawn curve holds one case, else the drying phase, until the user picks one."""
+
+    def __init__(self, on_pick: Callable[[], None]) -> None:
+        """Create the choice on the drying phase; ``on_pick`` redraws after each clock the user picks."""
+        self.widget = analysis.ui.controls.clock_group("phase")
+        self._default, self._picked, self._on_pick = "phase", False, on_pick
+        self.widget.observe(self._changed, names="value")
+
+    def resolve(self, series: Mapping[str, Sequence[Any]]) -> str:
+        """Return the clock to draw ``series`` with: the user's pick, else the default its curves call for, which the choice then shows."""
+        if not self._picked:
+            self._default = "hours" if all(len(records) <= 1 for records in series.values()) else "phase"
+            self.widget.value = self._default  # taken for no pick, so nothing redraws
+        return str(self.widget.value)
+
+    def _changed(self, change: Mapping[str, Any]) -> None:
+        if self._picked or change["new"] != self._default:
+            self._picked = True
+            self._on_pick()
+
+
 class _CaseFocus:
     """The datasets a transient case view shows, the cases they hold, and a case navigator over those cases' one-based positions."""
 
@@ -1380,17 +1474,25 @@ class _CaseFocus:
         selection_state: EvaluationSelectionState | None,
         status: analysis.ui.controls.StatusLine,
         on_change: Callable[[], None],
+        order: Callable[[Sequence[Any]], tuple[Any, ...]] | None = None,
     ) -> None:
-        """Create the dataset choice and the navigator on the shared case, else the first one; ``on_change`` follows the navigator."""
+        """
+        Create the dataset choice and the navigator on the shared case, else the first one; ``on_change`` follows the navigator.
+
+        ``order`` ranks the cases of the chosen datasets again at every change of the choice; without it they keep inventory order.
+        A ranked view opens on rank one and never jumps to the case another view chose.
+        """
         self._session = session
         self._entries = entries
         self._comparison = comparison
         self._state = selection_state
+        self._order = order
         self.choice = _SharedChoice(inventory, multiple=multiple, pool_reason=None, selection_state=selection_state)
-        self.shown = _focus_entries(session, entries, self.choice.selector.choices())
+        self.shown = self._focused()
+        shared = None if selection_state is None or order is not None else selection_state.selection.case_id
         self.navigator = analysis.ui.navigation.CaseNavigator(
             self._positions(),
-            value=self._position_of(None if selection_state is None else selection_state.selection.case_id) or 1,
+            value=self._position_of(shared) or 1,
             labels=_case_labels(self.shown, comparison=comparison),
             status=status,
             on_change=lambda _position: on_change(),
@@ -1407,50 +1509,62 @@ class _CaseFocus:
     def _position_of(self, case_id: str | None) -> int | None:
         return next((position for position, entry in enumerate(self.shown, start=1) if entry.case_id == case_id), None)
 
+    def _focused(self) -> tuple[Any, ...]:
+        """Return the cases of the chosen datasets, in the view's order when it ranks them."""
+        shown = _focus_entries(self._session, self._entries, self.choice.selector.choices())
+        return shown if self._order is None else self._order(shown)
+
     def rebind(self) -> bool:
-        """List the cases of the chosen datasets again, keeping the shown position where it exists; return whether there are any."""
-        self.shown = _focus_entries(self._session, self._entries, self.choice.selector.choices())
+        """List the cases of the chosen datasets again, keeping the shown position (ranked: rank one); return whether there are any."""
+        self.shown = self._focused()
         if self.shown:
-            self.navigator.rebind(self._positions(), preserve=True, notify=False, labels=_case_labels(self.shown, comparison=self._comparison))
+            labels = _case_labels(self.shown, comparison=self._comparison)
+            self.navigator.rebind(self._positions(), preserve=self._order is None, notify=False, labels=labels)
         return bool(self.shown)
 
     def pull(self) -> None:
-        """Take the datasets and the case the other views chose; only the navigator's own change callback reports a new case."""
+        """Take the datasets and (unranked) the case the other views chose; only the navigator's own change callback reports a new case."""
         if self.choice.pull():
             self.rebind()
-        wanted = self._position_of(None if self._state is None else self._state.selection.case_id)
+        wanted = self._position_of(None if self._state is None or self._order is not None else self._state.selection.case_id)
         if wanted is not None:
             self.navigator.field.value = wanted
 
 
-def _transient_outlier_inventory(
-    session: TransientEvaluationSession,
-    *,
-    fields: Sequence[Any],
-    comparison: bool,
-    selection_state: EvaluationSelectionState | None,
-) -> tuple[Any, ...]:
-    """Return the stable union of per-channel worst complete-rollout cases."""
-    inventory = _transient_inventory(
-        session,
-        comparison=comparison,
-        selection_state=selection_state,
-    )
-    by_key = {(entry.frame_name, entry.case_id): entry for entry in inventory}
+def _transient_outlier_order(
+    session: TransientEvaluationSession, *, fields: Sequence[Any], ranks: dict[tuple[str, str], tuple[str, int]] | None = None
+) -> Callable[[Sequence[Any]], tuple[Any, ...]]:
+    """
+    Return the ranking of given inventory entries: the stable union of their per-channel worst complete-rollout cases, else the entries.
+
+    The view ranks only the cases of the chosen datasets; a ranking over every dataset of the session can leave the chosen one empty.
+    Only a finite error ranks, so the first field with one is the ranking field of rank one; without any, the entries stay in
+    inventory order, unranked. ``ranks`` receives, at every ranking, each ranked case's (frame, case) with the field key and rank
+    under which it first entered.
+    """
     frame = session.case_dataframe(modes=("autonomous_full",))
     selected = frame.loc[(frame["requested_horizon"] == "full") & (frame["scope"] == "cumulative")]
-    ordered: list[Any] = []
-    seen: set[tuple[str, str]] = set()
-    for field in fields:
-        column = f"normalized_rmse_{field.key}" if field.stored else "physical_w_gr_rmse"
-        if column not in selected:
-            continue
-        for row in selected.nlargest(_OUTLIER_COUNT, column).itertuples(index=False):
-            key = (str(row.frame), str(row.case_id))
-            if key in by_key and key not in seen:
-                ordered.append(by_key[key])
-                seen.add(key)
-    return tuple(ordered) or inventory
+
+    def order(entries: Sequence[Any]) -> tuple[Any, ...]:
+        by_key = {(entry.frame_name, entry.case_id): entry for entry in entries}
+        within = selected.loc[[key in by_key for key in zip(selected["frame"].astype(str), selected["case_id"].astype(str), strict=True)]]
+        ordered: dict[tuple[str, str], Any] = {}
+        found: dict[tuple[str, str], tuple[str, int]] = {}
+        for field in fields:
+            column = f"normalized_rmse_{field.key}" if field.stored else "physical_w_gr_rmse"
+            if column not in within:
+                continue
+            finite = within.loc[np.isfinite(within[column].to_numpy(dtype=np.float64))]  # ``nlargest`` would rank NaN when short of values
+            for rank, row in enumerate(finite.nlargest(_OUTLIER_COUNT, column).itertuples(index=False), start=1):
+                key = (str(row.frame), str(row.case_id))
+                ordered.setdefault(key, by_key[key])
+                found.setdefault(key, (str(field.key), rank))
+        if ranks is not None:
+            ranks.clear()
+            ranks.update(found)
+        return tuple(ordered.values()) or tuple(entries)
+
+    return order
 
 
 def _frame_reference_scales(
@@ -1787,23 +1901,45 @@ def _transient_material_role(entry: Any) -> str:
     return analysis.presentation.display_labels.material_role_display_label(entry.material_family, declared_role)
 
 
-def _transient_model_label(session: TransientEvaluationSession, frame_name: str) -> str:
-    """Return the short model label «architecture · stage» from the saved run config, the frame name where it is incomplete."""
-    config = session.canonical_frames[frame_name].attrs.get(analysis.evaluation.dataframe.COMPLETED_RUN_CONFIG_ATTR)
-    if not isinstance(config, Mapping):
-        return frame_name
-    try:
-        label = naming.architecture_label(config)
-        stage = config.get("run", {}).get("layout", {}).get("stage")
-    except (AttributeError, KeyError, TypeError, ValueError):
-        return frame_name
-    return label if stage is None else f"{label} · {stage}"
+@dataclass(frozen=True, slots=True)
+class FrameRun:
+    """The run a session frame belongs to: its display label, and whether that is an explicit short label (a storage alias is never named)."""
+
+    label: str
+    named: bool
 
 
-def _transient_sample_title(entry: Any, *, model_label: str | None) -> str:
-    """Return the state-map title context like the case selector: material and role, the short model label when comparing, the compact case."""
-    parts = (_transient_material_role(entry), model_label, entry.case_label)
-    return " · ".join(part for part in parts if part is not None)
+def _run_models(frame_runs: Mapping[str, FrameRun] | None, frame_names: Iterable[str]) -> tuple[str, ...]:
+    """Return the short label of the run of each of ``frame_names`` for ``layout.models_suffix``; an unnamed or unmapped run is ``""``."""
+    runs = frame_runs or {}
+    return tuple(runs[name].label if name in runs and runs[name].named else "" for name in frame_names)
+
+
+def _run_labels(frame_runs: Mapping[str, FrameRun] | None, frame_names: Sequence[str]) -> dict[str, str]:
+    """Return the shown label of each of ``frame_names``, frames of distinct runs: its run label (else itself), equal ones told apart by frame."""
+    runs = frame_runs or {}
+    bases = [runs[name].label if name in runs else name for name in frame_names]
+    shown = analysis.presentation.display_labels.unique_display_labels(bases, [(name,) for name in frame_names])
+    return dict(zip(frame_names, shown, strict=True))
+
+
+def _transient_sample_title(entry: Any, *, outlier: bool, rank: tuple[str, int] | None = None, ranked: bool = True) -> str:
+    """
+    Return the state-map title context: the picked case, its material, role and number.
+
+    An outlier is named by its ranking field and rank (``rank``: field key, rank) where known: rank one is the «Largest» error.
+    An outlier view without any finite error to rank (not ``ranked``) names its case «Unranked».
+    """
+    if not outlier:
+        lead = "Selected sample:"
+    elif not ranked:
+        lead = "Unranked case in"
+    elif rank is None:
+        lead = "Largest error in"
+    else:
+        field = analysis.presentation.moisture_display.display_name(rank[0], mathtext=True)
+        lead = f"Largest {field} error in" if rank[1] == 1 else f"Rank {rank[1]} {field} error in"
+    return f"{lead} {_transient_material_role(entry)} · {entry.case_label}"
 
 
 def _transient_sample_caption(entry: Any, suffix: str) -> str:
@@ -1889,10 +2025,56 @@ def _publish_transient_capabilities(
         selection_state.select_physical_time(physical_time)
 
 
-def _shared_or_last_time(selection_state: EvaluationSelectionState | None, times: Sequence[float]) -> float:
-    """Return the physical time the other views chose where ``times`` stores it, else the last stored time."""
-    preferred = None if selection_state is None else selection_state.selection.physical_time
-    return times[-1] if preferred is None or preferred not in times else preferred
+# The time a user last stepped to on a time navigator of one of a session's views, per session. A shared selection's own time
+# cannot tell such a choice from a view's default, because every view publishes the time it draws. Every run or artifact-role
+# change opens a new session, so a choice stays across the views and cases of one session and never reaches another run's.
+_CHOSEN_TIMES: WeakKeyDictionary[TransientEvaluationSession, float] = WeakKeyDictionary()
+
+
+def _on_time_chosen(session: TransientEvaluationSession, redraw: Callable[[], None]) -> Callable[[TimeStepSelection], None]:
+    """Return the change callback of a time navigator: remember the user's time for the session's views, then redraw."""
+
+    def chosen(selection: TimeStepSelection) -> None:
+        _CHOSEN_TIMES[session] = float(selection.physical_time)
+        redraw()
+
+    return chosen
+
+
+def _chosen_or_default_time(session: TransientEvaluationSession, times: Sequence[float], default: float) -> float:
+    """Return the time the user chose on a view of the session where ``times`` stores it, else ``default``."""
+    chosen = _CHOSEN_TIMES.get(session)
+    return chosen if chosen is not None and chosen in times else default
+
+
+def _coverage_time(shown: Mapping[str, Sequence[Any]]) -> float:
+    """
+    Return the latest stored time that every shown record holds, so every selected case has a state there: the snapshot default.
+
+    Full rollouts all store their origin, so a common time exists; records without one are refused rather than given another default.
+    """
+    stored = [{float(value) for value in record.physical_times} for records in shown.values() for record in records]
+    common = set.intersection(*stored) if stored else set()
+    if not common:
+        msg = "The shown records share no stored time, so the snapshot has no time at which every selected case has a state."
+        raise ValueError(msg)
+    return max(common)
+
+
+def _bind_snapshot_clock(
+    session: TransientEvaluationSession,
+    clock: TimeNavigator,
+    shown: Mapping[str, Sequence[Any]],
+    *,
+    at_phase: bool,
+) -> None:
+    """Bind a snapshot navigator to the times the shown records store, at the chosen or covered time; only a shown navigator keeps its time."""
+    if shown:
+        times = _shared_transient_physical_times(tuple(record for records in shown.values() for record in records))
+        # On the drying phase the navigator is hidden: it reports no time, so another control's message on the status line stays.
+        clock.rebind(times, preserve_time=_chosen_or_default_time(session, times, _coverage_time(shown)), notify=False, report=not at_phase)
+    if not shown or at_phase:
+        clock.clear_status()  # the navigator is hidden: its time is no selection of an empty view or of the drying phase
 
 
 def _make_transient_sample_viewer(
@@ -1906,21 +2088,19 @@ def _make_transient_sample_viewer(
     export_title: str | None = None,
     outlier: bool = False,
     refused_roles: Mapping[str, str] | None = None,
+    frame_runs: Mapping[str, FrameRun] | None = None,
 ) -> ViewPanel:
-    """Build the EDA-native selected-case Reference/Prediction/Error view of one dataset (the focus dataset)."""
+    """Build the EDA-native selected-case Reference/Prediction/Error view of one dataset (the focus dataset), titled with its frame's run label."""
     ui = analysis.ui
     admitted_fields = _supported_transient_fields(fields)
     if not admitted_fields:
         msg = "Transient sample views require representable channels."
         raise ValueError(msg)
-    entries = (
-        _transient_outlier_inventory(session, fields=admitted_fields, comparison=comparison, selection_state=selection_state)
-        if outlier
-        else _transient_inventory(session, comparison=comparison, selection_state=selection_state)
-    )
+    entries = _transient_inventory(session, comparison=comparison, selection_state=selection_state)
     export: dict[str, Any] = {"export_state": export_state, "export_plot_name": export_plot_name, "export_title": export_title}
     status = ui.controls.StatusLine()
     view: ViewPanel | None = None
+    ranks: dict[tuple[str, str], tuple[str, int]] = {}  # each ranked case's ranking field and rank, for its title
     focus = _CaseFocus(
         session,
         entries,
@@ -1930,6 +2110,7 @@ def _make_transient_sample_viewer(
         selection_state=selection_state,
         status=status,
         on_change=lambda: cast("ViewPanel", view).request(refresh),
+        order=_transient_outlier_order(session, fields=admitted_fields, ranks=ranks) if outlier else None,
     )
     if not focus.shown:
         msg = "Transient field views require at least one exact case in the chosen dataset."
@@ -1954,9 +2135,9 @@ def _make_transient_sample_viewer(
         if outlier
         else ui.navigation.TimeNavigator(
             times,
-            value=_shared_or_last_time(selection_state, times),
+            value=_chosen_or_default_time(session, times, times[-1]),
             status=status,
-            on_change=lambda _selection: cast("ViewPanel", view).request(render),
+            on_change=_on_time_chosen(session, lambda: cast("ViewPanel", view).request(render)),
         )
     )
     rows = [
@@ -1975,7 +2156,9 @@ def _make_transient_sample_viewer(
             "error_mode": str(error_mode.value),
             "reference_scales": _transient_reference_scales(session, entry.frame_name, selected, record),
             "display_spatial_stride": display_stride.value,
-            "title_context": _transient_sample_title(entry, model_label=_transient_model_label(session, entry.frame_name) if comparison else None),
+            # An empty ranking is the inventory fallback: no case of the chosen datasets has a finite error.
+            "title_context": _transient_sample_title(entry, outlier=outlier, rank=ranks.get((entry.frame_name, entry.case_id)), ranked=bool(ranks)),
+            "models": _run_models(frame_runs, (entry.frame_name,)),  # the run's label ends the title, after the time
         }
 
     norms_cache: dict[str, Any] = {}  # the norms over all stored times of the last setting, replaced when the case or a norm setting changes
@@ -2015,7 +2198,7 @@ def _make_transient_sample_viewer(
         """Load the shown case's record, keep the shared time where the case stores it, and draw once."""
         times = tuple(float(value) for value in selected_record().physical_times)
         if clock is not None:
-            clock.rebind(times, preserve_time=_shared_or_last_time(selection_state, times), notify=False)
+            clock.rebind(times, preserve_time=_chosen_or_default_time(session, times, times[-1]), notify=False)
         render_now()
 
     def rebind_now() -> None:
@@ -2079,25 +2262,26 @@ def _transient_series(
     *,
     limit: int,
     comparison: bool,
-    owners: dict[int, str] | None = None,
-) -> dict[str, tuple[Any, ...]]:
+    frame_runs: Mapping[str, FrameRun] | None = None,
+) -> dict[str, tuple[str, tuple[Any, ...], str]]:
     """
-    Return the full-rollout records of the first ``limit`` cases of every dataset, one series per dataset and model frame.
+    Return the frame, the full-rollout records of the first ``limit`` cases and the dataset label of every dataset and frame.
 
-    A comparison names each series by its model frame after the dataset label; a single model has one frame per dataset.
-    ``owners``, when given, receives the frame name of every returned record under ``id(record)``.
+    The frame is the series' identity, which every join uses; the key is only its shown name. A comparison names each series
+    by its run (the run label of ``frame_runs``, else the frame; equal ones told apart) before the dataset label, which names
+    the role; a single model has one frame per dataset.
     """
-    series: dict[str, tuple[Any, ...]] = {}
+    series: dict[str, tuple[str, tuple[Any, ...], str]] = {}
     for context in contexts:
+        runs = _run_labels(frame_runs, context.frame_names)  # the frames of one dataset are distinct runs
         for frame_name in context.frame_names:
             held = set(session.case_ids(frame_name))
-            label = f"{context.label} · {frame_name}" if comparison else context.label
-            series[label] = tuple(
+            label = f"{runs[frame_name]} · {context.label}" if comparison else context.label
+            records = tuple(
                 _full_autonomous_record(session, frame_name=frame_name, case_id=case_id)
                 for case_id in [case_id for case_id in context.case_ids if case_id in held][:limit]
             )
-            if owners is not None:
-                owners.update((id(record), frame_name) for record in series[label])
+            series[label] = frame_name, records, context.label
     return series
 
 
@@ -2113,8 +2297,9 @@ def _make_transient_aggregate_viewer(
     export_plot_name: str | None = None,
     export_title: str | None = None,
     refused_roles: Mapping[str, str] | None = None,
+    frame_runs: Mapping[str, FrameRun] | None = None,
 ) -> ViewPanel:
-    """Build one exact-time multi-dataset aggregate with EDA-native controls."""
+    """Build one exact-time multi-dataset aggregate with EDA-native controls; the title names the runs of the chosen frames."""
     if plot_kind not in {"predicted_reference", "mean_error", "std_error"}:
         msg = "Unknown transient aggregate field-view kind."
         raise ValueError(msg)
@@ -2122,28 +2307,27 @@ def _make_transient_aggregate_viewer(
     admitted_fields = _supported_transient_fields(fields)
     export: dict[str, Any] = {"export_state": export_state, "export_plot_name": export_plot_name, "export_title": export_title}
     choice = _SharedChoice(
-        dataset_cuts.transient_inventory(session, refused=refused_roles or {}),
-        multiple=not comparison,  # a comparison draws one dataset (O1)
-        pool_reason=None,
-        selection_state=selection_state,
+        dataset_cuts.transient_inventory(session, refused=refused_roles or {}), multiple=True, pool_reason=None, selection_state=selection_state
     )
     maximum = _largest_dataset(session, choice)
     all_case_ids = [entry.case_id for entry in session.case_inventory()]
     status = ui.controls.StatusLine()
     channels = _Channels("Channels", admitted_fields, selection_state)
-    active: dict[str, Any] = {"key": None, "series": None, "owners": {}}  # owners: the frame each shown record comes from
+    # owners: the frame each shown record comes from; datasets: each series' dataset label, which a series without a case keeps
+    active: dict[str, Any] = {"key": None, "series": None, "owners": {}, "frames": (), "datasets": {}}
     view: ViewPanel | None = None
 
     def series() -> dict[str, tuple[Any, ...]]:
         contexts = dataset_cuts.transient_contexts(session, choice.selector.choices())
         key = (tuple((context.label, context.frame_names) for context in contexts), count.value)
         if active["key"] != key:
-            active["key"], active["owners"] = key, {}
-            active["series"] = _transient_series(session, contexts, limit=count.value, comparison=comparison, owners=active["owners"])
+            active["key"] = key
+            active["frames"] = tuple(name for context in contexts for name in context.frame_names)
+            pairs = _transient_series(session, contexts, limit=count.value, comparison=comparison, frame_runs=frame_runs)
+            active["series"] = {label: records for label, (_frame, records, _dataset) in pairs.items()}
+            active["owners"] = {id(record): frame for frame, records, _dataset in pairs.values() for record in records}
+            active["datasets"] = {label: dataset for label, (_frame, _records, dataset) in pairs.items()}
         return cast("dict[str, tuple[Any, ...]]", active["series"])
-
-    def times_of(shown: dict[str, tuple[Any, ...]]) -> tuple[float, ...]:
-        return _shared_transient_physical_times(tuple(record for records in shown.values() for record in records))
 
     count = ui.navigation.CountControl(
         value=min(_CASE_COUNT_STEP, maximum),
@@ -2152,14 +2336,12 @@ def _make_transient_aggregate_viewer(
         step=_CASE_COUNT_STEP,
         on_change=lambda _count: cast("ViewPanel", view).request(refresh),
     )
-    first = times_of(series())
-    clock = ui.navigation.TimeNavigator(
-        first,
-        value=_shared_or_last_time(selection_state, first),
-        status=status,
-        on_change=lambda _selection: cast("ViewPanel", view).request(render),
+    clock = ui.navigation.TimeNavigator(  # hidden on a placeholder time until records exist: every refresh binds the shown times
+        (0.0,), status=status, on_change=_on_time_chosen(session, lambda: cast("ViewPanel", view).request(render))
     )
-    clock_mode = ui.controls.choice_group(_CLOCK_OPTIONS, value="hours")
+    ui.controls.set_visible(clock.widget, False)
+    status.clear()  # the placeholder time is not a selection
+    clock_mode = ui.controls.clock_group("hours")
     percent = [round(100 * float(point)) for point in ui.time.PHASE_GRID]  # the slider steps through the phase grid in percent
     phase = ui.navigation.CountControl(
         value=percent[len(percent) // 2 - 1],
@@ -2180,10 +2362,10 @@ def _make_transient_aggregate_viewer(
     def render_now() -> None:
         current = cast("ViewPanel", view)
         at_phase = clock_mode.value == "phase"
-        ui.controls.set_visible(clock.widget, not at_phase)  # only the chosen clock's navigator shows
+        shown = series()
+        ui.controls.set_visible(clock.widget, bool(shown) and not at_phase)  # only the chosen clock's navigator shows, once records exist
         ui.controls.set_visible(phase.widget, at_phase)
         selected = channels.checks.selected
-        shown = series()
         if not shown:
             ui.viewers.clear_view(current, ui.viewers.EMPTY_SELECTION_MESSAGE, **export)
             return
@@ -2216,6 +2398,7 @@ def _make_transient_aggregate_viewer(
                 "compute_device": requested_device,
             }
             kwargs |= _series_reference_scales(session, active["owners"], supported, selected, error_mode)
+        kwargs["models"], kwargs["context_labels"] = _run_models(frame_runs, active["frames"]), active["datasets"]
 
         def draw() -> tuple[str, Figure]:
             return coverage, plot_func(supported, **kwargs)
@@ -2234,10 +2417,7 @@ def _make_transient_aggregate_viewer(
 
     def refresh_now() -> None:
         """Keep the shared time where the changed cases store it, and draw once."""
-        shown = series()
-        if shown:
-            times = times_of(shown)
-            clock.rebind(times, preserve_time=_shared_or_last_time(selection_state, times), notify=False)
+        _bind_snapshot_clock(session, clock, series(), at_phase=clock_mode.value == "phase")
         render_now()
 
     def device_changed() -> None:
@@ -2269,7 +2449,8 @@ def _make_transient_aggregate_viewer(
     channels.checks.observe(lambda: cast("ViewPanel", view).request(render))
     if error_mode is not None:
         error_mode.observe(lambda _change: cast("ViewPanel", view).request(render), names="value")
-    clock_mode.observe(lambda _change: cast("ViewPanel", view).request(render), names="value")
+    # A refresh, so the navigator reports its time again when the hours come back and its note goes with the phase.
+    clock_mode.observe(lambda _change: cast("ViewPanel", view).request(refresh), names="value")
     ui.controls.set_visible(phase.widget, False)  # hours first
     subscribe_device()
     view.request(refresh)
@@ -2287,8 +2468,9 @@ def _make_transient_scope_viewer(
     export_plot_name: str | None = None,
     export_title: str | None = None,
     refused_roles: Mapping[str, str] | None = None,
+    frame_runs: Mapping[str, FrameRun] | None = None,
 ) -> ViewPanel:
-    """Build one local Aggregate/Single case trajectory-style view of the selected datasets."""
+    """Build one local Aggregate/Single case trajectory-style view of the selected datasets; the title names the runs of the shown frames."""
     if plot_kind not in {"trajectory", "error_time", "target_magnitude"}:
         msg = "Unknown transient scoped view kind."
         raise ValueError(msg)
@@ -2302,7 +2484,7 @@ def _make_transient_scope_viewer(
         session,
         entries,
         inventory=dataset_cuts.transient_inventory(session, refused=refused_roles or {}),
-        multiple=not comparison,  # a comparison draws one dataset (O1)
+        multiple=True,
         comparison=comparison,
         selection_state=selection_state,
         status=status,
@@ -2312,7 +2494,7 @@ def _make_transient_scope_viewer(
     maximum = _largest_dataset(session, choice)
     channels = _Channels("Stored channels" if plot_kind == "error_time" else "Channels", admitted_fields, selection_state)
     scope = ui.controls.scope_group(selection_state.selection.scope if selection_state is not None else "aggregate")
-    active: dict[str, Any] = {"key": None, "series": None, "scaling_states": None}
+    active: dict[str, Any] = {"key": None, "series": None, "scaling_states": None, "frames": ()}
 
     def selected_series() -> tuple[dict[str, tuple[Any, ...]], dict[str, Mapping[str, Any]]]:
         contexts = dataset_cuts.transient_contexts(session, choice.selector.choices())
@@ -2322,17 +2504,15 @@ def _make_transient_scope_viewer(
         else:
             key = ("aggregate", tuple((context.label, context.frame_names) for context in contexts), count.value)
         if active["key"] != key:
+            active["frames"] = (entry.frame_name,) if entry is not None else tuple(name for context in contexts for name in context.frame_names)
             if entry is not None:
                 label = _transient_case_label(entry, comparison=comparison)
                 series = {label: (_full_autonomous_record(session, frame_name=entry.frame_name, case_id=entry.case_id),)}
                 scaling_states = {label: session.scaling_state(entry.frame_name)}
-            else:
-                series = _transient_series(session, contexts, limit=count.value, comparison=comparison)
-                scaling_states = {
-                    f"{context.label} · {name}" if comparison else context.label: session.scaling_state(name)
-                    for context in contexts
-                    for name in context.frame_names
-                }
+            else:  # both mappings take their keys from the same series, each joined to the scaler of its own frame
+                pairs = _transient_series(session, contexts, limit=count.value, comparison=comparison, frame_runs=frame_runs)
+                series = {label: records for label, (_frame, records, _dataset) in pairs.items()}
+                scaling_states = {label: session.scaling_state(frame) for label, (frame, _records, _dataset) in pairs.items()}
             active["key"], active["series"], active["scaling_states"] = key, series, scaling_states
         return cast("dict[str, tuple[Any, ...]]", active["series"]), cast("dict[str, Mapping[str, Any]]", active["scaling_states"])
 
@@ -2344,17 +2524,17 @@ def _make_transient_scope_viewer(
         on_change=lambda _count: cast("ViewPanel", view).request(render),
     )
     pooled_time = plot_kind in {"trajectory", "error_time"}
-    time_axis = ui.controls.choice_group(_CLOCK_OPTIONS, value="phase")  # placed in the row of the pooled time views only
+    time_axis = _PooledClock(lambda: cast("ViewPanel", view).request(render))  # placed in the row of the pooled time views only
     rows = [
         ui.panel.row(choice.selector.header, scope, count.widget, navigator.widget),
-        ui.panel.row(channels.checks.widget, *([time_axis] if pooled_time else [])),
+        ui.panel.row(channels.checks.widget, *([time_axis.widget] if pooled_time else [])),
     ]
 
     def update_scope_row() -> None:
         """Expose only the navigator of the active scope: the case count (aggregate) or the case (single), and the clock only in aggregate."""
         ui.controls.set_visible(count.widget, scope.value == "aggregate")
         ui.controls.set_visible(navigator.widget, scope.value == "single")
-        ui.controls.set_visible(time_axis, scope.value == "aggregate")
+        ui.controls.set_visible(time_axis.widget, scope.value == "aggregate")
 
     def render_now() -> None:
         current = cast("ViewPanel", view)
@@ -2376,7 +2556,7 @@ def _make_transient_scope_viewer(
                 channels=selected,
                 case_id=None if entry is None else entry.case_id,
             )
-        clock = str(time_axis.value) if pooled_time and scope.value == "aggregate" else "hours"  # a single case keeps its hours
+        clock = time_axis.resolve(series) if pooled_time and scope.value == "aggregate" else "hours"  # a single case keeps its hours
         plot_func: Callable[..., Figure]
         if plot_kind == "trajectory":
             plot_func = analysis.evaluation.plots.transient.plot_state_trajectory_summary
@@ -2387,6 +2567,7 @@ def _make_transient_scope_viewer(
         else:
             plot_func = analysis.evaluation.plots.transient.plot_error_vs_target_magnitude
             kwargs = {"state_fields": selected, "styles": session.series_styles()}
+        kwargs["models"] = _run_models(frame_runs, active["frames"])
 
         def draw() -> Figure:
             return plot_func(series, **kwargs)
@@ -2429,7 +2610,6 @@ def _make_transient_scope_viewer(
     choice.selector.observe(lambda: cast("ViewPanel", view).request(rebind))
     channels.checks.observe(lambda: cast("ViewPanel", view).request(render))
     scope.observe(lambda _change: scope_changed(), names="value")
-    time_axis.observe(lambda _change: cast("ViewPanel", view).request(render), names="value")
     update_scope_row()
     view.request(render)
     return view
@@ -2437,59 +2617,114 @@ def _make_transient_scope_viewer(
 
 def _transient_summary_table(session: TransientEvaluationSession) -> pd.DataFrame:
     """
-    Return a compact aggregate table without exposing identity hashes.
+    Return a compact aggregate table without exposing identity hashes; the artifact names its run and role.
 
-    A missing value shows its counters, as the steady overview does: the support counts of a
-    group with non-finite predictions, or the cases below the reference floor of a relative norm.
+    A missing value shows its counters, as the steady overview does, once per row in ``availability`` where the whole row
+    lacks values (no case at its horizon, or the support counts of a group with non-finite predictions), its metric cells
+    empty; a relative norm missing alone names its cases below the reference floor in its own cell. The rows stand in the display
+    order of every view: role group, then material display label, then the frames in order, mode, horizon ascending with ``full``
+    last, scope; so the runs of one dataset stand together.
     """
     frame = session.dataset_dataframe()
-    identity = ("frame", "material_family", "dataset_role", "mode", "requested_horizon", "scope", "contributing_record_count")
+    transient = analysis.evaluation.plots.transient
+    first = {column: list(dict.fromkeys(frame[column])) for column in ("frame", "mode", "scope")}
+    roles = frame["dataset_role"].astype(str).tolist() if "dataset_role" in frame else [""] * len(frame)  # one per frame
+    keys = [
+        (
+            transient.dataset_order(str(row["material_family"]), role),
+            first["frame"].index(row["frame"]),
+            first["mode"].index(row["mode"]),
+            transient.horizon_order(row["requested_horizon"]),
+            first["scope"].index(row["scope"]),
+        )
+        for row, role in zip(frame.to_dict("records"), roles, strict=True)
+    ]
+    frame = frame.iloc[sorted(range(len(frame)), key=keys.__getitem__)]
+    identity = ("frame", "material_family", "mode", "requested_horizon", "scope", "contributing_record_count")
     relative = ("physical_relative_l2", "physical_relative_h1")
     errors = ("normalized_drying_group_macro_rmse", *(f"normalized_rmse_{field}" for field in transient_artifact.STATE_ORDER), *relative)
 
-    def shown(row: Mapping[Any, Any], name: str) -> object:
-        value = row[name]
-        if value is not None and not pd.isna(value):
-            return value
+    def availability(row: Mapping[Any, Any]) -> str:
         if row["contributing_case_count"] == 0:
             missing = row["unavailable_case_count"]
             return f"unavailable (no cases at this horizon; {missing} missing)" if missing else "unavailable (no cases at this horizon)"
-        if row["finite_value_count"] < row["required_value_count"]:
-            return validity_contract.unavailable_text(row)
+        return validity_contract.unavailable_text(row) if row["finite_value_count"] < row["required_value_count"] else ""
+
+    def shown(row: Mapping[Any, Any], name: str, gap: str) -> object:
+        value = row[name]
+        if gap or (value is not None and not pd.isna(value)):
+            return value
         return f"unavailable ({row[f'{name}_unavailable_cases']} case-field values below the reference floor)"
 
-    rows = [
-        {**{name: row[name] for name in identity if name in row}, **{name: shown(row, name) for name in errors}} for row in frame.to_dict("records")
-    ]
+    rows = []
+    for row in frame.to_dict("records"):
+        gap = availability(row)
+        rows.append(
+            {**{name: row[name] for name in identity if name in row}, **{name: shown(row, name, gap) for name in errors}, "availability": gap}
+        )
     return pd.DataFrame.from_records(rows)
 
 
 def _transient_comparison_summary(session: TransientEvaluationSession) -> pd.DataFrame:
-    """Return one ranked full-rollout model comparison scoreboard whose error columns are the session's selection errors."""
+    """
+    Return one ranked full-rollout model comparison scoreboard whose error columns are the session's selection errors.
+
+    Every row ranks by ``_RANKING_CRITERION``, which the table's title names once; a physical error column carries its unit, the
+    humidity errors in percentage points like every shown difference of a fraction, converted on the ranked copy only.
+    """
+    field_labels = analysis.presentation.field_labels
     frame = session.dataset_dataframe(modes=("autonomous_full",))
     selected = frame.loc[(frame["requested_horizon"] == "full") & (frame["scope"] == "cumulative")]
     ranked = pd.DataFrame.from_records([{"frame": name, **session.selection_errors(name)} for name in dict.fromkeys(selected["frame"])])
     ranked = ranked.sort_values("normalized_drying_group_macro_rmse", na_position="last").reset_index(drop=True)
-    ranked["Ranking criterion"] = (
-        "Selection objective of the cumulative full rollouts: case errors equal over the cases of a material and over the materials (lower is better)"
-    )
+    shown: dict[str, str] = {}
+    for field, unit in zip(transient_artifact.STATE_ORDER, transient_artifact.STATE_UNITS, strict=True):
+        percent = field_labels.shown_in_percent(field)  # phi: a fraction shown in percent, its errors in pp
+        for column in (f"physical_rmse_{field}", f"physical_mae_{field}"):
+            ranked[column] = field_labels.display_values(ranked[column].to_numpy(dtype=np.float64), unit, field=field, quantity_kind="difference")
+            shown[column] = f"{column} [{field_labels.display_unit(unit, field=field, quantity_kind='difference') if percent else unit}]"
+    ranked = ranked.rename(columns=shown)
     ranked["Material count"] = ranked["frame"].map(selected.groupby("frame")["material_family"].nunique())
     ranked["Metric available"] = ranked["normalized_drying_group_macro_rmse"].map(lambda value: pd.notna(value) and isfinite(float(value)))
     return ranked
 
 
-def _transient_work_table(session: TransientEvaluationSession) -> pd.DataFrame:
-    """Return one work row per selected run, named by its first frame, with that artifact's drying-rollout model seconds per case."""
+def _comparison_summary_view(session: TransientEvaluationSession, frame_runs: Mapping[str, FrameRun] | None = None) -> widgets.VBox:
+    """
+    Show the ranked scoreboard compactly: one column per frame (rank, run label and role), the criterion first, then a block per field.
+
+    Only a frame with a finite criterion has a rank; the others follow under their run label and role alone. With several frames
+    each row is shaded across the runs, so every metric compares against its own values; the counts and the availability are text.
+    """
+    ranked = _transient_comparison_summary(session)
+    frames = [str(name) for name in ranked["frame"]]
+    runs = _frame_role_labels(session, frame_runs)  # one run's frames of two roles are told apart by role, never by the frame name
+    raw = ranked.drop(columns="frame").assign(**{"Material count": ranked["Material count"].map(str)})  # a count is no error to shade
+    criterion = "normalized_drying_group_macro_rmse"
+    blocks = [column for field in transient_artifact.STATE_ORDER for column in raw.columns if str(column).split(" [")[0].endswith(f"_{field}")]
+    order = [criterion, *blocks, *(column for column in raw.columns if column not in {*blocks, criterion})]
+    shown = analysis.evaluation.plots.run_summary.display_table(raw[order])
+    # The available frames stand first (``_transient_comparison_summary``), so their positions are their ranks.
+    ranks = zip(range(1, len(frames) + 1), frames, ranked["Metric available"], strict=True)
+    shown.index = pd.Index([f"{rank}. {runs[frame]}" if available else runs[frame] for rank, frame, available in ranks])
+    title = f"Global comparison summary, ranked by {_RANKING_CRITERION}"
+    return analysis.ui.tables.styled_dataframe(shown.transpose(), title=title, row_local=len(frames) > 1, row_heading="Metric")
+
+
+def _transient_work_table(session: TransientEvaluationSession, frame_runs: Mapping[str, FrameRun] | None = None) -> pd.DataFrame:
+    """Return one work row per run, named by its run label (else its first frame), with that artifact's drying-rollout model seconds per case."""
     run_summary = analysis.evaluation.plots.run_summary
-    return run_summary.build_frame_work_table(
+    table = run_summary.build_frame_work_table(
         session.canonical_frames, lambda frame_name, _frame: run_summary.transient_inference_seconds(session.timing_report(frame_name))
     )
+    return table.rename(index=_run_labels(frame_runs, list(table.index)))
 
 
-def _transient_architecture_table(session: TransientEvaluationSession) -> pd.DataFrame:
-    """Return exact model-family configuration from compact record identity."""
+def _transient_architecture_table(session: TransientEvaluationSession, frame_runs: Mapping[str, FrameRun] | None = None) -> pd.DataFrame:
+    """Return exact model-family configuration from compact record identity, one row per run by its run label (else its first frame)."""
     rows = []
-    for frame_name in session.frame_names:
+    first = list(analysis.evaluation.run_discovery.distinct_runs(session.canonical_frames))  # a run's first frame stands for it
+    for frame_name, label in _run_labels(frame_runs, first).items():
         case_id = session.case_ids(frame_name)[0]
         identity = _full_autonomous_summary(
             session,
@@ -2507,36 +2742,50 @@ def _transient_architecture_table(session: TransientEvaluationSession) -> pd.Dat
         except (KeyError, TypeError, ValueError):
             architecture_label = "Unavailable: incomplete architecture metadata"
         run = saved_config.get("run", {}) if isinstance(saved_config, Mapping) else {}
+        lineage = identity.get("stage_identity")  # the artifact's stage mapping, where no run config was saved
+        stage = run.get("layout", {}).get("stage", lineage.get("stage", "Unavailable") if isinstance(lineage, Mapping) else "Unavailable")
+        configuration = analysis.evaluation.plots.run_summary.architecture_items(parameters) if isinstance(parameters, Mapping) else ()
         rows.append(
             {
-                "Artifact": frame_name,
-                "Model family": identity.get("model_kind"),
+                "Run": label,
+                "model_kind": identity.get("model_kind"),
                 "Architecture label": architecture_label,
-                "Stage": run.get("layout", {}).get("stage", identity.get("stage_identity", "Unavailable")),
+                "Stage": stage.upper() if stage in {"a0", "b", "a1"} else stage,
                 "Seed": run.get("seed", "Unavailable"),
-                "Configuration": (dict(parameters) if isinstance(parameters, Mapping) else "Unavailable"),
+                **(dict(configuration) or {"Configuration": "Unavailable"}),
+                **(analysis.evaluation.plots.run_summary.channel_items(parameters) if isinstance(parameters, Mapping) else {}),
             }
         )
-    return pd.DataFrame.from_records(rows)
+    return pd.DataFrame.from_records(rows).set_index("Run")
 
 
 def _transient_outlier_table(
     session: TransientEvaluationSession,
     *,
     fields: Sequence[Any],
+    frame_runs: Mapping[str, FrameRun] | None = None,
 ) -> pd.DataFrame:
-    """Return per-channel worst complete-rollout cases from persisted metrics."""
+    """
+    Return per-channel worst complete-rollout cases from persisted metrics, ranked over every loaded dataset.
+
+    A stored channel ranks by its normalized RMSE, the grain water by its physical RMSE, each in a column of its own unit. A
+    case reads as its generation case number beside its exact id; its run is named by its label (else by its frame). Only a
+    finite error ranks, as in the outlier navigator; without any the table is empty, and without any metric column it raises.
+    """
     frame = session.case_dataframe(modes=("autonomous_full",))
     selected = frame.loc[(frame["requested_horizon"] == "full") & (frame["scope"] == "cumulative")]
+    cases = {(entry.frame_name, entry.case_id): entry.case_label for entry in session.case_inventory()}
+    runs = {name: run.label for name, run in (frame_runs or {}).items()}
     rows: list[dict[str, Any]] = []
+    metrics = 0  # the channels with a metric column, finite or not
     for field in fields:
         column = f"normalized_rmse_{field.key}" if field.stored else "physical_w_gr_rmse"
         if column not in selected:
             continue
-        for rank, row in enumerate(
-            selected.nlargest(_OUTLIER_COUNT, column).itertuples(index=False),
-            start=1,
-        ):
+        metrics += 1
+        error = "Normalized RMSE [1]" if field.stored else f"Physical RMSE [{field.unit}]"
+        finite = selected.loc[np.isfinite(selected[column].to_numpy(dtype=np.float64))]  # as the navigator: ``nlargest`` ranks NaN and infinity
+        for rank, row in enumerate(finite.nlargest(_OUTLIER_COUNT, column).itertuples(index=False), start=1):
             rows.append(
                 {
                     "Channel": field.label,
@@ -2545,15 +2794,17 @@ def _transient_outlier_table(
                         str(row.material_family),
                         str(row.declared_evaluation_role),
                     ),
-                    "Artifact": str(row.frame),
+                    "Run": runs.get(str(row.frame), str(row.frame)),
+                    "Case": cases.get((str(row.frame), str(row.case_id)), str(row.case_id)),
+                    error: float(getattr(row, column)),
                     "Exact case": str(row.case_id),
-                    "Error": float(getattr(row, column)),
-                    "Error unit": "1" if field.stored else field.unit,
                 }
             )
-    if not rows:
+    if not metrics:
         msg = "Transient outlier tables require at least one per-channel metric."
         raise ValueError(msg)
+    if not rows:  # no finite error to rank: an explicitly empty table under its headings
+        return pd.DataFrame(columns=["Channel", "Rank", "Material · Role", "Run", "Case", "Exact case"])
     return pd.DataFrame.from_records(rows)
 
 
@@ -2583,6 +2834,27 @@ def _transient_temporal_capabilities(
     return full, horizon, target
 
 
+def _pipeline_evidence(session: TransientEvaluationSession) -> dict[str, AirflowDegradationMetrics]:
+    """
+    Return the airflow substitution evidence of every model frame that has one, keyed by frame identity.
+
+    The session returns evidence only for the frames whose B/A drying-surrogate error is finite, in frame order, so a
+    frame's position in ``frame_names`` is not its position in that result.
+    """
+    available = [name for name in session.frame_names if isfinite(session.selection_objective(name))]
+    return dict(zip(available, session.pipeline_degradation(), strict=True))
+
+
+def _frame_role_labels(session: TransientEvaluationSession, frame_runs: Mapping[str, FrameRun] | None) -> dict[str, str]:
+    """Return every frame named by its run's label and its role (``FNO · B · ID``), never by the frame; the frames of one role are distinct runs."""
+    roles = {name: str(session.dataset_role(name)) for name in session.frame_names}
+    labels: dict[str, str] = {}
+    for role in dict.fromkeys(roles.values()):
+        runs = _run_labels(frame_runs, [name for name in roles if roles[name] == role])
+        labels |= {name: f"{run} · {analysis.presentation.display_labels.evaluation_role_display_label(role)}" for name, run in runs.items()}
+    return labels
+
+
 def _make_transient_runtime_viewer(
     *,
     session: TransientEvaluationSession,
@@ -2590,8 +2862,16 @@ def _make_transient_runtime_viewer(
     export_state: dict[str, Any] | None = None,
     export_plot_name: str | None = None,
     export_title: str | None = None,
+    frame_runs: Mapping[str, FrameRun] | None = None,
 ) -> ViewPanel:
-    """Display saved timing evidence with explicit model and measurement boundaries."""
+    """
+    Display saved timing evidence with explicit model and measurement boundaries; titles name the compared runs by ``frame_runs``.
+
+    The duration ratios name the chosen frame's Dataset role and run; their figure note and status line also list every other
+    selected frame, by its run label and role (``_frame_role_labels``), with the number of its ratios that have paired cases, and
+    the status names each ratio's measured boundaries. The airflow substitution draws every selected frame with evidence in its
+    run colour, names each one without it, and states each run's pipeline C availability in display text.
+    """
     ui = analysis.ui
     plots = analysis.evaluation.plots.transient
     model = ui.controls.dropdown(session.frame_names, description="Saved model")
@@ -2603,17 +2883,21 @@ def _make_transient_runtime_viewer(
         ),
         description="Measured boundary",
     )
-    status = ui.controls.StatusLine(
+    boundaries = (
         "Saved measurements only. Model calls exclude request preparation and scaling; "
         "prepared-request wall excludes Dataset/checkpoint loading and request construction. "
         "COMSOL reported solution and process times are separate boundaries. Duration ratios do not establish like-for-like end-to-end acceleration."
     )
-    view = ui.panel.ViewPanel([ui.panel.row(measure if kind == "tradeoff" else model)], status=status, slot=ui.panel.PlotSlot())
+    status = ui.controls.StatusLine(boundaries)
+    controls = {"tradeoff": [ui.panel.row(measure)], "pipeline": []}.get(kind, [ui.panel.row(model)])  # the pipeline figure shows every run
+    view = ui.panel.ViewPanel(controls, status=status, slot=ui.panel.PlotSlot())
+    export: dict[str, Any] = {"export_state": export_state, "export_plot_name": export_plot_name, "export_title": export_title}
 
     def render_now() -> None:
         kwargs: dict[str, Any] = {}
         args: tuple[Any, ...]
         function: Callable[..., Any]
+        frame_name = str(model.value)
         if kind == "tradeoff":
             frame = session.case_dataframe(modes=("autonomous_full",))
             frame = frame.loc[(frame["scope"] == "cumulative") & (frame["requested_horizon"] == "full")]
@@ -2621,23 +2905,53 @@ def _make_transient_runtime_viewer(
             args = (frame, {name: session.timing_report(name) for name in session.frame_names})
             kwargs["measure"] = measure.value
             kwargs["styles"] = session.series_styles()
-        elif kind == "pipeline":
-            values = session.pipeline_degradation()
-            selected = values[session.frame_names.index(model.value)]
-            function = plots.plot_pipeline_degradation
-            args = ((selected,),)
+            kwargs["models"] = _run_models(frame_runs, session.frame_names)
+            kwargs["run_labels"] = {name: run.label for name, run in (frame_runs or {}).items()}
+        elif kind == "pipeline":  # every selected run: its own panel in its colour, or its gap named
+            evidence = _pipeline_evidence(session)
+            labels = _frame_role_labels(session, frame_runs)
+            roles = {str(session.dataset_role(name)) for name in session.frame_names}
+            styles = session.series_styles()
+            reason = plots.unavailable_reason_text
+            gaps = [f"{labels[name]}: no finite B/A drying-surrogate error, so no evidence" for name in session.frame_names if name not in evidence]
+            c_states = "; ".join(
+                f"{labels[name]}: C {'available' if item.c_available else f'unavailable ({reason(item.c_unavailable_reason)})'}"
+                for name, item in evidence.items()
+            )
             status.set(
                 "Airflow conditions A/B/C are reference, drying-surrogate and full airflow-surrogate pipelines; "
-                "they are separate from training stages A0/B/A1. "
-                + (
-                    "Full pipeline C prediction evidence is available."
-                    if selected.c_available
-                    else f"Full pipeline C unavailable: {selected.c_unavailable_reason}"
-                )
+                f"they are separate from training stages A0/B/A1. Full pipeline C: {c_states or 'no run has evidence'}."
             )
+            if not evidence:  # no run to draw: the empty view names every run's gap instead of a failure
+                ui.viewers.clear_view(view, "No selected run has airflow substitution evidence. " + "; ".join(gaps), **export)
+                return
+            function = plots.plot_pipeline_degradation
+            args = (tuple(evidence.values()),)
+            kwargs = {
+                "role": next(iter(roles)) if len(roles) == 1 else None,
+                "models": _run_models(frame_runs, session.frame_names),
+                "labels": [labels[name] for name in evidence],
+                "styles": [styles[name] for name in evidence],  # colour and role hatch, as the global error bars
+                "unavailable": gaps,
+            }
         else:
             function = plots.plot_timing_speedups
-            args = (session.timing_report(str(model.value)),)
+            report = session.timing_report(frame_name)
+            args = (report,)
+            labels = _frame_role_labels(session, frame_runs)
+            reports = {name: session.timing_report(name) for name in session.frame_names if name != frame_name}
+            others = "; ".join(
+                f"{labels[name]} ({sum(summary.available_count > 0 for summary in other.speedups.values())} of {len(other.speedups)} ratios paired)"
+                for name, other in reports.items()
+            )
+            line = f"Other selected runs and roles: {others}" if others else None  # the figure and the status name them alike
+            kwargs = {"role": str(session.dataset_role(frame_name)), "models": _run_models(frame_runs, (frame_name,)), "others": line}
+            ratios = "; ".join(
+                f"{analysis.presentation.display_labels.token_display_label(name.removesuffix('_speedup'))}: "
+                f"{summary.reference_boundary} / {summary.surrogate_boundary}"
+                for name, summary in report.speedups.items()
+            )
+            status.set(f"{boundaries} Ratios: {ratios}." + (f" {line}." if line else ""))
         published = ui.viewers.render_view(
             view,
             function,
@@ -2645,13 +2959,13 @@ def _make_transient_runtime_viewer(
             kwargs=kwargs,
             export_state=export_state,
             export_plot_name=export_plot_name,
-            export_title=f"{export_title or kind} · {'all selected models' if kind == 'tradeoff' else model.value}",
+            export_title=f"{export_title or kind} · {'all selected models' if kind != 'ratios' else model.value}",
         )
         if published and export_state is not None:
-            context = "all_selected_models" if kind == "tradeoff" else str(model.value)
+            context = "all_selected_models" if kind != "ratios" else str(model.value)
             export_state["filename_stem"] = f"transient_{context}_{export_plot_name or kind}_{measure.value if kind == 'tradeoff' else kind}"
 
-    render = _guard(view, {"export_state": export_state, "export_plot_name": export_plot_name, "export_title": export_title}, render_now)
+    render = _guard(view, export, render_now)
     model.observe(lambda _change: view.request(render), names="value")
     measure.observe(lambda _change: view.request(render), names="value")
     view.request(render)
@@ -2661,25 +2975,67 @@ def _make_transient_runtime_viewer(
 def _transient_matched_stage_status(reason: str | None) -> widgets.HTML:
     """Explain missing controlled comparison evidence without blocking general plots."""
     text = reason or "Select exactly one admitted A0/B/A1 group with shared A0 and immutable B budget evidence."
-    return widgets.HTML(f"<b>Controlled stage comparison unavailable.</b> {escape(text)} General prediction comparisons remain available.")
+    sentence = text[:1].upper() + text[1:] + ("" if text.endswith(".") else ".")  # the reason is a clause of the lineage check
+    return widgets.HTML(f"<b>Controlled stage comparison unavailable.</b> {escape(sentence)} General prediction comparisons remain available.")
 
 
-def _transient_training_compute(loader: Callable[[], pd.DataFrame | None], lineage: LineageComparison | None) -> Figure:
-    """Plot only the performance evidence admitted by the workflow lineage validator, with every arm's end from it."""
+def _transient_training_curves(
+    session: TransientEvaluationSession, loader: Callable[[], Mapping[str, StageHistory]], frame_runs: Mapping[str, FrameRun] | None
+) -> Figure:
+    """
+    Plot the training curves of the loaded stages; each run takes the colour its run has in the session's other views.
+
+    The history label is the display label of the run, which ``frame_runs`` maps every frame to. A run takes the colour of its
+    first frame, as its break-even does, also when it is the only run. The line style is always the plot's own: a history has
+    no role. The title names the loaded histories by their labels where these are explicit short labels.
+    """
+    histories = loader()
+    styles = None
+    if frame_runs:
+        session_styles = session.series_styles()
+        styles = analysis.evaluation.plots.series.SeriesStyles()
+        for frame, run in frame_runs.items():
+            styles.setdefault(run.label, session_styles[frame])
+        styles.run_colours = session_styles.run_colours
+    named = {run.label for run in (frame_runs or {}).values() if run.named}
+    models = tuple(label if label in named else "" for label in histories)
+    return analysis.evaluation.plots.training.plot_training_curves(histories, styles=styles, models=models)
+
+
+def _transient_training_compute(
+    session: TransientEvaluationSession,
+    loader: Callable[[], pd.DataFrame | None],
+    lineage: LineageComparison | None,
+    frame_runs: Mapping[str, FrameRun] | None = None,
+) -> Figure:
+    """
+    Plot only the performance evidence admitted by the workflow lineage validator, with every arm's end from it and its run's colour.
+
+    The legend names each arm's run by its label of ``frame_runs`` and the title the compared runs.
+    """
     performance = loader()
     if performance is None or lineage is None:
         msg = "Admitted controlled stage comparison lacks performance evidence."
         raise RuntimeError(msg)
-    return analysis.evaluation.plots.transient.plot_training_performance_vs_compute(performance, lineage=lineage)
+    return analysis.evaluation.plots.transient.plot_training_performance_vs_compute(
+        performance,
+        lineage=lineage,
+        styles=session.series_styles(),
+        run_labels={name: run.label for name, run in (frame_runs or {}).items()},
+        models=_run_models(frame_runs, session.frame_names),
+    )
 
 
-def _transient_break_even(session: TransientEvaluationSession) -> Figure | widgets.HTML:
+def _transient_break_even(session: TransientEvaluationSession, frame_runs: Mapping[str, FrameRun] | None = None) -> tuple[Figure, str] | widgets.HTML:
     """
     Show the break-even of the loaded stages with the clocks of the drying-only speed-up (COMSOL drying study, drying model calls).
 
     The training seconds of B and A1 are those of the A0 their teacher handoff records plus their own. That A0 is the one loaded
     stage whose selected checkpoint has the handoff's checkpoint digest (a run name is not an identity); a B or A1 without
-    exactly one such A0 has no training seconds. Each clock is passed as recorded: the cost pairs the cases and counts the rest.
+    exactly one such A0 is named with that reason (no A0 selected, none selected of its handoff, or several), apart from
+    missing seconds of its own.
+    Each clock is passed as recorded: the cost pairs the cases and counts the rest. A run is shown by its label of ``frame_runs``
+    in its session colour; the title names the compared runs.
     """
     discovery = analysis.evaluation.run_discovery
     timing = analysis.evaluation.transient_timing
@@ -2695,24 +3051,33 @@ def _transient_break_even(session: TransientEvaluationSession) -> Figure | widge
         comsol = timing.component_case_medians(report, "comsol_transient_drying_seconds")
         surrogate = timing.component_case_medians(report, "drying_no_rollout_model_seconds")
         solver = ", ".join(sorted({f"{case.solver_hostname} ({case.solver_requested_cores} cores)" for case in report.cases}))
-        device = ", ".join(sorted({f"{case.device} ({case.gpu or case.cpu})" for case in report.cases}))
+        device = ", ".join(sorted({_device_text(case.device, case.gpu or case.cpu) for case in report.cases}))
         continued = work["stage"] in {"B", "A1"}
-        prior: float | None = 0.0
+        prior: float | str = 0.0
         if continued:
             handoff = ((summary.get("teacher_handoff") or {}).get("files") or {}).get("checkpoint", {}).get("sha256")
             a0 = [elapsed for checkpoint, elapsed in a0_runs if handoff is not None and checkpoint == handoff]
-            prior = a0[0] if len(a0) == 1 else None
+            if not a0_runs:
+                prior = "no A0 is selected: select the A0 of its handoff to cost the stage"
+            elif len(a0) != 1:
+                prior = f"{len(a0)} selected A0 runs have its handoff checkpoint, not one" if a0 else "no selected A0 has its handoff checkpoint"
+            else:
+                prior = "no training seconds of its A0" if a0[0] is None else float(a0[0])
         clocks = (
             f"COMSOL transient drying study time on {solver}; surrogate drying rollout model calls on {device}; "
             f"training seconds {'A0 + stage' if continued else 'of the stage'}"
         )
-        return False, comsol, surrogate, prior, clocks
+        return False, comsol, surrogate, prior, clocks, str(session.dataset_role(label))
 
-    return _break_even_view(session.canonical_frames, evidence)
+    labels = _run_labels(frame_runs, list(discovery.distinct_runs(session.canonical_frames)))
+    models = _run_models(frame_runs, session.frame_names)
+    return _break_even_view(session.canonical_frames, evidence, styles=session.series_styles(), labels=labels, models=models)
 
 
-def _transient_runtime_entry(session: TransientEvaluationSession, kind: str) -> Callable[..., ViewPanel]:
-    """Bind one lazy runtime viewer to the existing figure export context."""
+def _transient_runtime_entry(
+    session: TransientEvaluationSession, kind: str, frame_runs: Mapping[str, FrameRun] | None = None
+) -> Callable[..., ViewPanel]:
+    """Bind one lazy runtime viewer to the existing figure export context; ``frame_runs`` name the compared runs in its titles."""
 
     def build(
         *,
@@ -2726,13 +3091,27 @@ def _transient_runtime_entry(session: TransientEvaluationSession, kind: str) -> 
             export_state=export_state,
             export_plot_name=export_plot_name,
             export_title=export_title,
+            frame_runs=frame_runs,
         )
 
     return build
 
 
-def _transient_relative_norm_entry(session: TransientEvaluationSession) -> Callable[..., ViewPanel]:
-    """Bind the relative norms of every frame to one lazy view with the pooled views' clock choice, the drying phase first."""
+def _transient_relative_norm_entry(
+    session: TransientEvaluationSession,
+    *,
+    comparison: bool,
+    selection_state: EvaluationSelectionState | None,
+    refused_roles: Mapping[str, str] | None = None,
+    frame_runs: Mapping[str, FrameRun] | None = None,
+) -> Callable[..., ViewPanel]:
+    """
+    Bind the relative norms of the chosen datasets to one lazy view with the pooled views' clock: hours while each curve holds one case.
+
+    Else the clock is the drying phase. The dataset choice starts from the shared one, else every dataset, as in the other
+    aggregate views: one curve per chosen dataset (a material, or a role whose materials are pooled with equal weight) and frame,
+    named like ``_transient_series``.
+    """
 
     def build(
         *,
@@ -2742,17 +3121,40 @@ def _transient_relative_norm_entry(session: TransientEvaluationSession) -> Calla
     ) -> ViewPanel:
         ui = analysis.ui
         export: dict[str, Any] = {"export_state": export_state, "export_plot_name": export_plot_name, "export_title": export_title}
-        clock = ui.controls.choice_group(_CLOCK_OPTIONS, value="phase")
-        view = ui.panel.ViewPanel([ui.panel.row(clock)], slot=ui.panel.PlotSlot())
+        clock = _PooledClock(lambda: view.request(render))
+        choice = _SharedChoice(
+            dataset_cuts.transient_inventory(session, refused=refused_roles or {}), multiple=True, pool_reason=None, selection_state=selection_state
+        )
 
         def render_now() -> None:
-            curves = {name: session.relative_norm_curve(name, time_axis=str(clock.value)) for name in session.frame_names}
+            contexts = dataset_cuts.transient_contexts(session, choice.selector.choices())
+            if not contexts:
+                ui.viewers.clear_view(view, ui.viewers.EMPTY_SELECTION_MESSAGE, **export)
+                return
+            shown: dict[str, tuple[str, tuple[str, ...]]] = {}  # each curve's frame and cases
+            for context in contexts:
+                runs = _run_labels(frame_runs, context.frame_names)  # the frames of one dataset are distinct runs
+                for name in context.frame_names:
+                    shown[f"{runs[name]} · {context.label}" if comparison else context.label] = (name, context.case_ids)
+            time_axis = clock.resolve({label: cases for label, (_name, cases) in shown.items()})  # the cases each curve pools
+            curves = {label: session.relative_norm_curve(name, time_axis=time_axis, case_ids=cases) for label, (name, cases) in shown.items()}
             plot = analysis.evaluation.plots.transient.plot_relative_norms_over_time
-            if ui.viewers.render_view(view, plot, args=(curves,), kwargs={"styles": session.series_styles()}, **export) and export_state is not None:
-                export_state["filename_stem"] = "__".join(("transient_drying", str(export_plot_name or "relative_norms"), str(clock.value)))
+            kwargs = {"styles": session.series_styles(), "models": _run_models(frame_runs, dict.fromkeys(name for name, _cases in shown.values()))}
+            if ui.viewers.render_view(view, plot, args=(curves,), kwargs=kwargs, **export) and export_state is not None:
+                export_state["filename_stem"] = "__".join(("transient_drying", str(export_plot_name or "relative_norms"), time_axis))
 
+        def activate_now() -> None:
+            if choice.pull():
+                view.request(render)
+
+        view = ui.panel.ViewPanel(
+            [ui.panel.row(choice.selector.header, clock.widget)],
+            slot=ui.panel.PlotSlot(),
+            popovers=[(choice.selector.header, choice.selector.body)],
+            on_activate=activate_now,
+        )
         render = _guard(view, export, render_now)
-        clock.observe(lambda _change: view.request(render), names="value")
+        choice.selector.observe(lambda: view.request(render))
         view.request(render)
         return view
 
@@ -2767,27 +3169,40 @@ def _build_transient_sections(
     evaluation_compute_device: str | compute.AnalysisComputePreference,
     training_performance: Callable[[], pd.DataFrame | None] | None = None,
     training_lineage: LineageComparison | None = None,
-    training_histories: Callable[[], Mapping[str, StageHistory | UnavailableHistory]],
+    training_histories: Callable[[], Mapping[str, StageHistory]],
     matched_stage_unavailable_reason: str | None = None,
     refused_roles: Mapping[str, str] | None = None,
+    frame_runs: Mapping[str, FrameRun] | None = None,
 ) -> dict[str, tuple[list[tuple[str, Callable[..., Any], str]], str]]:
     """Bind compatible transient evidence under the established Evaluation sections."""
+    models = _run_models(frame_runs, session.frame_names)  # the compared runs, which every figure of all frames names
+    run_labels = {frame: run.label for frame, run in (frame_runs or {}).items()}  # the summary plots name a series' run by it
     fields = _transient_channel_fields(session)
     supported_fields = _supported_transient_fields(fields)
     stored_fields = _stored_transient_fields(fields)
     plots = analysis.evaluation.plots.transient
+    run_summary = analysis.evaluation.plots.run_summary
 
     def table(title: str, build: Callable[[], pd.DataFrame]) -> Callable[[], widgets.VBox]:
-        return lambda: analysis.ui.tables.styled_dataframe(build(), title=title)
+        def show() -> widgets.VBox:
+            raw = build()
+            shown = run_summary.display_table(raw)  # renames each column, keeping their order
+            # Shading means something only on error columns (lower is better), each against its own values, as in the steady tables.
+            errors = [shown.columns[index] for index, column in enumerate(raw.columns) if str(column).startswith(("normalized_", "physical_"))]
+            return analysis.ui.tables.styled_dataframe(shown, title=title, shade_columns=errors)
+
+        return show
 
     summary_table = table("Summary table", partial(_transient_summary_table, session))
-    comparison_summary = table("Global comparison summary", partial(_transient_comparison_summary, session))
+    comparison_summary = partial(_comparison_summary_view, session, frame_runs)
 
     def global_metrics() -> Figure:
         return plots.plot_channel_error(
             session.dataset_dataframe(),
             state_fields=tuple(field.key for field in stored_fields),
             styles=session.series_styles(),
+            models=models,
+            run_labels=run_labels,
         )
 
     def distributions() -> Figure:
@@ -2795,10 +3210,19 @@ def _build_transient_sections(
             session.case_dataframe(modes=("autonomous_full",)),
             state_fields=tuple(field.key for field in stored_fields),
             styles=session.series_styles(),
+            models=models,
+            run_labels=run_labels,
         )
 
-    architecture_table = table("Model-family configuration", partial(_transient_architecture_table, session))
-    outlier_table = table("Worst per-channel cases (tables)", partial(_transient_outlier_table, session, fields=supported_fields))
+    def architecture_table() -> widgets.VBox:
+        # The configuration renderer of both tasks: one row per setting, a dash where a run lacks it, no row that every run lacks.
+        shown = run_summary.display_configuration_table(_transient_architecture_table(session, frame_runs))
+        return analysis.ui.tables.styled_dataframe(shown, title="Model-family configuration")
+
+    outlier_table = table(
+        "Worst per-channel cases over all loaded datasets (the field plots rank within their chosen dataset)",
+        partial(_transient_outlier_table, session, fields=supported_fields, frame_runs=frame_runs),
+    )
 
     def scoped_view(plot_kind: str) -> Callable[..., ViewPanel]:
         def build(
@@ -2817,6 +3241,7 @@ def _build_transient_sections(
                 export_plot_name=export_plot_name,
                 export_title=export_title,
                 refused_roles=refused_roles,
+                frame_runs=frame_runs,
             )
 
         return build
@@ -2839,6 +3264,7 @@ def _build_transient_sections(
                 export_plot_name=export_plot_name,
                 export_title=export_title,
                 refused_roles=refused_roles,
+                frame_runs=frame_runs,
             )
 
         return build
@@ -2860,6 +3286,7 @@ def _build_transient_sections(
                 export_title=export_title,
                 outlier=outlier,
                 refused_roles=refused_roles,
+                frame_runs=frame_runs,
             )
 
         return build
@@ -2887,7 +3314,9 @@ def _build_transient_sections(
                 ("Std error maps", aggregate_view("std_error"), "std_error_maps"),
                 (
                     "Endpoint vs cumulative error",
-                    lambda: plots.plot_endpoint_vs_cumulative(session.dataset_dataframe(), styles=session.series_styles()),
+                    lambda: plots.plot_endpoint_vs_cumulative(
+                        session.dataset_dataframe(), styles=session.series_styles(), models=models, run_labels=run_labels
+                    ),
                     "endpoint_cumulative_error",
                 ),
             ],
@@ -2913,20 +3342,20 @@ def _build_transient_sections(
         registry["architecture"] = ([configuration_entry], EVALUATION_SECTION_TITLES["architecture"])
     registry["runtime"] = (
         [
-            ("Boundary-specific duration ratios", _transient_runtime_entry(session, "ratios"), "runtime_boundary_ratios"),
-            ("Accuracy vs measured runtime", _transient_runtime_entry(session, "tradeoff"), "accuracy_runtime_comparison"),
-            ("Airflow substitution evidence", _transient_runtime_entry(session, "pipeline"), "airflow_substitution"),
-            ("Work per stage", table("Work per stage", partial(_transient_work_table, session)), "work_per_stage"),
-            ("Break-even", partial(_transient_break_even, session), "break_even"),
+            ("Boundary-specific duration ratios", _transient_runtime_entry(session, "ratios", frame_runs), "runtime_boundary_ratios"),
+            ("Accuracy vs measured runtime", _transient_runtime_entry(session, "tradeoff", frame_runs), "accuracy_runtime_comparison"),
+            ("Airflow substitution evidence", _transient_runtime_entry(session, "pipeline", frame_runs), "airflow_substitution"),
+            ("Work per stage", lambda: run_summary.show_work_table(_transient_work_table(session, frame_runs)), "work_per_stage"),
+            ("Break-even", partial(_transient_break_even, session, frame_runs), "break_even"),
         ],
         EVALUATION_SECTION_TITLES["runtime"],
     )
     registry["matched_stages"] = (
         [
-            ("Training curves", lambda: analysis.evaluation.plots.training.plot_training_curves(training_histories()), "training_curves"),
+            ("Training curves", partial(_transient_training_curves, session, training_histories, frame_runs), "training_curves"),
             (
                 "Shared-A0 performance vs committed budget",
-                partial(_transient_training_compute, training_performance, training_lineage),
+                partial(_transient_training_compute, session, training_performance, training_lineage, frame_runs),
                 "matched_stage_compute",
             )
             if training_performance is not None
@@ -2945,14 +3374,20 @@ def _build_transient_sections(
             (
                 ("Reference vs prediction trajectories", scoped_view("trajectory"), "reference_prediction_trajectories"),
                 ("Error over drying phase and hours", scoped_view("error_time"), "error_over_physical_time"),
-                ("Relative norms over drying phase and hours", _transient_relative_norm_entry(session), "relative_norms_over_physical_time"),
+                (
+                    "Relative norms over drying phase and hours",
+                    _transient_relative_norm_entry(
+                        session, comparison=comparison, selection_state=selection_state, refused_roles=refused_roles, frame_runs=frame_runs
+                    ),
+                    "relative_norms_over_physical_time",
+                ),
             )
         )
     if has_horizon:
         temporal_entries.append(
             (
                 "Error vs rollout horizon",
-                lambda: plots.plot_horizon_error(session.dataset_dataframe(), styles=session.series_styles()),
+                lambda: plots.plot_horizon_error(session.dataset_dataframe(), styles=session.series_styles(), models=models, run_labels=run_labels),
                 "error_vs_rollout_horizon",
             )
         )
@@ -2961,7 +3396,10 @@ def _build_transient_sections(
             (
                 "Final-state drying summary",
                 lambda: plots.plot_target_time(
-                    {name: session.full_autonomous_summaries(name) for name in session.frame_names}, styles=session.series_styles()
+                    {name: session.full_autonomous_summaries(name) for name in session.frame_names},
+                    styles=session.series_styles(),
+                    models=models,
+                    run_labels=run_labels,
                 ),
                 "final_state_drying_summary",
             )
@@ -2981,16 +3419,27 @@ def build_transient_panel(
     comparison: bool = False,
     training_performance: Callable[[], pd.DataFrame | None] | None = None,
     training_lineage: LineageComparison | None = None,
-    training_histories: Callable[[], Mapping[str, StageHistory | UnavailableHistory]],
+    training_histories: Callable[[], Mapping[str, StageHistory]],
     matched_stage_unavailable_reason: str | None = None,
     selection_state: EvaluationSelectionState | None = None,
     evaluation_compute_device: str | compute.AnalysisComputePreference = "cpu",
     widths: WidthScope | None = None,
     refused_roles: Mapping[str, str] | None = None,
+    frame_runs: Mapping[str, FrameRun] | None = None,
 ) -> widgets.Widget:
-    """Build the baseline Evaluation architecture with transient capabilities; a refused role is listed as unavailable with its reason."""
+    """
+    Build the baseline Evaluation architecture with transient capabilities; a refused role is listed as unavailable with its reason.
+
+    ``frame_runs`` maps every frame of the session to its run: the display label that ``training_histories`` is keyed by, and whether
+    that label is an explicit short label (``FNO · B · seed 9``). Only explicit labels name the runs in titles, as a suffix of one run or
+    «A vs B» of two; a storage alias names none. With several runs the training curves take each run's colour from the session.
+    Only the workflow, which names the frames, knows how a frame name is built, so it supplies this mapping.
+    """
     if not session.frame_names:
         msg = "Transient panel requires one open session with frames."
+        raise ValueError(msg)
+    if frame_runs is not None and (set(frame_runs) != set(session.frame_names) or any(not run.label.strip() for run in frame_runs.values())):
+        msg = "Frame runs must name every frame of the session once, each with a non-blank label."
         raise ValueError(msg)
     if comparison:
         session.require_common_comparison_grids()
@@ -3004,6 +3453,7 @@ def build_transient_panel(
         training_histories=training_histories,
         matched_stage_unavailable_reason=matched_stage_unavailable_reason,
         refused_roles=refused_roles,
+        frame_runs=frame_runs,
     )
     selected = _selected_section_keys(
         sections,

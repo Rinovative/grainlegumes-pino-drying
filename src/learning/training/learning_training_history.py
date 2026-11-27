@@ -351,17 +351,24 @@ def reconcile_history(
 
     History is written at every event while ``last`` follows a wall-time cadence, so the
     epoch and validation records ahead of the checkpoint that :func:`validate_resume_history`
-    admitted are truncated atomically; this is the one writer of that truncation.
+    admitted are truncated atomically; this is the one writer of that truncation. It reads the
+    history as the resume admission does: a missing or malformed history is the run's persisted
+    state and raises ``ValueError``; any other failed read keeps its ``OSError``, the job's
+    environment, as does the truncation write.
     """
-    history = validate_resume_history(
-        run_dir,
-        task=task,
-        run_name=run_name,
-        checkpoint_identity=checkpoint_identity,
-        completed_epoch=completed_epoch,
-        validations=validations,
-        global_step=global_step,
-    )
+    try:
+        history = validate_resume_history(
+            run_dir,
+            task=task,
+            run_name=run_name,
+            checkpoint_identity=checkpoint_identity,
+            completed_epoch=completed_epoch,
+            validations=validations,
+            global_step=global_step,
+        )
+    except FileNotFoundError as error:
+        msg = f"Training history.json cannot be reconciled with the restored last checkpoint: {type(error).__name__}: {error}"
+        raise ValueError(msg) from error
     if len(history["epochs"]) > completed_epoch or len(history["validations"]) > len(validations):
         # Events after the newest last checkpoint are trained again, so their records are replaced.
         history["epochs"] = history["epochs"][:completed_epoch]

@@ -162,8 +162,8 @@ class _PositionNavigator:
         else:
             self._status.set(note)
 
-    def _rebound(self, values: tuple[Any, ...], position: int, warning: str | None, field_texts: Sequence[str]) -> None:
-        """Install new values, widen the field when needed, and report a replaced selection."""
+    def _rebound(self, values: tuple[Any, ...], position: int, warning: str | None, field_texts: Sequence[str], *, report: bool = True) -> None:
+        """Install new values, widen the field when needed, and report the selection (a replaced one with ``warning``) unless ``report`` is false."""
         self._values = values
         self._position = position
         label = controls.element_label(self.field) or 0
@@ -174,7 +174,8 @@ class _PositionNavigator:
             self.widget.layout.width = f"{needed + rest}px"
             controls.fit_element(self.widget)
         self._sync()
-        self._report(warning)
+        if report:
+            self._report(warning)
 
     def _sync(self) -> None:
         self._updating = True
@@ -353,13 +354,22 @@ class TimeNavigator(_PositionNavigator):
         """Replace the change callback without changing the selection."""
         self._on_change = callback
 
-    def rebind(self, times_h: Sequence[float], *, preserve_time: float | None = None, notify: bool = True) -> TimeStepSelection:
-        """Replace the stored times, select the one nearest to ``preserve_time`` (default: the current time), and notify once."""
+    def clear_status(self) -> None:
+        """Clear the status line only while it shows this navigator's own time text, never another control's message on it."""
+        if self._status is not None and self._status.text.endswith(self._note()):
+            self._status.clear()
+
+    def rebind(self, times_h: Sequence[float], *, preserve_time: float | None = None, notify: bool = True, report: bool = True) -> TimeStepSelection:
+        """
+        Replace the stored times, select the one nearest to ``preserve_time`` (default: the current time), and notify once.
+
+        Without ``report`` (a hidden navigator) neither the time nor a snap warning reaches the status line, so another control's message stays.
+        """
         stored = _stored_times(times_h)
         target = self.value if preserve_time is None else float(preserve_time)
         position = _nearest_time(stored, target)
         warning = None if stored[position] == target else f"Time {target:g} h is not stored; showing the nearest stored time {stored[position]:g} h."
-        self._rebound(stored, position, warning, [f"{time:g}" for time in stored])
+        self._rebound(stored, position, warning, [f"{time:g}" for time in stored], report=report)
         if notify:
             self._emit()
         return self.selection

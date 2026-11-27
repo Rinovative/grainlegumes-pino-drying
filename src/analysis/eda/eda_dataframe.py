@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Read an exact campaign case prefix through Source admission
+  - Read a published package, or one material's cases of a mixed package, under that membership's case accounting
   - Preserve task field physical units, stored representations, roles, and identities
   - Derive speed magnitude when the task declares compatible velocity outputs
 
@@ -39,6 +40,7 @@ _REQUIRED_SOURCE_KEYS: Final = (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from src.analysis.eda.eda_sources import GeneratedOutputEDABatch
@@ -198,11 +200,20 @@ def _steady_dataframe(
     return frame, logs
 
 
+def material_case_identities(manifest: Mapping[str, Any], material: str) -> list[dict[str, Any]]:
+    """Return the source case identities of one of a package's materials, in package order."""
+    if material not in manifest["materials"]:
+        message = f"Published Dataset {manifest['dataset_id']!r} has no material {material!r}."
+        raise ValueError(message)
+    return [entry for entry in manifest["source_case_identities"] if entry["source"]["material_family"] == material]
+
+
 def load_published_dataset_frame(
     manifest: dict[str, Any],
     *,
     storage_root: Path,
     max_cases: int | None,
+    material: str | None = None,
 ) -> pd.DataFrame:
     """
     Read actual model-facing package values with full-grid scientific support.
@@ -210,6 +221,9 @@ def load_published_dataset_frame(
     Steady PT admission necessarily materializes the complete payload once.
     Transient admission reads the index, then limits source-array reads to the
     selected complete cases. Fitted Training normalizers are never invented.
+    A ``material`` narrows the membership to that material's cases of a mixed
+    package: the case counts and accounting scope then describe the material,
+    while ``dataset_manifest`` stays the admitted package manifest.
     """
     from src import datasets  # noqa: PLC0415
     from src.datasets.runtime import dataset_runtime_steady as steady_runtime  # noqa: PLC0415
@@ -219,7 +233,8 @@ def load_published_dataset_frame(
 
     view = datasets.contracts.views.get_view(str(manifest["dataset_view"]))
     sampling = datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition") if view.id == "transient_drying" else None
-    identities = manifest["source_case_identities"]
+    identities = manifest["source_case_identities"] if material is None else material_case_identities(manifest, material)
+    scope = "published_package_membership" if material is None else "published_material_membership"
     selected = identities if max_cases is None else identities[:max_cases]
     package_ids = tuple(str(case["package_case_id"]) for case in selected)
     request = datasets.runtime.factory.DatasetRequest(
@@ -296,7 +311,7 @@ def load_published_dataset_frame(
             "generation_root": storage_root,
             "analysis_representation": "steady_field_rows",
             "dataset_backend": "published_steady_pt",
-            "case_accounting_scope": "published_package_membership",
+            "case_accounting_scope": scope,
         }
         frame, _logs = _steady_dataframe(loaded, batch_name=str(manifest["dataset_name"]), task=task)
         frame.attrs["source_physical_field_units"] = dict(frame.attrs["field_units"])
@@ -312,8 +327,9 @@ def load_published_dataset_frame(
         dataset_manifest=manifest,
         dataset_view=view.id,
         available_case_count=len(identities),
+        total_discovered_case_count=len(identities),  # the membership, so a bounded transient load counts the rest as unselected
         loaded_case_count=len(selected),
-        case_accounting_scope="published_package_membership",
+        case_accounting_scope=scope,
         normalization="Published values before train-fitted normalization; no fitted scaler is loaded.",
     )
     return frame

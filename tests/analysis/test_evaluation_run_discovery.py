@@ -511,9 +511,9 @@ def test_run_overview_uses_material_first_roles_and_shared_protocol_labels(
         ),
     )
 
-    assert "Lentil · ID · available" in html
-    assert "Chickpea · ID · available" in html
-    assert "Kidney bean · OOD · available" in html
+    assert "Lentil, ID · available" in html
+    assert "Chickpea, ID · available" in html
+    assert "Kidney bean, OOD · available" in html
     assert "Drying group macro RMSE" in html
     assert re.search(r"Spatial stride</th><td[^>]*>1</td>", html)
     assert "Generate full artifact coverage" not in html
@@ -1369,12 +1369,17 @@ def test_run_labels_stay_unique_through_the_shortest_separating_facet() -> None:
     assert all(label.startswith("FNO · B · seed 9 · ") for label in labels)
 
 
-def test_run_labels_stay_unique_when_no_facet_separates_the_runs() -> None:
-    """Runs no facet can tell apart still get unique labels (full run name, then directory) instead of failing the workspace."""
-    runs = (_label_run("B", run_dir="/x/a/b", run_name="same"), _label_run("B", run_dir="/x/b/a", run_name="same"))
+def test_run_labels_stay_unique_and_compact_when_no_saved_facet_separates_the_runs() -> None:
+    """Runs no saved facet tells apart get a short digest of their directory, never their full run name or path."""
+    name = "architecture_comparison__fno_m64x64_h32_l7__lr-0p000532"
+    runs = (_label_run("B", run_dir="/x/a/b", run_name=name), _label_run("B", run_dir="/x/b/a", run_name=name))
     labels = workspace._run_labels(runs)
     assert len(set(labels)) == 2
-    assert all(label.startswith("FNO · B · seed 9 · same") for label in labels)
+    for label in labels:
+        assert label.startswith("FNO · B · seed 9 · ")
+        assert "fno_m64x64" not in label
+        assert "/x/" not in label
+        assert len(label) <= len("FNO · B · seed 9 · ") + 24
 
 
 def test_run_label_without_a_resolved_family_keeps_the_model_descriptor() -> None:
@@ -1495,6 +1500,29 @@ def test_colliding_model_labels_are_distinct_at_actual_controller_handoff(tmp_pa
     assert controller is not None
     listed_names = tuple(str(box.description) for box in controller.runs.boxes.values())
     assert len(set(listed_names)) == len(listed_names) == 2
+    assert all(f"{controller._labels[run.run_dir]}: {run.run_name}</li>" in controller._details for run in controller.catalog.runs)
+    prepared.close()
+
+
+def test_a_comparison_that_fails_still_names_each_selected_run_by_its_label_and_full_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed load and an incompatible selection list each run's short label with its full name, as a prepared comparison does."""
+    for name in ("first-experiment", "second-experiment"):
+        _write_run(tmp_path, leaf=name, family=name, artifact=True)
+
+    def prepare(_run_dirs: tuple[Path, ...], **_kwargs: Any) -> Any:
+        message = "the comparison cannot be prepared"
+        raise ValueError(message)
+
+    monkeypatch.setattr(workspace.workflow, "prepare_model_comparison_evaluation_workspace", prepare)
+    prepared = workspace.prepare_model_comparison_evaluation_workspace(experiments_root=tmp_path)
+    controller = prepared._controller
+    assert controller is not None
+    runs = controller.catalog.runs
+    assert controller.view.status.level == "error"  # the load failed
+    assert all(f"{controller._labels[run.run_dir]}: {run.run_name}</li>" in controller._details for run in runs)
+    controller.runs.select([str(runs[0].run_dir)])  # one run alone is no compatible comparison
+    assert controller.view.status.level == "warning"
+    assert f"{controller._labels[runs[0].run_dir]}: {runs[0].run_name}</li>" in controller._details
     prepared.close()
 
 
@@ -1512,7 +1540,7 @@ def test_single_workspace_passes_the_short_label_and_shows_it_in_the_header(tmp_
     assert labels == ["FNO · seed 17"]
     controller = prepared._controller
     assert controller is not None
-    assert controller.runs.header.summary == "Lauf: FNO · seed 17"
+    assert controller.runs.header.summary == "Run: FNO · seed 17"
     prepared.close()
 
 
@@ -1535,17 +1563,17 @@ def test_labels_come_from_the_whole_catalog_so_an_unselected_run_still_separates
     assert len(set(controller._labels.values())) == 2
     first = labels[-1]
     assert first.startswith("FNO · seed 17 · ")
-    assert controller.runs.header.summary == f"Lauf: {first}"
+    assert controller.runs.header.summary == f"Run: {first}"
     other = next(key for key in controller.runs.boxes if key not in controller.runs.selected())
     controller.runs.select([other])
     assert labels[-1] != first
     assert labels[-1].startswith("FNO · seed 17 · ")
-    assert controller.runs.header.summary == f"Lauf: {labels[-1]}"
+    assert controller.runs.header.summary == f"Run: {labels[-1]}"
     prepared.close()
 
 
 def test_a_b_or_a1_run_stands_below_its_listed_a0_and_an_orphan_stands_unindented(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The selector places a run under the A0 its saved teacher handoff names; a run whose A0 is not listed keeps its name-order place."""
+    """The selector lists each run by its short label, a run under the A0 its saved teacher handoff names; an orphan keeps its place."""
     for leaf, name, a0 in (("a", "u__a0", None), ("b", "u__b-a1__b", "u__a0"), ("c", "z__b-a1__a1", "missing__a0")):
         _write_run(tmp_path, leaf=leaf, run_name=name, a0_run_name=a0)
     catalog = discovery.discover_evaluation_runs(tmp_path)
@@ -1554,7 +1582,9 @@ def test_a_b_or_a1_run_stands_below_its_listed_a0_and_an_orphan_stands_unindente
     assert [run.a0_run_name for run in runs] == [None, "u__a0", "missing__a0"]
     monkeypatch.setattr(workspace._EvaluationWorkspaceController, "_render", lambda _self: None)
     controller = workspace._EvaluationWorkspaceController(replace(catalog, runs=runs), kind="single", title="t", evaluation_compute_device="cpu")
-    assert [str(box.description) for box in controller.runs.boxes.values()] == ["u__a0", "u__b-a1__b", "z__b-a1__a1"]
+    listed = [str(box.description) for box in controller.runs.boxes.values()]
+    assert listed == [controller._labels[run.run_dir] for run in runs]  # the full run names stay in the details
+    assert not {run.run_name for run in runs} & set(listed)
     rows = [row for row in cast("widgets.Box", controller.runs.body).children if isinstance(row, widgets.HBox)]
     margins = [next(row.layout.margin for row in rows if row.children == (box,)) for box in controller.runs.boxes.values()]
     assert margins == [None, "0 0 0 24px", None]
@@ -1580,21 +1610,27 @@ _VALIDATIONS = ((1, 5, 4.0, 0.5, False), (1, 10, 10.0, None, True), (2, 20, 20.0
 
 
 def _admitted_history_run(
-    run_dir: Path, monkeypatch: pytest.MonkeyPatch, *, task: str = "steady_flow", summary: dict[str, Any] | None = None, write: bool = True
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch, *, task: str = "steady_flow", summary: dict[str, Any] | None = None
 ) -> None:
     """Write a two-epoch history with the real writer and admit the run through a fake lease that yields its checkpoint evidence."""
     run_dir.mkdir()
     binding = {"task": task, "run_name": "run", "checkpoint_identity": _HISTORY_IDENTITY}
-    if write:
-        writer = training_history.make_epoch_state_callback(run_dir, **binding)
-        for epoch, point, step, value, ends_epoch in _VALIDATIONS:
-            validation = {
-                "global_step": step,
-                "validation/point": float(point),
-                "validation/eligible": float(value is not None),
-                **({} if value is None else {"id/rmse": value}),
-            }
-            writer(epoch, {"global_step": step, "train/loss_total": 1.0 / epoch} if ends_epoch else None, validation)
+    writer = training_history.make_epoch_state_callback(run_dir, **binding)
+    for epoch, point, step, value, ends_epoch in _VALIDATIONS:
+        validation = {
+            "global_step": step,
+            "validation/point": float(point),
+            "validation/eligible": float(value is not None),
+            **({} if value is None else {"id/rmse": value}),
+        }
+        writer(epoch, {"global_step": step, "train/loss_total": 1.0 / epoch} if ends_epoch else None, validation)
+    last = {
+        "completed_epoch": 2,
+        "objective_history": [
+            {"point": point, "epoch": epoch, "objective_id": "rmse", "value": value, "bound_violations": {}}
+            for epoch, point, _step, value, _ends in _VALIDATIONS
+        ],
+    }
     admitted = {
         "run_dir": run_dir,
         "config": {"task": task, "run": {"name": "run"}, "model": {"kind": "fno"}, "loss": {"physics": {"enabled": True}}},
@@ -1602,13 +1638,11 @@ def _admitted_history_run(
         "checkpoint_identity": _HISTORY_IDENTITY,
         "selected_checkpoint_sha256": _HISTORY_CHECKPOINT,
         "best_checkpoint": {"best_epoch": 2, "best_metric": 0.3},
-        "last_checkpoint": {
-            "completed_epoch": 2,
-            "objective_history": [
-                {"point": point, "epoch": epoch, "objective_id": "rmse", "value": value, "bound_violations": {}}
-                for epoch, point, _step, value, _ends in _VALIDATIONS
-            ],
-        },
+        "last_checkpoint": last,
+        # The real admission returns the history it admitted against the last checkpoint.
+        "history": training_history.validate_completed_history(
+            run_dir, **binding, completed_epoch=last["completed_epoch"], validations=last["objective_history"]
+        ),
     }
 
     @contextmanager
@@ -1652,24 +1686,6 @@ def test_a_stage_history_of_another_checkpoint_than_expected_raises_with_both_di
 
     with pytest.raises(RuntimeError, match=rf"{'e' * 64}.*{_HISTORY_CHECKPOINT}|{_HISTORY_CHECKPOINT}.*{'e' * 64}"):
         discovery.stage_history(run_dir, expected_checkpoint_sha256="e" * 64)
-
-
-@pytest.mark.parametrize("defect", ["missing", "stale_value"])
-def test_unusable_stage_history_is_unavailable_with_its_reason(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str) -> None:
-    """No history, or one the validator refuses (here a stale objective at a non-selected validation), is unavailable, not an error."""
-    run_dir = tmp_path / defect
-    _admitted_history_run(run_dir, monkeypatch, write=defect != "missing")
-    path = training_history.history_path(run_dir)
-    if defect != "missing":
-        persisted = json.loads(path.read_text(encoding="utf-8"))
-        persisted["validations"][0]["id/rmse"] = 0.45
-        path.write_text(json.dumps(persisted), encoding="utf-8")
-
-    history = discovery.stage_history(run_dir, expected_checkpoint_sha256=_HISTORY_CHECKPOINT)
-
-    assert isinstance(history, discovery.UnavailableHistory)
-    assert history.run_dir == run_dir
-    assert history.reason
 
 
 def _study_payload(**changes: Any) -> dict[str, Any]:

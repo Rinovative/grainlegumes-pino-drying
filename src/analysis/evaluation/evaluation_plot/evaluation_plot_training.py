@@ -3,15 +3,16 @@
 Responsibilities:
   - Draw each stage's training loss per completed epoch and its validation objective at every validation point, marking the
     selected checkpoint, with B and A1 continuing from their A0 handoff epoch
-  - Name every run whose history is unavailable, with its reason, instead of failing the view
   - Draw an Optuna study's trial values by outcome group and its best value so far as a step line, with the counts per group
   - Reduce a learning-curve table to the median and the seed range per material, architecture and train size, and draw it
   - Pair per-case COMSOL and surrogate seconds into one cost per model and draw cumulative COMSOL against surrogate cost with
     the break-even case count
 
 Design principles:
-  - Colour comes from ``plots.series.resolve_styles``; in training curves the line style is the stage (A0 and steady solid, B
-    dashed, A1 dash-dot), so the stages of one pipeline share the colour of its A0
+  - Colour comes from ``plots.series.resolve_styles``; in training curves and the break-even a run takes the colour the
+    evaluation comparison gives it when given, and a training curve's line style is the stage (A0 and steady solid, B dashed,
+    A1 dash-dot)
+  - A positive axis spanning less than a decade stays linear with plain decimal ticks
   - Histories are read only through ``run_discovery.stage_history``; this module never opens run files
   - Break-even n* = (C_gen + C_train) / (t_c - t_s) with C_gen = t_c x train cases; a surrogate not faster per case never breaks even
   - Values that cannot be drawn on the chosen axes raise ``ValueError`` instead of being clipped or dropped
@@ -32,6 +33,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from matplotlib.ticker import ScalarFormatter
 
 from src.analysis.evaluation import evaluation_run_discovery as run_discovery
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
@@ -65,6 +67,14 @@ LEARNING_CURVE_COLUMNS: Final = ("material", "architecture", "train_cases_per_ma
 _BAND_ALPHA: Final = 0.2
 _SECONDS_PER_HOUR: Final = 3600.0
 _BREAK_EVEN_SPAN: Final = 2.0  # the cost axis runs to twice the largest break-even (or train) case count
+_LOG_SPAN: Final = 10.0  # a positive range narrower than a decade reads better on a linear axis with plain decimal ticks
+_ROUND_TRIP_DECIMALS: Final = 17  # decimals that write any float64 n* exactly, so its integer part is never rounded up
+_NBSP: Final = "\N{NO-BREAK SPACE}"  # keeps a number with its unit and a count with its noun on one line of the note
+_T_C: Final = r"$t_\mathrm{c}$"
+_T_S: Final = r"$t_\mathrm{s}$"
+_C_GEN: Final = r"$C_\mathrm{gen}$"
+_C_TRAIN: Final = r"$C_\mathrm{train}$"
+_N_STAR: Final = r"$n^*$"
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +83,7 @@ class BreakEvenCost:
     Hold one model's paired per-case seconds and fixed costs; the entity's label names the model.
 
     ``comsol_seconds`` (t_c) and ``surrogate_seconds`` (t_s) are means over the ``paired_cases`` cases that have both clocks;
-    ``unpaired_cases`` had only one. ``clocks`` names the clocks and hardware for the context line.
+    ``unpaired_cases`` had only one. ``clocks`` names the clocks and hardware for the runtime details below the figure.
     """
 
     entity: series.SeriesEntity
@@ -156,9 +166,23 @@ def break_even_cost(
 
 
 def _log_scale_when_positive(axis: Axes, values: Sequence[float]) -> None:
-    """Use a logarithmic y axis when every drawn value is positive, else keep it linear."""
-    if values and min(values) > 0.0:
+    """Use a logarithmic y axis when every drawn value is positive over at least a decade, else a linear one with plain decimals."""
+    if values and min(values) > 0.0 and max(values) >= _LOG_SPAN * min(values):
         figure_layout.set_log_scale(axis, "y")
+        return
+    plain = ScalarFormatter(useOffset=False)
+    plain.set_scientific(False)
+    axis.yaxis.set_major_formatter(plain)
+
+
+def _three_digits(value: float) -> str:
+    """Return ``value`` positionally with three significant digits and their trailing zeros (``2.00``, ``0.00222``, ``600``)."""
+    return np.format_float_positional(value, precision=3, unique=False, fractional=False, trim="k").removesuffix(".")
+
+
+def _crossing_text(n_star: float) -> str:
+    """Return n* with one decimal, or as many more as keep it below the integer it lies below (9.96, never 10.0)."""
+    return next(text for digits in range(1, _ROUND_TRIP_DECIMALS + 1) if math.floor(float(text := f"{n_star:.{digits}f}")) == math.floor(n_star))
 
 
 def _entity(label: str, architecture: str, run_key: str) -> series.SeriesEntity:
@@ -168,8 +192,9 @@ def _entity(label: str, architecture: str, run_key: str) -> series.SeriesEntity:
 
 
 def _objective_label(objective_id: str, direction: str) -> str:
-    """Return the y label of an objective with the direction that is better."""
-    return f"{objective_id}\n({'lower' if direction == 'minimize' else 'higher'} is better)"
+    """Return the y label of a (normalized, dimensionless) objective in its shared display label, with the direction that is better."""
+    label = display_labels.evaluation_protocol_display_label(objective_id)
+    return f"{label} [{field_labels.display_unit('1')}]\n({'lower' if direction == 'minimize' else 'higher'} is better)"
 
 
 def validation_positions(history: run_discovery.StageHistory) -> np.ndarray:
@@ -184,42 +209,50 @@ def validation_positions(history: run_discovery.StageHistory) -> np.ndarray:
     return history.start_epoch + np.interp(steps, ends, np.arange(ends.size, dtype=float))
 
 
-def plot_training_curves(histories: Mapping[str, run_discovery.StageHistory | run_discovery.UnavailableHistory]) -> Figure:
+def plot_training_curves(
+    histories: Mapping[str, run_discovery.StageHistory],
+    *,
+    styles: series.SeriesStyles | None = None,
+    models: Sequence[str] = (),
+) -> Figure:
     """
     Plot the training loss per epoch and the validation objective per validation point of every labelled stage.
 
     The left panel draws ``train/loss_total`` at the end of every completed epoch, the right one the objective at every
     eligible validation point (a point) and at the selected checkpoint (a star). The x axis is the epoch counted from the
     start of A0 (or of the steady run): B and A1 continue from their A0 handoff epoch. An ineligible validation's value
-    is not bound to the checkpoint, so it is not drawn; the note counts such validations and names unavailable histories
-    with their reasons.
+    is not bound to the checkpoint, so it is not drawn; the note counts such validations. A stage's colour is its run's:
+    ``styles`` (by history label) gives the colours the evaluation views of the same comparison use; without it every stage
+    run is its own series. The line style is always the stage. The title ends with the short labels ``models`` of the compared
+    runs (``layout.models_suffix``).
 
     Raises
     ------
     ValueError
-        If no history is available, or the available ones validate different objectives.
+        If no history is given, the histories validate different objectives, or ``styles`` lacks a history label.
 
     """
-    available = {label: item for label, item in histories.items() if isinstance(item, run_discovery.StageHistory)}
-    unavailable = [f"{label}: {item.reason}" for label, item in histories.items() if isinstance(item, run_discovery.UnavailableHistory)]
-    if not available:
-        message = "No training history is available. " + " ".join(unavailable)
+    if not histories:
+        message = "No training history is available."
         raise ValueError(message)
-    objectives = {(item.objective_id, item.objective_direction) for item in available.values()}
+    objectives = {(item.objective_id, item.objective_direction) for item in histories.values()}
     if len(objectives) != 1:
         message = f"Training curves compare stages of one validation objective; got {sorted(objectives)}."
         raise ValueError(message)
     ((objective_id, direction),) = objectives
     objective_key = f"id/{objective_id}"
-    # The run key is the pipeline, so the stages of one A0 share a colour.
-    styles = series.resolve_styles([_entity(label, item.model_family, item.pipeline) for label, item in available.items()])
+    if styles is None:  # each stage is its own run, as in the evaluation views, where B and A1 differ by checkpoint
+        styles = series.resolve_styles([_entity(label, item.model_family, item.run_name) for label, item in histories.items()])
+    elif missing := sorted(set(histories).difference(styles)):
+        message = f"Training-curve styles lack the histories {missing}."
+        raise ValueError(message)
     figure, axes = figure_layout.panel_figure(1, 2, sharex=True)
     loss_axis, objective_axis = axes[0]
     handles: list[Artist] = []
     losses: list[float] = []
     objectives_drawn: list[float] = []
     ineligible = 0
-    for label, history in available.items():
+    for label, history in histories.items():
         color, linestyle = styles[label].color, _STAGE_LINESTYLES[history.stage]
         loss = [record[_LOSS_KEY] for record in history.epochs]
         loss_axis.plot([history.start_epoch + record["epoch"] for record in history.epochs], loss, color=color, linestyle=linestyle)
@@ -240,14 +273,13 @@ def plot_training_curves(histories: Mapping[str, run_discovery.StageHistory | ru
     loss_axis.set_ylabel(f"Total training loss [{field_labels.display_unit('1')}]")
     objective_axis.set_ylabel(_objective_label(objective_id, direction))
     for axis in axes[0]:
-        axis.set_xlabel("Epoch from the start of A0" if any(item.stage != "steady" for item in available.values()) else "Epoch")
+        axis.set_xlabel("Epoch from the start of A0" if any(item.stage != "steady" for item in histories.values()) else "Epoch")
         axis.grid(True, linestyle="--", alpha=0.3)
     selected_handle = Line2D([], [], marker="*", markersize=_SELECTED_MARKER_SIZE, color="white", markeredgecolor="black", linestyle="none")
-    figure_layout.add_legend(figure, axes, [*handles, selected_handle], [*available, "Selected checkpoint"])
+    figure_layout.add_legend(figure, axes, [*handles, selected_handle], [*histories, "Selected checkpoint"])
     note = "Line style: stage (steady and A0 solid, B dashed, A1 dash-dot); points: validations; B and A1 start at the A0 handoff"
     skipped = [f"{ineligible} ineligible validation{'s' if ineligible > 1 else ''} not drawn"] if ineligible else []
-    note_lines = [note, *skipped, *(f"Unavailable: {text}" for text in unavailable)]
-    figure_layout.set_figure_title(figure, axes, "Training curves", note=layout.series_note(styles, *note_lines))
+    figure_layout.set_figure_title(figure, axes, "Training curves" + layout.models_suffix(models), note=layout.series_note(styles, note, *skipped))
     return figure
 
 
@@ -371,24 +403,39 @@ def plot_learning_curve(frame: pd.DataFrame, *, error_label: str) -> Figure:
     return figure
 
 
-def plot_break_even(costs: Sequence[BreakEvenCost]) -> Figure:
+def plot_break_even(
+    costs: Sequence[BreakEvenCost],
+    *,
+    styles: series.SeriesStyles | None = None,
+    unavailable: Sequence[str] = (),
+    models: Sequence[str] = (),
+) -> Figure:
     """
     Plot cumulative COMSOL cost n t_c against the surrogate's C_gen + C_train + n t_s, one panel per model.
 
-    The dotted line marks the break-even n*; a surrogate not faster per case is marked «never». The cost axis runs to twice
-    the largest finite n* (or twice the largest train case count when no model breaks even).
+    The dotted line marks the break-even n*, where the costs cross; the note names each model's role and gives n* and the
+    first case from which the surrogate is cheaper (n* keeps the decimals that hold it below that case), the seconds and hours
+    three significant digits; a surrogate not faster per case is marked «never». The cost axis runs to twice the largest
+    finite n* (or twice the largest train case count when no model breaks even). ``styles`` (by label) are the colours the
+    other views give the runs, else each model is its own series. Below the figure stand the runs ``unavailable`` names as
+    lacking evidence; the clocks and hardware (``BreakEvenCost.clocks``) are the caller's runtime details, never figure text.
+    The title ends with the short labels ``models``.
 
     Raises
     ------
     ValueError
-        If no cost is given or two share a label.
+        If no cost is given, two share a label, or ``styles`` lacks one.
 
     """
     labels = [cost.entity.label for cost in costs]
     if not costs or len(set(labels)) != len(costs):
         message = "Break-even needs at least one model cost, each with its own label."
         raise ValueError(message)
-    styles = series.resolve_styles([cost.entity for cost in costs])
+    if styles is None:
+        styles = series.resolve_styles([cost.entity for cost in costs])
+    elif missing := sorted(set(labels).difference(styles)):
+        message = f"Break-even styles lack the models {missing}."
+        raise ValueError(message)
     finite = [n for cost in costs if (n := cost.break_even_cases) is not None]
     span = _BREAK_EVEN_SPAN * (max(finite) if finite else max(cost.train_cases for cost in costs))
     cases = np.linspace(0.0, span, 200)
@@ -406,21 +453,30 @@ def plot_break_even(costs: Sequence[BreakEvenCost]) -> Figure:
         n_star = cost.break_even_cases
         if n_star is None:
             axis.text(0.98, 0.04, "Break-even: never", transform=axis.transAxes, ha="right", va="bottom", fontsize=figure_layout.TICK_PT)
-            outcome = "never (t_s >= t_c)"
+            outcome = r"never ($t_\mathrm{s} \geq t_\mathrm{c}$)"
         else:
-            markers.append(axis.axvline(n_star, color="grey", linestyle=":", linewidth=1.2))
-            outcome = f"n* = {n_star:.4g} (after {math.ceil(n_star)} cases)"
+            # Marked as a reference line: it spans the view, so the key clears it without counting it as data extent.
+            markers.append(axis.axvline(n_star, color="grey", linestyle=":", linewidth=1.2, gid=figure_layout.REFERENCE_GID))
+            outcome = rf"{_N_STAR} = {_crossing_text(n_star)}, cheaper from case{_NBSP}{math.floor(n_star) + 1}"
         axis.set_xlabel("Predicted cases n")
         axis.grid(True, linestyle="--", alpha=0.3)
-        figure_layout.set_panel_title(axis, cost.entity.label)
+        if len(costs) > 1:  # one panel is named by the figure title and the legend
+            figure_layout.set_panel_title(axis, cost.entity.label)
+        generation, training = (_three_digits(seconds / _SECONDS_PER_HOUR) for seconds in (cost.generation_seconds, cost.training_seconds))
         notes.append(
-            f"{cost.entity.label}: t_c = {cost.comsol_seconds:.3g} s, t_s = {cost.surrogate_seconds:.3g} s per case over {cost.paired_cases} "
-            f"paired cases ({cost.unpaired_cases} unpaired); C_gen = {cost.generation_seconds / _SECONDS_PER_HOUR:.3g} h ({cost.train_cases} "
-            f"train cases x t_c), C_train = {cost.training_seconds / _SECONDS_PER_HOUR:.3g} h; {outcome}; {cost.clocks}"
+            f"{cost.entity.label} · {display_labels.evaluation_role_display_label(cost.entity.role)}: "
+            f"{_T_C} = {_three_digits(cost.comsol_seconds)}{_NBSP}s, {_T_S} = {_three_digits(cost.surrogate_seconds)}{_NBSP}s per case over "
+            f"{cost.paired_cases}{_NBSP}paired{_NBSP}cases ({cost.unpaired_cases}{_NBSP}unpaired)\n"
+            f"{_C_GEN} = {generation}{_NBSP}h ({cost.train_cases}{_NBSP}train{_NBSP}cases{_NBSP}\N{MULTIPLICATION SIGN}{_NBSP}{_T_C}), "
+            f"{_C_TRAIN} = {training}{_NBSP}h; {outcome}"
         )
     figure_layout.label_rows_once(axes, f"Cumulative wall time [{field_labels.display_unit('h')}]")
-    legend_labels = ["COMSOL n t_c", *(f"{label}: C_gen + C_train + n t_s" for label in labels), *(["Break-even n*"] if markers else [])]
+    formula = r"$C_\mathrm{gen} + C_\mathrm{train} + n\,t_\mathrm{s}$"
+    legend_labels = [r"COMSOL: $n\,t_\mathrm{c}$", *(f"{label}: {formula}" for label in labels), *([r"Break-even $n^*$"] if markers else [])]
     figure_layout.add_legend(figure, axes, [comsol, *handles, *markers[:1]], legend_labels)
     notes.append("Generation cost counts neither failed candidates nor validation cases")
-    figure_layout.set_figure_title(figure, axes, "Break-even against COMSOL", note=layout.series_note(styles, *notes))
+    title = "Break-even against COMSOL" + layout.models_suffix(models)
+    figure_layout.set_figure_title(figure, axes, title, note=layout.series_note(styles, *notes))
+    if unavailable:
+        figure.supxlabel("Without break-even evidence: " + "; ".join(unavailable), fontsize=figure_layout.NOTE_PT)
     return figure

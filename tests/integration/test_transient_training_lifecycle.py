@@ -3,6 +3,15 @@
 Responsibilities:
   - Exercise compact transient packages, scaling, A0/B/A1 lifecycle, A0 budget identity, and model optimizer paths
   - Exercise best-checkpoint payload kinds and the refusal of non-completed B runs for evaluation
+  - Exercise the plan's refusal, without rerun advice or traceback, to continue a B that its persisted state or a pinned
+    input refuses, and its rerun advice, also without a traceback, for a B whose job runs on another GPU type or in
+    another image
+  - Exercise B as its receipt's one owner: its saved-config resume and its plan step publish the same bytes, an A1 without
+    the receipt is refused, naming B's step, and A1 writes only its own copy, whose failed write leaves A1 interrupted,
+    as does host memory exhausted while A1 decodes its best after its terminal last checkpoint
+  - Exercise a pinned manifest that is malformed, has a grid digest its binding refuses or contradicts the saved split,
+    which refuses an interrupted A1 alike in its recovery check and its rerun, and a Dataset area behind a symbolic link,
+    which both read like the transient loaders
   - Compare an interrupted B, resumed with another memory batch, group by group with an uninterrupted B
   - Exercise one real A0 Optuna trial whose study signature equals the dry run's and whose trial and history validate
 
@@ -15,6 +24,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 from typing import TYPE_CHECKING, Any
@@ -28,7 +38,9 @@ from torch.optim.adamw import AdamW
 
 from src import analysis, common, datasets, domain, experiments, generation, learning
 from src.datasets.packages import dataset_packages_selection as selection
+from src.experiments import experiments_matched_budget as matched_budget
 from src.experiments import experiments_wandb_schema as wandb_schema
+from src.experiments.cli import cli_train
 from src.learning.inference import learning_inference_transient as transient_inference
 from src.learning.learning_temporal import TemporalConditioningSpec
 from src.learning.transient import learning_transient_adapter as transient_adapter
@@ -37,7 +49,7 @@ from src.learning.transient.learning_transient_contracts import TransientTensori
 from src.learning.transient.learning_transient_curriculum import RolloutCurriculum, RolloutCurriculumState
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
 pytestmark = pytest.mark.integration
@@ -467,13 +479,212 @@ def _interrupt_training(*_args: Any, **_kwargs: Any) -> Any:
     raise KeyboardInterrupt(message)
 
 
-def test_matched_b_restarts_its_schedule_at_the_scaled_a0_start_rate(transient_package: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+def _exhausted_memory(*_args: Any, **_kwargs: Any) -> Any:
+    """Stand in for the selected-checkpoint evaluation whose decode of the best checkpoint exhausts host memory."""
+    message = "DefaultCPUAllocator: can't allocate memory"
+    raise MemoryError(message)
+
+
+def _contradicted_split(*_args: Any, **_kwargs: Any) -> Any:
+    """Stand in for the split resolution of a Dataset that changed since a run saved its split."""
+    message = "Saved split does not match the current Dataset manifests, partition, evaluation membership or item expansion."
+    raise ValueError(message)
+
+
+def _malformed(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Return a Dataset manifest whose first case lost its Source entry, which the manifest schema reads."""
+    del manifest["source_case_identities"][0]["source"]
+    return manifest
+
+
+def _regridded(axes_sha256: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """Return a change of a Dataset manifest to the grid digest ``axes_sha256``, with the Dataset digest of that content."""
+
+    def regrid(manifest: dict[str, Any]) -> dict[str, Any]:
+        manifest["grid"]["axes_sha256"] = axes_sha256
+        provenance = {key: manifest[key] for key in datasets.packages.manifest.PACKAGE_PROVENANCE_KEYS}
+        manifest["dataset_digest"] = datasets.contracts.identity.package_identity_from_provenance(provenance)[1]
+        return manifest
+
+    return regrid
+
+
+def _failed_continuation(run_dir: Path, capsys: pytest.CaptureFixture[str], command: Sequence[str]) -> str:
+    """Run ``command``, which must fail to continue ``run_dir`` and leave it unchanged, and return what it printed to stderr."""
+    before_attempt = {path: path.read_bytes() for path in sorted(run_dir.rglob("*")) if path.is_file()}
+    capsys.readouterr()
+    assert cli_train.main(list(command)) == 1
+    assert {path: path.read_bytes() for path in sorted(run_dir.rglob("*")) if path.is_file()} == before_attempt
+    return capsys.readouterr().err
+
+
+def _assert_refused_without_rerun(stderr: str, reason: str, *, refusal: str = "not eligible for checkpoint resume") -> None:
+    """Require a refusal that names ``reason`` and ``refusal``, advises no rerun or retry, which is refused again, and prints no traceback."""
+    assert reason in stderr
+    assert refusal in stderr
+    assert "Rerun" not in stderr
+    assert "Retry" not in stderr
+    assert "Traceback" not in stderr
+
+
+def _assert_rerun_offered(stderr: str, reason: str, *, rerun: str = "Rerun the same command inside a matching Slurm allocation") -> None:
+    """Require an end by the job's environment that names ``reason`` and offers the ``rerun`` in a matching allocation, without a traceback."""
+    assert reason in stderr
+    assert rerun in stderr
+    assert "not eligible" not in stderr
+    assert "Traceback" not in stderr
+
+
+def _interrupting_the_second_group() -> Callable[..., Any]:
+    """Return the training loop's group training, interrupted at its second call, after the first committed group."""
+    real_groups = learning.training.loop.train_update_groups
+    calls = [0]
+
+    def interrupt_the_second_group(*args: Any, **kwargs: Any) -> Any:
+        # Each call trains up to the next stage event, and the first event publishes the last checkpoint.
+        calls[0] += 1
+        if calls[0] == 2:
+            message = "synthetic interruption after the first committed group"
+            raise KeyboardInterrupt(message)
+        return real_groups(*args, **kwargs)
+
+    return interrupt_the_second_group
+
+
+def _a1_trains_on_the_receipt_b_published(
+    plan_path: Path, output_root: Path, b_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    Train A1 on the receipt that only B writes, which B's saved config published when it continued B to its end.
+
+    B's plan step republishes the same bytes. Without the receipt, A1's plan and A1's ``--resume`` are refused, naming B's
+    step, and change neither leaf. A1's started attempt writes only its own copy: a damaged copy refuses A1 unchanged, and
+    a write of it that the job's environment fails leaves A1 interrupted, which its ``--resume`` finishes. A pinned
+    manifest that A1's loaders refuse refuses the interrupted A1 in its recovery check as in its rerun.
+    """
+    b_receipt = b_dir / matched_budget.RECEIPT_NAME
+    published = b_receipt.read_bytes()
+    plan_a1 = (str(plan_path), "--train-stages", "a1")
+
+    def republished_by_bs_step() -> None:
+        experiments.run.run_experiment(plan_path, device="cpu", output_root=output_root, train_stages=("b",))
+        assert b_receipt.read_bytes() == published
+
+    def refused_without_bs_receipt(command: Sequence[str]) -> None:
+        b_receipt.unlink()
+        stderr = _failed_continuation(b_dir.parent, capsys, command)  # B's leaf and A1's
+        _assert_refused_without_rerun(stderr, "--train-stages b", refusal="refused before its attempt started")
+        republished_by_bs_step()
+
+    republished_by_bs_step()
+    refused_without_bs_receipt(plan_a1)
+    b_leaf = {path: path.read_bytes() for path in sorted(b_dir.rglob("*")) if path.is_file()}
+    with monkeypatch.context() as interruption:
+        interruption.setattr(learning.training.loop, "train_update_groups", _interrupting_the_second_group())
+        with pytest.raises(experiments.run.MatchedStageInterrupted) as interrupted:
+            experiments.run.run_experiment(plan_path, device="cpu", output_root=output_root, train_stages=("a1",))
+    a1_dir = interrupted.value.run_dir
+    a1_copy = a1_dir / matched_budget.RECEIPT_NAME
+    assert interrupted.value.recovery == "resumable"
+    assert a1_copy.read_bytes() == published
+    refused_without_bs_receipt(("--resume", str(a1_dir)))
+    a1_copy.write_bytes(published[: len(published) // 2])
+    _assert_refused_without_rerun(_failed_continuation(a1_dir, capsys, plan_a1), "Immutable B budget receipt differs")
+    a1_copy.unlink()
+    publish, writes = matched_budget.publish_b_receipt, []
+
+    def unwritable_a1(run_dir: Path, receipt: Mapping[str, Any]) -> Path:
+        writes.append(run_dir)
+        if a1_dir.samefile(run_dir):
+            raise OSError(errno.ENOSPC, "No space left on device", str(a1_copy))
+        return publish(run_dir, receipt)
+
+    with monkeypatch.context() as unwritable:
+        unwritable.setattr(matched_budget, "publish_b_receipt", unwritable_a1)
+        with pytest.raises(experiments.run.MatchedStageExecutionError) as ended:
+            experiments.run.run_experiment(plan_path, device="cpu", output_root=output_root, train_stages=("a1",))
+    assert [a1_dir.samefile(path) for path in writes] == [True]
+    assert (ended.value.recovery, experiments.run.read_run_summary(a1_dir)["status"]) == ("resumable", "interrupted")
+    # A pinned manifest A1's loaders refuse is A1's state: an interrupt in A1's admission gets the recovery check, which
+    # refuses A1 by that manifest as the rerun's admission does, and advises no rerun; the restored manifest admits A1
+    # again. That is a malformed manifest, a grid digest its binding refuses, and another grid, which contradicts A1's split.
+    saved_a1 = experiments.config.loader.load_yaml(a1_dir / "config.yaml")
+    manifest_path = common.paths.resolve_dataset_manifest_path(
+        "transient_drying", saved_a1["data"]["train_dataset"], dataset_root=saved_a1["paths"]["dataset_root"]
+    )
+    pinned = manifest_path.read_bytes()
+
+    def recovery_of_an_interrupted_admission() -> tuple[str, str]:
+        """Interrupt A1's admission once and return the recovery check's verdict and reason."""
+        require_attempt_history, admissions = experiments.run._require_attempt_history, []
+
+        def interrupted_once(*args: Any, **kwargs: Any) -> None:
+            admissions.append(args)
+            if len(admissions) == 1:
+                message = "synthetic interruption in A1's admission"
+                raise KeyboardInterrupt(message)
+            require_attempt_history(*args, **kwargs)
+
+        with monkeypatch.context() as interruption:
+            interruption.setattr(experiments.run, "_require_attempt_history", interrupted_once)
+            with pytest.raises(experiments.run.MatchedStageInterrupted) as interrupted_admission:
+                experiments.run.run_experiment(plan_path, device="cpu", output_root=output_root, train_stages=("a1",))
+        return interrupted_admission.value.recovery, interrupted_admission.value.recovery_reason
+
+    for damage, reason in (
+        (_malformed, f"Dataset manifest is malformed: {manifest_path}"),
+        (_regridded("not-a-digest"), "Dataset grid axes_sha256 must be"),
+        (_regridded("0" * 64), "Saved split does not match the current Dataset"),
+    ):
+        common.serialization.atomic_write_json(manifest_path, damage(json.loads(pinned)))
+        recovery, recovery_reason = recovery_of_an_interrupted_admission()
+        assert (recovery, reason in recovery_reason) == ("refused", True), recovery_reason
+        _assert_refused_without_rerun(_failed_continuation(a1_dir, capsys, plan_a1), reason)
+        common.serialization.atomic_write_bytes(manifest_path, pinned)
+    # Its loaders read the Datasets below the storage root, also through a Dataset area that is a symbolic link, and so
+    # does its admission: the recovery check finds A1 resumable.
+    datasets_root = common.paths.get_datasets_root(storage_root=saved_a1["paths"]["storage_root"])
+    moved = datasets_root.with_name("datasets_behind_a_link")
+    datasets_root.rename(moved)
+    datasets_root.symlink_to(moved, target_is_directory=True)
+    assert recovery_of_an_interrupted_admission()[0] == "resumable"
+    datasets_root.unlink()
+    moved.rename(datasets_root)
+    # Host memory exhausted while A1 decodes its best after its terminal last is the job's environment too: A1 ends
+    # interrupted, reported so without a traceback and advised the rerun that continues it, which then only finalizes it.
+    with monkeypatch.context() as exhausted:
+        exhausted.setattr(learning.training.loop, "evaluate_selected_checkpoint", _exhausted_memory)
+        capsys.readouterr()
+        assert cli_train.main(list(plan_a1)) == 1
+    stderr = capsys.readouterr().err
+    assert "Matched stage a1 interrupted" in stderr
+    _assert_rerun_offered(stderr, "MemoryError", rerun="Rerun the same command inside a matching Slurm allocation; it continues this stage")
+    assert experiments.run.read_run_summary(a1_dir)["status"] == "interrupted"
+    assert experiments.run.run_experiment(a1_dir / "config.yaml", resume=a1_dir)["result"]["status"] == "completed"
+    assert a1_copy.read_bytes() == published
+    assert {path: path.read_bytes() for path in sorted(b_dir.rglob("*")) if path.is_file()} == b_leaf
+
+
+def test_matched_b_restarts_its_schedule_at_the_scaled_a0_start_rate(
+    transient_package: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     """
     A fresh B starts its own cosine at lr_scale times A0's start rate and keeps A0's Adam step counters; a resume continues it.
 
     The matched A0 handoff best keeps full training state without schedule state. B is
     interrupted after its first committed group, refused for evaluation while interrupted,
-    resumed on its full identity to the end of its budget, and then never extended.
+    resumed on its full identity to the end of its budget, and then never extended. While its
+    A0 was trained by other training code, a Dataset contradicts its saved split, its last
+    checkpoint does not restore, or its admission before the writer lease refuses its summary,
+    the plan, and for its A0 also its saved config, refuses to continue B, leaves its leaf
+    unchanged and advises no rerun, which would be refused again, and prints no traceback.
+    A job on another GPU type than B's first attempt, in another image than its checkpoints', or
+    with other packages than its A0 fails by its environment: B stays unchanged and is offered
+    the rerun in a matching allocation, also without a traceback, unless the read-only recovery
+    check finds B's own state refusing, such as a truncated last checkpoint, whose reason is then
+    the only advice. B continued to its end by its
+    saved config publishes its receipt, an interrupted continuation none; A1 trains on that
+    receipt and writes only its own copy.
     """
     root = transient_package["root"]
     monkeypatch.setenv("STORAGE_ROOT", str(root))
@@ -493,23 +704,12 @@ def test_matched_b_restarts_its_schedule_at_the_scaled_a0_start_rate(transient_p
     start_rate = float(experiments.config.loader.load_yaml(common.paths.resolve_run_config_path(a0_dir))["optimizer"]["lr"])
     _assert_curated_series_are_produced(a0_dir, cuda=False)  # the CPU run of a real A0 checks the producers where no GPU is needed
 
-    real_groups = learning.training.loop.train_update_groups
-    calls = [0]
-
-    def interrupt_the_second_group(*args: Any, **kwargs: Any) -> Any:
-        # One batch per epoch: each call trains one group, and the first event publishes the last checkpoint.
-        calls[0] += 1
-        if calls[0] == 2:
-            message = "synthetic interruption after the first committed group"
-            raise KeyboardInterrupt(message)
-        return real_groups(*args, **kwargs)
-
     with monkeypatch.context() as interruption:
-        interruption.setattr(learning.training.loop, "train_update_groups", interrupt_the_second_group)
+        interruption.setattr(learning.training.loop, "train_update_groups", _interrupting_the_second_group())
         with pytest.raises(experiments.run.MatchedStageInterrupted) as interrupted:
             experiments.run.run_experiment(plan_path, device="cpu", output_root=output_root, train_stages=("b",))
     b_dir = interrupted.value.run_dir
-    assert interrupted.value.resumable
+    assert interrupted.value.recovery == "resumable"
     _assert_evaluation_refused(b_dir, "interrupted")
     # The first group ran at the scaled stage start rate (p = 0), whatever rate A0's cosine had reached at its best; the
     # checkpoint holds that start rate and the cosine rate at the fraction of K x N transitions the group committed.
@@ -524,18 +724,63 @@ def test_matched_b_restarts_its_schedule_at_the_scaled_a0_start_rate(transient_p
     first_work = experiments.run.read_run_summary(b_dir)["training_work"]
     assert first_work["optimizer_steps"] == 1
     assert first_work["gradient_predictions"] > 0
+
+    plan_b = (str(plan_path), "--train-stages", "b")
+
+    def continue_b(*command: str) -> str:
+        """Continue B by ``command``, its plan by default, which must fail and leave B unchanged, and return its stderr."""
+        return _failed_continuation(b_dir, capsys, command or plan_b)
+
     with monkeypatch.context() as drift:
-        # An A0 trained by other training code is no longer a valid teacher for continuing B.
+        # An A0 trained by other training code is no longer a valid teacher for continuing B: its persisted state refuses B
+        # before its attempt, whether its plan or its saved config continues it.
         run_state.drift_training_code(drift, "transient_drying")
-        before_drift = {path: path.read_bytes() for path in sorted(b_dir.rglob("*")) if path.is_file()}
-        with pytest.raises(ValueError, match=r"A0 .*: training_transient_drying implementation changed"):
-            experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir)
-        assert {path: path.read_bytes() for path in sorted(b_dir.rglob("*")) if path.is_file()} == before_drift
+        for command in (plan_b, ("--resume", str(b_dir))):
+            stderr = continue_b(*command)
+            _assert_refused_without_rerun(stderr, "training_transient_drying implementation changed", refusal="Run continuation refused")
+
+    # Another GPU type than B's first attempt, or another image than the one its checkpoints come from, is the job's
+    # environment, not B's state: the plan offers the rerun in a matching allocation, which continues B, without a traceback.
+    summary_path = common.paths.resolve_run_summary_path(b_dir)
+    recorded = summary_path.read_bytes()
+    summary = json.loads(recorded)
+    summary["runtime_sessions"][0].update(device_type="cuda", cuda_device_name="NVIDIA RTX 6000 Ada Generation")
+    common.serialization.atomic_write_json(summary_path, summary)
+    _assert_rerun_offered(continue_b(), "Run it on that GPU type")
+    # With a truncated last checkpoint as well, the recovery check finds B's own state refusing, which that rerun would
+    # meet again: its reason only, no rerun.
+    last_path = b_dir / "last_checkpoint.pt"
+    restorable = last_path.read_bytes()
+    last_path.write_bytes(restorable[: len(restorable) // 2])
+    _assert_refused_without_rerun(continue_b(), "Checkpoint is unreadable")
+    last_path.write_bytes(restorable)
+    summary_path.write_bytes(recorded)
+    environment = learning.training.checkpoint.numerical_environment_identity()
+    with monkeypatch.context() as image:
+        image.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda: {**environment, "sif_sha256": "0" * 64})
+        _assert_rerun_offered(continue_b(), "differs in sif_sha256")
+    # So is another package version, which already B's teacher, A0, cannot be read in: the plan offers the rerun before B.
+    with monkeypatch.context() as packages:
+        packages.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda: {**environment, "numpy": "0.0.0"})
+        _assert_rerun_offered(continue_b(), "differs in numpy", rerun="next: rerun the same command in a matching allocation, the run is unchanged")
+    # A Dataset that changed since B started contradicts B's saved split: B's pinned input refuses the continuation.
+    with monkeypatch.context() as changed:
+        changed.setattr(datasets.preprocessing.splits, "resolve_split", _contradicted_split)
+        _assert_refused_without_rerun(continue_b(), "Saved split does not match the current Dataset")
+    # A loss state with an unexpected key passes the read-only checks and fails only the attempt's full restore.
+    common.serialization.atomic_torch_save({**b_last, "loss_state_dict": {**b_last["loss_state_dict"], "unexpected": torch.zeros(1)}}, last_path)
+    _assert_refused_without_rerun(continue_b(), "Unexpected key")
+    last_path.write_bytes(restorable)
+    # An attempt history of an earlier summary schema is refused by the read-only admission before the writer lease.
+    common.serialization.atomic_write_json(summary_path, {key: value for key, value in json.loads(recorded).items() if key != "duration_contract"})
+    _assert_refused_without_rerun(continue_b(), "earlier summary schema")
+    summary_path.write_bytes(recorded)
     with monkeypatch.context() as interruption:
         interruption.setattr(learning.training.loop, "train_loop", _interrupt_training)
         with pytest.raises(KeyboardInterrupt):
             experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir)
     _assert_evaluation_refused(b_dir, "interrupted")
+    assert not (b_dir / matched_budget.RECEIPT_NAME).exists()  # an unfinished B has no receipt
     resumed = experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir)
 
     assert resumed["result"]["status"] == "completed"
@@ -548,8 +793,10 @@ def test_matched_b_restarts_its_schedule_at_the_scaled_a0_start_rate(transient_p
     assert _saved_learning_rates(b_dir)[1] == pytest.approx(start_rate * _LR_SCALE)
     experiments.run.validate_completed_run(b_dir)
     # The finished B has spent its budget: it is never extended.
-    with pytest.raises(ValueError, match="never extended"):
+    with pytest.raises(experiments.run.ContinuationRefusedError, match="never extended"):
         experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir)
+    # Continued to its end by its saved config, B published its receipt, the one A1 trains on.
+    _a1_trains_on_the_receipt_b_published(plan_path, output_root, b_dir, monkeypatch, capsys)
     # Its training curve continues from the A0 handoff; without its history the admission itself refuses the stage.
     selected = experiments.run.validate_evaluable_run(b_dir)["selected_checkpoint_sha256"]
     history = analysis.evaluation.run_discovery.stage_history(b_dir, expected_checkpoint_sha256=selected)

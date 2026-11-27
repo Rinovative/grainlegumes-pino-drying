@@ -10,16 +10,21 @@ This module does NOT:
   - Extend source trajectories or fit training normalizers
 """
 
+from __future__ import annotations
+
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import pytest
 from matplotlib.colors import BoundaryNorm, to_rgb
+from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
 from src import analysis, domain
+from src.analysis.catalog import analysis_catalog_transient as catalog_transient
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda import eda_dataframe
 from src.analysis.eda import eda_transient as transient
@@ -28,12 +33,15 @@ from src.analysis.eda.plots import eda_plot_case_statistics as statistics
 from src.analysis.eda.plots import eda_plot_spectral_analysis as spectra
 from src.analysis.eda.plots import eda_plot_transient as plots
 from src.analysis.presentation import analysis_display_labels as display_labels
+from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_visual_semantics as semantics
+from src.analysis.ui import analysis_ui_time as time_ui
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping, Sequence
 
-    from matplotlib.figure import Figure
+    from matplotlib.axes import Axes
+    from matplotlib.patches import Rectangle
 
 
 def test_aggregate_preserves_long_tail_and_equal_case_weight() -> None:
@@ -77,38 +85,25 @@ def test_invalid_source_support_fails_instead_of_shrinking_score(
         transient.aggregate_exact_series([times], [values])
 
 
-def test_single_contributor_has_line_without_dispersion_band() -> None:
-    """One observed value is shown without implying population dispersion."""
-    figure, axes = plt.subplots(1, 2)
+def test_the_master_time_marker_at_the_main_windows_start_is_drawn_unclipped() -> None:
+    """The master-time marker at the main window's 1 h start sits on its frame, so it is drawn unclipped and shows its whole disc."""
+    figure, axes = plt.subplots(2, 2)
     try:
-        plots._plot_split_time_series(
-            axes[0],
-            axes[1],
-            np.array([0.0, 1.0, 2.0]),
-            np.array([1.0, 2.0, 3.0]),
-            lower=np.array([1.0, 2.0, 3.0]),
-            upper=np.array([1.0, 2.0, 3.0]),
-            style=semantics.SeriesStyle("black", "-", None),
-            contributor_count=np.ones(3, dtype=np.int64),
+        label, frame = next(iter(catalog_transient._eda_datasets().items()))
+        schedules = list(axes[:, 0])
+        plots._draw_exact_schedule_split_axes(
+            schedules,
+            list(axes[:, 1]),
+            datasets={label: frame},
+            case_ids={label: "case_0001"},
+            colors={label: "black"},
+            linestyles={label: "-"},
+            master_time_hours=1.0,
+            case_times={label: time_ui.ResolvedPhysicalTime(1.0, exact_master_match=True, final_hold=False)},
         )
-        assert all(axis.lines for axis in axes)
-        assert all(not collection.get_paths() for axis in axes for collection in axis.collections)
-    finally:
-        plt.close(figure)
-
-
-def test_count_display_preserves_every_exact_time_and_support_change() -> None:
-    """The exported figure retains n(t), including gaps and nonmonotone support."""
-    figure, axes = plt.subplots(1, 2)
-    try:
-        times = np.array([0.0, 1.0, 3.0, 6.0])
-        counts = np.array([3, 1, 2, 1])
-        plots._plot_contributors(axes[0], axes[1], times, counts, style=semantics.SeriesStyle("black", "--", None))
-        np.testing.assert_array_equal(axes[0].lines[0].get_xdata(), times[1:])
-        np.testing.assert_array_equal(axes[0].lines[0].get_ydata(), counts[1:])
-        np.testing.assert_array_equal(axes[1].lines[0].get_xdata(), times[:2])
-        np.testing.assert_array_equal(axes[1].lines[0].get_ydata(), counts[:2])
-        assert all(axis.lines[0].get_linestyle() == "--" and axis.lines[0].get_drawstyle() == "steps-post" for axis in axes)
+        markers = [marker for axis in schedules for marker in axis.collections]
+        assert [axis.get_xlim()[0] for axis in schedules] == [marker.get_offsets()[0][0] for marker in markers] == [1.0, 1.0]
+        assert not any(marker.get_clip_on() for marker in markers)
     finally:
         plt.close(figure)
 
@@ -232,10 +227,11 @@ def test_published_inlet_profile_follows_the_edge_of_smallest_y_along_x() -> Non
 
 def test_histogram_grid_labels_x_on_the_lowest_panel_of_every_column_and_draws_dashes_in_the_legend() -> None:
     """A column that ends a row early still gets its x label; a dashed legend line is thin enough to show its dashes."""
-    styles = plots.batch_styles({"A": "lentil", "B": "lentil"})
+    styles = plots.batch_styles({"A": "lentil", "B": "lentil"}, roles={"A": "id", "B": "parameter_ood"})
     rng = np.random.default_rng(0)
     data = {name: {key: rng.normal(size=20) for key in "abcde"} for name in styles}
     figure = statistics._hist_grid(data_by_dataset=data, active_datasets=list(styles), columns=list("abcde"), title="t", styles=styles)
+    assert isinstance(figure, Figure)
     try:
         assert [axis.get_xlabel() for axis in figure.axes[:5]] == ["", "", "Value", "Value", "Value"]  # 3 columns: the last row has two panels
         handles = figure.legends[0].legend_handles
@@ -254,6 +250,7 @@ def test_histogram_grid_writes_counts_once_per_row_and_colors_datasets_by_materi
     rng = np.random.default_rng(0)
     data = {name: {key: rng.normal(size=20) for key in "abcd"} for name in styles}
     figure = statistics._hist_grid(data_by_dataset=data, active_datasets=list(styles), columns=list("abcd"), title="t", styles=styles)
+    assert isinstance(figure, Figure)
     try:
         panels = figure.axes[:4]
         assert [axis.get_ylabel() for axis in panels] == ["Counts", "", "Counts", ""]
@@ -296,24 +293,24 @@ def test_long_dataset_name_wraps_at_its_separators_without_losing_characters() -
         display_labels.wrapped_dataset_display_label(name, width=26, max_lines=0)
 
 
-def test_field_distribution_panels_write_their_power_of_ten_into_the_x_label_not_an_offset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A panel of values near 1e-13 shows plain tick labels and ``[10⁻¹³]`` in its x label; a panel of ordinary values keeps its label."""
+def _steady_frame(offsets: Sequence[float], values: Mapping[str, float] | None = None) -> pd.DataFrame:
+    """Return one steady frame with a case per offset; every field is constant per case, at its ``values`` entry (else position + 1) + offset."""
     task = domain.tasks.registry.get_task("steady_flow")
-    shape = (2, 3)
-    values = {"v": 3.0e-13, "Kxx": -9.0}
-    row = {
-        **{
-            name: np.full(shape, values.get(name, index + 1.0), dtype=np.float32)
-            for index, name in enumerate((*task.input_names, *task.output_names))
-        },
-        "meta": {"case_id": "case_0001"},
-    }
+    names = (*task.input_names, *task.output_names)
+    ids = [f"case_{number:04d}" for number in range(1, len(offsets) + 1)]
+    rows = [
+        {
+            **{name: np.full((2, 3), (values or {}).get(name, index + 1.0) + offset, dtype=np.float32) for index, name in enumerate(names)},
+            "meta": {"case_id": case_id},
+        }
+        for offset, case_id in zip(offsets, ids, strict=True)
+    ]
     loaded = {
         "task": task,
-        "sample_ids": ["case_0001"],
-        "rows": [row],
-        "available_case_count": 1,
-        "total_discovered_case_count": 1,
+        "sample_ids": ids,
+        "rows": rows,
+        "available_case_count": len(ids),
+        "total_discovered_case_count": len(ids),
         "failed_case_count": 0,
         "incomplete_case_count": 0,
         "invalid_case_count": 0,
@@ -326,6 +323,17 @@ def test_field_distribution_panels_write_their_power_of_ten_into_the_x_label_not
         "generation_root": Path("/synthetic"),
     }
     frame, _logs = eda_dataframe._steady_dataframe(loaded, batch_name="synthetic_steady", task=task)
+    return frame
+
+
+def _histogram_count(axis: Axes) -> int:
+    """Return how many values the bars of one histogram panel count."""
+    return round(sum(cast("Rectangle", patch).get_height() for patch in axis.patches))
+
+
+def test_field_distribution_panels_write_their_power_of_ten_into_the_x_label_not_an_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A panel of values near 1e-13 shows plain tick labels and ``[10⁻¹³]`` in its x label; a panel of ordinary values keeps its label."""
+    frame = _steady_frame([0.0], {"v": 3.0e-13, "Kxx": -9.0})
     name = "lentil-train1-val1-pood1+chickpea-train1-val1-pood1+kidney-bean-ood2__ref-param-ext__sobol-seed-9300"
     monkeypatch.setattr(analysis.ui.viewers, "case_count_view", lambda plot, **_options: plot)
     # The monkeypatched viewer hands back the figure function itself.
@@ -338,10 +346,68 @@ def test_field_distribution_panels_write_their_power_of_ten_into_the_x_label_not
         assert len(panels) > 1
         exponents = [axis.get_xlabel() for axis in panels.values()]
         assert any("10⁻¹³" in label for label in exponents)
+        assert all(axis.get_xlabel().endswith("]") for axis in grid)  # every panel states its unit, rescaled or not
         assert all(not axis.xaxis.get_offset_text().get_text() for axis in grid)
         assert "\n" in figure.legends[0].get_texts()[0].get_text()
     finally:
         plt.close(figure)
+
+
+def test_field_distributions_draw_only_the_requested_case_prefix_and_name_the_cases_clipping_leaves_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At 100 cases every panel names, in the series color, the 2 cases its 1st-99th percentile display omits; 8 cases after it draw just 8."""
+    monkeypatch.setattr(analysis.ui.viewers, "case_count_view", lambda plot, **_options: plot)
+    frame = _steady_frame([float(offset) for offset in range(100)])
+    styles = plots.batch_styles({"S": None})
+    draw = cast("Callable[..., Figure]", statistics.plot_field_value_distributions(datasets={"S": frame}, styles=styles))
+    for cases, drawn, notes in ((100, 98, ["2 of 100 cases left out"]), (8, 8, [])):
+        figure = draw(cases, datasets={"S": frame})
+        try:
+            panels = [axis for axis in figure.axes if axis.get_subplotspec() is not None]
+            assert len(panels) > 1
+            for axis in panels:
+                tails = [text for text in axis.texts if text.get_text().startswith("shown ")]  # not a row header
+                assert _histogram_count(axis) == drawn
+                assert [text.get_text().split("; ")[-1] for text in tails] == notes
+                assert all(text.get_color() == styles["S"].color for text in tails)
+        finally:
+            plt.close(figure)
+
+
+def test_a_clipped_range_note_reads_in_the_scaled_values_of_its_axis(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Values near 1.5e4 show in units of 10⁴ (x label); the note's shown range is written on that scale, inside the axis limits."""
+    monkeypatch.setattr(analysis.ui.viewers, "case_count_view", lambda plot, **_options: plot)
+    frame = _steady_frame([1.0e4 + 100.0 * offset for offset in range(100)])
+    draw = cast("Callable[..., Figure]", statistics.plot_field_value_distributions(datasets={"S": frame}, styles=plots.batch_styles({"S": None})))
+    figure = draw(100, datasets={"S": frame})
+    try:
+        scaled = [axis for axis in figure.axes if "10⁴" in axis.get_xlabel()]
+        assert scaled
+        for axis in scaled:
+            (note,) = [text.get_text() for text in axis.texts if text.get_text().startswith("shown ")]
+            lower, upper = (float(value) for value in note.removeprefix("shown ").split(";")[0].split(" to "))
+            assert axis.get_xlim()[0] <= lower < upper <= axis.get_xlim()[1]
+    finally:
+        plt.close(figure)
+
+
+def test_parameter_histograms_draw_only_the_requested_case_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After four cases, three draw the values of cases 1 to 3 only: generated parameters and material scalars alike."""
+    monkeypatch.setattr(analysis.ui.viewers, "case_count_view", lambda plot, **_options: plot)
+    frame = pd.DataFrame(
+        {
+            "meta": [{"case_id": f"c{case}", "parameters": {"a": float(case)} if case else {}} for case in range(4)],
+            "scalar_conditioning": [{"A_osw": float(case)} if case else {} for case in range(4)],
+        }
+    )
+    styles = plots.batch_styles({"P": None})
+    for build in (statistics.plot_meta_statistics, statistics.plot_meta_parameters):
+        draw = cast("Callable[..., Figure]", build(datasets={"P": frame}, styles=styles))
+        plt.close(draw(4, datasets={"P": frame}))
+        figure = draw(3, datasets={"P": frame})
+        try:
+            assert _histogram_count(figure.axes[0]) == 2  # the first case holds no value
+        finally:
+            plt.close(figure)
 
 
 def test_parameter_histogram_writes_its_power_of_ten_into_the_x_label_not_an_offset() -> None:
@@ -357,11 +423,63 @@ def test_parameter_histogram_writes_its_power_of_ten_into_the_x_label_not_an_off
         styles=styles,
         units_by_column={"kappa": "m²", "porosity": "1"},
     )
+    assert isinstance(figure, Figure)
     try:
         kappa, porosity = figure.axes[:2]
         assert kappa.get_xlabel() == "Value [10⁻⁸ m²]"
-        assert porosity.get_xlabel() == "Value"
+        assert porosity.get_xlabel() == "Value [-]"
         assert not kappa.xaxis.get_offset_text().get_text()
         assert max(float(tick.get_text()) for tick in kappa.get_xticklabels() if tick.get_text()) < 10.0  # shown in units of 1e-8
     finally:
         plt.close(figure)
+
+
+def test_scalar_conditioning_panels_take_registered_symbols_and_keep_the_unit_only_on_the_x_axis() -> None:
+    """Every scalar material input has a declared symbol; a panel title names it without unit, the x label holds unit and power of ten."""
+    fields = statistics._SCALAR_MATERIAL_FIELDS
+    assert all(field_labels.has_declared_field_metadata(field.name) for field in fields)
+    oswin = [field_labels.field_label(name, mathtext=True, control=True) for name in ("A_osw", "B_osw", "C_osw")]
+    assert oswin == ["$A$", "$B$", "$C$"]  # the symbols of docs/02_physical_model.md
+    styles = plots.batch_styles({"A": "lentil"})
+    data = {"A": {"r_surf_0": np.linspace(2.5e-4, 3.5e-4, 8), "cp_gr_dry": np.linspace(1400.0, 1600.0, 8)}}
+    figure = statistics._hist_grid(
+        data_by_dataset=data,
+        active_datasets=["A"],
+        columns=["r_surf_0", "cp_gr_dry"],
+        title="t",
+        styles=styles,
+        units_by_column=statistics._SCALAR_MATERIAL_UNITS,
+    )
+    try:
+        assert isinstance(figure, Figure)
+        rate, heat = figure.axes[:2]
+        assert rate.get_title() == field_labels.field_label("r_surf_0", mathtext=True)
+        assert all("[" not in axis.get_title() for axis in (rate, heat))
+        assert rate.get_xlabel() == "Value [10⁻⁴ 1/s]"
+        assert heat.get_xlabel() == "Value [J/(kg·K)]"
+    finally:
+        plt.close(figure)
+
+
+def test_sparse_histograms_keep_every_case_and_draw_a_kernel_density_only_from_enough_cases() -> None:
+    """Eight cases keep their extremes and get no density curve; twenty cases get one."""
+    sparse = np.linspace(0.0, 1.0, 8)
+    np.testing.assert_array_equal(statistics._clip_for_plot(sparse), sparse)
+    style = semantics.SeriesStyle("black", "-", None)
+    for size, curves in ((8, 0), (statistics._KDE_MINIMUM_OBSERVATIONS, 1)):
+        figure, axis = plt.subplots()
+        try:
+            statistics._draw_dataset_histogram(axis, np.linspace(0.0, 1.0, size) ** 2, style)
+            assert len(axis.get_lines()) == curves
+        finally:
+            plt.close(figure)
+
+
+def test_generated_case_parameters_without_any_parameter_return_a_one_line_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cases whose metadata carries no sampled parameter (a published runtime view) give a note instead of an empty figure."""
+    frame = pd.DataFrame({"meta": [{"case_id": "case_0001"}]}, index=pd.Index(["case_0001"]))
+    monkeypatch.setattr(analysis.ui.viewers, "case_count_view", lambda plot, **_options: plot)
+    draw = cast("Callable[..., object]", statistics.plot_meta_statistics(datasets={"P": frame}, styles=plots.batch_styles({"P": None})))
+    note = draw(1, datasets={"P": frame})
+    assert isinstance(note, str)
+    assert note

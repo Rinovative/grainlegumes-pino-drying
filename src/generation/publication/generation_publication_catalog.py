@@ -11,6 +11,7 @@ Design principles:
   - One task and campaign name bound every query
   - Manifest evidence, not directory order or modification time, establishes outcome
   - Expensive artifact hashing occurs only on explicit source admission
+  - Admitting many references reads each Source's listings and frozen evidence once per call, while every case keeps its own checks
   - The cases view reads only immutable records, so re-rendering a settled campaign is byte-identical
   - A successful row reads the evidence admission requires strictly for either task; only evidence the producer may omit stays optional
 
@@ -31,8 +32,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
+    from src.generation.cases.generation_cases_config import CampaignConfig
     from src.generation.runtime.generation_runtime_batch import TerminalCaseEvidence
     from src.generation.runtime.generation_runtime_timing import CaseTimingEvidence
 
@@ -54,6 +56,11 @@ _CASES_VIEW_COLUMNS: Final = (
 )
 # A stationary solve has no time axis, so only the transient task shows these result columns.
 _TRANSIENT_RESULT_COLUMNS: Final = ("simulated_end_h", "final_bulk_moisture_wb")
+_RAW_CASE_SELECTOR_KEYS: Final = frozenset(
+    {"campaign_name", "campaign_digest", "material_family", "case_id", "case_input_id", "simulation_case_id", "case_hdf5_sha256"}
+)
+# One Source's frozen plan, reconstructed campaign and candidate records keyed by material and case ID.
+type _FrozenSource = tuple[dict[str, Any], CampaignConfig, dict[tuple[str, str], list[dict[str, Any]]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,6 +494,33 @@ def _contained_file(relative: str, *, storage_root: Path) -> Path:
     return candidate
 
 
+def _contained_sha256(path: Path, *, storage_root: Path) -> str:
+    """Return the SHA-256 of one storage file after the containment and symlink checks of ``_contained_file``."""
+    return common.serialization.file_sha256(_contained_file(Path(path).relative_to(storage_root).as_posix(), storage_root=storage_root))
+
+
+def _frozen_source(task: str, campaign_name: str, *, storage: Path) -> _FrozenSource:
+    """Read one Source's frozen plan, reconstructed campaign and candidate records keyed by material and case ID."""
+    plan = lifecycle.load_campaign_plan(task, campaign_name, storage_root=storage)
+    run = campaign_evidence.load_campaign_run(f"source~{task}~{campaign_name}", storage_root=storage)
+    campaign = lifecycle.campaign_from_frozen_run(run, require_executable=False, storage_root=storage)
+    records: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for record in lifecycle.candidate_records(task, campaign_name, storage_root=storage):
+        records.setdefault((record["reservation"]["material_family"], record["reservation"]["case_id"]), []).append(record)
+    return plan, campaign, records
+
+
+def _source_digests(task: str, campaign_name: str, *, storage: Path) -> tuple[str, str | None]:
+    """Return one Source's plan digest and, once its selected pool is admitted, the pool digest."""
+    root = common.paths.resolve_generation_campaign_directory(task, campaign_name, storage_root=storage)
+    plan_sha = common.serialization.file_sha256(common.paths.resolve_generation_campaign_plan_path(root))
+    pool_path = common.paths.resolve_generation_selected_pool_path(root)
+    if not pool_path.exists():
+        return plan_sha, None
+    lifecycle.load_selected_pool(task, campaign_name, storage_root=storage)
+    return plan_sha, common.serialization.file_sha256(pool_path)
+
+
 def resolve_raw_case_reference(
     task: str,
     source: Mapping[str, Any],
@@ -494,136 +528,159 @@ def resolve_raw_case_reference(
     storage_root: Path | str | None = None,
 ) -> AdmittedRawCase:
     """Admit one successful canonical raw case by exact identities and hashes."""
-    required = {
-        "campaign_name",
-        "campaign_digest",
-        "material_family",
-        "case_id",
-        "case_input_id",
-        "simulation_case_id",
-        "case_hdf5_sha256",
-    }
-    if set(source) != required:
-        msg = "Raw case selector must contain exactly the seven source identity fields."
-        raise ValueError(msg)
-    storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
-    design_name = common.paths.validate_logical_name(source.get("campaign_name"), label="source_campaign_name")
-    identity.source_name(design_name, source.get("campaign_digest"))
-    material = common.paths.validate_logical_name(source.get("material_family"), label="source_material")
-    case_id = common.paths.validate_logical_name(source.get("case_id"), label="source_case_id")
-    # A Source folder may carry an authored label, so locate it through its frozen design name and digest.
-    located = [
-        (campaign["source_name"], row)
-        for campaign in list_campaigns(task, storage_root=storage)
-        if campaign["campaign_name"] == design_name and campaign["campaign_digest"] == source.get("campaign_digest")
-        for row in list_campaign_cases(task, campaign["source_name"], storage_root=storage)
-        if row["material_family"] == material and row["case_id"] == case_id
-    ]
-    if len(located) != 1 or located[0][1]["outcome"] != "successful":
-        msg = "Raw case reference does not select one successful canonical source."
-        raise ValueError(msg)
-    campaign_name, row = located[0]
-    for key in ("campaign_digest", "case_input_id", "simulation_case_id", "case_hdf5_sha256"):
-        if source.get(key) != row[key]:
-            msg = f"Raw case source identity disagrees at {key!r}."
-            raise ValueError(msg)
-    relative = row["case_hdf5_relative"]
-    if not isinstance(relative, str):
-        msg = "Successful raw case lacks a canonical HDF5 locator."
-        raise ValueError(msg)  # noqa: TRY004 -- invalid persisted JSON evidence is reported by the established ValueError contract
-    path = _contained_file(relative, storage_root=storage)
-    if common.serialization.file_sha256(path) != row["case_hdf5_sha256"]:
-        msg = "Canonical raw case HDF5 hash disagrees with frozen successful evidence."
-        raise ValueError(msg)
-    from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence  # noqa: PLC0415 -- frozen run admission
+    (admitted,) = resolve_raw_case_references(task, (source,), storage_root=storage_root)
+    return admitted
+
+
+def resolve_raw_case_references(
+    task: str,
+    sources: Sequence[Mapping[str, Any]],
+    *,
+    storage_root: Path | str | None = None,
+) -> tuple[AdmittedRawCase, ...]:
+    """
+    Admit successful canonical raw cases by exact identities and hashes, in input order.
+
+    Every source passes the same checks as a single reference: its selector fields, one located successful row,
+    identity agreement, a contained ``case.h5`` with its frozen hash, one frozen design, one reservation and decision,
+    and completed-case admission. Campaign-wide evidence (the campaign and case listings, frozen plan and run,
+    reconstructed campaign, candidate records, plan and selected-pool digests) is read once per Source and call.
+
+    Raises
+    ------
+    ValueError
+        If a source fails its admission, or two sources name the same Source case.
+
+    """
     from src.generation.runtime import generation_runtime_batch as runtime_batch  # noqa: PLC0415 -- completed case admission
 
-    root = common.paths.resolve_generation_campaign_directory(task, campaign_name, storage_root=storage)
-    plan = lifecycle.load_campaign_plan(task, campaign_name, storage_root=storage)
-    matches = [batch for batch in plan["batches"] if batch["batch_id"] == row["batch_id"]]
-    if len(matches) != 1:
-        msg = "Raw case has no unique frozen source design."
-        raise ValueError(msg)
-    design = matches[0]
-    run_id = f"source~{task}~{campaign_name}"
-    run = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
-    campaign = lifecycle.campaign_from_frozen_run(run, require_executable=False, storage_root=storage)
-    records = [
-        record
-        for record in lifecycle.candidate_records(task, campaign_name, storage_root=storage)
-        if record["reservation"]["material_family"] == material and record["reservation"]["case_id"] == case_id
-    ]
-    if len(records) != 1 or records[0]["decision"] is None:
-        msg = "Successful raw case lacks one immutable reservation and decision."
-        raise ValueError(msg)
-    record = records[0]
-    reservation = record["reservation"]
-    if reservation["origin"] == "replacement":
-        batch = lifecycle.replacement_batch_from_reservation(campaign, reservation, storage_root=storage)
-    else:
-        matching_batch = next((item for item in campaign.batches if item.batch_id == row["batch_id"]), None)
-        if matching_batch is None:
+    storage: Path | None = None
+    campaigns: tuple[dict[str, Any], ...] | None = None
+    listings: dict[str, tuple[dict[str, Any], ...]] = {}
+    frozen: dict[str, _FrozenSource] = {}
+    digests: dict[str, tuple[str, str | None]] = {}
+    seen: set[tuple[str, str, str, str]] = set()
+    admitted: list[AdmittedRawCase] = []
+    for source in sources:
+        if set(source) != _RAW_CASE_SELECTOR_KEYS:
+            msg = "Raw case selector must contain exactly the seven source identity fields."
+            raise ValueError(msg)
+        # Resolved after the first selector check, so a malformed selector is reported first, as for one reference.
+        if storage is None:
+            storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
+        design_name = common.paths.validate_logical_name(source.get("campaign_name"), label="source_campaign_name")
+        identity.source_name(design_name, source.get("campaign_digest"))
+        material = common.paths.validate_logical_name(source.get("material_family"), label="source_material")
+        case_id = common.paths.validate_logical_name(source.get("case_id"), label="source_case_id")
+        key = (design_name, str(source["campaign_digest"]), material, case_id)
+        if key in seen:
+            msg = f"Raw case references repeat the source case {key!r}."
+            raise ValueError(msg)
+        seen.add(key)
+        if campaigns is None:
+            campaigns = list_campaigns(task, storage_root=storage)
+        # A Source folder may carry an authored label, so locate it through its frozen design name and digest.
+        names = [campaign["source_name"] for campaign in campaigns if (campaign["campaign_name"], campaign["campaign_digest"]) == key[:2]]
+        for name in names:
+            if name not in listings:
+                listings[name] = list_campaign_cases(task, name, storage_root=storage)
+        located = [(name, row) for name in names for row in listings[name] if row["material_family"] == material and row["case_id"] == case_id]
+        if len(located) != 1 or located[0][1]["outcome"] != "successful":
+            msg = "Raw case reference does not select one successful canonical source."
+            raise ValueError(msg)
+        campaign_name, row = located[0]
+        for field in ("campaign_digest", "case_input_id", "simulation_case_id", "case_hdf5_sha256"):
+            if source.get(field) != row[field]:
+                msg = f"Raw case source identity disagrees at {field!r}."
+                raise ValueError(msg)
+        relative = row["case_hdf5_relative"]
+        if not isinstance(relative, str):
+            msg = "Successful raw case lacks a canonical HDF5 locator."
+            raise ValueError(msg)  # noqa: TRY004 -- invalid persisted JSON evidence is reported by the established ValueError contract
+        path = _contained_file(relative, storage_root=storage)
+        if common.serialization.file_sha256(path) != row["case_hdf5_sha256"]:
+            msg = "Canonical raw case HDF5 hash disagrees with frozen successful evidence."
+            raise ValueError(msg)
+        if campaign_name not in frozen:
+            frozen[campaign_name] = _frozen_source(task, campaign_name, storage=storage)
+        plan, campaign, records_by_case = frozen[campaign_name]
+        matches = [batch for batch in plan["batches"] if batch["batch_id"] == row["batch_id"]]
+        if len(matches) != 1:
+            msg = "Raw case has no unique frozen source design."
+            raise ValueError(msg)
+        design = matches[0]
+        records = records_by_case.get((material, case_id), [])
+        if len(records) != 1 or records[0]["decision"] is None:
+            msg = "Successful raw case lacks one immutable reservation and decision."
+            raise ValueError(msg)
+        record = records[0]
+        reservation = record["reservation"]
+        batch = (
+            lifecycle.replacement_batch_from_reservation(campaign, reservation, storage_root=storage)
+            if reservation["origin"] == "replacement"
+            else next((item for item in campaign.batches if item.batch_id == row["batch_id"]), None)
+        )
+        if batch is None:
             msg = "Raw case has no unique admitted source batch."
             raise ValueError(msg)
-        batch = matching_batch
-    if batch is None:
-        msg = "Raw case has no unique admitted source batch."
-        raise ValueError(msg)
-    if not case_id.startswith("case_") or not case_id[5:].isdigit():
-        msg = "Raw case selector has a malformed candidate ID."
-        raise ValueError(msg)
-    case_index = int(case_id[5:])
-    case = runtime_batch.admit_completed_case(batch, case_index, storage_root=storage, validation_depth="routine")
-    if (
-        case.hdf5_path != path
-        or case.case_input_id != row["case_input_id"]
-        or case.simulation_case_id != row["simulation_case_id"]
-        or case.case_hdf5_sha256 != row["case_hdf5_sha256"]
-    ):
-        msg = "Admitted raw case differs from its successful source decision."
-        raise ValueError(msg)
-    plan_sha = common.serialization.file_sha256(common.paths.resolve_generation_campaign_plan_path(root))
-    pool_path = common.paths.resolve_generation_selected_pool_path(root)
-    pool_sha = None
-    if pool_path.exists():
-        lifecycle.load_selected_pool(task, campaign_name, storage_root=storage)
-        pool_sha = common.serialization.file_sha256(pool_path)
-    source_identity = {
-        "schema_kind": "generation_source_case_reference",
-        "task": task,
-        "campaign_name": plan["campaign_name"],
-        "source_name": campaign_name,
-        "campaign_digest": row["campaign_digest"],
-        "source_plan_sha256": plan_sha,
-        "material_family": material,
-        "domain_profile": row["domain_profile"],
-        "source_batch_id": batch.batch_id,
-        "source_design_parent_batch_id": reservation["batch_id"],
-        "case_id": case_id,
-        "case_input_id": row["case_input_id"],
-        "simulation_case_id": row["simulation_case_id"],
-        "case_hdf5_relative": relative,
-        "case_hdf5_sha256": row["case_hdf5_sha256"],
-        "reservation_sha256": common.serialization.file_sha256(common.paths.resolve_generation_case_reservation_path(record["case_directory"])),
-        "decision_sha256": common.serialization.file_sha256(common.paths.resolve_generation_case_decision_path(record["case_directory"])),
-        "selected_pool_sha256": pool_sha,
-    }
-    design_provenance = {
-        "design_recipe": plan["design_recipe"],
-        "design_kind": reservation["sampling_regime"],
-        "original_design_size": len(design["case_indices"]),
-        "candidate_position": reservation["candidate_position"],
-        "origin": reservation["origin"],
-        "root_seed": reservation["root_seed"],
-        "candidate_seed": reservation["candidate_seed"],
-        "derived_seeds": reservation["derived_seeds"],
-        "design_evidence": reservation["design_evidence"],
-    }
-    return AdmittedRawCase(
-        case=case,
-        hdf5_path=path,
-        _source_identity_json=json.dumps(source_identity, sort_keys=True),
-        _design_provenance_json=json.dumps(design_provenance, sort_keys=True),
-        _scientific_config_json=json.dumps(batch.scientific_values, sort_keys=True),
-        _git_commit=str(case.metadata_payload()["git_commit"]),
-    )
+        if not case_id.startswith("case_") or not case_id[5:].isdigit():
+            msg = "Raw case selector has a malformed candidate ID."
+            raise ValueError(msg)
+        case_index = int(case_id[5:])
+        case = runtime_batch.admit_completed_case(batch, case_index, storage_root=storage, validation_depth="routine")
+        if (
+            case.hdf5_path != path
+            or case.case_input_id != row["case_input_id"]
+            or case.simulation_case_id != row["simulation_case_id"]
+            or case.case_hdf5_sha256 != row["case_hdf5_sha256"]
+        ):
+            msg = "Admitted raw case differs from its successful source decision."
+            raise ValueError(msg)
+        if campaign_name not in digests:
+            digests[campaign_name] = _source_digests(task, campaign_name, storage=storage)
+        plan_sha, pool_sha = digests[campaign_name]
+        reservation_path = common.paths.resolve_generation_case_reservation_path(record["case_directory"])
+        decision_path = common.paths.resolve_generation_case_decision_path(record["case_directory"])
+        source_identity = {
+            "schema_kind": "generation_source_case_reference",
+            "task": task,
+            "campaign_name": plan["campaign_name"],
+            "source_name": campaign_name,
+            "campaign_digest": row["campaign_digest"],
+            "source_plan_sha256": plan_sha,
+            "material_family": material,
+            "domain_profile": row["domain_profile"],
+            "source_batch_id": batch.batch_id,
+            "source_design_parent_batch_id": reservation["batch_id"],
+            "case_id": case_id,
+            "case_input_id": row["case_input_id"],
+            "simulation_case_id": row["simulation_case_id"],
+            "case_hdf5_relative": relative,
+            "case_hdf5_sha256": row["case_hdf5_sha256"],
+            # Hashed through the containment check: the records were read once per Source, the files may have changed since.
+            "reservation_sha256": _contained_sha256(reservation_path, storage_root=storage),
+            "decision_sha256": _contained_sha256(decision_path, storage_root=storage),
+            "selected_pool_sha256": pool_sha,
+        }
+        design_provenance = {
+            "design_recipe": plan["design_recipe"],
+            "design_kind": reservation["sampling_regime"],
+            "original_design_size": len(design["case_indices"]),
+            "candidate_position": reservation["candidate_position"],
+            "origin": reservation["origin"],
+            "root_seed": reservation["root_seed"],
+            "candidate_seed": reservation["candidate_seed"],
+            "derived_seeds": reservation["derived_seeds"],
+            "design_evidence": reservation["design_evidence"],
+        }
+        admitted.append(
+            AdmittedRawCase(
+                case=case,
+                hdf5_path=path,
+                _source_identity_json=json.dumps(source_identity, sort_keys=True),
+                _design_provenance_json=json.dumps(design_provenance, sort_keys=True),
+                _scientific_config_json=json.dumps(batch.scientific_values, sort_keys=True),
+                _git_commit=str(case.metadata_payload()["git_commit"]),
+            )
+        )
+    return tuple(admitted)

@@ -3,6 +3,7 @@
 Responsibilities:
   - Check each style's field, unit and metric labels for state, moisture, difference and velocity quantities
   - Check that control texts keep their symbols and percent basis in every style and that an invalid style raises
+  - Check that compound material units read with multiplication dots
 
 Design principles:
   - Every test that selects a style restores the default through one fixture
@@ -41,6 +42,14 @@ def _labels() -> dict[str, str]:
         "u": field_labels.field_label("u"),
         "v": field_labels.field_label("v"),
     }
+
+
+def test_compound_material_units_read_with_multiplication_dots_and_keep_their_stored_tokens() -> None:
+    """``W/(m*K)`` and ``J/(kg*K)`` read with a dot in every label; exponents and plain units are unchanged."""
+    assert field_labels.display_unit("W/(m*K)") == "W/(m·K)"
+    assert field_labels.display_unit("J/(kg*K)") == "J/(kg·K)"
+    assert field_labels.display_unit("kg/m^3") == "kg/m³"
+    assert field_labels.field_label_with_unit("k_gr", "W/(m*K)") == "k_gr [W/(m·K)]"
 
 
 def test_default_style_is_symbol() -> None:

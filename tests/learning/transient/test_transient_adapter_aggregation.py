@@ -4,8 +4,7 @@ Responsibilities:
   - Check rollout scoring with the one-step guardrail view
   - Check that physical moisture telemetry accumulates in float64 and stays finite for finite float32 predictions
   - Check that grain-moisture validation errors are reduced per case, then over cases and materials
-  - Check that one non-finite case, physical or standardized, leaves a validation without metric values, and the
-    per-channel bound diagnostics
+  - Check that one non-finite case leaves a validation without metric values, and the per-channel bound diagnostics
 
 Design principles:
   - Fixed evaluation views isolate the aggregation from rollout numerics
@@ -32,15 +31,14 @@ from src.learning.transient import learning_transient_adapter as transient_adapt
 
 class _Metric:
     id = "metric"
-    space = "physical"
     requires_cases = True
 
     def reset(self) -> None:
         self.values: list[float] = []
         self.masks: list[torch.Tensor | None] = []
 
-    def update(self, pred: torch.Tensor, target: torch.Tensor, *, space: str, batch_index: int, cases: Any, mask: torch.Tensor | None = None) -> None:
-        del space, batch_index, cases
+    def update(self, pred: torch.Tensor, target: torch.Tensor, *, batch_index: int, cases: Any, mask: torch.Tensor | None = None) -> None:
+        del batch_index, cases
         self.values.extend((pred - target).flatten().tolist())
         self.masks.append(mask)
 
@@ -70,11 +68,8 @@ class _EvalAdapter:
         one_step = target + 1.0
         mask = torch.ones(2, 2, 1, 1, 1, dtype=torch.bool)
         return adapter_contract.AdapterEvaluationViews(
-            normalized_prediction=pred,
-            normalized_target=target,
             physical_prediction=pred,
             physical_target=target,
-            one_step_normalized_prediction=one_step,
             one_step_physical_prediction=one_step,
             sample_count=2,
             processed_target_transitions=4,
@@ -97,7 +92,6 @@ class _FixedViewsAdapter(_EvalAdapter):
 def test_adapter_moisture_telemetry_stays_finite_for_finite_float32_predictions() -> None:
     """Squares of finite float32 moisture predictions near 1e20 overflow float32 but not the float64 telemetry."""
     f_surf = torch.full((1, 2), 0.5)
-    normalized = torch.zeros(1, 2, 4, 1, 2)
     physical_target = torch.zeros(1, 2, 4, 1, 2)
     physical_target[:, :, 2] = 0.25
     physical_target[:, :, 3] = 0.5
@@ -105,11 +99,8 @@ def test_adapter_moisture_telemetry_stays_finite_for_finite_float32_predictions(
     physical_prediction[:, :, 2] = torch.tensor([[[[1.0e20, 2.0e20]], [[3.0e20, 4.0e20]]]])
     physical_prediction[:, :, 3] = 2.0e20
     views = adapter_contract.AdapterEvaluationViews(
-        normalized_prediction=normalized,
-        normalized_target=normalized,
         physical_prediction=physical_prediction,
         physical_target=physical_target,
-        one_step_normalized_prediction=normalized,
         one_step_physical_prediction=physical_prediction,
         sample_count=1,
         processed_target_transitions=2,
@@ -155,11 +146,8 @@ def _moisture_case(case_id: str, *, length: int, error: float) -> dict[str, Any]
     prediction = target.clone()
     prediction[:, :, 2:] = error
     views = adapter_contract.AdapterEvaluationViews(
-        normalized_prediction=target,
-        normalized_target=target,
         physical_prediction=prediction,
         physical_target=target,
-        one_step_normalized_prediction=target,
         one_step_physical_prediction=prediction,
         sample_count=1,
         processed_target_transitions=length,
@@ -178,18 +166,6 @@ def test_grain_moisture_validation_averages_each_case_before_the_cases_like_the_
 
     assert values["physical/w_gr_mae"] == pytest.approx(2.0)
     assert values["physical/w_gr_rmse"] == pytest.approx(math.sqrt(5.0))
-
-
-def test_a_finite_physical_rollout_whose_standardized_view_overflows_is_a_non_finite_case() -> None:
-    """A complete case whose standardized prediction is inf is counted like an incomplete one, and the validation reports no value."""
-    views = _EvalAdapter().evaluation_step(nn.Identity(), None)
-    normalized = views.normalized_prediction.clone()
-    normalized[1, 0] = math.inf
-    adapter = _FixedViewsAdapter(replace(views, normalized_prediction=normalized))
-
-    values = loop._eval_adapter_one_epoch(nn.Identity(), [_batch("a", "b")], {"metric": _Metric()}, torch.device("cpu"), adapter)
-
-    assert values == {"nonfinite_cases": 1.0}
 
 
 def test_adapter_evaluation_scores_the_rollout_and_guards_with_the_one_step_view() -> None:
@@ -247,7 +223,7 @@ class _NonFiniteOneStepAdapter(_EvalAdapter):
         views = super().evaluation_step(model, batch)
         one_step = views.one_step_physical_prediction.clone()
         one_step[1, 0] = math.inf
-        return replace(views, one_step_normalized_prediction=one_step, one_step_physical_prediction=one_step)
+        return replace(views, one_step_physical_prediction=one_step)
 
 
 def test_a_non_finite_one_step_diagnostic_never_affects_eligibility() -> None:

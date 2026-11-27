@@ -1445,8 +1445,9 @@ def _duplicate_trial_outcome(config: Mapping[str, Any], trial: TrialProtocol) ->
     """Return the stored value and owner of a trial whose exact experiment already ran.
 
     A trial of the same study (which fixes the epoch budget through its directory
-    name) that completed its budget with the same objective supplies its stored value.
-    Any other existing owner of the identity (another study of the same epoch budget,
+    name) that completed its budget with the same objective supplies its stored value,
+    once its run passes :func:`experiments.run.validate_completed_run`, whose refusal
+    fails the trial. Any other existing owner of the identity (another study of the same epoch budget,
     an unfinished, pruned, diverged or ineligible trial) supplies no value, and the
     trial is pruned; the repeat of a diverged trial of the same study gets the same
     violated constraint. The trial's digest includes its epoch budget, so a trial
@@ -1463,6 +1464,9 @@ def _duplicate_trial_outcome(config: Mapping[str, Any], trial: TrialProtocol) ->
     if not same_study:
         return None, relative
     summary = experiments.run.read_run_summary(entry.target)
+    if summary.get("status") == "completed":
+        # A completed owner's value is reused only through the completed-run admission of every consumer, its history included.
+        summary = experiments.run.validate_completed_run(entry.target)["summary"]
     outcome = summary.get("training_outcome")
     outcome_status = outcome.get("status") if isinstance(outcome, Mapping) else None
     value = summary.get("best_metric")
@@ -1645,7 +1649,6 @@ def run_trial(
         result = experiments.run.execute_prepared_run(
             config,
             run_dir=run_dir,
-            persisted_config=config,
             event_callback=report,
             summary_extra=context,
             device_resolution=device_resolution,

@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check table schema, metadata identity, contained rebuilds, and run discovery admission
+  - Check that an explicitly named parent or incomplete run exits nonzero with its reason instead of a skip
   - Check that a recorded analysis producer is identity evidence, validated strictly and never compared with the running code
 
 Design principles:
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +26,7 @@ import pytest
 
 from src import analysis, common, experiments
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
+from src.experiments.cli import cli_build_artifacts
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -439,6 +442,39 @@ def test_discovery_skips_unselected_non_completed_runs_and_refuses_a_selected_on
     assert list(service.iter_run_dirs(tmp_path, run_names=["finished"])) == [tmp_path / "finished"]
     with pytest.raises(experiments.run.RunLifecycleError, match=r"interrupted.*Resume the run to completion"):
         list(service.iter_run_dirs(tmp_path, run_names=["unfinished"]))
+
+
+@pytest.mark.parametrize(
+    ("selection", "reason"),
+    [
+        ("run_dir_parent", r"holds no run; select the runs below it with --runs-root"),
+        ("run_dir_interrupted", r"interrupted.*Resume the run to completion"),
+        ("runs_root_interrupted", r"interrupted.*Resume the run to completion"),
+    ],
+)
+def test_an_explicitly_named_parent_or_incomplete_run_exits_nonzero_with_its_reason(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    selection: str,
+    reason: str,
+) -> None:
+    """--run-dir is one exact run and a run given as the root is named too: neither discovers leaves or skips with exit 0."""
+    run = tmp_path / "runs" / "unfinished"
+    run.mkdir(parents=True)
+    (run / "config.yaml").write_text(json.dumps({"run": {"name": "unfinished"}}), encoding="utf-8")
+    (run / "summary.json").write_text(json.dumps({"status": "interrupted"}), encoding="utf-8")
+    option, path = {
+        "run_dir_parent": ("--run-dir", run.parent),
+        "run_dir_interrupted": ("--run-dir", run),
+        "runs_root_interrupted": ("--runs-root", run),
+    }[selection]
+
+    exit_code = cli_build_artifacts.main([option, str(path), "--split", "id", "--dataset-root", str(tmp_path / "datasets"), "--device", "cpu"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "[SKIP]" not in captured.out
+    assert re.search(reason, captured.err)
 
 
 _TRIAL_LAYOUT = {

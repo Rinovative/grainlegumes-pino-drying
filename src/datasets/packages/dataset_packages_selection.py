@@ -89,12 +89,13 @@ def select_exact_cases(
     *,
     storage_root: Path | str | None = None,
 ) -> tuple[dict[str, str], ...]:
-    """Resolve ordered campaign/material/case picks without hiding failures."""
+    """Resolve ordered campaign/material/case picks without hiding failures; each campaign is listed once per call."""
     if not picks:
         msg = "Exact Dataset selection requires at least one source case."
         raise ValueError(msg)
     selected: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
+    listings: dict[str, tuple[dict[str, Any], ...]] = {}
     for pick in picks:
         if not isinstance(pick, Mapping) or set(pick) != {"source_name", "material_family", "case_id"}:
             msg = "Exact source pick requires source_name, material_family, and case_id."
@@ -107,11 +108,9 @@ def select_exact_cases(
             msg = "Exact Dataset selection repeats one source case."
             raise ValueError(msg)
         seen.add(key)
-        matches = [
-            row
-            for row in catalog.list_campaign_cases(task, campaign, storage_root=storage_root)
-            if row["material_family"] == material and row["case_id"] == case_id
-        ]
+        if campaign not in listings:
+            listings[campaign] = catalog.list_campaign_cases(task, campaign, storage_root=storage_root)
+        matches = [row for row in listings[campaign] if row["material_family"] == material and row["case_id"] == case_id]
         if len(matches) != 1:
             msg = f"Exact source case {key!r} is missing or ambiguous."
             raise ValueError(msg)

@@ -1,14 +1,15 @@
 """Protect the (material, role) dataset path of steady, comparison, and transient evaluation.
 
 Responsibilities:
-  - Check that a cut frame recomputes the material-balanced objective of the artifact contract, per material and pooled
+  - Check that a cut frame recomputes the objective of the artifact contract on its rows, and that a pooled choice is one cut per
+    material whose pooled value is the equal-weight mean of the materials' objectives
   - Check role and material admission: unavailable materials, refused roles, and case-matched comparison cuts
   - Check that transient inventories take the declared case role and resolve choices to frames and cases
   - Check that a session binds frames and cuts once, admits a cut only as an exact ordered subset of its source, guards their
     identity on every rebinding and draw, and releases them and its scratch on every failure
 
 Design principles:
-  - The expected objective is computed by hand from per-case errors, so a row mean or a mean of roots fails
+  - The expected objective is computed by hand from per-case errors, so a row-weighted pooled value fails
   - Frames are small synthetic steady tables built from the real case statistics and metric columns
 
 This module does NOT:
@@ -40,6 +41,7 @@ from src.analysis.evaluation import evaluation_datasets as datasets
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_session
 from src.analysis.evaluation import evaluation_transient_session as transient_session
+from src.analysis.evaluation.evaluation_plot import evaluation_plot_series as series
 from src.analysis.presentation import dataset_selection as selection
 
 if TYPE_CHECKING:
@@ -122,9 +124,9 @@ def test_steady_inventory_reads_the_role_from_the_split_and_the_materials_from_t
 
     assert inventory.poolable
     assert [(item.key, item.label) for item in inventory.items] == [
-        (("chickpea", "id"), "chickpea, ID"),
-        (("lentil", "id"), "lentil, ID"),
-        (("lentil", "parameter_ood"), "lentil, Parameter OOD"),
+        (("chickpea", "id"), "Chickpea, ID"),
+        (("lentil", "id"), "Lentil, ID"),
+        (("lentil", "parameter_ood"), "Lentil, Parameter OOD"),
     ]
     with pytest.raises(ValueError, match="one frame per role"):
         datasets.steady_inventory({"first": frames["id"], "second": frames["id"]})
@@ -141,7 +143,7 @@ def test_steady_cuts_union_to_the_rows_keep_run_attributes_and_leave_the_source_
 
     cuts = datasets.steady_frames({"id": frame}, choices)
 
-    assert list(cuts) == ["chickpea, ID", "kidney bean, ID", "lentil, ID"]
+    assert list(cuts) == ["Chickpea, ID", "Kidney bean, ID", "Lentil, ID"]
     assert sum(len(cut) for cut in cuts.values()) == len(frame)
     assert set(pd.concat(cuts.values())["simulation_case_id"]) == set(frame["simulation_case_id"])
     for cut in cuts.values():
@@ -150,22 +152,22 @@ def test_steady_cuts_union_to_the_rows_keep_run_attributes_and_leave_the_source_
     assert _objective(frame) == objective_before
 
 
-def test_cut_objective_is_material_balanced_with_the_roots_after_the_means() -> None:
-    # One lentil case with error 1 and three chickpea cases with error 3: the case-weighted mean square is 7,
-    # the mean of the per-material roots is 2, and only the material-balanced reduction gives sqrt((1 + 9) / 2).
+def test_a_pooled_choice_is_one_cut_per_material_and_its_value_the_mean_of_their_objectives() -> None:
+    # One lentil case with error 1 and three chickpea cases with error 3: the row-weighted mean square is 7, the artifact objective
+    # of the whole frame sqrt((1 + 9) / 2), and only the mean of the per-material values weights both materials equally: (1 + 3) / 2.
     frame = _frame([("l1", "lentil", 1.0), ("c1", "chickpea", 3.0), ("c2", "chickpea", 3.0), ("c3", "chickpea", 3.0)])
     inventory = datasets.steady_inventory({"id": frame})
 
-    separate = datasets.steady_frames({"id": frame}, selection.resolve_choices(inventory, [item.key for item in inventory.items], pooled=False))
     pooled = datasets.steady_frames({"id": frame}, selection.resolve_choices(inventory, [item.key for item in inventory.items], pooled=True))
 
-    assert _objective(separate["lentil, ID"]) == pytest.approx(_PRESSURE_WEIGHT * 1.0)
-    assert _objective(separate["chickpea, ID"]) == pytest.approx(_PRESSURE_WEIGHT * 3.0)
-    assert list(pooled) == ["ID, alle Materialien"]
-    assert _objective(pooled["ID, alle Materialien"]) == pytest.approx(_PRESSURE_WEIGHT * math.sqrt(5.0))
-    assert _objective(pooled["ID, alle Materialien"]) == pytest.approx(_objective(frame))
-    assert _objective(pooled["ID, alle Materialien"]) != pytest.approx(_PRESSURE_WEIGHT * math.sqrt(7.0))
-    assert _objective(pooled["ID, alle Materialien"]) != pytest.approx(_PRESSURE_WEIGHT * 2.0)
+    assert list(pooled) == ["Chickpea, ID", "Lentil, ID"]  # no cut holds the rows of both materials
+    assert [set(cut["material_family"]) for cut in pooled.values()] == [{"chickpea"}, {"lentil"}]
+    assert set(pooled.labels.values()) == {("ID, all materials", "")}  # one series of one dataset panel and one model
+    pooled_value, per_material = series.material_mean(list(pooled), lambda key: [_objective(pooled[key])])
+    np.testing.assert_allclose(per_material[:, 0], [_PRESSURE_WEIGHT * 3.0, _PRESSURE_WEIGHT * 1.0])
+    assert pooled_value[0] == pytest.approx(_PRESSURE_WEIGHT * 2.0)
+    assert pooled_value[0] != pytest.approx(_PRESSURE_WEIGHT * math.sqrt(7.0))
+    assert pooled_value[0] != pytest.approx(_objective(frame))
 
 
 def test_steady_cut_of_an_unknown_role_or_material_or_an_unavailable_choice_is_refused() -> None:
@@ -189,11 +191,11 @@ def test_comparison_inventory_keeps_unshared_materials_and_refused_roles_visible
 
     inventory = datasets.comparison_inventory({"id": {"run a": run_a, "run b": run_b}}, refused={"parameter_ood": "Rolle ist nicht verfügbar"})
 
-    assert [item.label for item in inventory.items] == ["lentil, ID"]
+    assert [item.label for item in inventory.items] == ["Lentil, ID"]
     reasons = {item.label: reason for item, reason in inventory.unavailable}
-    assert reasons["chickpea, ID"] == "keine gemeinsamen Fälle in run b"
-    assert reasons["kidney bean, ID"] == "keine gemeinsamen Fälle in run a"
-    assert reasons["field pea, ID"] == "keine gemeinsamen Fälle in run a, run b"  # both hold it, but no case is shared
+    assert reasons["Chickpea, ID"] == "no shared cases in run b"
+    assert reasons["Kidney bean, ID"] == "no shared cases in run a"
+    assert reasons["Field pea, ID"] == "no shared cases in run a, run b"  # both hold it, but no case is shared
     assert reasons["Parameter OOD"] == "Rolle ist nicht verfügbar"
     with pytest.raises(ValueError, match="both refused and loaded"):
         datasets.comparison_inventory({"id": {"run a": run_a}}, refused={"id": "x"})
@@ -210,10 +212,11 @@ def test_comparison_cut_keeps_the_shared_cases_per_material_and_recomputes_each_
 
     cuts = datasets.comparison_frames(frames_by_model, pooled[0])
 
-    assert list(cuts) == ["run a", "run b"]
-    for cut in cuts.values():
-        assert sorted(cut["simulation_case_id"]) == ["c1", "l2"]
-        assert _objective(cut) == pytest.approx(_PRESSURE_WEIGHT * math.sqrt((9.0 + 25.0) / 2))
+    assert list(cuts) == [f"{model} · {material}, ID" for model in ("run a", "run b") for material in ("Chickpea", "Lentil")]
+    assert dict(cuts.labels) == {key: (pooled[0].label, key.split(" · ")[0]) for key in cuts}
+    for key, cut in cuts.items():
+        assert list(cut["simulation_case_id"]) == (["c1"] if "Chickpea" in key else ["l2"])
+        assert _objective(cut) == pytest.approx(_PRESSURE_WEIGHT * (5.0 if "Chickpea" in key else 3.0))
     with pytest.raises(ValueError, match="at least one model"):
         datasets.comparison_frames({}, pooled[0])
 
@@ -244,10 +247,11 @@ def test_cuts_carry_their_effective_membership_to_the_comparison_admission_and_k
     cuts = datasets.comparison_frames(frames_by_model, pooled[0])
 
     dataframe.validate_comparison(cuts, verify_grid=False)
-    for model, cut in cuts.items():
-        assert cut.attrs["source_artifact_provenance"] == frames_by_model[model].attrs["artifact_provenance"]
-        assert cut.attrs["artifact_provenance"]["selection"]["effective_case_count"] == len(cut) == 2
-        assert cut.attrs["artifact_provenance"]["selection"]["material_families"] == ["chickpea", "lentil"]
+    for key, cut in cuts.items():
+        material = "chickpea" if "Chickpea" in key else "lentil"
+        assert cut.attrs["source_artifact_provenance"] == frames_by_model[cuts.labels[key][1]].attrs["artifact_provenance"]
+        assert cut.attrs["artifact_provenance"]["selection"]["effective_case_count"] == len(cut) == 1
+        assert cut.attrs["artifact_provenance"]["selection"]["material_families"] == [material]
 
 
 def _two_material_frame(tmp_path: Path) -> pd.DataFrame:
@@ -255,6 +259,11 @@ def _two_material_frame(tmp_path: Path) -> pd.DataFrame:
     frame, _grid = steady_frame(tmp_path)
     frame.loc[1, "material_family"] = "chickpea"
     return frame
+
+
+def _whole_cut(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return the cut holding every row of ``frame``: the membership of its source, as a session must still bind it apart."""
+    return datasets._cut(frame, [True] * len(frame))
 
 
 def _separate_choices(frame: pd.DataFrame) -> tuple[selection.DatasetChoice, ...]:
@@ -277,7 +286,7 @@ def test_separate_material_cuts_of_one_live_run_are_comparable_and_draw_from_the
     lentil = {}
     for run, source in (("run a", run_a), ("run b", run_b)):
         choices = selection.resolve_choices(datasets.steady_inventory({"id": source}), [("lentil", "id")], pooled=False)
-        lentil[run] = datasets.steady_frames({"id": source}, choices)["lentil, ID"]
+        lentil[run] = datasets.steady_frames({"id": source}, choices)["Lentil, ID"]
     with pytest.raises(dataframe.ComparisonCompatibilityError, match="membership"):  # one choice, different cases
         dataframe.validate_comparison(lentil, verify_grid=False)
 
@@ -286,7 +295,7 @@ def test_a_whole_frame_and_a_cut_of_one_role_are_refused_together() -> None:
     run_a = _frame([("l1", "lentil", 1.0), ("c1", "chickpea", 1.0)])
     run_b = _frame([("l1", "lentil", 2.0), ("c1", "chickpea", 2.0)])
     choices = selection.resolve_choices(datasets.steady_inventory({"id": run_b}), [("lentil", "id")], pooled=False)
-    cut_b = datasets.steady_frames({"id": run_b}, choices)["lentil, ID"]
+    cut_b = datasets.steady_frames({"id": run_b}, choices)["Lentil, ID"]
 
     with pytest.raises(dataframe.ComparisonCompatibilityError, match="'eval'"):
         dataframe.validate_comparison({"run a": run_a, "run b": cut_b}, verify_grid=False)
@@ -304,18 +313,16 @@ def test_a_direct_call_binds_cuts_only_beside_their_source(tmp_path: Path) -> No
         assert [live.full_summary(cut).sample_count for cut in cuts.values()] == [1, 1]
         assert len(live.canonical_frames) == 1
         with pytest.raises(ValueError, match="binds once"):
-            live.bind_frame(cuts["lentil, ID"].copy())
+            live.bind_frame(cuts["Lentil, ID"].copy())
 
 
 def test_both_entry_points_bind_a_cut_only_as_an_exact_ordered_subset_of_its_bound_source_with_derived_attrs(tmp_path: Path) -> None:
     """bind_cut and bind_frame refuse tampering that keeps the membership columns, and a cut whose source is not bound."""
     frame = _two_material_frame(tmp_path)
-    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
-    inventory = datasets.steady_inventory({"id": frame})
-    pooled = selection.resolve_choices(inventory, [item.key for item in inventory.items], pooled=True)
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "Lentil, ID"]
 
     def lentil_cut() -> pd.DataFrame:
-        return datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+        return datasets.steady_frames({"id": frame}, lentil)["Lentil, ID"]
 
     tampers = (
         lambda attrs: attrs["artifact_provenance"]["run"].update(name="steady-other"),
@@ -337,7 +344,7 @@ def test_both_entry_points_bind_a_cut_only_as_an_exact_ordered_subset_of_its_bou
         tamper(tampered[-1].attrs)
     stray_row, single = lentil_cut(), lentil_cut()
     stray_row["split_local_index"] = 7
-    [both] = datasets.steady_frames({"id": frame}, pooled).values()
+    both = _whole_cut(frame)
     repeated, reordered = single.iloc[[0, 0]].copy(), both.iloc[::-1].copy()
     repeated.attrs, reordered.attrs = copy.deepcopy(single.attrs), copy.deepcopy(both.attrs)
 
@@ -356,13 +363,10 @@ def test_both_entry_points_bind_a_cut_only_as_an_exact_ordered_subset_of_its_bou
 def test_a_cut_of_a_bound_cut_binds_apart_from_an_equal_rows_cut_of_the_canonical_frame(tmp_path: Path) -> None:
     """The recorded source is part of a cut's identity, so the nested cut neither displaces nor invalidates the direct one."""
     frame = _two_material_frame(tmp_path)
-    inventory = datasets.steady_inventory({"id": frame})
-    pooled = selection.resolve_choices(inventory, [item.key for item in inventory.items], pooled=True)
-    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "Lentil, ID"]
     with evaluation_session.EvaluationSession({"id": frame}) as live:
-        direct = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
-        [both] = datasets.steady_frames({"id": frame}, pooled).values()
-        nested = datasets.steady_frames({"id": both}, lentil)["lentil, ID"]
+        direct = datasets.steady_frames({"id": frame}, lentil)["Lentil, ID"]
+        nested = datasets.steady_frames({"id": _whole_cut(frame)}, lentil)["Lentil, ID"]
 
         assert nested is not direct
         assert evaluation_session.bound_session(nested) is live
@@ -373,9 +377,9 @@ def test_a_cut_binds_although_its_run_summary_records_a_non_finite_metric(tmp_pa
     """A persisted run summary may hold NaN; the cut admission compares such attrs instead of failing to encode them."""
     frame = _two_material_frame(tmp_path)
     frame.attrs[dataframe.COMPLETED_RUN_SUMMARY_ATTR] = {"metrics": {"val_rel_l2_p": math.nan}}
-    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "Lentil, ID"]
     with evaluation_session.EvaluationSession({"id": frame}) as live:
-        cut = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+        cut = datasets.steady_frames({"id": frame}, lentil)["Lentil, ID"]
 
         assert evaluation_session.bound_session(cut) is live
 
@@ -396,9 +400,9 @@ def test_rebinding_a_held_canonical_frame_returns_its_key_and_refuses_an_invalid
 
 def test_a_bound_cut_changed_after_binding_is_refused_on_the_next_draw_and_invalidated(tmp_path: Path) -> None:
     frame = _two_material_frame(tmp_path)
-    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "Lentil, ID"]
     with evaluation_session.EvaluationSession({"id": frame}) as live:
-        cut = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+        cut = datasets.steady_frames({"id": frame}, lentil)["Lentil, ID"]
         cut.attrs[dataframe.PRIMARY_OBJECTIVE_ID] = {**cut.attrs[dataframe.PRIMARY_OBJECTIVE_ID], "value": 0.0}
 
         with pytest.raises(evaluation_session.EvaluationArtifactChangedError, match="cut changed"):
@@ -410,8 +414,8 @@ def test_a_bound_cut_changed_after_binding_is_refused_on_the_next_draw_and_inval
 def test_rebinding_a_cut_whose_payload_changed_after_a_cached_summary_is_refused(tmp_path: Path) -> None:
     """A rebinding revalidates the bound cut, so fresh payload witnesses never cover a summary cached under the old ones."""
     frame = _two_material_frame(tmp_path)
-    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
-    cut = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "Lentil, ID"]
+    cut = datasets.steady_frames({"id": frame}, lentil)["Lentil, ID"]
     with evaluation_session.EvaluationSession({"id": frame, "lentil": cut}) as live:
         live.full_summary(cut)
         path = Path(str(cut.iloc[0]["npz_path"]))
@@ -551,9 +555,9 @@ def test_an_interrupted_binding_detaches_every_frame_it_bound(tmp_path: Path, mo
 
 def test_a_cut_records_the_aggregate_and_the_prediction_validity_of_its_own_rows(tmp_path: Path) -> None:
     frame = _two_material_frame(tmp_path)
-    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "Lentil, ID"]
 
-    cut = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+    cut = datasets.steady_frames({"id": frame}, lentil)["Lentil, ID"]
 
     provenance = cut.attrs["artifact_provenance"]
     assert provenance["aggregate"] == cut.attrs[dataframe.PRIMARY_OBJECTIVE_ID] != frame.attrs[dataframe.PRIMARY_OBJECTIVE_ID]
@@ -568,7 +572,7 @@ def test_a_cut_shares_no_nested_attribute_object_with_the_source_frame() -> None
     snapshot = copy.deepcopy(frame.attrs)
     choices = selection.resolve_choices(datasets.steady_inventory({"id": frame}), [("lentil", "id")], pooled=False)
 
-    cut = datasets.steady_frames({"id": frame}, choices)["lentil, ID"]
+    cut = datasets.steady_frames({"id": frame}, choices)["Lentil, ID"]
     cut.attrs["train_scales"].clear()
     cut.attrs["artifact_provenance"]["evaluator"]["output_groups"].clear()
     cut.attrs["artifact_provenance"]["selection"]["nested"]["note"].clear()
@@ -581,40 +585,38 @@ def test_a_cut_shares_no_nested_attribute_object_with_the_source_frame() -> None
 
 def test_display_labels_live_per_call_and_leave_the_bound_frame_untouched(tmp_path: Path) -> None:
     frame = _two_material_frame(tmp_path)
-    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "Lentil, ID"]
     with evaluation_session.EvaluationSession({"id": frame}):
         first = datasets.steady_frames({"id": frame}, lentil, model="run a")
-        attrs = copy.deepcopy(first["lentil, ID"].attrs)
+        attrs = copy.deepcopy(first["Lentil, ID"].attrs)
         attrs.pop(evaluation_session.SESSION_ATTR)
 
         again = datasets.steady_frames({"id": frame}, lentil, model="run b")
         unnamed = datasets.steady_frames({"id": frame}, lentil)
 
-        assert again["lentil, ID"] is first["lentil, ID"] is unnamed["lentil, ID"]
-        assert [r.labels["lentil, ID"] for r in (first, again, unnamed)] == [("lentil, ID", m) for m in ("run a", "run b", "")]
-        remaining = copy.deepcopy(first["lentil, ID"].attrs)
+        assert again["Lentil, ID"] is first["Lentil, ID"] is unnamed["Lentil, ID"]
+        assert [r.labels["Lentil, ID"] for r in (first, again, unnamed)] == [("Lentil, ID", m) for m in ("run a", "run b", "")]
+        remaining = copy.deepcopy(first["Lentil, ID"].attrs)
         remaining.pop(evaluation_session.SESSION_ATTR)
         assert remaining == attrs
 
 
 def test_a_live_session_binds_each_cut_once_and_redraws_hit_its_caches(tmp_path: Path) -> None:
     frame = _two_material_frame(tmp_path)
-    lentil = [choice for choice in _separate_choices(frame) if choice.label == "lentil, ID"]
-    comparison = datasets.comparison_inventory({"id": {"run": frame}}, refused={})
-    pooled = selection.resolve_choices(comparison, [item.key for item in comparison.items], pooled=True)[0]
+    lentil = [choice for choice in _separate_choices(frame) if choice.label == "Lentil, ID"]
     with evaluation_session.EvaluationSession({"id": frame}) as live:
-        first = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+        first = datasets.steady_frames({"id": frame}, lentil)["Lentil, ID"]
         assert live.full_summary(first).sample_count == 1
         hits = live.counters["aggregate_hits"]
 
-        second = datasets.steady_frames({"id": frame}, lentil)["lentil, ID"]
+        second = datasets.steady_frames({"id": frame}, lentil)["Lentil, ID"]
 
         assert second is first
         with evaluation_session.scoped_session({"cut": second}) as scoped:
             assert scoped is live
             assert scoped.full_summary(second).sample_count == 1
         assert live.counters["aggregate_hits"] == hits + 1
-        every_material = datasets.comparison_frames({"run": frame}, pooled)["run"]  # same membership as its source, no collision
+        every_material = _whole_cut(frame)  # same membership as its source, no collision
         assert evaluation_session.bound_session(every_material) is live
         assert every_material is not frame
         assert live.full_summary(every_material).sample_count == len(frame)
@@ -667,9 +669,10 @@ def test_transient_inventory_takes_the_declared_case_role_and_resolves_choices_t
 
     contexts = datasets.transient_contexts(session, choices)  # type: ignore[arg-type]
 
+    # A context's label captions the aggregate maps and scoped rollouts: the display material and the declared role, one unit.
     assert [(context.label, context.frame_names, context.case_ids) for context in contexts] == [
-        ("lentil, ID", ("ID",), ("c1",)),
-        ("lentil, Parameter OOD", ("OOD",), ("c3", "c4")),
+        ("Lentil, ID", ("ID",), ("c1",)),
+        ("Lentil, Parameter OOD", ("OOD",), ("c3", "c4")),
     ]
     with pytest.raises(ValueError, match="unavailable"):
         datasets.transient_contexts(session, selection.resolve_choices(inventory, [("", "material_ood")], pooled=False))  # type: ignore[arg-type]

@@ -368,6 +368,7 @@ def _incompatible(
     role: ArtifactRole,
     root: Path,
     reason: str,
+    scoped: bool = False,
 ) -> IncompatibleEvaluationArtifactsError:
     """
     Build an actionable incompatible-artifact failure.
@@ -384,13 +385,22 @@ def _incompatible(
         Exact observed artifact root.
     reason : str
         Path-qualified admission failure.
+    scoped : bool, optional
+        Whether ``root`` is a scoped (bounded) output, which no ``--rebuild`` replaces.
 
     Returns
     -------
     IncompatibleEvaluationArtifactsError
-        Failure carrying the generic host-side rebuild command.
+        Failure carrying the generic host-side rebuild command, or for a scoped output the instruction to delete it and generate again.
 
     """
+    if scoped:
+        return IncompatibleEvaluationArtifactsError(
+            f"Evaluation artifacts are incompatible with run {task}/{run_name} ({role} at {root}): {reason}\n"
+            "A bounded build never replaces an output; delete this scoped output and generate it again.",
+            role=role,
+            run_dir=run_dir,
+        )
     command = artifact_command(run_dir=run_dir, roles=(artifact_plan.dataset_role_of(role),), rebuild=True)
     return IncompatibleEvaluationArtifactsError(
         f"Evaluation artifacts are incompatible with run {task}/{run_name} "
@@ -1121,7 +1131,9 @@ def _transient_role_artifact(
             raise _missing(task="transient_drying", run_name=plan.run_name, run_dir=run_dir, role=split_role, root=target)
         reason = f"partial sequence artifact has no completion marker {marker.name}"
     if reason is not None:
-        raise _incompatible(task="transient_drying", run_name=plan.run_name, run_dir=run_dir, role=split_role, root=target, reason=reason)
+        raise _incompatible(
+            task="transient_drying", run_name=plan.run_name, run_dir=run_dir, role=split_role, root=target, reason=reason, scoped=scoped
+        )
     try:
         loaded = (
             transient.validate_scoped_transient_role_artifact_index(target, completed=admitted, saved_role=role_plan)
@@ -1136,6 +1148,7 @@ def _transient_role_artifact(
             role=split_role,
             root=target,
             reason=f"{type(error).__name__}: {error}",
+            scoped=scoped,
         ) from error
     frame = loaded.frame
     _apply_role_attrs(

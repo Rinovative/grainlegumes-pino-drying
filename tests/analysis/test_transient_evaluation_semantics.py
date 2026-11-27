@@ -109,7 +109,7 @@ def test_target_fraction_uses_canonical_masked_trapezoidal_mass_weighting() -> N
     static[transient_artifact.STATIC_ORDER.index("rho_bu_dry")] = 1.0
     scalars = np.zeros(len(transient_artifact.SCALAR_ORDER), dtype=np.float64)
     scalars[transient_artifact.SCALAR_ORDER.index("f_surf")] = 0.5
-    fraction = rollout._wet_fraction_series(
+    fraction = rollout.wet_fraction_series(
         states,
         static=static,
         scalars=scalars,

@@ -1,9 +1,9 @@
 """Protect the run and dataset selectors of the notebook control standard.
 
 Responsibilities:
-  - Check the summary «k von n gewählt» for single and multiple choice, observer counts, and single-choice exclusivity
-  - Check the architecture grouping and the disabled «Metadaten fehlen» group of the run selector
-  - Check the single-choice run header «Lauf: <label>», the indent of derived runs and the shared button width of a group
+  - Check the summary «k of n selected» for single and multiple choice, observer counts, and single-choice exclusivity
+  - Check the architecture grouping and the disabled «Missing metadata» group of the run selector
+  - Check the single-choice run header «Run: <name>», the indent of derived runs and the shared button width of a group
   - Check the dataset groups, the unavailable group, and the enabled, disabled, and absent pooling switch
 
 Design principles:
@@ -36,30 +36,30 @@ def _texts(widget: widgets.Widget) -> list[str]:
 
 
 def test_summary_counts_selectable_items_for_multiple_and_single_choice() -> None:
-    multiple = selectors.ChoiceBlock("Läufe", GROUPS, multiple=True, selected=[1, 3])
-    assert multiple.header.summary == "Läufe: 2 von 3 gewählt"
-    single = selectors.ChoiceBlock("Datensätze", GROUPS, multiple=False, selected=())
-    assert single.header.summary == "Datensätze: 1 von 3 gewählt"
+    multiple = selectors.ChoiceBlock("Runs", GROUPS, multiple=True, selected=[1, 3])
+    assert multiple.header.summary == "Runs: 2 of 3 selected"
+    single = selectors.ChoiceBlock("Datasets", GROUPS, multiple=False, selected=())
+    assert single.header.summary == "Datasets: 1 of 3 selected"
     assert single.selected() == (1,)
     assert multiple.body.layout.display == "none"
-    assert not any(text.lower() in {"alle", "keine"} for text in _texts(multiple.body))
+    assert not any(text.lower() in {"all", "none"} for text in _texts(multiple.body))
 
 
 def test_select_notifies_once_and_single_choice_stays_exclusive() -> None:
-    block = selectors.ChoiceBlock("Läufe", GROUPS, multiple=True, selected=[])
+    block = selectors.ChoiceBlock("Runs", GROUPS, multiple=True, selected=[])
     calls: list[tuple[object, ...]] = []
     block.observe(lambda: calls.append(block.selected()))
     block.select([2, 3])
     assert calls == [(2, 3)]
     block.boxes[2].value = False
     assert calls[-1] == (3,)
-    single = selectors.ChoiceBlock("Datensätze", GROUPS, multiple=False, selected=[2])
+    single = selectors.ChoiceBlock("Datasets", GROUPS, multiple=False, selected=[2])
     single.boxes[3].value = True
     assert single.selected() == (3,)
     single.boxes[3].value = False
     assert single.selected() == (3,)
     with pytest.raises(ValueError, match="not selectable"):
-        selectors.ChoiceBlock("Läufe", GROUPS, multiple=True, selected=[9])
+        selectors.ChoiceBlock("Runs", GROUPS, multiple=True, selected=[9])
     with pytest.raises(ValueError, match="exactly one"):
         single.select([1, 2])
 
@@ -78,7 +78,7 @@ def test_runs_group_by_architecture_and_missing_metadata_stays_disabled() -> Non
     headings = [text for text in texts if text.startswith("<b>")]
     assert headings == ["<b>FNO</b>", "<b>U-NO</b>", "<b>PI-U-NO</b>", f"<b>{selectors.MISSING_METADATA_GROUP}</b>"]
     assert list(selector.boxes) == ["f1", "f2", "u", "pu"]
-    assert selector.header.summary == "Läufe: 1 von 4 gewählt"
+    assert selector.header.summary == "Runs: 1 of 4 selected"
     disabled = [text for text in texts if "physics block missing" in text or "mlp" in text]
     assert len(disabled) == 2
     assert all(len(row.children) == 1 for row in cast("widgets.Box", selector.body).children if isinstance(row, widgets.HBox))
@@ -91,16 +91,15 @@ def test_runs_group_by_architecture_and_missing_metadata_stays_disabled() -> Non
 
 
 def test_run_header_names_the_selected_run_for_a_single_choice_and_counts_for_a_multiple_choice() -> None:
-    runs = [selectors.RunOption("fno_a", "fno", "a", label="FNO · A0 · seed 9"), selectors.RunOption("fno_b", "fno", "b", label="FNO · B · seed 9")]
+    runs = [selectors.RunOption("FNO · A0 · seed 9", "fno", "a"), selectors.RunOption("FNO · B · seed 9", "fno", "b")]
     single = selectors.RunSelector(runs, multiple=False, selected=["a"])
-    assert single.header.summary == "Lauf: FNO · A0 · seed 9"
+    assert single.header.summary == "Run: FNO · A0 · seed 9"
     single.boxes["b"].value = True
-    assert single.header.summary == "Lauf: FNO · B · seed 9"
+    assert single.header.summary == "Run: FNO · B · seed 9"
     single.select(["a"])
-    assert single.header.summary == "Lauf: FNO · A0 · seed 9"
-    assert selectors.RunSelector(runs, multiple=False).header.summary == "Lauf: FNO · A0 · seed 9"
-    assert selectors.RunSelector([selectors.RunOption("fno_a", "fno", "a")], multiple=False).header.summary == "Lauf: fno_a"
-    assert selectors.RunSelector(runs, multiple=True, selected=["a", "b"]).header.summary == "Läufe: 2 von 2 gewählt"
+    assert single.header.summary == "Run: FNO · A0 · seed 9"
+    assert selectors.RunSelector(runs, multiple=False).header.summary == "Run: FNO · A0 · seed 9"
+    assert selectors.RunSelector(runs, multiple=True, selected=["a", "b"]).header.summary == "Runs: 2 of 2 selected"
 
 
 def test_a_run_with_a_listed_parent_stands_indented_directly_below_it_and_an_orphan_stands_unindented() -> None:
@@ -123,7 +122,7 @@ def test_a_run_with_a_listed_parent_stands_indented_directly_below_it_and_an_orp
 
 def test_indented_applies_to_per_line_choices_only() -> None:
     with pytest.raises(ValueError, match="indented"):
-        selectors.ChoiceBlock("Läufe", GROUPS, multiple=False, selected=[], indented=[2])
+        selectors.ChoiceBlock("Runs", GROUPS, multiple=False, selected=[], indented=[2])
 
 
 def test_close_on_pick_closes_a_single_choice_before_its_observers_run() -> None:
@@ -147,7 +146,7 @@ def test_close_on_pick_closes_a_single_choice_before_its_observers_run() -> None
 def _inventory(*, poolable: bool = True) -> presentation.dataset_selection.DatasetInventory:
     item = presentation.dataset_selection.DatasetItem
     items = [item(("lentil", "id"), "lentil", "id", "lentil, ID"), item(("chickpea", "id"), "chickpea", "id", "chickpea, ID")]
-    refused = [(item(("lentil", "material_ood"), "lentil", "material_ood", "lentil, Material OOD"), "keine gemeinsamen Fälle in run_a")]
+    refused = [(item(("lentil", "material_ood"), "lentil", "material_ood", "lentil, Material OOD"), "no shared cases in run_a")]
     return presentation.dataset_selection.DatasetInventory(
         items,
         group_order=("id", "material_ood"),
@@ -162,8 +161,8 @@ def test_dataset_selector_groups_and_lists_unavailable_items() -> None:
     texts = _texts(selector.body)
     assert "<b>ID</b>" in texts
     assert f"<b>{selectors.UNAVAILABLE_GROUP}</b>" in texts
-    assert any("keine gemeinsamen Fälle" in text for text in texts)
-    assert selector.header.summary == "Datensätze: 1 von 2 gewählt"
+    assert any("no shared cases" in text for text in texts)
+    assert selector.header.summary == "Datasets: 1 of 2 selected"
     assert [choice.label for choice in selector.choices()] == ["lentil, ID"]
 
 
@@ -176,7 +175,7 @@ def test_pool_switch_enabled_disabled_with_reason_or_absent() -> None:
     enabled.observe(lambda: calls.append(enabled.pooled))
     enabled.pool_toggle.value = True
     assert calls == [True]
-    assert [choice.label for choice in enabled.choices()] == ["ID, alle Materialien"]
+    assert [choice.label for choice in enabled.choices()] == ["ID, all materials"]
     enabled.set_state([("lentil", "id")], pooled=False)
     assert calls == [True]
     assert not enabled.pooled

@@ -2,6 +2,8 @@
 
 Responsibilities:
   - Report the run start block, one startup line, one line per training event, and one end line with epochs run, budget spent and duration parts
+  - Report an interrupted run, and a continuation its environment failed before it started, with how to continue it,
+    and a failed run or a refused continuation with its reason and no rerun
   - Report one line per finished Optuna trial plus the study start and end
   - Redact secrets from messages and complete traceback chains
 
@@ -252,24 +254,60 @@ class ConsoleReporter:
         )
         return parts
 
-    def failure(self, error: BaseException, *, status: str, phase: str | None = None) -> None:
-        """Print the sanitized failure, the last reached startup phase, and how to continue; the caller owns any traceback."""
+    def _stop(self, label: str, error: BaseException, *, phase: str | None) -> None:
+        """Print ``label`` with the run, its phase and the sanitized error, then the startup phase it stopped after, if any."""
         epoch = getattr(error, "completed_epoch", None)
-        checkpoint = common.paths.resolve_last_checkpoint_file(self.run_dir).is_file()
         _line(
-            f"{'interrupted' if status == 'interrupted' else 'FAILED'} {_text(self.config['run']['name'])}"
-            f" in {phase or getattr(error, 'training_phase', 'run_lifecycle')}"
+            f"{label} {_text(self.config['run']['name'])} in {phase or getattr(error, 'training_phase', 'run_lifecycle')}"
             f"{'' if epoch is None else f' after epoch {epoch}'}: {type(error).__name__}: {_clean(error)}",
             to_stderr=True,
         )
         if self._phases and "training_start" not in self._phases:
             _line(f"  startup stopped after {next(reversed(self._phases))}: {_text(list(self._phases.values())[-1])}", to_stderr=True)
-        _line(
-            "  next: "
-            + ("rerun the same command to continue from the last checkpoint" if checkpoint else "rerun the same command, no checkpoint saved yet")
-            + f" | W&B {status} | run {display_path(self.run_dir)}",
-            to_stderr=True,
-        )
+
+    def failure(self, error: BaseException, *, status: str, phase: str | None = None, restarts: bool = False) -> None:
+        """Print the sanitized failure, the last reached startup phase, and the next step; the caller owns any traceback.
+
+        Only an interrupted run continues, so only it is advised a rerun; every other failure status is terminal. An
+        interrupted trial never resumes, so its rerun reopens its study; a run without a checkpoint is promised a restart
+        only when ``restarts`` says that its start command replaces its leaf.
+        """
+        self._stop("interrupted" if status == "interrupted" else "FAILED", error, phase=phase)
+        if status != "interrupted":
+            step = "resolve the reason above; a failed run never continues"
+        elif self.trial_number is not None:
+            step = "rerun the same command, which reopens the study for its trials left; a trial never resumes"
+        elif common.paths.resolve_last_checkpoint_file(self.run_dir).is_file():
+            step = "rerun the same command to continue from the last checkpoint"
+        elif restarts:
+            step = "rerun the same command, which restarts the run: no checkpoint saved yet"
+        else:
+            step = "rerun the same command, which restarts the run only if its leaf admits that, otherwise names why: no checkpoint saved yet"
+        _line(f"  next: {step} | W&B {status} | run {display_path(self.run_dir)}", to_stderr=True)
+
+    def unstarted(self, error: BaseException, *, refused: bool) -> None:
+        """
+        Print a continuation that ended before its attempt changed the run, with its reason and the next step.
+
+        A rerun repeats a refusal by the run's persisted state, so none is advised; after an interrupt or a failure of the
+        job's environment, a rerun in a matching allocation continues the unchanged run.
+        """
+        interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
+        self._stop("refused" if refused else "interrupted" if interrupted else "FAILED", error, phase=None)
+        unstarted_next_step(self.run_dir, refused=refused)
+
+
+def unstarted_next_step(run_dir: Path | None, *, refused: bool, partly_replaced: bool = False) -> None:
+    """
+    Print the next step of a continuation that ended before its attempt started; ``None`` names no run directory.
+
+    The run is unchanged, unless the job's environment ended its replacement midway (``partly_replaced``), which may
+    have changed the leaf that the rerun replaces.
+    """
+    step = "resolve the reason above" if refused else "rerun the same command in a matching allocation"
+    state = "which replaces the run; its leaf may be partly replaced already" if partly_replaced else "the run is unchanged"
+    run = "" if run_dir is None else f" | run {display_path(run_dir)}"
+    _line(f"  next: {step}, {state}{run}", to_stderr=True)
 
 
 def sanitized_exception_message(error: BaseException) -> str:

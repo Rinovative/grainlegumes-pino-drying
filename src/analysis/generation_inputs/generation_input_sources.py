@@ -4,7 +4,10 @@ Responsibilities:
   - Discover manifest-admitted input batches without exposing completed raw
   - Group sources by canonical batch identity and deduplicate exact cases
   - Fail closed when one case-input identity binds conflicting case.json bytes or COMSOL input identities
-  - Admit selected cases lazily and cache empirical dataset diagnostics
+  - Admit selected cases lazily, cache empirical dataset diagnostics, and keep the storage root the discovery read
+  - Rate campaign candidates per material, declared sampling role (else domain profile) and origin, listed by material in
+    the display order of the campaign's frozen plan (ID materials, then held-out test-only ones, each by display label) and
+    then by role in the design order, and name the campaign of a Dataset from its batch locator
 
 Design principles:
   - Dataset identity is independent of storage location
@@ -28,23 +31,26 @@ from __future__ import annotations
 import json
 from collections import OrderedDict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, TypeAlias
 
 import numpy as np
 import pandas as pd
 
 from src import common
+from src.analysis.presentation import analysis_dataset_selection as dataset_selection
+from src.analysis.presentation import analysis_display_labels as display_labels
 from src.generation.cases import generation_cases_admission as admission
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.contracts import generation_contracts_vocabulary as vocabulary
 from src.generation.publication import generation_publication_catalog as campaign_catalog
 
 from . import generation_input_diagnostics as diagnostics
 from . import generation_input_labels as labels
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
     from pathlib import Path
 
 DatasetKey: TypeAlias = tuple[str, str]  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
@@ -54,6 +60,9 @@ DEFAULT_MAX_CACHED_CASES: Final = 24
 DEFAULT_MAX_CACHED_DATASETS: Final = 2
 CASE_KEY_PARTS: Final = 3
 _CANDIDATE_COLUMNS: Final = ("material_family", "domain_profile", "case_id", "origin", "outcome", "selected", "design_key", "duration_seconds")
+# Candidate rates group by material, declared sampling role (else domain profile) and origin, never by the exact design: one
+# design is one candidate.
+_RATE_KEYS: Final = ("material_family", "sampling_regime", "origin")
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,12 +264,15 @@ class GenerationInputDatasetCatalog:
         max_cached_cases: int = DEFAULT_MAX_CACHED_CASES,
         max_cached_datasets: int = DEFAULT_MAX_CACHED_DATASETS,
         outcomes: CampaignOutcomeCatalog | None = None,
+        storage_root: Path | None = None,
     ) -> None:
         """
         Group one manifest-first input discovery into scientific datasets.
 
         Completed-raw sources are deliberately excluded. Dataset membership is
         never truncated because every empirical mean must use all unique cases.
+        ``storage_root`` is the root the discovery read, from which views write
+        input locations; a catalog built from discovery evidence alone has none.
         """
         if not isinstance(discovery, admission.InputSourceDiscovery):
             msg = "Generation-input catalogs require InputSourceDiscovery evidence."
@@ -285,6 +297,7 @@ class GenerationInputDatasetCatalog:
             key = (source.profile_id, source.batch_identity)
             grouped.setdefault(key, []).append(source)
         self.outcomes = outcomes or CampaignOutcomeCatalog(())
+        self.storage_root = storage_root
         self._datasets = tuple(_build_dataset(tuple(publications)) for publications in grouped.values())
         keys = tuple(dataset_key(dataset) for dataset in self._datasets)
         if len(keys) != len(set(keys)):
@@ -457,15 +470,17 @@ def discover_generation_input_datasets(
         max_cached_cases=max_cached_cases,
         max_cached_datasets=max_cached_datasets,
         outcomes=discover_campaign_outcomes(root, discovery),
+        storage_root=root,
     )
 
 
 @dataclass(frozen=True, slots=True)
 class CampaignOutcomeCatalog:
-    """Retain one bounded discovery checkpoint without payload-array reads."""
+    """Retain one bounded discovery checkpoint without payload-array reads, with each campaign's frozen design sizes by (task, source name)."""
 
     rows: tuple[dict[str, Any], ...]
     issues: tuple[str, ...] = ()
+    designs: Mapping[tuple[str, str], Mapping[str, Mapping[str, int]]] = field(default_factory=dict)
 
 
 def discover_campaign_outcomes(storage_root: Path, discovery: admission.InputSourceDiscovery) -> CampaignOutcomeCatalog:
@@ -478,6 +493,7 @@ def discover_campaign_outcomes(storage_root: Path, discovery: admission.InputSou
     }
     rows: list[dict[str, Any]] = []
     issues: list[str] = []
+    designs: dict[tuple[str, str], Mapping[str, Mapping[str, int]]] = {}
     for task in profiles.available_profiles():
         try:
             campaigns = campaign_catalog.list_campaigns(task, storage_root=storage_root)
@@ -486,6 +502,7 @@ def discover_campaign_outcomes(storage_root: Path, discovery: admission.InputSou
             continue
         for campaign in campaigns:
             name = campaign["source_name"]
+            designs[task, name] = campaign["original_design_sizes"]
             try:
                 candidates = campaign_catalog.list_campaign_cases(task, name, storage_root=storage_root)
             except (OSError, ValueError, TypeError, KeyError) as error:
@@ -505,7 +522,7 @@ def discover_campaign_outcomes(storage_root: Path, discovery: admission.InputSou
                 else:
                     row["input_admission"] = "no admitted input metadata at this checkpoint"
                 rows.append(row)
-    return CampaignOutcomeCatalog(tuple(rows), tuple(issues))
+    return CampaignOutcomeCatalog(tuple(rows), tuple(issues), designs)
 
 
 def query_campaign_outcomes(
@@ -545,31 +562,79 @@ def campaign_outcome_table(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def campaign_outcome_rates(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
-    """Use all terminal candidates as the rate denominator; keep pending visible."""
-    grouped: dict[tuple[str, str, str, str], dict[str, int]] = {}
-    keys = ("material_family", "domain_profile", "origin", "design_key")
-    for row in rows:
-        key = (str(row["material_family"]), str(row["domain_profile"]), str(row["origin"]), str(row["design_key"]))
-        counts = grouped.setdefault(key, {"successful": 0, "failed": 0, "pending": 0})
+def dataset_campaign(dataset: GenerationInputDataset) -> tuple[str, str]:
+    """Return the (task, Source name) of the campaign that owns ``dataset``, decoded from its validated batch locator."""
+    parts = common.paths.campaign_batch_parts(dataset.batch_storage_name)
+    if parts is None:
+        msg = f"Generation-input dataset has no campaign batch locator: {dataset.batch_storage_name!r}."
+        raise ValueError(msg)
+    return parts[0], parts[1]
+
+
+def _rate_group(row: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Return the rate group of one candidate: its material, its declared role or, without one, its domain profile, and its origin."""
+    role = row.get("sampling_regime")
+    return str(row["material_family"]), str(row["domain_profile"] if role is None else role), str(row["origin"])
+
+
+def campaign_material_order(designs: Mapping[str, Mapping[str, int]]) -> tuple[str, ...]:
+    """
+    Return the materials of a campaign's frozen design sizes by role (``dataset_selection.EVALUATION_GROUP_ORDER``), then by display label.
+
+    A material whose plan holds test designs only is held out (Material OOD), the only design a Dataset plan gives a held-out
+    material; every other material is ID. The frozen plan decides, so a checkpoint that reserved only some designs never reorders.
+    """
+    order = dataset_selection.EVALUATION_GROUP_ORDER
+    held_out = {name: {kind for kind, size in sizes.items() if size} == {"test"} for name, sizes in designs.items()}
+    return tuple(
+        sorted(held_out, key=lambda name: (order.index("material_ood" if held_out[name] else "id"), display_labels.material_display_label(name)))
+    )
+
+
+def _material_order(rows: Sequence[Mapping[str, Any]], materials: Sequence[str]) -> tuple[str, ...]:
+    """Return ``materials``, a campaign's ``campaign_material_order``, then any further material of ``rows`` by display label."""
+    rest = {str(row["material_family"]) for row in rows}.difference(materials)
+    return (*materials, *sorted(rest, key=display_labels.material_display_label))
+
+
+def _display_order(group: tuple[str, ...], materials: Sequence[str]) -> tuple[int, int, str, str]:
+    """Return the list position of a (material, role, origin) group: its material in ``materials``, then its role in the design order."""
+    material, role, origin = group
+    kinds = vocabulary.DESIGN_KINDS
+    return materials.index(material), kinds.index(role) if role in kinds else len(kinds), role, origin
+
+
+def campaign_outcome_rates(rows: Iterable[Mapping[str, Any]], *, materials: Sequence[str] = ()) -> pd.DataFrame:
+    """
+    Count outcomes per material, declared role and origin; a group's terminal candidates are its rate denominator, pending stays visible.
+
+    The groups follow ``materials``, the campaign's ``campaign_material_order``, so that no filter reorders them (a material not
+    in it follows by display label), then the design order of their role (train, validation, test, parameter OOD).
+    """
+    candidates = tuple(rows)
+    order = _material_order(candidates, materials)
+    grouped: dict[tuple[str, ...], dict[str, int]] = {}
+    for row in candidates:
+        counts = grouped.setdefault(_rate_group(row), {"successful": 0, "failed": 0, "pending": 0})
         counts[str(row["outcome"])] += 1
     values = []
-    for key, counts in sorted(grouped.items()):
+    for key, counts in sorted(grouped.items(), key=lambda item: _display_order(item[0], order)):
         terminal = counts["successful"] + counts["failed"]
         values.append(
-            dict(zip(keys, key, strict=True)) | counts | {"success_fraction_terminal": counts["successful"] / terminal if terminal else None}
+            dict(zip(_RATE_KEYS, key, strict=True)) | counts | {"success_fraction_terminal": counts["successful"] / terminal if terminal else None}
         )
     return pd.DataFrame(values)
 
 
-def campaign_failure_rates(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
-    """Count terminal reasons against all terminal candidates in the same group."""
+def campaign_failure_rates(rows: Iterable[Mapping[str, Any]], *, materials: Sequence[str] = ()) -> pd.DataFrame:
+    """Count terminal reasons against all terminal candidates of one material, declared role and origin, ordered as ``campaign_outcome_rates``."""
     candidates = tuple(rows)
-    keys = ("material_family", "domain_profile", "origin", "design_key")
+    order = _material_order(candidates, materials)
+    keys = _RATE_KEYS
     totals: dict[tuple[str, ...], int] = {}
     failures: dict[tuple[str, ...], int] = {}
     for row in candidates:
-        group = tuple(str(row[key]) for key in keys)
+        group: tuple[str, ...] = _rate_group(row)
         outcome = row["outcome"]
         if outcome in {"successful", "failed"}:
             totals[group] = totals.get(group, 0) + 1
@@ -579,7 +644,7 @@ def campaign_failure_rates(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
             key = group + reason
             failures[key] = failures.get(key, 0) + 1
     records = []
-    for key, count in sorted(failures.items()):
+    for key, count in sorted(failures.items(), key=lambda item: (_display_order(item[0][: len(keys)], order), item[0][len(keys) :])):
         group = key[: len(keys)]
         records.append(
             dict(zip((*keys, "failure_stage", "failure_class", "reason_code"), key, strict=True))

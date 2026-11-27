@@ -4,11 +4,18 @@ Responsibilities:
   - Plan fixed-inch map grids: equal maps with the domain's aspect, colour bars as tall as their maps, fixed gaps, the
     margins of row labels and a figure title, a width cap or none, and non-map bands above, below or right of the maps
   - Assemble a fixed map grid's map axes and hidden colour-bar slots in one place and give each band's figure rectangle
-  - Write map-grid column headers with notes, row labels, one figure title and the text of an empty cell
+  - Write map-grid column headers with notes, row labels, one figure title and the text of an empty cell; an emptied
+    map takes its note inside and hands its column's x labels to the nearest map drawn above it, an ordinary subplot
+    only turns empty
   - Fill reserved fixed-inch colour-bar slots
   - Label the colour bar of a field-map scale from its kind: a constant's value, a cyclic scale's boundaries, a signed
     one's band centres, a wide log scale's decades, the power of ten in the unit bracket from the size of a state's
     values and from the step of an error, every label thinned to the bar's real tick spacing
+  - Write every bar of a map row in the row's one power of ten, with two exceptions (``bar_exponent``): a wide log bar
+    keeps its decades, which are powers of ten already, and a linear bar whose steps would need more than three decimals
+    in the row's power keeps its own
+  - Write a value positionally with three significant digits, trailing zeros kept and a negative one with the true minus
+    sign (``significant``): the labels of a narrow geometric bar and the values of figure notes and tables
   - Lay out a line figure's time windows as columns of one grid inside a given grid cell, rows sharing their y axis
     (``window_axes``), and head a row of such a figure with a formula and unit (``add_channel_row_label``)
   - Normalize finite constant and varying physical fields predictably
@@ -32,12 +39,15 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axis import Axis, YAxis
+from matplotlib.collections import QuadMesh
 from matplotlib.colors import Normalize
+from matplotlib.text import Annotation
 from matplotlib.ticker import Formatter, LogFormatterSciNotation, NullFormatter
 from mpl_toolkits.axes_grid1 import Size, make_axes_locatable  # type: ignore[import-untyped]
 
@@ -74,16 +84,18 @@ TICK_LABEL_SPACING_MIN_IN = 0.16  # colour-bar labels closer than this are thinn
 _LOG_DECADE_RATIO = 30.0  # a geometric scale wider than this factor ...
 _LOG_DECADES_MIN = 4  # ... that holds at least this many decades is labelled at its decades
 _MINIMUM_TICKS = 2
-_GEOMETRIC_SIGNIFICANT_DIGITS = 3  # a narrow geometric scale (no decade labels) writes its smallest boundary with this many digits
+_SIGNIFICANT_DIGITS = 3  # a narrow geometric scale's boundary, a constant bar's value, a note or table value: this many digits
+_MAX_SIGNIFICANT_DIGITS = 17  # significant digits that tell any two distinct float64 values apart
 _CYCLIC_COLORMAPS = frozenset({"twilight", "twilight_shifted", "hsv"})  # Matplotlib's cyclic colormaps: their two ends meet
 _TITLE_FROM_TOP_IN = 0.12
 _ROW_LABEL_OFFSET_PT = 62.0  # left of the first column's y tick labels and "y [m]"
 _HEADER_PAD_PT = 4.0  # header to its map: slightly below Matplotlib's 6 pt
 _HEADER_NOTE_LINE_PT = 14.0  # one 10 pt note line under a header
 _NOTE_COLOUR = "0.20"
+_MAP_NOTE_GID = "map-note"  # a note line above a map (add_map_note), which an emptied map takes inside
+_X_LABEL_OWNER_GID = "map-x-label-owner"  # the x label of the map that owns its column's x labels (prepare_map_axes)
 _SUPERSCRIPT = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
 _UNIT_BRACKET = re.compile(r"\[([^\]]*)\]\s*$")
-_MATH_SPAN = re.compile(r"\$([^$]+)\$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,10 +142,28 @@ class MapGeometry:
 
 @dataclass(frozen=True, slots=True)
 class TickFormat:
-    """The labels of a colour bar: ``decimals`` after the point, the ticks written divided by 10**``exponent`` (the factor stands in the unit)."""
+    """
+    The labels of a colour bar: ``decimals`` after the point, the ticks written divided by 10**``exponent`` (the factor stands in the unit).
+
+    A positive ``significant`` writes each label with that many significant digits of its own instead (a narrow geometric bar).
+    """
 
     decimals: int = 1
     exponent: int = 0
+    significant: int = 0
+
+
+def significant(value: float, digits: int = _SIGNIFICANT_DIGITS, exponent: int = 0) -> str:
+    """
+    Write ``value`` in 10**``exponent`` positionally with ``digits`` significant digits, trailing zeros kept: 0.04521 as 0.0452.
+
+    A negative value takes the true minus sign and zero reads 0. The power of ten moves the decimal point of the value's
+    shortest repr exactly; a float division could merge distinct values.
+    """
+    if value == 0.0:
+        return "0"
+    rounded = Decimal(f"{Decimal(repr(float(value))).scaleb(-exponent):.{digits - 1}e}")
+    return f"{rounded:.{max(0, digits - 1 - rounded.adjusted())}f}".replace("-", "\N{MINUS SIGN}")
 
 
 class _BarLabels(Formatter):
@@ -144,14 +174,22 @@ class _BarLabels(Formatter):
 
     def __call__(self, x: float, pos: int | None = None) -> str:  # noqa: ARG002 -- Matplotlib's formatter signature
         """Return one label; rounding first turns a small negative value into +0.0, so no label reads "-0.0"."""
+        if self._shown.significant:
+            return significant(x, self._shown.significant, self._shown.exponent)
         value = round(x / 10.0**self._shown.exponent, self._shown.decimals) + 0.0
         return f"{value:.{self._shown.decimals}f}".replace("-", "\N{MINUS SIGN}")
 
     def format_ticks(self, values: list[float]) -> list[str]:
         """Return the labels of all tick ``values``, empty for the ticks thinned out (``_labelled_ticks``)."""
-        ticks = np.asarray(values, dtype=np.float64)
-        kept = _labelled_ticks(ticks, _tick_gaps_in(self.axis, ticks))
-        return [self(value) if index in kept else "" for index, value in enumerate(ticks)]
+        return _thinned(self.axis, values, [self(value) for value in values])
+
+
+class _DecadeLabels(LogFormatterSciNotation):
+    """Write the decade labels of a wide geometric colour bar in scientific notation, thinned like ``_BarLabels``."""
+
+    def format_ticks(self, values: list[float]) -> list[str]:
+        """Return the labels of all decade ``values``, empty for the ticks thinned out (``_labelled_ticks``)."""
+        return _thinned(self.axis, values, super().format_ticks(values))
 
 
 def linear_norm(*values: np.ndarray) -> Normalize:
@@ -192,6 +230,13 @@ def _tick_gaps_in(axis: object, ticks: np.ndarray) -> np.ndarray:
     return np.abs(np.diff(axis.axes.transData.transform(points)[:, along])) / figure.dpi
 
 
+def _thinned(axis: object, values: Sequence[float], labels: Sequence[str]) -> list[str]:
+    """Return ``labels`` of the tick ``values`` on ``axis``, empty for the ticks ``_labelled_ticks`` thins out."""
+    ticks = np.asarray(values, dtype=np.float64)
+    kept = _labelled_ticks(ticks, _tick_gaps_in(axis, ticks))
+    return [label if index in kept else "" for index, label in enumerate(labels)]
+
+
 def _labelled_ticks(ticks: np.ndarray, gaps_in: np.ndarray) -> set[int]:
     """
     Return the indices of the ``ticks`` that keep a label when neighbouring ticks stand ``gaps_in`` inches apart.
@@ -199,8 +244,9 @@ def _labelled_ticks(ticks: np.ndarray, gaps_in: np.ndarray) -> set[int]:
     Every tick is labelled while each gap holds one label (``TICK_LABEL_SPACING_MIN_IN``). Otherwise every k-th tick keeps
     its label, k the smallest count of gaps that holds one: both ends always, no interior label closer than k gaps to an
     end, and a scale symmetric about 0 thinned symmetrically (an odd count from its centre tick, an even one from both
-    ends). An odd symmetric scale always keeps its centre 0: with both ends when each half holds one label, else alone.
-    Any other bar too short for both end labels keeps only its top label.
+    ends, dropping the middle pair when it stands closer than k gaps to its mirror). An odd symmetric scale always keeps
+    its centre 0: with both ends when each half holds one label, else alone. Any other bar too short for both end labels
+    keeps only its top label.
     """
     last = ticks.size - 1
     smallest = float(np.min(gaps_in)) if last >= 1 else math.inf
@@ -216,8 +262,8 @@ def _labelled_ticks(ticks: np.ndarray, gaps_in: np.ndarray) -> set[int]:
         return {0, centre, last} | {index for index in core if min(index, last - index) >= step}
     if float(np.sum(gaps_in)) < TICK_LABEL_SPACING_MIN_IN:
         return {last}
-    if symmetric:
-        core = {index for index in range(last + 1) if min(index, last - index) % step == 0}
+    if symmetric:  # an even count: a label from each end, never closer than k gaps to its mirror across the centre
+        core = {index for index in range(last + 1) if min(index, last - index) % step == 0 and abs(last - 2 * index) >= step}
     else:
         core = {index for index in range(last + 1) if (last - index) % step == 0}
     return {0, last} | {index for index in core if min(index, last - index) >= step}
@@ -234,17 +280,20 @@ def _decades(boundaries: np.ndarray) -> list[float] | None:
     return [10.0**power for power in range(low, high + 1)]
 
 
-def _geometric_format(boundaries: np.ndarray) -> TickFormat:
+def _geometric_format(boundaries: np.ndarray, exponent: int | None = None) -> TickFormat:
     """
-    Return the format that writes every boundary of a narrow geometric scale with the significant digits of its smallest one.
+    Return the format that writes each boundary of a narrow geometric scale with three significant digits of its own.
 
-    At least three; more when the smallest relative step r between adjacent boundaries needs them (1 - floor(log10 r)), so
-    every absolute step is at least one unit of the last decimal and adjacent boundaries never read alike.
+    More digits only where three would write two boundaries alike, so adjacent boundaries never read alike: at the most, 17
+    tell any two distinct float64 boundaries apart. Only the labels are rounded, never the boundaries, so every value keeps
+    its band. The labels stand in 10**``exponent``, by default the power of the largest boundary.
     """
-    exponent = math.floor(math.log10(float(boundaries[-1])))
-    smallest = float(boundaries[0]) / 10.0**exponent
-    digits = max(_GEOMETRIC_SIGNIFICANT_DIGITS, 1 - math.floor(math.log10(float(np.min(np.diff(boundaries) / boundaries[:-1])))))
-    return TickFormat(decimals=max(0, digits - 1 - math.floor(math.log10(smallest))), exponent=exponent)
+    exponent = math.floor(math.log10(float(boundaries[-1]))) if exponent is None else exponent
+    candidates = range(_SIGNIFICANT_DIGITS, _MAX_SIGNIFICANT_DIGITS)
+    digits = next(
+        (n for n in candidates if len({significant(value, n, exponent) for value in boundaries}) == boundaries.size), _MAX_SIGNIFICANT_DIGITS
+    )
+    return TickFormat(exponent=exponent, significant=digits)
 
 
 def error_ticks(boundaries: np.ndarray, *, signed: bool) -> np.ndarray:
@@ -288,9 +337,55 @@ def state_format(steps: Iterable[float | None], exponent: int = 0) -> TickFormat
     return TickFormat(max(fitting) if fitting else field_maps.MAX_TICK_DECIMALS if needed else 1, exponent)
 
 
-def error_format(boundaries: np.ndarray | None, *, signed: bool) -> TickFormat:
-    """Return the label format of an error bar over ``boundaries``, the one ``set_fixed_decimal_ticks`` derives from its ticks."""
-    return TickFormat() if boundaries is None else tick_format(tick_step(error_ticks(boundaries, signed=signed)))
+def _in_row_power(shown: TickFormat, step: float | None, exponent: int | None) -> TickFormat:
+    """Return ``shown`` written in the row's 10**``exponent`` when the bar's tick ``step`` needs at most three decimals there, else as it is."""
+    if exponent is None or step is None:
+        return shown
+    decimals = field_maps.step_decimals(step / 10.0**exponent)
+    return TickFormat(decimals, exponent) if decimals <= field_maps.MAX_TICK_DECIMALS else shown
+
+
+def error_format(boundaries: np.ndarray | None, *, signed: bool, exponent: int | None = None) -> TickFormat:
+    """Return the label format of an error bar over ``boundaries``, the one ``add_field_map_colorbar`` gives it (``exponent``: its row's)."""
+    if boundaries is None:
+        return TickFormat()
+    step = tick_step(error_ticks(boundaries, signed=signed))
+    return _in_row_power(tick_format(step), step, exponent)
+
+
+def _constant_format(value: float, exponent: int) -> TickFormat:
+    """Return the format of a constant bar's tick in 10**``exponent``: the decimals its value needs there, at most three significant digits."""
+    shown = abs(value) / 10.0**exponent
+    if shown == 0.0:
+        return TickFormat(0, exponent)
+    figures = _SIGNIFICANT_DIGITS - 1 - math.floor(math.log10(shown))
+    return TickFormat(max(0, min(field_maps.step_decimals(shown), figures)), exponent)
+
+
+def _linear_format(scale: field_maps.FieldMapDefinition, exponent: int | None) -> tuple[np.ndarray, TickFormat]:
+    """Return the labelled ticks of the linear bar of ``scale`` and their format in a row written in 10**``exponent`` (``add_field_map_colorbar``)."""
+    boundaries = np.asarray(scale.boundaries, dtype=np.float64)
+    centred = scale.semantic in field_maps.SIGNED_SEMANTICS and scale.colormap.name not in _CYCLIC_COLORMAPS
+    ticks = error_ticks(boundaries, signed=centred)
+    if scale.semantic in field_maps.ERROR_SEMANTICS:
+        return ticks, error_format(boundaries, signed=centred, exponent=exponent)
+    step = tick_step(ticks)
+    own = state_format([step], field_maps.state_exponent(float(boundaries[0]), float(boundaries[-1])))
+    return ticks, _in_row_power(own, step, exponent)
+
+
+def bar_exponent(scale: field_maps.FieldMapDefinition, exponent: int) -> int | None:
+    """
+    Return the power of ten the bar of ``scale`` writes its labels in when its map row is written in 10**``exponent``; ``None`` for decades.
+
+    It differs from ``exponent`` only at the two exceptions of ``add_field_map_colorbar``: a wide log bar keeps its decade labels,
+    and a linear bar whose steps would need more than three decimals in the row's power keeps its own.
+    """
+    if scale.semantic is field_maps.FieldMapSemantic.LOG_POSITIVE:
+        return None if _decades(np.asarray(scale.boundaries, dtype=np.float64)) is not None else exponent
+    if scale.semantic is field_maps.FieldMapSemantic.CONSTANT:
+        return exponent
+    return _linear_format(scale, exponent)[1].exponent
 
 
 def is_finer_than_decimals(step: float | None, decimals: int) -> bool:
@@ -344,7 +439,7 @@ def add_channel_row_label(
     axis_x: float = -0.28,
     figure_x: float | None = None,
 ) -> None:
-    """Place one shared formula-and-unit heading at the far-left row margin."""
+    """Place one shared formula-and-unit heading at the far-left row margin, bold with its symbols upright (``figure_layout.bold_label``)."""
     if not isinstance(label, str) or not label.strip():
         message = "Channel row labels must be non-empty text."
         raise ValueError(message)
@@ -362,7 +457,7 @@ def add_channel_row_label(
         location = (float(figure_x), (position.y0 + position.y1) / 2.0)
         coordinates = axis.figure.transFigure
     annotation = axis.annotate(
-        label,
+        figure_layout.bold_label(label),
         xy=location,
         xycoords=coordinates,
         rotation=90,
@@ -394,11 +489,6 @@ def label_with_exponent(label: str, exponent: int) -> str:
 def power_of_ten(exponent: int) -> str:
     """Return ten to ``exponent`` with a superscript exponent, as a bar's unit writes it (-4 gives 10⁻⁴)."""
     return f"10{str(exponent).translate(_SUPERSCRIPT)}"
-
-
-def _bold_label(text: str) -> str:
-    """Return ``text`` with its mathtext spans set bold; ``fontweight`` alone never bolds mathtext."""
-    return _MATH_SPAN.sub(lambda match: "$\\mathbf{" + match.group(1).replace("\\mathrm{", "\\mathbf{") + "}$", text)
 
 
 def plan_geometry(
@@ -503,7 +593,7 @@ def prepare_map_axes(axis: Axes, *, extent: tuple[float, float, float, float], b
 
     The map gets equal aspect on the physical ``extent`` (x0, x1, y0, y1); the slot of fixed width and pad sits
     right of it and is exactly as tall as the drawn map. Tick and coordinate labels stand only on the bottom
-    row (``bottom``) and the left column (``left``).
+    row (``bottom``), whose map owns its column's x labels (``empty_cell``), and the left column (``left``).
     """
     axis.set_aspect("equal", adjustable="box")
     axis.set_xlim(extent[0], extent[1])
@@ -511,7 +601,7 @@ def prepare_map_axes(axis: Axes, *, extent: tuple[float, float, float, float], b
     slot = make_axes_locatable(axis).append_axes("right", size=Size.Fixed(COLORBAR_WIDTH_IN), pad=Size.Fixed(COLORBAR_PAD_IN))
     slot.set_visible(False)
     axis.tick_params(labelbottom=bottom, labelleft=left, labelsize=figure_layout.TICK_PT)
-    axis.set_xlabel("x [m]" if bottom else "", fontsize=figure_layout.LABEL_PT)
+    axis.set_xlabel("x [m]" if bottom else "", fontsize=figure_layout.LABEL_PT, gid=_X_LABEL_OWNER_GID if bottom else None)
     axis.set_ylabel("y [m]" if left else "", fontsize=figure_layout.LABEL_PT)
     return slot
 
@@ -522,8 +612,9 @@ def map_grid(
     """
     Return the figure of ``map_figure`` with its map axes and their hidden colour-bar slots, each [rows, columns].
 
-    Every map is prepared on the physical ``extent`` (``prepare_map_axes``). The slots are added after all maps, so the
-    figure lists the maps first in row-major order, then the slots.
+    Every map is prepared on the physical ``extent`` (``prepare_map_axes``), the bottom row with the x labels; a bottom map
+    later left empty (``empty_cell``) hands them to the nearest map drawn above it. The slots are added after all maps, so
+    the figure lists the maps first in row-major order, then the slots.
     """
     figure, grid = map_figure(geometry, figure=figure)
     axes = np.empty((geometry.rows, geometry.columns), dtype=object)
@@ -566,6 +657,7 @@ def add_field_map_colorbar(
     *,
     label: str,
     extend: FieldMapExtend | None = None,
+    exponent: int | None = None,
 ) -> Colorbar:
     """
     Fill one map's slot with the bar of ``scale`` (``add_slot_colorbar``) and label it from the scale's kind, the one place that does.
@@ -574,15 +666,19 @@ def add_field_map_colorbar(
     - A cyclic scale (a colormap whose ends meet, ``_CYCLIC_COLORMAPS``) is labelled at its boundaries, so both wrap ends are named.
     - Any other signed scale (``field_maps.SIGNED_SEMANTICS``) is labelled at its band centres 0, ±w, ±2w ...
     - A log-positive scale is labelled at its decades when it is wide (``_decades``), every boundary a minor tick, else at its
-      boundaries with the significant digits of the smallest one that keep adjacent ones distinct, at least three (``_geometric_format``).
+      boundaries, each with three significant digits of its own, more only where adjacent ones would read alike (``_geometric_format``).
     - Where the ticks stand and how they are written are separate: a linear state, positive or signed, has at most three decimals
       in the power of ten of its boundaries' size (``field_maps.state_exponent``, the one its state bands were built in; none
       between 10^-3 and 10^4) in the unit bracket (``state_format``); an error (``field_maps.ERROR_SEMANTICS``), signed or not,
       gets exactly the decimals its step needs, a finer step as a power of ten in the unit bracket.
 
     Labels are thinned to the bar's real height. ``extend`` replaces the scale's arrows for one of several maps that share a locked
-    scale but not its values beyond. A categorical scale raises ``ValueError``, and so does a linear or narrow geometric scale whose ticks, written
-    as the bar writes them, would repeat a label (locked boundaries off the grid of their format).
+    scale but not its values beyond. ``exponent`` is the one power of ten of the bars of a map row: a constant bar writes its value
+    in it (the decimals the value needs, at most those of three significant digits), a narrow geometric and a linear bar their
+    labels, except where ``bar_exponent`` names the two exceptions: a wide log bar keeps its decades and a linear bar whose steps
+    would need more than three decimals there keeps its own power. Without ``exponent`` a constant bar keeps Matplotlib's label. A
+    categorical scale raises ``ValueError``, and so does a linear or narrow geometric scale whose ticks, written as the bar writes
+    them, would repeat a label (locked boundaries off the grid of their format).
     """
     if scale.semantic is field_maps.FieldMapSemantic.CATEGORICAL:
         message = "A categorical field map has no slot colour bar."
@@ -590,24 +686,24 @@ def add_field_map_colorbar(
     colorbar = add_slot_colorbar(figure, image, slot, label=label, extend=scale.extend if extend is None else extend)
     boundaries = np.asarray(scale.boundaries, dtype=np.float64)
     if scale.semantic is field_maps.FieldMapSemantic.CONSTANT:
-        colorbar.set_ticks(boundaries.tolist())
+        if exponent is None:
+            colorbar.set_ticks(boundaries.tolist())
+        else:
+            set_fixed_decimal_ticks(colorbar, boundaries, _constant_format(float(boundaries[0]), exponent))
         return colorbar
     if scale.semantic is field_maps.FieldMapSemantic.LOG_POSITIVE:
         decades = _decades(boundaries)
         if decades is None:
-            set_fixed_decimal_ticks(colorbar, boundaries, _geometric_format(boundaries))
+            set_fixed_decimal_ticks(colorbar, boundaries, _geometric_format(boundaries, exponent))
             _require_distinct_labels(colorbar, boundaries, label)
             return colorbar
         colorbar.set_ticks(decades)
-        colorbar.ax.yaxis.set_major_formatter(LogFormatterSciNotation())
+        colorbar.ax.yaxis.set_major_formatter(_DecadeLabels())
         colorbar.set_ticks(boundaries.tolist(), minor=True)
         colorbar.ax.yaxis.set_minor_formatter(NullFormatter())
         return colorbar
-    centred = scale.semantic in field_maps.SIGNED_SEMANTICS and scale.colormap.name not in _CYCLIC_COLORMAPS
-    ticks = error_ticks(boundaries, signed=centred)
-    error = scale.semantic in field_maps.ERROR_SEMANTICS
-    exponent = field_maps.state_exponent(float(boundaries[0]), float(boundaries[-1]))
-    set_fixed_decimal_ticks(colorbar, ticks, None if error else state_format([tick_step(ticks)], exponent))
+    ticks, shown = _linear_format(scale, exponent)
+    set_fixed_decimal_ticks(colorbar, ticks, shown)
     _require_distinct_labels(colorbar, ticks, label)
     return colorbar
 
@@ -620,8 +716,41 @@ def _require_distinct_labels(colorbar: Colorbar, ticks: np.ndarray, label: str) 
         raise ValueError(message)
 
 
+def _drawn_map_above(axis: Axes) -> Axes | None:
+    """Return the nearest shown, framed grid cell above ``axis`` in its column of the same grid that holds a drawn map, else ``None``."""
+    spec, figure = axis.get_subplotspec(), axis.get_figure(root=True)
+    if spec is None or figure is None:
+        return None
+    above = [
+        (other_spec.rowspan.start, other)
+        for other in figure.axes
+        if other.axison
+        and other.get_visible()
+        and (other.images or any(isinstance(artist, QuadMesh) for artist in other.collections))
+        and (other_spec := other.get_subplotspec()) is not None
+        and other_spec.get_gridspec() is spec.get_gridspec()
+        and other_spec.colspan == spec.colspan
+        and other_spec.rowspan.stop <= spec.rowspan.start
+    ]
+    return max(above, key=lambda item: item[0])[1] if above else None
+
+
 def empty_cell(axis: Axes, text: str) -> None:
-    """Show one grid cell as empty: no frame and no ticks, ``text`` centred in it."""
+    """
+    Show one grid cell as empty: no frame and no ticks, ``text`` centred in it.
+
+    Only a map grid's marks move. The map that owns its column's x tick labels and x label (``prepare_map_axes``) hands them
+    to the nearest map drawn above it in its column, so the column keeps them wherever its last map stands; without such a
+    map nothing moves. A note written above the cell before (``add_map_note``) moves under ``text``, clear of x labels
+    handed above the cell. Any other axes, an ordinary subplot among them, only turns empty.
+    """
+    if axis.xaxis.label.get_gid() == _X_LABEL_OWNER_GID and (above := _drawn_map_above(axis)) is not None:
+        above.tick_params(labelbottom=True)
+        above.set_xlabel(axis.get_xlabel(), fontsize=figure_layout.LABEL_PT)
+    for note in axis.texts:
+        if isinstance(note, Annotation) and note.get_gid() == _MAP_NOTE_GID:  # one label line under ``text``
+            note.xy, note.xyann = (0.5, 0.5), (0.0, -figure_layout.LABEL_PT)
+            note.set_verticalalignment("top")
     axis.set_axis_off()
     axis.text(0.5, 0.5, text, ha="center", va="center", wrap=True, transform=axis.transAxes, fontsize=figure_layout.LABEL_PT)
 
@@ -638,6 +767,7 @@ def add_map_note(axis: Axes, text: str) -> None:
         va="bottom",
         fontsize=figure_layout.NOTE_PT,
         color=_NOTE_COLOUR,
+        gid=_MAP_NOTE_GID,
     )
 
 
@@ -651,7 +781,7 @@ def set_column_headers(axes: np.ndarray, titles: Sequence[str], notes: Sequence[
     for column, text in enumerate(titles):
         axis = axes[0, column]
         axis.set_title(
-            _bold_label(text),
+            figure_layout.bold_label(text),
             fontsize=figure_layout.PANEL_TITLE_PT,
             fontweight="bold",
             pad=_HEADER_PAD_PT + (_HEADER_NOTE_LINE_PT if raised else 0.0),
@@ -664,7 +794,7 @@ def set_row_labels(axes: np.ndarray, labels: Sequence[str]) -> None:
     """Write each row label once, left of the first column's tick and coordinate labels."""
     for row, text in enumerate(labels):
         annotation = axes[row, 0].annotate(
-            _bold_label(text),
+            figure_layout.bold_label(text),
             xy=(0.0, 0.5),
             xycoords="axes fraction",
             xytext=(-_ROW_LABEL_OFFSET_PT, 0.0),

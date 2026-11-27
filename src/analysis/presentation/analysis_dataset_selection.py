@@ -3,7 +3,8 @@
 Responsibilities:
   - Describe the selectable datasets of one view as items grouped by role or sampling regime, with unavailable items kept apart with their reason
   - Resolve selected item keys into ordered draw choices: one choice per item by default, one per group when pooled
-  - Label an item «material, group» and a pooled choice «group, k von n Materialien» or «group, alle Materialien»
+  - Label an item of an evaluation role by the shared material and role label («Chickpea, ID») and a pooled choice
+    «group, k of n materials» or «group, all materials»
 
 Design principles:
   - Choices follow the inventory and group order, never the order of the selection
@@ -22,6 +23,8 @@ from __future__ import annotations
 from dataclasses import KW_ONLY, dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
+
+from . import analysis_display_labels as display_labels
 
 if TYPE_CHECKING:
     from collections.abc import Hashable, Iterable, Mapping, Sequence
@@ -96,12 +99,9 @@ class DatasetChoice:
         return tuple(item.key for item in self.items)
 
 
-def dataset_label(material: str, group_label: str) -> str:
-    """Return the dataset label «lentil, ID» with underscores of the material shown as spaces."""
-    if not material or not group_label:
-        message = "A dataset label needs a material and a group label."
-        raise ValueError(message)
-    return f"{material.replace('_', ' ')}, {group_label}"
+def dataset_label(material: str, role: str) -> str:
+    """Return the label of the dataset of one material in one evaluation role, as every view writes it («Chickpea, ID»)."""
+    return display_labels.material_role_display_label(material, role)
 
 
 def resolve_choices(inventory: DatasetInventory, selected: Iterable[Hashable], *, pooled: bool) -> tuple[DatasetChoice, ...]:
@@ -155,5 +155,5 @@ def _pooled_label(group_label: str, members: tuple[DatasetItem, ...], total: int
     if len(members) == 1:
         return members[0].label
     if len(members) == total:
-        return f"{group_label}, alle Materialien"
-    return f"{group_label}, {len(members)} von {total} Materialien"
+        return f"{group_label}, all materials"
+    return f"{group_label}, {len(members)} of {total} materials"

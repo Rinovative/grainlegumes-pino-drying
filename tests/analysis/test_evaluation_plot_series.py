@@ -3,7 +3,8 @@
 Responsibilities:
   - Check colour, line style, hatch and marker per entity rule: run shades of one architecture, single material, pooled role
   - Check that a run keeps its colour across materials, the material markers and the shade limit
-  - Check the panel grouping of keys and the styles read from steady provenance
+  - Check the panel grouping of keys and the styles read from steady provenance, also of a pooled series
+  - Check that a pooled series is the unweighted mean of its materials
 
 Design principles:
   - Entities are tiny and synthetic; provenance reading uses the steady fixture only
@@ -17,6 +18,7 @@ from __future__ import annotations
 import copy
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 from support.steady_evaluation import steady_frame
 
@@ -93,6 +95,44 @@ def test_panel_groups_give_the_original_keys_in_order_of_appearance_and_refuse_a
     assert series.panel_groups(labels) == {"d1": {"m1": "m1 · d1", "m2": "m2 · d1"}, "d2": {"m1": "m1 · d2"}}
     with pytest.raises(ValueError, match=r"'first' and 'second'"):
         series.panel_groups({"first": ("d", "m"), "second": ("d", "m")})
+
+
+def test_panel_series_group_the_keys_of_a_pooled_series_under_one_pair_and_its_head_stands_for_it() -> None:
+    labels = {"lentil": ("ID, all materials", "m1"), "chickpea": ("ID, all materials", "m1"), "m2": ("ID, all materials", "m2")}
+    groups = series.panel_series(labels)
+
+    assert groups == {"ID, all materials": {"m1": ("lentil", "chickpea"), "m2": ("m2",)}}
+    assert series.series_heads(groups) == {"ID, all materials": {"m1": "lentil", "m2": "m2"}}
+    with pytest.raises(ValueError, match="both model"):
+        series.panel_groups(labels)  # the views that cannot pool still refuse two frames of one series
+
+
+def test_a_pooled_series_is_the_unweighted_mean_of_its_materials_and_unavailable_when_one_is() -> None:
+    values = {"a": [1.0, 10.0], "b": [3.0, np.nan], "c": [8.0, 2.0]}
+
+    pooled, per_key = series.material_mean(["a", "b"], values.__getitem__)
+    alone, _ = series.material_mean(["c"], values.__getitem__)
+
+    assert pooled[0] == 2.0
+    assert np.isnan(pooled[1])  # never the mean of the materials that remain
+    np.testing.assert_array_equal(per_key[0], [1.0, 10.0])
+    np.testing.assert_array_equal(alone, [8.0, 2.0])  # a series of one key is its own value
+
+
+def test_the_keys_of_a_pooled_series_take_the_series_style_not_the_style_of_their_material(tmp_path: Path) -> None:
+    frame, _grid = steady_frame(tmp_path)
+    frames = {}
+    for material in ("lentil", "chickpea"):
+        frames[material] = frame.copy(deep=True)
+        frames[material].attrs = copy.deepcopy(frame.attrs)
+        frames[material].attrs["artifact_provenance"]["selection"]["material_families"] = [material]
+
+    separate = series.series_styles(frames)
+    pooled = series.series_styles(frames, [("lentil", "chickpea")])
+
+    assert separate["lentil"] == visual_semantics.series_style(material="lentil", role="id")
+    assert separate["lentil"].color != separate["chickpea"].color
+    assert pooled == dict.fromkeys(frames, visual_semantics.series_style(role="id", pooled=True))
 
 
 def test_series_styles_read_the_provenance_and_need_the_model_only_of_several_runs(tmp_path: Path) -> None:

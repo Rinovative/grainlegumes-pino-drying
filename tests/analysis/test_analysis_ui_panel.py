@@ -4,7 +4,7 @@ Responsibilities:
   - Check row validation, first-label alignment, grid membership, reserved height, and popover placement (F1, F2)
   - Check that hidden views stay idle, batches redraw once, and only the newest render publishes (rules 3, 4, 12)
   - Check re-entrant requests from a plot, an observer, or a nested view's host, and a failing display, without a lock
-  - Check on-demand drawing with «Berechnen» and its cache, empty-selection clearing, and failures in the plot's place
+  - Check on-demand drawing with «Compute» and its cache, empty-selection clearing, and failures in the plot's place
   - Check notebook-wide tab and selector widths, view sections, and the lazy panel shell with persistent control rows
   - Check the case-count viewer built on view panels, with its dataset selector and channel control
   - Check that tables show as HTML and that a failure display escapes markup and keeps its traceback collapsed
@@ -67,8 +67,8 @@ def on_grid(width: int) -> bool:
 
 
 def _three_row_panel() -> tuple[panel.ViewPanel, selectors.ChoiceBlock, selectors.ChoiceBlock]:
-    runs = selectors.ChoiceBlock("Läufe", [("FNO", [("fno_a", "a")])], multiple=True, selected=["a"])
-    other = selectors.ChoiceBlock("Datensätze", [("ID", [("lentil, ID", "l")])], multiple=True, selected=["l"])
+    runs = selectors.ChoiceBlock("Runs", [("FNO", [("fno_a", "a")])], multiple=True, selected=["a"])
+    other = selectors.ChoiceBlock("Datasets", [("ID", [("lentil, ID", "l")])], multiple=True, selected=["l"])
     rows = [
         panel.row(controls.dropdown(["x", "y"], description="Model")),
         panel.row(runs.header, other.header),
@@ -339,7 +339,7 @@ def test_on_demand_view_draws_cheap_at_once_and_expensive_on_compute() -> None:
     view.refresh()
     assert draws == ["a", "x"]
     assert panel.CACHE_NOTE in expensive_panel.status.text
-    with pytest.raises(ValueError, match="Berechnen"):
+    with pytest.raises(ValueError, match="Compute"):
         panel.OnDemandView(expensive_panel, draw, lambda: "z", expensive=True)
 
 
@@ -535,7 +535,7 @@ def test_show_result_on_a_hidden_view_publishes_nothing_and_closes_the_figure(sh
 
 def test_lazy_panel_keeps_control_rows_and_exports_to_the_view_status(monkeypatch: pytest.MonkeyPatch) -> None:
     state: dict[str, Any] = {}
-    block = selectors.ChoiceBlock("Datensätze", [("ID", [("lentil, ID", "l")])], multiple=True, selected=["l"])
+    block = selectors.ChoiceBlock("Datasets", [("ID", [("lentil, ID", "l")])], multiple=True, selected=["l"])
     controls_row = panel.row(block.header)
     sections = [notebook_ui.view_section([("One", plt.figure, "one")], export_state=state)]
     lazy = notebook_ui.LazyPanel(

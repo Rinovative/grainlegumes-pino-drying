@@ -83,10 +83,12 @@ def _install_stage_fakes(monkeypatch: pytest.MonkeyPatch, *, fail_arm: str | Non
     monkeypatch.setattr(run_service, "_run_resolved_experiment", fake_execute)
     monkeypatch.setattr(run_service, "validate_completed_run", fake_validate_completed)
     monkeypatch.setattr(run_service, "_validate_reusable_stage_a", fake_handoff_check)
-    # A1's device check reads the receipt's device: the synthetic plans run on the CPU.
+    # A1's device check reads the receipt's device: the synthetic plans run on the CPU. Its contents are not validated here.
     monkeypatch.setattr(budget, "build_b_receipt", lambda **_kwargs: {"test": "receipt", "device": {"device_type": "cpu", "cuda_device_name": None}})
-    monkeypatch.setattr(budget, "publish_b_receipt", lambda *_args: None)
-    monkeypatch.setattr(budget, "load_b_receipt", lambda *_args, **_kwargs: {"test": "receipt"})
+    monkeypatch.setattr(budget, "validate_b_receipt", dict)
+    # B's step creates B's receipt file, which A1's prerequisite admission then compares.
+    monkeypatch.setattr(budget, "publish_b_receipt", lambda run_dir, _receipt: (Path(run_dir) / budget.RECEIPT_NAME).touch())
+    monkeypatch.setattr(budget, "verify_b_receipt_copy", lambda run_dir, _receipt: (Path(run_dir) / budget.RECEIPT_NAME).is_file())
     return executions, handoff_checks
 
 
@@ -160,7 +162,7 @@ def test_rerunning_the_plan_continues_the_incomplete_selected_leaf_in_place(
 def test_source_binding_refusal_of_a_stage_continuation_is_not_wrapped_as_a_stage_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_path: Path
 ) -> None:
-    """An implicit source-tree switch is an admission decision: it reaches the caller unchanged, with no resume advice."""
+    """An implicit source-tree switch is an admission decision: it reaches the caller as the refusal with its cause, with no resume advice."""
     _install_stage_fakes(monkeypatch)
     plan = _requested_plan(tmp_path)
     _publish_parent_record(plan, tmp_path, config_path)
@@ -168,12 +170,14 @@ def test_source_binding_refusal_of_a_stage_continuation_is_not_wrapped_as_a_stag
 
     def refuse(_config: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         msg = "This run is bound to source tree x."
-        raise run_service.SourceBindingError(msg)
+        # The continuation's one refusal before its start, as the stage's own admission raises it.
+        raise run_service.ContinuationRefusedError(msg) from run_service.SourceBindingError(msg)
 
     monkeypatch.setattr(run_service, "_run_resolved_experiment", refuse)
 
-    with pytest.raises(run_service.SourceBindingError, match="bound to source tree"):
+    with pytest.raises(run_service.ContinuationRefusedError, match="bound to source tree") as refused:
         run_service.run_experiment(config_path, device="cpu", output_root=tmp_path, train_stages=("a0",))
+    assert isinstance(refused.value.__cause__, run_service.SourceBindingError)
 
 
 def test_existing_a0_with_changed_science_at_the_same_name_is_refused_with_the_revision_hint(

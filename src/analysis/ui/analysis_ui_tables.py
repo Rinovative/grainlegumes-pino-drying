@@ -2,12 +2,14 @@
 
 Responsibilities:
   - Format numeric table values consistently for notebook display
+  - Shade only the columns or rows a caller opts into, with one key naming the shading, never a text or boolean cell
+  - Hide a positional index and the axis names, so no index metadata forms a header row or corner of its own
   - Derive reusable readable row-local colors for HTML and figure tables
   - Compose compact single or grouped table widget layouts with safe titles
 
 Design principles:
   - Table styling is presentation-only
-  - Numeric color scaling is configurable by column or per-row
+  - Shading is opt-in: only the caller knows which values are comparable and which are identities
   - Callers retain ownership of table content, grouping, and semantic labels
 
 This module does NOT:
@@ -32,12 +34,12 @@ if TYPE_CHECKING:
     from typing import Any
 
 
-def _blue_numeric_styles(table: pd.DataFrame, *, shade_constant: bool, columns: Sequence[str] | None = None) -> pd.DataFrame:
-    """Return quantile-bounded blue fills for the finite numeric cells of ``columns`` (default: all), column-local."""
+def _blue_numeric_styles(table: pd.DataFrame, *, shade_constant: bool, columns: Sequence[str]) -> pd.DataFrame:
+    """Return quantile-bounded blue fills for the finite numeric cells of ``columns``, column-local; text and booleans stay unfilled."""
     styles = pd.DataFrame("", index=table.index, columns=table.columns)
     colormap = plt.get_cmap("Blues")
-    for column in table.columns if columns is None else columns:
-        numeric = np.asarray(pd.to_numeric(table[column], errors="coerce"), dtype=float)
+    for column in columns:
+        numeric = np.array([np.nan if (number := _finite_number(value)) is None else number for value in table[column]], dtype=float)
         finite = numeric[np.isfinite(numeric)]
         if finite.size == 0:
             continue
@@ -56,6 +58,7 @@ def _blue_numeric_styles(table: pd.DataFrame, *, shade_constant: bool, columns: 
 
 
 ROW_EQUAL_RELATIVE_TOLERANCE = 1.0e-9
+_SHADING_KEY = '<p style="margin: 0 0 6px 0; color: #52606d">Shading compares the cells of each {}: darker means larger.</p>'
 _NEUTRAL_BACKGROUND_COLOR = "#eef1f5"
 _DARK_TEXT_COLOR = "#1f2933"
 _LIGHT_TEXT_COLOR = "#ffffff"
@@ -161,45 +164,19 @@ def row_local_style_matrix(
     return styles
 
 
-def styled_dataframe(
+def _render_table(
     table: pd.DataFrame,
     *,
     title: str,
-    format_spec: str = "{:.4g}",
-    shade_constant: bool = True,
-    row_local: bool = False,
-    heading_level: int = 2,
-    shade_columns: Sequence[str] | None = None,
-) -> widgets.VBox:
-    """
-    Render one analysis table using the maintained blue numeric style.
-
-    Parameters
-    ----------
-    table : pandas.DataFrame
-        Caller-owned table to render without mutation.
-    title : str
-        Human-readable heading escaped before HTML insertion.
-    format_spec : str, optional
-        Pandas Styler format applied to numeric columns.
-    shade_constant : bool, optional
-        Apply a pale fill to constant numeric columns. Disable this when constant
-        columns should remain visually neutral.
-    row_local : bool, optional
-        Normalize each row independently across numeric cells before applying
-        coloring.
-    heading_level : int, optional
-        HTML heading level, from 2 through 4, used for the table title.
-    shade_columns : Sequence[str], optional
-        Fill only these columns, each against its own values; the default fills every numeric column. Not combined with
-        ``row_local``.
-
-    Returns
-    -------
-    ipywidgets.VBox
-        Heading and styled HTML table.
-
-    """
+    format_spec: str,
+    shade_constant: bool,
+    row_local: bool,
+    heading_level: int,
+    shade_columns: Sequence[str] | None,
+    keyed: bool,
+    row_heading: str | None = None,
+) -> tuple[widgets.VBox, bool]:
+    """Return the heading and table of ``styled_dataframe`` and whether a cell is shaded; ``keyed`` writes the shading key."""
     if not isinstance(table, pd.DataFrame):
         message = "Styled analysis tables require a pandas DataFrame."
         raise TypeError(message)
@@ -222,7 +199,8 @@ def styled_dataframe(
         else _blue_numeric_styles(
             display_table,
             shade_constant=shade_constant,
-            columns=shade_columns,
+            # A column shades against its own values: a single row has nothing to compare and stays plain.
+            columns=(shade_columns or ()) if len(display_table) > 1 else (),
         )
     )
 
@@ -235,14 +213,83 @@ def styled_dataframe(
         display_table.columns,
         format_value,
     )
-    styler = display_table.style
+    index = display_table.index
+    positions = index.nlevels == 1 and index.name is None and pd.api.types.is_integer_dtype(index.dtype)
+    # Only the caller's row heading heads the corner cell; a pandas axis name forms no header row or cell of its own.
+    shown = display_table if row_heading is None else display_table.rename_axis(index=None, columns=row_heading)
+    styler = shown.style
     styler.format(formats)
     styler.apply(lambda _table: styles, axis=None)
-    heading = widgets.HTML(f"<h{heading_level}>{escape(title)}</h{heading_level}>")
+    styler.hide(axis="index", names=True)
+    if row_heading is None:
+        styler.hide(axis="columns", names=True)
+    if positions:
+        styler.hide(axis="index")  # row positions, not row labels
+    shaded = bool((styles != "").to_numpy().any())
+    key = _SHADING_KEY.format("row" if row_local else "column") if keyed and shaded else ""
+    heading = widgets.HTML(f"<h{heading_level}>{escape(title)}</h{heading_level}>{key}")
     return widgets.VBox(
         (heading, widgets.HTML(styler.to_html())),
         layout=widgets.Layout(width="100%", overflow="auto"),
-    )
+    ), shaded
+
+
+def styled_dataframe(
+    table: pd.DataFrame,
+    *,
+    title: str,
+    format_spec: str = "{:.4g}",
+    shade_constant: bool = True,
+    row_local: bool = False,
+    heading_level: int = 2,
+    shade_columns: Sequence[str] | None = None,
+    row_heading: str | None = None,
+) -> widgets.VBox:
+    """
+    Render one analysis table, shaded in the maintained blue style only where the caller opts in.
+
+    A positional index (unnamed integers) is hidden, named row labels stay, and no pandas axis name forms a header row or
+    corner cell of its own; only ``row_heading`` heads the corner cell. A shaded table carries a key under its heading. Text
+    and boolean cells are never shaded.
+
+    Parameters
+    ----------
+    table : pandas.DataFrame
+        Caller-owned table to render without mutation.
+    title : str
+        Human-readable heading escaped before HTML insertion.
+    format_spec : str, optional
+        Pandas Styler format applied to numeric columns.
+    shade_constant : bool, optional
+        Apply a pale fill to constant numeric columns or rows that are shaded. Disable this when constant ones should
+        remain visually neutral.
+    row_local : bool, optional
+        Shade each row, normalized independently across its numeric cells.
+    heading_level : int, optional
+        HTML heading level, from 2 through 4, used for the table title.
+    shade_columns : Sequence[str], optional
+        Shade these columns, each against its own values, when the table has at least two rows; the default shades none. Not
+        combined with ``row_local``.
+    row_heading : str, optional
+        What the rows are («Dataset», «Model»), written in the corner cell above the row labels of a single-level table.
+
+    Returns
+    -------
+    ipywidgets.VBox
+        Heading, with the shading key when a cell is shaded, and the styled HTML table.
+
+    """
+    return _render_table(
+        table,
+        title=title,
+        format_spec=format_spec,
+        shade_constant=shade_constant,
+        row_local=row_local,
+        heading_level=heading_level,
+        shade_columns=shade_columns,
+        keyed=True,
+        row_heading=row_heading,
+    )[0]
 
 
 def grouped_styled_dataframes(
@@ -272,7 +319,7 @@ def grouped_styled_dataframes(
     Returns
     -------
     ipywidgets.VBox
-        Shared heading followed by one or more compact table rows.
+        Shared heading, with the shading key once when a cell is shaded, followed by one or more compact table rows.
 
     """
     selected = tuple(groups)
@@ -282,8 +329,8 @@ def grouped_styled_dataframes(
     if columns <= 0:
         message = "Grouped analysis tables require a positive column count."
         raise ValueError(message)
-    rendered = tuple(
-        styled_dataframe(
+    results = [
+        _render_table(
             table,
             title=group_title,
             format_spec=format_spec,
@@ -291,9 +338,12 @@ def grouped_styled_dataframes(
             row_local=row_local,
             heading_level=3,
             shade_columns=shade_columns,
+            keyed=False,
         )
         for group_title, table in selected
-    )
+    ]
+    rendered = tuple(box for box, _shaded in results)
+    key = _SHADING_KEY.format("row" if row_local else "column") if any(shaded for _box, shaded in results) else ""
     rows = []
     for start in range(0, len(rendered), columns):
         children = rendered[start : start + columns]
@@ -314,6 +364,6 @@ def grouped_styled_dataframes(
             )
         )
     return widgets.VBox(
-        (widgets.HTML(f"<h2>{escape(title)}</h2>"), *rows),
+        (widgets.HTML(f"<h2>{escape(title)}</h2>{key}"), *rows),
         layout=widgets.Layout(width="100%", align_items="stretch"),
     )

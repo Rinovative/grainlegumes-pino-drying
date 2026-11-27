@@ -70,7 +70,6 @@ def _evaluate_physical_partitions(
             metric.update(
                 pred[start:stop],
                 target[start:stop],
-                space="physical",
                 batch_index=batch_index,
                 cases=cases,
             )
@@ -171,7 +170,7 @@ def test_field_metrics_reduce_cases_then_materials_alike_in_validation_and_artif
         cases = learning.metrics.metrics.CaseMembership((case_id,), (material,))
         for metric in metrics.values():
             row = slice(index, index + 1)
-            metric.update(prediction[row], target[row], space="physical", batch_index=index, cases=cases)
+            metric.update(prediction[row], target[row], batch_index=index, cases=cases)
     validation = learning.metrics.metrics.finalize_metrics(metrics)
 
     sums = learning.metrics.metrics.field_statistics(prediction, target, grid_spacing=spacing)
@@ -297,7 +296,7 @@ def test_group_metric_is_task_owned_and_rejects_invalid_scales_or_statistics(
     target = torch.zeros((2, synthetic_task.out_channels, 1, 2), dtype=torch.float64)
     errors = torch.tensor([2.0, 12.0], dtype=torch.float64).reshape(1, -1, 1, 1)
     assert isinstance(metric, learning.metrics.metrics.GroupMacroRMSEMetric)
-    metric.update(target + errors, target, space="physical", batch_index=0, cases=learning.metrics.metrics.CaseMembership(("c1", "c2"), ("A", "A")))
+    metric.update(target + errors, target, batch_index=0, cases=learning.metrics.metrics.CaseMembership(("c1", "c2"), ("A", "A")))
 
     assert metric.fields == synthetic_task.output_names
     assert metric.compute() == pytest.approx(1.5)

@@ -66,7 +66,7 @@ def test_group_objective_weighs_materials_equally_whatever_their_case_counts_and
     )
     for index, (prediction, cases, materials) in enumerate(batches):
         membership = _METRICS.CaseMembership(cases, materials)
-        metric.update(prediction, target[: len(cases)], space="physical", batch_index=index, cases=membership)
+        metric.update(prediction, target[: len(cases)], batch_index=index, cases=membership)
 
     material_a = dict.fromkeys(_TASK.metric_names, 0.5 * (1.0 + 9.0))
     material_b = dict(zip(_TASK.metric_names, (4.0, 16.0, 36.0, 64.0), strict=True))
@@ -79,7 +79,7 @@ def test_group_objective_weighs_materials_equally_whatever_their_case_counts_and
     assert components["T"] == pytest.approx(math.sqrt(population["T"]) / _SCALES[0])
     assert components["grain_moisture"] == pytest.approx(0.5 * (components["w_surf"] + components["w_int"]))
     with pytest.raises(ValueError, match="one case membership per batch row"):
-        metric.update(other, target[:3], space="physical", batch_index=2)
+        metric.update(other, target[:3], batch_index=2)
 
 
 def test_group_objective_rejects_a_case_that_enters_twice() -> None:
@@ -97,8 +97,8 @@ def test_mae_averages_each_case_over_its_states_before_the_materials() -> None:
     second = torch.zeros(1, 4, 1, 2)
     first[:, 0, 0] = torch.tensor([[1.0, -3.0], [10.0, 10.0]])
     second[:, 0, 0] = torch.tensor([5.0, -7.0])
-    metric.update(first, torch.zeros_like(first), space="physical", batch_index=0, cases=_METRICS.CaseMembership(("a1", "b1"), ("A", "B")))
-    metric.update(second, torch.zeros_like(second), space="physical", batch_index=1, cases=_METRICS.CaseMembership(("a1",), ("A",)))
+    metric.update(first, torch.zeros_like(first), batch_index=0, cases=_METRICS.CaseMembership(("a1", "b1"), ("A", "B")))
+    metric.update(second, torch.zeros_like(second), batch_index=1, cases=_METRICS.CaseMembership(("a1",), ("A",)))
     assert metric.compute() == pytest.approx(0.5 * (4.0 + 10.0))
 
 

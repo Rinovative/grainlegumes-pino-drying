@@ -93,8 +93,9 @@ def prepare_dataset_selection(
     package_ids: set[str] = set()
     first_grid: dict[str, Any] | None = None
     steady_conditioning_digest: str | None = None
-    for reference in authored["source_cases"]:
-        admitted = catalog.resolve_raw_case_reference(source_task, reference, storage_root=storage_root)
+    # One call reads each Source's campaign evidence once; every case keeps its own admission checks.
+    admissions = catalog.resolve_raw_case_references(source_task, authored["source_cases"], storage_root=storage_root)
+    for reference, admitted in zip(authored["source_cases"], admissions, strict=True):
         identity = admitted.source_identity
         design = admitted.design_provenance
         if any(identity.get(key) != expected for key, expected in reference.items()):

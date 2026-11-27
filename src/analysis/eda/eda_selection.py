@@ -2,6 +2,8 @@
 
 Responsibilities:
   - Describe one admitted batch through its authoritative simulation profile
+  - Describe one published package, or the cases of one of its materials, through its manifest, with the evaluation role
+    its fixed partition gives the selected cases, labelled «material, role» like the evaluation inventory
   - Materialize and cache validated dataframes only when compatible views need them
   - Retain one session-scoped dataset set and exact shared case selection
   - Resolve profile-derived scientific capabilities without user task selection
@@ -24,8 +26,11 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 
 import pandas as pd
 
-from src import generation
+from src import datasets, generation
+from src.analysis.presentation import analysis_dataset_selection as dataset_selection
+from src.analysis.presentation import analysis_display_labels as display_labels
 
+from . import eda_dataframe as dataframe
 from . import eda_sources as sources
 
 if TYPE_CHECKING:
@@ -41,6 +46,7 @@ _CAPABILITY_TRANSIENT_STATE: GeneratedOutputCapability = "transient_state"
 _CAPABILITY_PHYSICAL_TIME: GeneratedOutputCapability = "physical_time"
 _CAPABILITY_SCHEDULE: GeneratedOutputCapability = "schedule"
 _CAPABILITY_COMPLETION: GeneratedOutputCapability = "completion"
+_NO_SINGLE_ROLE = "no single role"  # the group of a published view whose cases have no one evaluation role (or no partition)
 
 
 def _profile_capabilities(simulation_profile: str) -> frozenset[GeneratedOutputCapability]:
@@ -191,37 +197,73 @@ class GeneratedOutputEDAView:
 
 
 class PublishedDatasetEDAView:
-    """Expose one lazy published package without impersonating Generation evidence."""
+    """
+    Expose one lazy published package, or the cases of one of its materials, without impersonating Generation evidence.
 
-    def __init__(self, *, manifest: dict[str, Any], case_limit: int | None, loader: Callable[[], pd.DataFrame]) -> None:
-        """Bind package membership and a bounded authoritative runtime loader."""
+    ``manifest`` stays the admitted package manifest; a ``material`` view selects only that material's cases and takes its
+    identity, so a mixed-material package shows one series per material in the material's colour.
+    """
+
+    def __init__(
+        self,
+        *,
+        manifest: dict[str, Any],
+        case_limit: int | None,
+        loader: Callable[[], pd.DataFrame],
+        material: str | None = None,
+        label: str | None = None,
+    ) -> None:
+        """Bind package (or package-material) membership, a bounded loader of exactly it, and a ``label`` that replaces the derived one."""
+        self._material = material
+        self._label = label
         self.manifest = manifest
         self._loader = loader
         self._frame: pd.DataFrame | None = None
-        identities = manifest["source_case_identities"]
-        selected = identities if case_limit is None else identities[:case_limit]
-        if not selected:
+        identities = manifest["source_case_identities"] if material is None else dataframe.material_case_identities(manifest, material)
+        self._selected = tuple(identities if case_limit is None else identities[:case_limit])
+        if not self._selected:
             message = "Published Dataset EDA requires at least one source case."
             raise ValueError(message)
         self._case_ids = (
-            tuple(sorted(str(case["source"]["simulation_case_id"]) for case in selected))
+            tuple(sorted(str(case["source"]["simulation_case_id"]) for case in self._selected))
             if self.task_id == "transient_drying"
-            else tuple(str(case["package_case_id"]) for case in selected)
+            else tuple(str(case["package_case_id"]) for case in self._selected)
         )
         if len(set(self._case_ids)) != len(self._case_ids):
             message = "Published Dataset EDA source case identities must be unique."
             raise ValueError(message)
 
     @property
-    def key(self) -> str:
+    def package_key(self) -> str:
         """Return the exact immutable package identity."""
         return str(self.manifest["dataset_id"])
 
     @property
-    def label(self) -> str:
-        """Show the package identity once when the authored name equals it, else the name and the identity."""
+    def key(self) -> str:
+        """Return the package identity, followed by the material of a material view."""
+        return self.package_key if self._material is None else f"{self.package_key}/{self._material}"
+
+    @property
+    def package_label(self) -> str:
+        """Return the package name, followed by its identity in brackets when the two differ."""
         name = str(self.manifest["dataset_name"])
-        return self.key if name == self.key else f"{name} [{self.key}]"
+        return self.package_key if name == self.package_key else f"{name} [{self.package_key}]"
+
+    @property
+    def label(self) -> str:
+        """
+        Return the given label, else the evaluation inventory's «material, role» label («Lentil, ID»).
+
+        A selection without one role reads «material, no single role»; a whole mixed-material package keeps its name, and its
+        identity in brackets when the two differ. The workspace makes equal labels unique by the package name.
+        """
+        if self._label is not None:
+            return self._label
+        if (material := self.material_family) is None:
+            return self.package_label
+        if (role := self.role) is None:
+            return f"{display_labels.material_display_label(material)}, {_NO_SINGLE_ROLE}"
+        return dataset_selection.dataset_label(material, role)
 
     @property
     def task_id(self) -> str:
@@ -235,9 +277,20 @@ class PublishedDatasetEDAView:
 
     @property
     def material_family(self) -> str | None:
-        """Return the package's one material from its validated manifest, or ``None`` for a mixed-material package."""
+        """Return the view's material, else its package's one material, or ``None`` for a whole mixed-material package."""
         materials = self.manifest["materials"]
-        return str(materials[0]) if len(materials) == 1 else None
+        return self._material or (str(materials[0]) if len(materials) == 1 else None)
+
+    @property
+    def role(self) -> str | None:
+        """Return the role (``id``, ``parameter_ood``, ``material_ood``) the fixed partition gives every selected case, else ``None``."""
+        partition = self.manifest["case_partition"]
+        if partition is None:
+            return None
+        members = {str(case["package_case_id"]) for case in self._selected}
+        ood = {stored: role for role, stored in datasets.contracts.partition.OOD_PARTITION_ROLES.items()}
+        roles = {ood.get(stored, "id") for stored in datasets.contracts.partition.CASE_ROLES if members.intersection(partition[stored])}
+        return roles.pop() if len(roles) == 1 else None
 
     @property
     def capabilities(self) -> frozenset[GeneratedOutputCapability]:
@@ -251,7 +304,8 @@ class PublishedDatasetEDAView:
     @property
     def tooltip(self) -> str:
         """Disclose package membership, provenance and deferred hash admission."""
-        return f"Published Dataset: {self.key}; view: {self.task_id}; selected cases: {self.case_count}; payload hash checked on load."
+        scope = "" if self._material is None else f"; material: {self._material} (cases of this material only)"
+        return f"Published Dataset: {self.package_key}{scope}; view: {self.task_id}; selected cases: {self.case_count}; payload hash checked on load."
 
     @property
     def case_ids(self) -> tuple[str, ...]:

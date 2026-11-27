@@ -11,7 +11,7 @@ Responsibilities:
     decodes like the same colour filling a later frame
   - Check that a frame without finite values keeps every colour bar and the error scale fixed over all frames
   - Check that the GIF admission estimate covers the measured peak of all live frame images
-  - Check that the sample title names the compact case, the frame only when comparing, and fits the frame
+  - Check that the sample title names sample or outlier, the compact case and the workspace short label, and fits the frame
   - Check that a field fixed over time draws the pooled state bands in every frame while a free field follows its frame,
     that the norms and the requested fixed fields must agree, that a state bar draws the union of its norms' arrows, and
     that the mean-error line writes its mean positionally in its bar's power of ten
@@ -361,7 +361,7 @@ def test_the_scale_note_says_nothing_about_times_or_fixed_fields() -> None:
         (note,) = (text.get_text() for text in figure.texts if text.get_text().startswith("Colour scales:"))
         texts[lock_scale, fixed] = note
         plt.close(figure)
-    head, tail = "Colour scales: 5th\N{EN DASH}95th percentile", "arrows mark values outside"
+    head, tail = "Colour scales: 5th\N{EN DASH}95th percentile, covered by round bands", "arrows mark values outside"
     assert texts[True, ("T",)] == texts[True, ()] == f"{head}; prediction uses the reference scale; {tail}"
     assert texts[False, ("T",)] == f"{head}; {tail}"
 
@@ -430,14 +430,14 @@ def test_a_constant_frame_never_sets_the_decimals_of_a_bar() -> None:
 
 
 def test_the_mean_error_line_writes_the_power_of_ten_of_its_bar() -> None:
-    """A signed bar of band width 5e-5 m/s labels in [10⁻⁵ m/s]; its mean line says 15 times 10⁻⁵ m/s, a coarse bar the plain value."""
+    """A signed bar of band width 5e-5 m/s labels in [10⁻⁵ m/s]; its mean line says 15.0 times 10⁻⁵ m/s, a coarse bar the plain value."""
     plot_layout = analysis.evaluation.plots.layout
     errors = np.array([1.5e-4, -1.5e-4, np.nan])
     fine = layout.error_format(field_maps.error_boundaries(2e-4 * np.linspace(-1.0, 1.0, 21), signed=True), signed=True)
     assert fine.exponent == -5
     power = "10\N{SUPERSCRIPT MINUS}\N{SUPERSCRIPT FIVE}"
-    assert plot_layout.mean_error_text(errors, unit="m/s", exponent=fine.exponent) == f"mean |e| = 15 \N{MULTIPLICATION SIGN} {power} m/s"
-    assert plot_layout.mean_error_text(errors * 1e4, unit="Pa") == "mean |e| = 1.5 Pa"
+    assert plot_layout.mean_error_text(errors, unit="m/s", exponent=fine.exponent) == f"mean |e| = 15.0 \N{MULTIPLICATION SIGN} {power} m/s"
+    assert plot_layout.mean_error_text(errors * 1e4, unit="Pa") == "mean |e| = 1.50 Pa"
     assert plot_layout.mean_error_text(np.array([np.nan]), unit="Pa") == "mean |e| n/a"
     # Three significant digits stay positional: no e-notation for a large or a tiny mean.
     assert plot_layout.mean_error_text(np.array([1234.0]), unit="Pa") == "mean |e| = 1230 Pa"
@@ -875,25 +875,26 @@ def test_a_frame_without_finite_values_keeps_every_colour_bar_and_the_error_scal
     assert extends[0] == extends[1] == ["min", "min", "neither"]
 
 
-def test_sample_title_names_the_compact_case_and_the_frame_only_when_comparing_and_fits_the_frame() -> None:
-    """A real case key and run frame name stay out of a single-model title, which then lies inside the drawn frame."""
+def test_sample_title_names_the_view_the_compact_case_and_the_workspace_short_label_and_fits_the_frame() -> None:
+    """The title says sample or outlier, names the compact case but not its key, ends with the given short label after the time, and fits."""
     entry = SimpleNamespace(
         material_family="lentil",
-        dataset_role="id",
+        dataset_role="material_ood",
         evaluation_assignment=None,
         case_id="lentil__case_0041__ab0c122b4995",
         case_label="case_0041",
-        frame_name="architecture_comparison__uno_m64x64_h32_l7_p0p1_s1-05-05-1-1-2-2_r0p495__lr-0p000532__a0smp-one-step-transition TEST",
+        frame_name="U-NO · A0 · seed 9 MATERIAL_OOD",
     )
-    single = panel._transient_sample_title(entry, model_label=None)
-    assert "case_0041" in single
+    single = panel._transient_sample_title(entry, outlier=False)
+    assert single.startswith("Selected sample")
+    assert single.endswith("case_0041")
     assert entry.case_id not in single
-    assert entry.frame_name not in single
-    assert "U-NO · A0" in panel._transient_sample_title(entry, model_label="U-NO · A0")
+    assert panel._transient_sample_title(entry, outlier=True).startswith("Largest error")
     record = _record()
     geometry = transient.state_map_geometry(record, state_fields=FIELDS)
     figure, _grid = layout.map_figure(geometry)
-    transient.plot_state_maps(record, state_fields=FIELDS, physical_time=1.0, figure=figure, title_context=single)
+    transient.plot_state_maps(record, state_fields=FIELDS, physical_time=1.0, figure=figure, title_context=single, models=("U-NO · A0 · seed 9",))
+    assert figure.get_suptitle().endswith(" h (U-NO · A0 · seed 9)")
     figure.canvas.draw()
     (title,) = (text for text in figure.texts if text.get_text() == figure.get_suptitle())
     extent = title.get_window_extent(cast("Any", figure.canvas).get_renderer())

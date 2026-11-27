@@ -6,6 +6,8 @@ Responsibilities:
   - Restrict Dataset B to the simulation profile of Dataset A
   - Provide a local optional A/B map-scale lock, a dataset-overview selector, atlas field checkboxes, campaign-outcome filters, and the
     Campaign A/B choice of the paired template comparison
+  - Open the dataset-overview selector on a given Dataset and the campaign filter on a given campaign, named by its task and
+    listed even without candidates
 
 Design principles:
   - Visible labels are concise while values retain canonical immutable keys
@@ -26,6 +28,7 @@ from typing import TYPE_CHECKING, Any, cast
 from src.analysis import presentation, ui
 
 from . import generation_input_diagnostics as diagnostics
+from . import generation_input_labels as labels
 from . import generation_input_selection as shared_selection
 from . import generation_input_sources as sources
 from . import generation_input_table_schema as table_schema
@@ -60,17 +63,17 @@ def _dataset_block(
     profile_ids: Iterable[str] | None = None,
 ) -> ui.selectors.ChoiceBlock:
     """Return a one-of dataset block over the catalog's datasets, grouped by sampling regime."""
-    labels = {key: label for label, key in catalog.dataset_options(profile_ids=profile_ids)}
+    shown = {key: label for label, key in catalog.dataset_options(profile_ids=profile_ids)}
     groups: dict[str, list[tuple[str, sources.DatasetKey]]] = {}
     for dataset in catalog.datasets:
         key = sources.dataset_key(dataset)
-        if key in labels:
-            groups.setdefault(dataset.sampling_regime, []).append((labels[key], key))
+        if key in shown:
+            groups.setdefault(dataset.sampling_regime, []).append((shown[key], key))
     return ui.selectors.ChoiceBlock(
         noun,
         [(presentation.display_labels.regime_display_label(regime), items) for regime, items in groups.items()],
         multiple=False,
-        selected=[selected] if selected in labels else [],
+        selected=[selected] if selected in shown else [],
     )
 
 
@@ -162,7 +165,7 @@ class FieldAtlasControls:
         self._updating = False
         selection = selection_state.selection
         self.status = ui.controls.StatusLine()
-        self.dataset = _dataset_block(catalog, "Datensätze", selection.dataset_a_key)
+        self.dataset = _dataset_block(catalog, "Datasets", selection.dataset_a_key)
         self._case = _CaseSelector(
             catalog, selection.dataset_a_key, selection.case_a_key, description="Case", status=self.status, publish=selection_state.select_case_a
         )
@@ -237,14 +240,14 @@ class PairCaseControls:
         self._updating = True
         selection = selection_state.selection
         self.status = ui.controls.StatusLine()
-        self.dataset_a = _dataset_block(catalog, "Datensatz A", selection.dataset_a_key)
+        self.dataset_a = _dataset_block(catalog, "Dataset A", selection.dataset_a_key)
         self._cases_a = _CaseSelector(
             catalog, selection.dataset_a_key, selection.case_a_key, description="Case A", status=self.status, publish=selection_state.select_case_a
         )
         self.case_a = self._cases_a.navigator
         # Dataset B offers only Dataset A's profile, so every profile has its own block and the matching one is shown.
         self._datasets_b = {
-            profile: _dataset_block(catalog, "Datensatz B", selection.dataset_b_key, profile_ids=(profile,)) for profile in catalog.profiles
+            profile: _dataset_block(catalog, "Dataset B", selection.dataset_b_key, profile_ids=(profile,)) for profile in catalog.profiles
         }
         self._cases_b = _CaseSelector(
             catalog, selection.dataset_b_key, selection.case_b_key, description="Case B", status=self.status, publish=selection_state.select_case_b
@@ -335,13 +338,12 @@ class DatasetControls:
         self,
         catalog: sources.GenerationInputDatasetCatalog,
         *,
-        profile_ids: Iterable[str] | None = None,
+        selected: sources.DatasetKey,
     ) -> None:
-        """Initialize one dataset selector with an immediate valid default."""
+        """Initialize one dataset selector on ``selected``, the panel's Dataset A; a later local choice stays the view's own."""
         self._catalog = catalog
         self._callback: Callable[[], None] | None = None
-        options = catalog.dataset_options(profile_ids=profile_ids)
-        self.dataset = _dataset_block(catalog, "Datensätze", options[0][1] if options else None, profile_ids=profile_ids)
+        self.dataset = _dataset_block(catalog, "Datasets", selected)
         self.status = ui.controls.StatusLine()
         self.rows = (ui.panel.row(self.dataset.header),)
         self.popovers: tuple[ViewPopover, ...] = ((self.dataset.header, self.dataset.body),)
@@ -368,20 +370,32 @@ class DatasetControls:
 class CampaignOutcomeControls:
     """Filter a single discovered campaign checkpoint without storage reads."""
 
-    def __init__(self, catalog: sources.CampaignOutcomeCatalog) -> None:
-        """Retain exact candidate selection independently of successful Dataset pools."""
+    def __init__(self, catalog: sources.CampaignOutcomeCatalog, *, preferred: template.Campaign | None = None) -> None:
+        """Retain exact candidate selection independently of successful Dataset pools; open on ``preferred``, listed even without candidates."""
         self.catalog = catalog
         dropdown = ui.controls.dropdown
-        campaigns = tuple(sorted({(row["task"], row["source_name"]) for row in catalog.rows}))
-        self.campaign = dropdown([(f"{task}/{name}", (task, name)) for task, name in campaigns], description="Campaign")
+        campaigns = sorted({(row["task"], row["source_name"]) for row in catalog.rows} | ({preferred} if preferred is not None else set()))
+        names = labels.campaign_display_labels(catalog.rows, campaigns)
+        self.campaign = dropdown([(names[campaign], campaign) for campaign in campaigns], description="Campaign", value=preferred)
         self.material = dropdown(
-            [("All materials", None), *((name, name) for name in sorted({row["material_family"] for row in catalog.rows}))], description="Material"
+            [
+                ("All materials", None),
+                *(
+                    (presentation.display_labels.material_display_label(name), name)
+                    for name in sorted({row["material_family"] for row in catalog.rows})
+                ),
+            ],
+            description="Material",
         )
         self.outcome = dropdown(
             [("All outcomes", None), ("Successful", "successful"), ("Failed", "failed"), ("Pending", "pending")], description="Outcome"
         )
         self.origin = dropdown(
-            [("All origins", None), *((name, name) for name in sorted({row["origin"] for row in catalog.rows}))], description="Origin"
+            [
+                ("All origins", None),
+                *((presentation.display_labels.humanize_identifier(name), name) for name in sorted({row["origin"] for row in catalog.rows})),
+            ],
+            description="Origin",
         )
         parameters = {
             (name, str(unit))
@@ -400,8 +414,10 @@ class CampaignOutcomeControls:
             selected=[],
             per_line=True,  # the names are long
         )
-        # Candidate evidence follows the filters, so its width covers every candidate the catalog can offer.
-        self.case = dropdown(self._case_options(), description="Evidence", width_texts=[_candidate_label(row) for row in catalog.rows])
+        # Candidate evidence follows the filters, so its width covers every candidate the catalog can offer. A dropdown is built on
+        # one option; the rebind then offers the opened campaign's candidates, none for a campaign without candidates.
+        self.case = dropdown([("", None)], description="Evidence", width_texts=[_candidate_label(row) for row in catalog.rows])
+        self._rebind_case()
         self.status = ui.controls.StatusLine()
         self.rows = (
             ui.panel.row(self.campaign, self.material),
@@ -469,9 +485,9 @@ class TemplateComparisonControls:
         """Offer the campaigns of ``partners``, the result of ``comparable_campaigns``; Campaign B starts on the first partner of A."""
         self.catalog = catalog
         self._partners = partners
-        self._labels = {campaign: f"{campaign[0]}/{campaign[1]}" for campaign in self._partners}
-        texts = list(self._labels.values())
-        self.campaign_a = ui.controls.dropdown([(label, campaign) for campaign, label in self._labels.items()], description="Campaign A")
+        self.captions = labels.campaign_display_labels(catalog.rows, self._partners)  # the dropdowns' and the table titles' names
+        texts = list(self.captions.values())
+        self.campaign_a = ui.controls.dropdown([(label, campaign) for campaign, label in self.captions.items()], description="Campaign A")
         self.campaign_b = ui.controls.dropdown(self._b_options(), description="Campaign B", width_texts=texts)
         self.status = ui.controls.StatusLine()
         self.rows = (ui.panel.row(self.campaign_a, self.campaign_b),)
@@ -492,7 +508,7 @@ class TemplateComparisonControls:
 
     def _b_options(self) -> list[tuple[str, template.Campaign]]:
         """Return the partners of the selected Campaign A."""
-        return [(self._labels[campaign], campaign) for campaign in self._partners[cast("template.Campaign", self.campaign_a.value)]]
+        return [(self.captions[campaign], campaign) for campaign in self._partners[cast("template.Campaign", self.campaign_a.value)]]
 
     def _a_changed(self, _change: dict[str, Any]) -> None:
         """Offer the partners of the new Campaign A, keep Campaign B when it is one of them, then update once."""
@@ -516,8 +532,11 @@ def _rebind(dropdown: widgets.Dropdown, options: list[tuple[str, Any]]) -> None:
     dropdown.options = options
     if previous in {value for _label, value in options}:
         dropdown.value = previous
+    elif options:
+        dropdown.index = 0  # ipywidgets leaves a dropdown without selection (index None) unselected when its options change
 
 
 def _candidate_label(row: dict[str, Any]) -> str:
     """Return the evidence choice text of one campaign candidate."""
-    return f"{row['material_family']}/{row['case_id']} — {row['outcome']}"
+    names = presentation.display_labels
+    return f"{names.material_display_label(row['material_family'])} · {names.case_display_label(row['case_id'])} — {row['outcome']}"

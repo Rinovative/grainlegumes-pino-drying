@@ -7,6 +7,8 @@ Responsibilities:
   - Derive task-fixed channels, defaults, objective, and task-contract digest
   - Record the running training and model digests as a fresh config's ``producer`` evidence and preserve them on saved configs
   - Construct dataloaders from an already resolved configuration, capping their workers at the CPUs available to the process
+  - Resolve a config's pinned Dataset folders and admit them read-only for a continuation by its loaders' steps before a
+    payload, against its saved split
   - Atomically save resolved YAML and derive the run layout and observer organization from the config source
 
 Design principles:
@@ -40,7 +42,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from io import StringIO
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import yaml
 
@@ -355,15 +357,19 @@ def load_yaml(path: Path | str) -> dict[str, Any]:
     FileNotFoundError
         If `path` does not exist.
     ConfigError
-        If the YAML root is not a mapping.
+        If the file is no valid YAML, chained from the parser's error, or the YAML root is not a mapping.
 
     """
     source_path = Path(path)
     if not source_path.exists():
         msg = f"Config file not found: {source_path}"
         raise FileNotFoundError(msg)
-    with source_path.open(encoding="utf-8") as stream:
-        payload = yaml.safe_load(stream) or {}
+    try:
+        with source_path.open(encoding="utf-8") as stream:
+            payload = yaml.safe_load(stream) or {}
+    except yaml.YAMLError as error:
+        msg = f"Config file is no valid YAML: {source_path}: {error}"
+        raise ConfigError(msg) from error
     if not isinstance(payload, Mapping):
         msg = f"YAML root must be a mapping: {source_path}"
         raise ConfigError(msg)
@@ -1783,6 +1789,105 @@ def _effective_num_workers(configured: int) -> int:
     return effective
 
 
+def dataset_storage_root(config: Mapping[str, Any]) -> str:
+    """
+    Return the storage root below which the loaders of a resolved config read its Datasets.
+
+    Transient drying reads below ``paths.storage_root``, steady flow below the storage root whose Dataset area is
+    ``paths.dataset_root``.
+    """
+    if config["task"] == "transient_drying":
+        return str(config["paths"]["storage_root"])
+    return str(common.paths.storage_root_for_datasets_root(config["paths"]["dataset_root"]))
+
+
+def pinned_dataset_dirs(config: Mapping[str, Any]) -> tuple[Path, ...]:
+    """Return the folders of the Datasets a resolved config pins below its loaders' storage root, the training Dataset's first."""
+    dataset_root = common.paths.get_datasets_root(storage_root=dataset_storage_root(config))
+    return tuple(
+        common.paths.resolve_dataset_dir(str(config["task"]), dataset_id, dataset_root=dataset_root)
+        for dataset_id in (config["data"]["train_dataset"], *config["data"]["material_ood_datasets"])
+    )
+
+
+def admit_pinned_datasets(config: Mapping[str, Any], split_indices: Mapping[str, Any]) -> None:
+    """
+    Admit, read-only, the Datasets a resolved config pins by its loaders' steps before they open a payload.
+
+    The steps of :func:`create_dataloaders_from_config` for both tasks: its storage root, each pinned manifest and its
+    binding, the training partition, the declared evaluation assignments, the Train grid, the role leakage, and the
+    split rebuilt from them, which must equal the saved ``split_indices``. The payloads are neither opened nor rehashed,
+    so their own identities and the transient item expansion are the saved split's; ``split_indices`` names every
+    pinned Dataset, as a resume admission has checked.
+
+    Raises
+    ------
+    ValueError, TypeError
+        If a pinned Dataset contradicts its contracts or the saved split, or a manifest lacks a key or an item its schema
+        reads (a ``LookupError`` of the steps that read only the manifests, which names them).
+    OSError
+        If a Dataset cannot be read.
+
+    """
+    task = validate_resolved_task_contract(config).id
+    data_cfg = _as_mapping(config.get("data"), path="data")
+    storage_root = dataset_storage_root(config)
+    train_id, material_ood_ids = data_cfg["train_dataset"], tuple(data_cfg["material_ood_datasets"])
+    splits = datasets.preprocessing.splits
+    try:
+        bindings = {
+            dataset_id: datasets.contracts.identity.manifest_binding(
+                datasets.packages.load_package_manifest_evidence(task, dataset_id, storage_root=storage_root)
+            )
+            for dataset_id in (train_id, *material_ood_ids)
+        }
+        train = bindings[train_id]
+        fixed = datasets.contracts.partition.validate_training_partition(
+            train.case_partition,
+            dataset_id=train_id,
+            case_ids=train.case_ids,
+            material_by_case=train.materials,
+            design_kind_by_case=train.design_kinds,
+        )
+        assignments = datasets.packages.declared_evaluation_assignments(task, train_id, material_ood_ids, storage_root=storage_root)
+        datasets.contracts.identity.require_train_grid(train, [bindings[dataset_id] for dataset_id in material_ood_ids])
+        parts = {
+            role: [
+                (
+                    bindings[item["dataset_id"]],
+                    datasets.contracts.partition.evaluation_cases(cast("Mapping[str, Any]", bindings[item["dataset_id"]].case_partition), role),
+                    item,
+                )
+                for item in assignments[role]
+            ]
+            for role in splits.OOD_SPLIT_ROLES
+        }
+        splits.reject_role_leakage(
+            train, fixed, {role: [(binding, case_ids) for binding, case_ids, _ in parts[role]] for role in splits.OOD_SPLIT_ROLES}
+        )
+    except LookupError as error:
+        manifests = " or ".join(str(directory / common.paths.DATASET_MANIFEST_FILENAME) for directory in pinned_dataset_dirs(config))
+        msg = f"Dataset manifest is malformed: {manifests}: {type(error).__name__}: {error}."
+        raise ValueError(msg) from error
+    saved = splits.admit_split(split_indices)
+    saved_identities = {part.dataset_id: part.dataset for part in (saved.train, *saved.material_ood, *saved.parameter_ood)}
+
+    def split_identity(binding: datasets.contracts.identity.ManifestBinding) -> dict[str, Any]:
+        # The saved payload identity under the current manifest binding, as the payload is not opened.
+        return {**saved_identities[binding.dataset_id], **binding.split_identity()}
+
+    rebuilt = splits.build_split(
+        task=task,
+        train_dataset=split_identity(train),
+        case_partition=fixed,
+        train_subset=data_cfg["train_subset"],
+        material_by_case=train.materials,
+        ood_parts={role: [(split_identity(binding), case_ids, item) for binding, case_ids, item in parts[role]] for role in splits.OOD_SPLIT_ROLES},
+        extension=saved.extension,
+    )
+    splits.resolve_split(rebuilt, split_indices)
+
+
 def create_dataloaders_from_config(
     config: dict[str, Any],
     *,
@@ -1867,7 +1972,7 @@ def create_dataloaders_from_config(
             units_per_update=config["training"]["units_per_update"],
             memory_batch=config["training"]["memory_batch"],
             model_sha256=model_sha256,
-            storage_root=config["paths"]["storage_root"],
+            storage_root=dataset_storage_root(config),
             spatial_stride=data_cfg["spatial_stride"],
             loader_seed=seed_plan["loader"],
             worker_seed=seed_plan["worker"],
@@ -1891,7 +1996,7 @@ def create_dataloaders_from_config(
         train_subset=data_cfg["train_subset"],
         task=task,
         model_sha256=model_sha256,
-        storage_root=common.paths.storage_root_for_datasets_root(config["paths"]["dataset_root"]),
+        storage_root=dataset_storage_root(config),
         spatial_stride=data_cfg["spatial_stride"],
         units_per_update=config["training"]["units_per_update"],
         memory_batch=config["training"]["memory_batch"],

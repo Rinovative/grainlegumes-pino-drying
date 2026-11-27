@@ -6,6 +6,9 @@ Responsibilities:
     counted records end exactly at the checkpoint's global step, and live non-finite metric classification
   - Check the one guarded float conversion of read and live values, counts integral as written, and the refusal of
     a linked history file
+  - Check that the reconciliation classifies its read of the history as the resume admission does, a missing or
+    malformed history as the run's state and any other failed read as the job's environment, and its truncation write
+    as the attempt's own persistence, which the run service marks as the job's environment
 
 Design principles:
   - Admission is exact and read-only; only reconciliation against a restored last checkpoint rewrites the file,
@@ -17,14 +20,16 @@ This module does NOT:
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from src import common
+from src import common, experiments
 from src.learning.training import learning_training_history as history
 
 # Epoch ``e`` ends at optimizer step ``_EPOCH_STEPS * e``; validation point ``p`` of epoch 1 lies at step ``p``.
@@ -234,6 +239,54 @@ def test_reconcile_history_truncates_records_ahead_of_the_checkpoint_only(tmp_pa
     _write_history(tmp_path, _history_payload(_identity("other"), epochs=2, points=(5, 10)))
     with pytest.raises(ValueError, match="identity"):
         history.reconcile_history(tmp_path, **binding, completed_epoch=2, validations=entries)
+
+
+@pytest.mark.parametrize("failure", ["missing", "malformed", "unreadable", "write"])
+def test_the_reconciliation_reads_the_history_as_the_admission_does_and_only_its_write_is_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """
+    The reconciliation reads the history as the resume admission does: missing or malformed it is the run's state.
+
+    Any other failed read is the job's environment there as in the admission, and so is a failed truncation write, the
+    attempt's own persistence: the run service marks such an ``OSError`` as the job's environment, which interrupts the
+    attempt for a rerun that continues it from its intact last checkpoint. The history's state refuses the admission and,
+    as a ``ValueError``, fails the attempt, because every rerun meets that history again.
+    """
+    identity = _identity()
+    # The last counts epoch 1 and its points 5 and 10; the record of epoch 2 lies ahead of it and is truncated.
+    binding = {"task": "steady_flow", "run_name": "run", "checkpoint_identity": identity, "global_step": _EPOCH_STEPS}
+    counted = {"completed_epoch": 1, "validations": _objective_history((5, 10))}
+    if failure != "missing":
+        _write_history(tmp_path, _history_payload(identity, epochs=2, points=(5, 10)))
+    if failure == "malformed":
+        history.history_path(tmp_path).write_text("{", encoding="utf-8")
+    read_text = Path.read_text
+
+    def unreadable(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == history.history_path(tmp_path):
+            raise OSError(errno.EIO, "Input/output error")
+        return read_text(path, *args, **kwargs)
+
+    def full_disk(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    if failure == "unreadable":
+        monkeypatch.setattr(Path, "read_text", unreadable)
+    if failure == "write":
+        monkeypatch.setattr(common.serialization, "atomic_write_json", full_disk)
+    state = failure in {"missing", "malformed"}
+    if failure != "write":
+        # The resume admission reads the same file read-only: the run's state refuses it, the job's environment keeps its error.
+        with pytest.raises((OSError, experiments.run.ContinuationRefusedError)) as admitted, experiments.run._refused_by_state():
+            history.validate_resume_history(tmp_path, **binding, **counted)
+        assert isinstance(admitted.value, experiments.run.ContinuationRefusedError) is state
+    with pytest.raises((OSError, ValueError)) as ended, experiments.run._own_persistence():
+        history.reconcile_history(tmp_path, **binding, **counted)
+
+    assert isinstance(ended.value, OSError) is not state
+    assert experiments.run.interrupted_by_environment(ended.value) is not state
+    assert experiments.run._failure_status(ended.value, None) == ("failed" if state else "interrupted")
 
 
 @pytest.mark.parametrize(

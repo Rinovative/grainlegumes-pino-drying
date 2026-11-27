@@ -8,11 +8,12 @@ Responsibilities:
   - Record B's validation schedule from its admitted history, bound to its last checkpoint's work, which A1 replays
   - Report B's optimisation seconds, which budget nothing, and bind the one GPU model of the B/A1 pair
   - Validate the exact receipt keys, field types and their agreement with B's transitions and budget total
-  - Publish one receipt and admit it before its selected A1 continuation
+  - Publish one receipt, and compare a copy with it read-only before its selected A1 continuation
 
 Design principles:
   - A canonical JSON digest binds the complete receipt payload
-  - Publication accepts an existing destination only when its bytes are identical
+  - One encoding: publication accepts an existing destination only when its bytes are identical, and a copy's comparison
+    reads the same bytes without ever writing
   - Parent, handoff, and B run identities must match the requested continuation
 
 This module does NOT:
@@ -25,6 +26,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import stat
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -38,6 +40,8 @@ from src.learning.transient import learning_transient_handoff as transient_hando
 from . import experiments_run_identity as run_identity
 
 RECEIPT_NAME = "b_train_budget_receipt.json"
+# The prefix of the temporary each publication writes before it links the receipt; a killed publication leaves it.
+RECEIPT_TEMPORARY_PREFIX = ".b-budget-"
 _SCHEMA_KIND = "matched_a1_b_train_budget"
 _SHA256_LENGTH = 64
 _PROTOCOL_MATCHED = "matched_a1_b"
@@ -183,7 +187,7 @@ def pair_device(sessions: object) -> dict[str, str | None]:
     sessions name several is refused here.
     """
     if not isinstance(sessions, list) or not sessions or not all(isinstance(session, Mapping) for session in sessions):
-        msg = "Finished B lacks its runtime sessions."
+        msg = "B records no runtime session of its attempts, so their GPU model is unknown."
         raise ValueError(msg)
     devices = {json.dumps(transient_handoff.device_evidence(session), sort_keys=True) for session in sessions}
     if len(devices) != 1:
@@ -337,27 +341,47 @@ def validate_b_receipt(value: object) -> dict[str, Any]:
     return dict(value)
 
 
+def _encoded_b_receipt(receipt: Mapping[str, Any]) -> bytes:
+    """Return a valid receipt's one encoding: the bytes its publication writes and every copy of it holds."""
+    validated = validate_b_receipt(dict(receipt))
+    return (json.dumps(validated, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+
+
+def verify_b_receipt_copy(run_dir: Path | str, receipt: Mapping[str, Any]) -> bool:
+    """
+    Compare the receipt copy in ``run_dir`` with ``receipt`` without ever writing; return whether a copy exists.
+
+    A copy is a regular file holding exactly the published bytes: a symlink, another file type or other bytes raise
+    ``FileExistsError``, and a copy that vanishes between this check and its read raises ``FileNotFoundError``.
+    """
+    path = Path(run_dir) / RECEIPT_NAME
+    encoded = _encoded_b_receipt(receipt)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(mode) or path.read_bytes() != encoded:
+        msg = f"Immutable B budget receipt differs: {path}"
+        raise FileExistsError(msg)
+    return True
+
+
 def publish_b_receipt(run_dir: Path | str, receipt: Mapping[str, Any]) -> Path:
     """Publish once; a repeat accepts only exact identical receipt bytes."""
     path = Path(run_dir) / RECEIPT_NAME
-    validated = validate_b_receipt(dict(receipt))
-    encoded = (json.dumps(validated, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
-    if path.exists() or path.is_symlink():
-        if path.is_file() and not path.is_symlink() and path.read_bytes() == encoded:
-            return path
-        msg = f"Immutable B budget receipt differs: {path}"
-        raise FileExistsError(msg)
-    descriptor, temporary = tempfile.mkstemp(prefix=".b-budget-", dir=path.parent)
+    if verify_b_receipt_copy(run_dir, receipt):
+        return path
+    descriptor, temporary = tempfile.mkstemp(prefix=RECEIPT_TEMPORARY_PREFIX, dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as stream:
-            stream.write(encoded)
+            stream.write(_encoded_b_receipt(receipt))
             stream.flush()
             os.fsync(stream.fileno())
         os.link(temporary, path)
-    except FileExistsError as error:
-        if not path.is_file() or path.is_symlink() or path.read_bytes() != encoded:
-            msg = f"Immutable B budget receipt differs: {path}"
-            raise FileExistsError(msg) from error
+    except FileExistsError:
+        # Published concurrently: only the same bytes are accepted.
+        if not verify_b_receipt_copy(run_dir, receipt):
+            raise
     finally:
         Path(temporary).unlink()
     return path

@@ -2,6 +2,12 @@
 
 Responsibilities:
   - Check completed-source dispatch, exact-time trajectories, target outcomes, and spatial maps
+  - Check that state trajectories take the documented drying windows: one below 72 h, else the first day in hours, the middle
+    in days and the last day before each distinct case end, with the cases counted per window; and that the authored
+    schedules keep their start-up and exact-support clock up to an exact stop between stored states
+  - Check that a time without a two-case neighbour draws its whole q10-q90 range as one unclipped interval, and that the count
+    strip steps through every stored time of a window with its contributing cases
+  - Check that an emptied time axis clears only its own time, never the availability message on the shared status line
   - Check the aggregate state rows over the drying phase: reached cases only at their nearest stored states, censored ones
     named, schedules kept in hours, and the phase offered only where every case carries completion evidence
 
@@ -25,8 +31,10 @@ import numpy as np
 import pandas as pd
 import pytest
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.colors import BoundaryNorm
 from matplotlib.figure import Figure
+from matplotlib.text import Text
 
 from src import common, datasets, domain, generation
 from src.analysis.catalog import analysis_catalog_transient as catalog_transient
@@ -222,6 +230,28 @@ def test_physical_time_channel_and_view_control_contracts(
     assert _is_shown(trajectory_viewer, "Case")
     assert not _is_shown(trajectory_viewer, "Cases")
     assert not any(getattr(widget, "description", "") == "Time [h]" for widget in _walk_widgets(trajectory_viewer))
+
+
+def test_leaving_a_transient_snapshot_for_a_steady_only_selection_keeps_the_availability_message(
+    transient_frame: pd.DataFrame, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The emptied time axis clears only its own time from the shared status line, never the controls' availability message."""
+    monkeypatch.setattr(viewers.ui.viewers, "render_view", lambda *_args, **_kwargs: True)
+    timed = _adaptive_catalog((("Drying · Lentil · fg · ID", transient_frame),))
+    profile = {"batch_id": "steady", "simulation_profile": "steady_flow", "available_learning_views": ("steady_flow",)}
+    first = timed.views[0]
+    assert isinstance(first, selection.GeneratedOutputEDAView)
+    batch = cast("Any", SimpleNamespace(**{**vars(first.batch), **profile}))
+    steady = selection.GeneratedOutputEDAView(label="Airflow · Lentil", batch=batch, case_limit=None, loader=pd.DataFrame)
+    catalog = selection.GeneratedOutputEDACatalog((*timed.views, steady), source_catalog=timed.source_catalog)
+    state = selection.GeneratedOutputSelectionState(catalog)
+    state.select_datasets((timed.views[0].key,))
+    view = viewers.make_transient_case_view(
+        catalog=catalog, selection_state=state, kind="snapshot", export_state=None, export_plot_name=None, export_title=None
+    )
+    assert view.status.text.startswith("Time")
+    state.select_datasets((steady.key,))
+    assert view.status.text == "No selected datasets provide this diagnostic."
 
 
 def _walk_widgets(widget: Any) -> tuple[Any, ...]:
@@ -570,45 +600,50 @@ def test_supported_schedule_stops_at_exact_final_time_without_mutating_source(
         series.value_at(exact_final + 1.0e-6)
 
 
-def test_aggregate_schedule_drops_completed_cases_without_forward_fill(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Aggregate only schedules whose exact simulated support includes the time."""
-    supported = {
-        "short": transient.SupportedScheduleSeries(
+def test_aggregate_schedule_drops_completed_cases_without_forward_fill() -> None:
+    """Aggregate only schedules whose exact simulated support includes the time, in the main and the start-up window of the schedules."""
+    supported = (
+        transient.SupportedScheduleSeries(
             quantity="T_in_bc",
             unit="K",
             physical_time_hours=np.asarray((0.0, 1.0, 1.25)),
             values=np.asarray((290.0, 291.0, 291.25)),
             final_time_hours=1.25,
         ),
-        "long": transient.SupportedScheduleSeries(
+        transient.SupportedScheduleSeries(
             quantity="T_in_bc",
             unit="K",
             physical_time_hours=np.asarray((0.0, 1.0, 2.0, 2.5)),
             values=np.asarray((300.0, 301.0, 302.0, 302.5)),
             final_time_hours=2.5,
         ),
-    }
-    monkeypatch.setattr(
-        transient_plots.transient,
-        "supported_schedule_series",
-        lambda _frame, case_id, _quantity: supported[case_id],
     )
-    frame = pd.DataFrame(index=pd.Index(("short", "long"), name="sample_id"))
+    main, startup = transient_plots.time_axis.STARTUP_WINDOWS
 
-    physical_time, q10, median, q90, contributors = transient_plots._aggregate_supported_schedule(
-        frame,
-        ("short", "long"),
-        "T_in_bc",
-    )
+    physical_time, q10, median, q90, contributors = transient_plots._aggregate_supported_schedule(supported, main)
 
-    np.testing.assert_allclose(physical_time, (0.0, 1.0, 1.25, 2.0, 2.5))
-    np.testing.assert_array_equal(contributors, (2, 2, 2, 1, 1))
+    np.testing.assert_allclose(physical_time, (1.0, 1.25, 2.0, 2.5))
+    np.testing.assert_array_equal(contributors, (2, 2, 1, 1))
     assert physical_time[-1] == pytest.approx(2.5)
     assert median[-1] == pytest.approx(302.5)
     assert q10[-1] == pytest.approx(302.5)
     assert q90[-1] == pytest.approx(302.5)
+    early_time, *_quantiles, early_contributors = transient_plots._aggregate_supported_schedule(supported, startup)
+    np.testing.assert_allclose(early_time, (0.0, 1.0))
+    np.testing.assert_array_equal(early_contributors, (2, 2))
+
+
+def test_a_sparse_schedule_draws_its_segment_on_both_sides_of_the_startup_boundary() -> None:
+    """A schedule with nodes only at 0 h and its stop at 24.5 h gets the 1 h edge in both windows, so each draws its segment."""
+    sparse = transient.SupportedScheduleSeries(
+        quantity="T_in_bc", unit="K", physical_time_hours=np.asarray((0.0, 24.5)), values=np.asarray((290.0, 339.0)), final_time_hours=24.5
+    )
+    main, startup = transient_plots.time_axis.STARTUP_WINDOWS
+    for window, expected in ((startup, (0.0, 1.0)), (main, (1.0, 24.5))):
+        times, _q10, median, _q90, contributors = transient_plots._aggregate_supported_schedule((sparse,), window)
+        np.testing.assert_allclose(times, expected)
+        np.testing.assert_allclose(median, [290.0 + 2.0 * hour for hour in expected])
+        np.testing.assert_array_equal(contributors, (1, 1))
 
 
 def test_inlet_pressure_profile_uses_the_authoritative_spatial_coordinate(
@@ -647,30 +682,228 @@ def test_trajectory_time_views_split_exact_support_at_one_hour() -> None:
     np.testing.assert_array_equal(values, original_values)
 
 
-def test_trajectory_view_draws_its_main_and_startup_windows_through_the_shared_time_helper(transient_frame: pd.DataFrame) -> None:
-    """Every row has the helper's two windows: titles on the top row, main from hour 1, startup 0-1 h on a shared y, time label at the bottom."""
+def _frame_at_hours(stored: list[np.ndarray]) -> pd.DataFrame:
+    """Return the catalog's synthetic Source frame with one case per entry of ``stored``, its states and schedule at exactly those hours."""
+    cases = []
+    for position, hours in enumerate(stored):
+        case = cast("dict[str, Any]", catalog_transient._eda_case(position, 0.0))
+        case["state_trajectories"] = {
+            name: np.stack([states[0] * (1.0 + 0.001 * step) for step in range(hours.size)]) for name, states in case["state_trajectories"].items()
+        }
+        horizon = max(float(item[-1]) for item in stored)
+        valid = {"valid_state_mask": np.ones(hours.size, dtype=bool), "trajectory_length": hours.size, "configured_horizon_hours": horizon}
+        case["time"] = {**case["time"], "regular_state_hours": hours, **valid}
+        case["schedule"] = {"t": hours, "T_in_bc": 300.0 + hours / 10.0, "omega_in_bc": np.full(hours.size, 0.006)}
+        case["completion"] = {**case["completion"], "physical_duration_hours": float(hours[-1])}
+        cases.append(case)
+    frame = pd.DataFrame(cases, index=pd.Index([f"case_{position:04d}" for position in range(1, len(stored) + 1)], name="sample_id"))
+    frame.attrs.update(copy.deepcopy(next(iter(catalog_transient._eda_datasets().values())).attrs))
+    return frame
+
+
+def _hourly_frame(ends: tuple[float, ...]) -> pd.DataFrame:
+    """Return the synthetic frame of ``_frame_at_hours`` with one case per entry of ``ends``, stored hourly and at its end."""
+    return _frame_at_hours([np.r_[np.arange(0.0, np.ceil(end)), end] for end in ends])
+
+
+def _summary_state_row(frame: pd.DataFrame) -> tuple[Figure, list[Axes], list[Axes]]:
+    """Draw the aggregate temperature trajectories of a ``_frame_at_hours`` frame and return the figure, its state row and its count strip."""
+    label = "Lentil, ID"
+    figure = transient_plots.plot_state_trajectory_summary(
+        datasets={label: frame}, max_cases=len(frame), styles=transient_plots.batch_styles({label: "lentil"}), channels=("T",)
+    )
+    return figure, figure.axes[-6:-3], figure.axes[-3:]  # the windows of the last row and of its count strip
+
+
+def test_a_window_of_one_stored_time_draws_its_state_and_count_as_unclipped_points_and_one_case_no_range() -> None:
+    """
+    A case stored hourly to 24 h, then at 48 h and at its 96 h end: the middle and the last window hold one time each.
+
+    A line needs two times, so each draws its state and its count as a point, unclipped, as a lone time may sit on the window's
+    frame; the first window keeps its line. One contributing case draws no q10-q90 range anywhere.
+    """
+    figure, state, strip = _summary_state_row(_frame_at_hours([np.r_[np.arange(25.0), 48.0, 96.0]]))
+    try:
+        for row in (state, strip):
+            lines = [axis.get_lines()[0] for axis in row]
+            assert [line.get_marker() for line in lines] == ["None", "o", "o"]
+            assert [line.get_clip_on() for line in lines] == [True, False, False]
+            assert [np.asarray(line.get_xdata()).tolist() for line in lines[1:]] == [[48.0], [96.0]]
+        assert not any(collection.get_paths() for axis in state for collection in axis.collections)
+    finally:
+        plt.close(figure)
+
+
+def test_a_time_whose_neighbours_lack_a_second_case_draws_its_range_as_one_unclipped_interval_and_no_band() -> None:
+    """
+    Two cases share the hours of the first day, 48 h and the 96 h end; only one of them also stores 36 h and 60 h.
+
+    A band needs adjacent times with two contributing cases: the first day keeps its band, while 48 h (between the single-case 36 h
+    and 60 h) and the end (the last window's only time) each draw their range as one vertical interval, unclipped, and no band,
+    from the q10 to the q90 of the two cases' displayed means at that time. The count strip steps through every stored time of
+    a window with its number of contributing cases.
+    """
+    frame = _frame_at_hours([np.r_[np.arange(25.0), 36.0, 48.0, 60.0, 96.0], np.r_[np.arange(25.0), 48.0, 96.0]])
+    means = [capabilities.field_display_trajectory(frame, capabilities.case_row(frame, case), "T")[:2] for case in frame.index]
+    figure, (first, middle, last), strip = _summary_state_row(frame)
+    try:
+        assert any(isinstance(collection, PolyCollection) for collection in first.collections)
+        assert not any(isinstance(collection, LineCollection) for collection in first.collections)
+        for axis, hour in ((middle, 48.0), (last, 96.0)):
+            assert not any(isinstance(collection, PolyCollection) for collection in axis.collections)
+            (interval,) = [collection for collection in axis.collections if isinstance(collection, LineCollection)]
+            q10, q90 = np.quantile([float(values[times == hour][0]) for times, values in means], (0.1, 0.9))
+            assert q10 < q90
+            (segment,) = interval.get_segments()
+            np.testing.assert_allclose(segment, [[hour, q10], [hour, q90]], rtol=1e-12)
+            assert not interval.get_clip_on()
+        steps = [axis.get_lines()[0] for axis in strip]
+        assert {line.get_drawstyle() for line in steps} == {"steps-post"}
+        assert [(np.asarray(line.get_xdata()).tolist(), np.asarray(line.get_ydata()).tolist()) for line in steps] == [
+            (np.arange(25.0).tolist(), [2] * 25),
+            ([36.0, 48.0, 60.0], [1, 2, 1]),
+            ([96.0], [2]),
+        ]
+    finally:
+        plt.close(figure)
+
+
+def test_a_case_below_72_h_shows_its_states_in_one_whole_run_window_without_a_startup_panel(transient_frame: pd.DataFrame) -> None:
+    """A run below 72 h has one state window from 0 h to its last stored state in hours; no start-up panel stands beside it."""
     label = "Drying · Lentil · ID"
     figure = transient_plots.plot_state_trajectory_comparison(
         datasets={label: transient_frame}, case_ids={label: "case_0001"}, styles=transient_plots.batch_styles({label: None}), channels=("T",)
     )
     try:
-        windows = transient_plots.time_axis.STARTUP_WINDOWS
-        grid = [
-            axis for axis in figure.axes if axis.axison and (spec := axis.get_subplotspec()) is not None and spec.get_gridspec().ncols == len(windows)
-        ]
-        main, startup = grid[0::2], grid[1::2]  # row-major: the main and the startup axis of each row
-        assert len(main) == len(startup) > 1
-        assert [main[0].get_title(), startup[0].get_title()] == [window.title for window in windows]
-        assert all(axis.get_xlim()[0] == 1.0 for axis in main)
-        assert all(axis.get_xlim() == (0.0, 1.0) for axis in startup)
-        for main_axis, startup_axis in zip(main, startup, strict=True):
-            assert main_axis.get_shared_y_axes().joined(main_axis, startup_axis)
-            assert not startup_axis.yaxis.get_tick_params()["labelleft"]
-        assert all(axis.get_xlabel() == "" and not axis.xaxis.get_tick_params()["labelbottom"] for axis in (*main[:-1], *startup[:-1]))
-        assert main[-1].get_xlabel().startswith("Time")
-        assert startup[-1].get_xlabel() == "Time [h]"
+        end = transient.available_physical_times(transient_frame, "case_0001", include_exact_stop=False)[-1]
+        (window,) = transient_plots.time_axis.drying_windows(end, before_end=False)
+        (state,) = [axis for axis in figure.axes if cast("Any", axis.get_subplotspec()).get_gridspec().ncols == 1]
+        assert (state.get_title(), state.get_xlim(), state.get_xlabel()) == (window.title, (0.0, end), "Time [h]")
     finally:
         plt.close(figure)
+
+
+def _stopped_between_stored_states() -> pd.DataFrame:
+    """Return the catalog's reached Source case with its states stored at 0, 1 and 24 h, its exact stop at 24.5 h and schedule nodes to 48 h."""
+    case = cast("dict[str, Any]", catalog_transient._eda_case(0, 0.0))
+    case["exact_stop"] = {"time_hours": 24.5, "state": {name: states[-1] for name, states in case["state_trajectories"].items()}}
+    case["schedule"] = {**case["schedule"], "t": np.asarray((0.0, 1.0, 48.0))}
+    case["completion"] = {**case["completion"], "physical_duration_hours": 24.5}
+    frame = pd.DataFrame([case], index=pd.Index(["case_0001"], name="sample_id"))
+    frame.attrs.update(copy.deepcopy(next(iter(catalog_transient._eda_datasets().values())).attrs))
+    return frame
+
+
+def test_schedules_keep_their_start_up_and_exact_support_clock_up_to_a_stop_between_stored_states() -> None:
+    """
+    With states stored to 24 h and the exact stop at 24.5 h, the state row takes the drying window to 24 h.
+
+    The authored schedules keep their start-up window and their main window up to the exact stop, as one exact case and as
+    the aggregate with its count strips.
+    """
+    frame = _stopped_between_stored_states()
+    label = "Lentil, ID"
+    styles = transient_plots.batch_styles({label: "lentil"})
+    figures = (
+        transient_plots.plot_state_trajectory_comparison(datasets={label: frame}, case_ids={label: "case_0001"}, styles=styles, channels=("T",)),
+        transient_plots.plot_state_trajectory_summary(datasets={label: frame}, max_cases=1, styles=styles, channels=("T",)),
+    )
+    try:
+        windows = transient_plots.time_axis.STARTUP_WINDOWS
+        for figure in figures:
+            specs = {axis: cast("Any", axis.get_subplotspec()) for axis in figure.axes}
+            schedules = [axis for axis, spec in specs.items() if spec.get_gridspec().ncols == len(windows)]
+            assert [axis.get_title() for axis in schedules[: len(windows)]] == [window.title for window in windows]
+            main = [axis for axis in schedules if specs[axis].colspan.start == 0]  # every schedule row and count strip of the main window
+            assert all(np.asarray(axis.get_lines()[-1].get_xdata())[-1] == 24.5 for axis in main)
+            assert all(axis.get_xlim() == (1.0, 24.5) for axis in main)
+            assert all(axis.get_xlim() == (0.0, 24.0) for axis, spec in specs.items() if spec.get_gridspec().ncols == 1)
+    finally:
+        for figure in figures:
+            plt.close(figure)
+
+
+def test_aggregate_trajectories_of_unequal_runs_share_the_documented_windows_and_count_the_last_day_before_each_end() -> None:
+    """
+    Runs of 100 h, 80.5 h, 40 h and 20 h share the first 24 h in hours, the middle in days and the last 24 h before each end.
+
+    Every stored hour lies in one window: all four cases count in the first day up to the 20 h case's end; the 80.5 h case
+    leaves the middle after its own cutoff at 56.5 h and holds the last day on half hours before its end; the 40 h case enters
+    the last day after hour 24; every terminal state meets at 0 h before the end. The key names the datasets and the
+    statistics drawn.
+    """
+    frame = _hourly_frame((100.0, 80.5, 40.0, 20.0))
+    figure = transient_plots.plot_state_trajectory_summary(
+        datasets={"Lentil, ID": frame}, max_cases=4, styles=transient_plots.batch_styles({"Lentil, ID": "lentil"}), channels=("T",)
+    )
+    try:
+        windows = transient_plots.time_axis.drying_windows(100.0, before_end=True)
+        assert [axis.get_title() for axis in figure.axes[-6:-3]] == [window.title for window in windows]  # the state row, the last one
+        strips = figure.axes[-3:]  # its count strip in the three windows
+        assert [axis.get_xlabel() for axis in strips] == ["Time [h]", "Time [d]", "Time before end [h]"]
+        (first,), (middle,), (last,) = (axis.get_lines() for axis in strips)
+        np.testing.assert_array_equal(first.get_xdata(), np.arange(0.0, 25.0))
+        np.testing.assert_array_equal(first.get_ydata(), np.r_[np.full(21, 4), np.full(4, 3)])
+        np.testing.assert_array_equal(middle.get_xdata(), np.arange(25.0, 77.0))
+        np.testing.assert_array_equal(middle.get_ydata(), np.r_[np.full(32, 2), np.full(20, 1)])
+        before_end = np.arange(-23.5, 0.5, 0.5)
+        whole = before_end == np.round(before_end)
+        np.testing.assert_array_equal(last.get_xdata(), before_end)
+        # The 100 h case on whole hours, the 80.5 h case on half hours and at its end, the 40 h case on whole hours from -15 h.
+        np.testing.assert_array_equal(last.get_ydata(), whole.astype(int) + (~whole | (before_end == 0.0)) + (whole & (before_end >= -15.0)))
+        assert figure.legends[0].get_title().get_text() == "Dataset"
+        entries = {text.get_text() for legend in figure.legends for text in legend.get_texts()}
+        assert {"Median over cases", "q10-q90 over cases", "n(t): contributors (strip below each row)"} <= entries
+    finally:
+        plt.close(figure)
+
+
+def test_ends_that_differ_by_less_than_a_microhour_still_count_the_last_day_before_each_end() -> None:
+    """Ends of 80 h and 80.0000005 h are distinct canonical ends, so the last day counts before each: the terminal states meet at 0 h, n = 2."""
+    frame = _hourly_frame((80.0, 80.0000005))
+    figure = transient_plots.plot_state_trajectory_summary(
+        datasets={"Lentil, ID": frame}, max_cases=2, styles=transient_plots.batch_styles({"Lentil, ID": "lentil"}), channels=("T",)
+    )
+    try:
+        last = figure.axes[-1]  # the count strip of the state row in the last window
+        assert last.get_xlabel() == "Time before end [h]"
+        (counts,) = last.get_lines()
+        assert (np.asarray(counts.get_xdata())[-1], np.asarray(counts.get_ydata())[-1]) == (0.0, 2)
+    finally:
+        plt.close(figure)
+
+
+def test_single_case_views_name_the_shared_case_number_in_their_title(transient_frame: pd.DataFrame, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The map, snapshot and trajectory figures of one case end their title with its number, and the spatial view passes the selected one."""
+    label = "Drying · Lentil · ID"
+    common = {"datasets": {label: transient_frame}, "case_ids": {label: "case_0001"}, "case_number": 7}
+    styles = transient_plots.batch_styles({label: None})
+    figures = (
+        transient_plots.plot_spatial_field_comparison(**common, fields=("T",), physical_time_hours=1.0),
+        transient_plots.plot_state_snapshot_comparison(**common, physical_time_hours=1.0, styles=styles, channels=("T",)),
+        transient_plots.plot_state_trajectory_comparison(**common, styles=styles, channels=("T",)),
+    )
+    try:
+        assert all(any("Case 7" in text.get_text() for text in figure.findobj(Text)) for figure in figures)
+    finally:
+        plt.close("all")
+
+    catalog = _adaptive_catalog(((label, transient_frame),))
+    state = selection.GeneratedOutputSelectionState(catalog)
+    state.select_datasets((catalog.views[0].key,))
+    passed: list[Any] = []
+
+    def plot(**kwargs: Any) -> Figure:
+        passed.append(kwargs["case_number"])
+        return Figure()
+
+    monkeypatch.setattr(viewers.plots.transient, "plot_spatial_field_comparison", plot)
+    export_state: dict[str, Any] = {"fig": None, "figures": (), "plot_name": "spatial", "title": "spatial"}
+    viewers.make_spatial_case_view(
+        catalog=catalog, selection_state=state, export_state=export_state, export_plot_name="spatial", export_title="spatial"
+    )
+    assert passed == [state.selection.case_number]
+    assert passed[0] is not None
 
 
 def test_changed_transient_plot_builders_preserve_authoritative_time_support(
@@ -741,19 +974,24 @@ def test_spatial_map_grid_has_a_unit_bar_per_map_an_empty_unavailable_cell_and_g
         plt.close(wider)
 
 
-def test_dataset_styles_keep_material_colors_and_tell_batches_of_one_material_apart() -> None:
-    """Batches of one material share its color and differ in line style and hatch; a lone material stays solid; order colors avoid every material."""
+def test_dataset_styles_take_the_material_color_and_the_line_style_and_hatch_of_the_evaluation_role() -> None:
+    """Batches of one material share its color and take their roles' line style and hatch; without a role a batch is solid whatever its label."""
     semantics = transient_plots.visual_semantics
     materials = set(semantics.MATERIAL_COLORS.values())
     assert not materials & set(transient_plots._ORDER_COLORS)
-    styles = transient_plots.batch_styles({"B": "chickpea", "A": "chickpea", "C": "lentil", "D": "unregistered", "E": None})
+    styles = transient_plots.batch_styles(
+        {"B": "chickpea", "A": "chickpea", "C": "lentil", "D": "unregistered", "E": None, "F": "lentil"},
+        roles={"B": "id", "A": "material_ood", "C": "parameter_ood", "F": None},
+    )
     assert styles["A"].color == styles["B"].color == semantics.material_color("chickpea")
-    assert styles["A"].linestyle == "-" != styles["B"].linestyle  # the sorted first label keeps the solid line
-    assert styles["A"].hatch == "" != styles["B"].hatch
-    assert (styles["C"].color, styles["C"].linestyle) == (semantics.material_color("lentil"), "-")
-    assert styles["D"].linestyle == styles["E"].linestyle == "-"
+    for label, role in (("A", "material_ood"), ("B", "id"), ("C", "parameter_ood")):
+        assert (styles[label].linestyle, styles[label].hatch) == (semantics.ROLE_LINESTYLES[role], semantics.ROLE_HATCHES[role])
+    assert {(styles[label].linestyle, styles[label].hatch) for label in "DEF"} == {("-", "")}
+    assert styles["C"].color == styles["F"].color == semantics.material_color("lentil")
     assert styles["D"].color != styles["E"].color
     assert {styles["D"].color, styles["E"].color} <= set(transient_plots._ORDER_COLORS)
+    unassigned = transient_plots.batch_styles({"A": "chickpea", "B": "chickpea"})
+    assert unassigned["A"] == unassigned["B"]  # the label order never sets a line style
 
 
 def test_trajectory_summary_over_the_phase_pools_only_reached_cases_and_keeps_the_schedules_in_hours() -> None:
@@ -767,7 +1005,9 @@ def test_trajectory_summary_over_the_phase_pools_only_reached_cases_and_keeps_th
     styles = transient_plots.batch_styles(dict.fromkeys(frames, "lentil"))
     figure = transient_plots.plot_state_trajectory_summary(datasets=frames, max_cases=2, styles=styles, channels=("T",), time_axis="phase")
     try:
-        (phase_axis,) = [axis for axis in figure.axes if axis.get_xlabel() == "τ = t / t_end [-]"]
+        (phase_strip,) = [axis for axis in figure.axes if axis.get_xlabel() == "τ = t / t_end [-]"]  # the time label sits under the strip
+        (phase_axis,) = [axis for axis in figure.axes if axis.get_title() == transient_plots.time_axis.PHASE_WINDOW.title]
+        assert phase_strip.get_ylabel() == "n(τ)"
         grid = transient_plots.time_axis.PHASE_GRID
         means = [line for line in phase_axis.get_lines() if np.array_equal(line.get_xdata(), grid)]
         assert len(means) == len(frames)
@@ -818,17 +1058,20 @@ def test_the_trajectory_viewer_offers_the_drying_phase_only_where_every_case_car
 
 
 def test_trajectory_lines_keep_batch_colors_and_line_styles_with_n_t_on_every_row_and_one_outside_legend(transient_frame: pd.DataFrame) -> None:
-    """Two batches of one material draw one color in two line styles; n(t) is on every row; the legend sits right of all axes."""
+    """Batches of one material in two roles draw one color in two line styles; n(t) has a strip below every row; the legend sits right of all axes."""
     frames = {label: transient_frame.copy() for label in ("A", "B")}
-    styles = transient_plots.batch_styles({"A": "chickpea", "B": "chickpea"})
+    styles = transient_plots.batch_styles({"A": "chickpea", "B": "chickpea"}, roles={"A": "id", "B": "parameter_ood"})
     figure = transient_plots.plot_state_trajectory_summary(datasets=frames, max_cases=1, styles=styles, channels=("T",))
     try:
         lines = [line for axis in figure.axes for line in axis.get_lines() if line.get_linestyle() != "None"]
         assert {line.get_color() for line in lines} == {transient_plots.visual_semantics.material_color("chickpea")}
         assert {line.get_linestyle() for line in lines} == {"-", "--"}
-        twins = [axis for axis in figure.axes if axis.get_ylabel() == "n(t)"]
-        assert len(twins) == 2 * (len(transient_plots._schedule_fields()) + 1)
-        counts = [line for axis in twins for line in axis.get_lines()]
+        strips = [axis for axis in figure.axes if axis.get_ylabel() == "n(t)"]
+        assert len(strips) == len(transient_plots._schedule_fields()) + 1  # one strip per row, labelled on its main window
+        data = [axis for axis in figure.axes if axis.get_lines() and axis not in strips]
+        strip_boxes = {(round(axis.get_position().x0, 6), round(axis.get_position().y0, 6)) for axis in strips}
+        assert not strip_boxes & {(round(axis.get_position().x0, 6), round(axis.get_position().y0, 6)) for axis in data}  # no twin axes
+        counts = [line for axis in figure.axes for line in axis.get_lines() if line.get_drawstyle() == "steps-post"]
         assert {line.get_linestyle() for line in counts} == {"-", "--"}  # n(t) carries the batch line style
         assert {line.get_drawstyle() for line in counts} == {"steps-post"}
         assert figure.legends
@@ -837,6 +1080,27 @@ def test_trajectory_lines_keep_batch_colors_and_line_styles_with_n_t_on_every_ro
         renderer = figure.canvas.get_renderer()
         right = max(_tight_bbox(axis, renderer).x1 for axis in figure.axes)  # the n(t) tick labels count as panel
         assert all(legend.get_window_extent(renderer).x0 >= right for legend in figure.legends)
+    finally:
+        plt.close(figure)
+
+
+def test_trajectory_row_labels_stand_left_of_the_first_column_tick_labels(transient_frame: pd.DataFrame) -> None:
+    """The bold row label is the first column's y label, so the layout keeps its gutter clear of that column's tick labels."""
+    label = "A"
+    styles = transient_plots.batch_styles({label: None})
+    figure = transient_plots.plot_state_trajectory_comparison(
+        datasets={label: transient_frame}, case_ids={label: "case_0001"}, styles=styles, channels=("T",)
+    )
+    try:
+        assert isinstance(figure.canvas, FigureCanvasAgg)
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        labelled = [axis for axis in figure.axes if axis.yaxis.label.get_gid() == "channel-row-label"]
+        assert len(labelled) == len(transient_plots._schedule_fields()) + 1  # a row per schedule and per state channel
+        for axis in labelled:
+            ticks = [tick.get_window_extent(renderer) for tick in axis.get_yticklabels() if tick.get_text()]
+            assert ticks
+            assert axis.yaxis.label.get_window_extent(renderer).x1 <= min(box.x0 for box in ticks)
     finally:
         plt.close(figure)
 
@@ -890,15 +1154,84 @@ def test_two_line_column_header_clears_the_schedule_band_above_the_maps(transien
         plt.close(figure)
 
 
-def test_single_case_map_figure_names_the_case_in_its_title(transient_frame: pd.DataFrame) -> None:
-    """A figure of one dataset and one case carries the case in its figure title."""
+def test_single_case_map_figure_keeps_the_exact_case_in_its_details_not_its_title(transient_frame: pd.DataFrame) -> None:
+    """A figure of one dataset and one case names the exact case in its footnote; the title stays free of raw identities."""
     figure = transient_plots.plot_spatial_field_comparison(
         datasets={"A": transient_frame}, case_ids={"A": "case_0001"}, fields=("T",), physical_time_hours=1.0
     )
     try:
-        assert "case_0001" in figure.get_suptitle()
+        assert "case_0001" not in figure.get_suptitle()
+        assert any("case_0001" in text.get_text() for text in figure.texts)
     finally:
         plt.close(figure)
+
+
+def test_one_datasets_retained_maps_wrap_into_two_columns_and_name_a_near_uniform_range(transient_frame: pd.DataFrame) -> None:
+    """Three fields of one dataset fill two map columns; a near-uniform field states its observed range, a varying one does not."""
+    figure = transient_plots.plot_spatial_field_comparison(
+        datasets={"A": transient_frame}, case_ids={"A": "case_0001"}, fields=("T", "p", "Kxx"), physical_time_hours=1.0
+    )
+    try:
+        maps = [axis for axis in figure.axes if axis.get_aspect() == 1.0 and axis.collections]
+        assert len(maps) == 3
+        assert len({round(axis.get_position().x0, 6) for axis in maps}) == 2
+    finally:
+        plt.close(figure)
+    near = np.full((2, 3), 15.6) + np.array([[0.0, 0.004, 0.011], [0.002, 0.006, 0.008]])
+    note = transient_plots._near_uniform_range_note(near, "°C")
+    assert all(part in note for part in ("15.6 ", "15.611", "°C"))
+    assert "0.4" in transient_plots._near_uniform_range_note(np.full((2, 2), 0.4), "-")
+    assert transient_plots._near_uniform_range_note(np.array([[10.0, 30.0]]), "°C") == ""
+    lower, upper = transient_plots._near_uniform_range_note(np.array([[15.6, 15.6 + 1e-9]]), "°C").removesuffix(" °C").split(" to ")
+    assert lower.removeprefix("range ") != upper  # unequal endpoints never print equal
+
+
+def test_a_near_uniform_range_note_stands_outside_its_map_below_its_header_and_whatever_is_above(
+    transient_frame: pd.DataFrame, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In the wrapped, the grid and the schedule-band layout every note lies above its map, under its header and below the map or band above."""
+    monkeypatch.setattr(transient_plots, "_near_uniform_range_note", lambda _values, _unit: "range 15.597 to 15.608 °C")
+    label = "Lentil · parameter OOD · test · extended campaign with a second long descriptive tail"
+    two = {"A": transient_frame, "B": transient_frame.copy()}
+    figures = [
+        transient_plots.plot_spatial_field_comparison(
+            datasets={"A": transient_frame}, case_ids={"A": "case_0001"}, fields=("T", "p", "Kxx"), physical_time_hours=1.0
+        ),
+        transient_plots.plot_spatial_field_comparison(
+            datasets=two, case_ids=dict.fromkeys(two, "case_0001"), fields=("T", "p"), physical_time_hours=1.0
+        ),
+        transient_plots.plot_state_snapshot_comparison(
+            datasets={label: transient_frame},
+            case_ids={label: "case_0001"},
+            physical_time_hours=1.0,
+            styles=transient_plots.batch_styles({label: None}),
+            channels=("T",),
+        ),
+    ]
+    try:
+        for figure in figures:
+            figure.canvas.draw()
+            assert isinstance(figure.canvas, FigureCanvasAgg)
+            renderer = figure.canvas.get_renderer()
+            maps = [axis for axis in figure.axes if axis.get_aspect() == 1.0 and axis.collections]
+            top_row = max(axis.get_window_extent(renderer).y1 for axis in maps)
+            texts = [text for axis in figure.axes if axis not in maps for text in (axis.xaxis.label, *axis.get_xticklabels()) if text.get_text()]
+            ceilings = [y0 for text in texts if (y0 := text.get_window_extent(renderer).y0) > top_row]  # a schedule band's texts
+            for axis in maps:
+                frame = axis.get_window_extent(renderer)
+                (note,) = [text.get_window_extent(renderer) for text in axis.texts if text.get_text().startswith("range")]
+                assert frame.y1 <= note.y0
+                top = note.y1
+                if axis.title.get_text():
+                    header = axis.title.get_window_extent(renderer)
+                    assert note.y1 <= header.y0
+                    top = header.y1
+                boxes = [other.get_window_extent(renderer) for other in maps]
+                above = [box.y0 for box in boxes if box.y0 > frame.y1 and box.x0 < frame.x1 and frame.x0 < box.x1]  # the map above in its column
+                assert all(top <= ceiling for ceiling in [*above, *ceilings])
+    finally:
+        for figure in figures:
+            plt.close(figure)
 
 
 def test_schedule_band_has_no_left_labels_on_startup_axes_and_a_whole_word_legend_at_the_top_frame(transient_frame: pd.DataFrame) -> None:

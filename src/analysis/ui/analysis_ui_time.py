@@ -3,7 +3,8 @@
 Responsibilities:
   - Validate canonical irregular time coordinates and form their exact union
   - Resolve comparison master timelines without interpolating scientific arrays
-  - Format physical-time axes without resampling authoritative coordinates
+  - Format physical-time axes without resampling authoritative coordinates; an hour axis of a day or more ticks in the clock
+    step (1 to 24 h) that gives it at most eight steps
   - Define the time windows of a line figure (the EDA start-up view, the evaluation's first, middle and last day, the
     drying phase τ) and style one axis per window: limits, ticks, and the time label under the bottom row only
   - Own the drying-phase rule of every pooled transient view (``phase_cohort``): τ = t / t_end on a fixed 20-point grid, the
@@ -46,6 +47,8 @@ _BEFORE_END_DECIMALS: Final = 9  # hours before an end are rounded so equal offs
 _HOUR_WINDOW_WIDTH: Final = 0.55  # an hour column beside a day column of width 1
 _HOUR_TICK_STEP_HOURS: Final = 6.0  # an hour window of at least the span below ticks every 6 h counted from its start
 _HOUR_TICK_MIN_SPAN_HOURS: Final = 12.0
+_HOUR_TICK_STEPS: Final = (1.0, 2.0, 3.0, 6.0, 12.0, 24.0)  # the clock steps an hour axis of a day or more ticks in
+_MAX_HOUR_TICK_STEPS: Final = 8
 _EMPTY_WINDOW_HOURS: Final = 1.2  # span of an open window without any shown data
 _TAU_TICK_STEP: Final = 0.2
 _PHASE_POINTS: Final = 20  # the drying-phase grid τ = 0.05, 0.10, ..., 1.00
@@ -119,7 +122,7 @@ class PhysicalTimeDisplay:
             target_axis.set_major_locator(mticker.MultipleLocator(1.0))
             target_axis.set_major_formatter(mticker.StrMethodFormatter("{x:g}"))
         elif self.maximum_hours - self.minimum_hours >= _HOURS_PER_DAY:
-            target_axis.set_major_locator(mticker.MultipleLocator(_HOURS_PER_DAY))
+            target_axis.set_major_locator(mticker.MultipleLocator(_hour_tick_step(self.maximum_hours - self.minimum_hours)))
             target_axis.set_major_formatter(mticker.StrMethodFormatter("{x:g}"))
         else:
             target_axis.set_major_locator(mticker.MaxNLocator(nbins=6, min_n_ticks=3))
@@ -225,8 +228,14 @@ STARTUP_WINDOWS: Final = (
     TimeWindow("Startup: 0-1 h", 0.0, 1.0, "h", 0.34),
 )
 # The pooled views' drying phase τ = t / t_end: its axis, and its fixed grid of 20 post-origin points 0.05, ..., 1.
-PHASE_WINDOW: Final = TimeWindow("drying phase, τ = t / t_end", 0.0, 1.0, "1", 1.0)
+PHASE_WINDOW: Final = TimeWindow("Drying phase, τ = t / t_end", 0.0, 1.0, "1", 1.0)
 PHASE_GRID: Final = np.arange(1, _PHASE_POINTS + 1) / _PHASE_POINTS
+
+
+def _hour_tick_step(span_hours: float) -> float:
+    """Return the tick step of an hour axis over ``span_hours``: the finest of 1, 2, 3, 6, 12 or 24 h with at most 8 steps, else whole days."""
+    fitting = [step for step in _HOUR_TICK_STEPS if span_hours / step <= _MAX_HOUR_TICK_STEPS]
+    return fitting[0] if fitting else _HOURS_PER_DAY * math.ceil(span_hours / (_HOURS_PER_DAY * _MAX_HOUR_TICK_STEPS))
 
 
 def _hours_text(hours: float) -> str:

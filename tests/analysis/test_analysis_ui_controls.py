@@ -105,11 +105,11 @@ def test_vocabularies_keep_their_values_and_defaults() -> None:
 def test_action_buttons_share_one_width_and_their_kind_colour() -> None:
     kinds: tuple[tuple[str, controls.ActionKind], ...] = (("Close", "close"), ("Export PDF", "export"), ("Export GIF", "export"))
     buttons = {label: controls.action_button(label, kind=kind) for label, kind in kinds}
-    buttons["Berechnen"] = controls.action_button(controls.COMPUTE_LABEL, kind="compute")
+    buttons["Compute"] = controls.action_button(controls.COMPUTE_LABEL, kind="compute")
     assert len({controls.element_width(button) for button in buttons.values()}) == 1
     assert buttons["Close"].button_style == "danger"
     assert buttons["Export PDF"].button_style == ""
-    assert buttons["Berechnen"].button_style == "primary"
+    assert buttons["Compute"].button_style == "primary"
     opener = controls.action_button("Generation inputs - Open", kind="open")
     assert opener.button_style == "primary"
     assert controls.element_width(opener) == style.GRID.snap(style.text_px("Generation inputs - Open", allowance_ch=style.BUTTON_ALLOWANCE_CH))

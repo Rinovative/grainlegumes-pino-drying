@@ -5,12 +5,16 @@ Responsibilities:
   - Prepare full-resolution discrete scales once for a selected case
   - Render independently selected fields without reloading case evidence, each as a header-labelled map with its
     unit-bearing colour bar on the shared fixed-inch map grid, at most three per row, in the order of a 2 x 3 grid
+  - Title the figure by the case's caption in its Dataset, as the comparison figures name their cases
+  - Note per task which inputs have no domain map, and the observed range of an anisotropy or axial direction map that
+    fills little of its scale
 
 Design principles:
   - Persisted arrays and exact tensor diagnostics determine availability
   - Missing stochastic fields are disclosed rather than regenerated
   - Constant density belongs to metadata, not a fabricated spatial map
-  - Fields show on their shared display scale (equilibrium relative humidity in %) under the active label style
+  - Fields show on their shared display scale (equilibrium relative humidity in %) under the active label style; every
+    header, the axial direction's included, comes from the one quantity name rule, and the direction reads in degrees
 
 This module does NOT:
   - Discover files, run Generation, normalize model inputs, or compute errors
@@ -29,7 +33,6 @@ from src.analysis.generation_inputs import generation_input_diagnostics as diagn
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
-from src.analysis.ui import analysis_ui_figure_layout as figure_layout
 from src.analysis.ui import analysis_ui_plot_layout as shared_layout
 
 from . import generation_input_plot_layout as layout
@@ -38,6 +41,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from matplotlib.figure import Figure
+
+    from src.analysis.generation_inputs import generation_input_sources as sources
 
 _MAXIMUM_COLUMNS = 3
 _SPATIAL_DIMENSIONS = 2
@@ -64,8 +69,10 @@ def prepare_field_atlas(record: diagnostics.GenerationInputDiagnostics) -> Gener
     labels: dict[str, str] = {}
     units: dict[str, str] = {}
     notes = [
-        "Pressure uses its inlet profile; temperature and humidity use their schedules.",
-        "Backbone z and background z_bg are unavailable: their exact arrays were not persisted.",
+        "Inlet pressure is a boundary profile and inlet temperature and humidity are schedules, so none of them has a domain map."
+        if diagnostics.is_transient(record)
+        else "Inlet pressure is a boundary profile, so it has no domain map.",
+        "The latent bed fields behind the permeability (multiscale backbone and background) were not persisted, so they have no map.",
     ]
     shape = record.fields["x"].shape
     for name in diagnostics.display_field_names(record):
@@ -90,13 +97,18 @@ def prepare_field_atlas(record: diagnostics.GenerationInputDiagnostics) -> Gener
         orientation = np.rad2deg(0.5 * np.arctan2(2.0 * cross, diagonal_difference))
         orientation.setflags(write=False)
         fields["K_orientation"] = orientation
-        labels["K_orientation"] = "Major permeability direction (modulo 180°)"
-        units["K_orientation"] = "degree"
+        labels["K_orientation"] = layout.quantity_label("K_orientation")
+        units["K_orientation"] = "°"
+        spread = layout.axial_note(orientation)
+        axial = f"{diagnostics.field_name('K_orientation')} is axial (modulo 180°): \N{MINUS SIGN}90° and 90° name one direction"
+        notes.append(f"{axial}; {spread}." if spread else f"{axial}.")
     else:
         notes.append("Principal-direction map unavailable: isotropic cells have no unique direction.")
 
     fields = dict(sorted(fields.items(), key=lambda item: _ATLAS_ORDER.index(item[0]) if item[0] in _ATLAS_ORDER else len(_ATLAS_ORDER)))
     scales = {name: layout.physical_norm(name, values) for name, values in fields.items() if name != "K_orientation"}
+    if "K_anisotropy" in scales and (crowded := layout.compressed_note(fields["K_anisotropy"], scales["K_anisotropy"])):
+        notes.append(f"{diagnostics.field_name('K_anisotropy')}: {crowded}, a small part of its scale.")
     if "K_orientation" in fields:
         # Axial angles wrap at +-90 degrees, so the cyclic colormap's two ends meet there. A constant orientation keeps the
         # truthful one-value scale.
@@ -121,8 +133,14 @@ def prepare_field_atlas(record: diagnostics.GenerationInputDiagnostics) -> Gener
     )
 
 
-def field_atlas(atlas: GeneratedFieldAtlas, selected: Sequence[str], *, display_spatial_stride: display_grid.DisplayStride = "auto") -> Figure | None:
-    """Render selected fields using unchanged full-grid scientific scale objects."""
+def field_atlas(
+    atlas: GeneratedFieldAtlas,
+    selected: Sequence[str],
+    *,
+    dataset: diagnostics.DatasetDiagnostics | sources.GenerationInputDataset | None = None,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
+) -> Figure | None:
+    """Render selected fields using unchanged full-grid scientific scale objects, titled by the case's caption in its ``dataset`` when given."""
     if len(set(selected)) != len(selected) or any(name not in atlas.fields for name in selected):
         message = "Atlas selection must contain unique admitted domain fields."
         raise ValueError(message)
@@ -144,9 +162,7 @@ def field_atlas(atlas: GeneratedFieldAtlas, selected: Sequence[str], *, display_
         )
         shared_layout.set_column_headers(axes[row : row + 1, column : column + 1], [atlas.labels[name]], [])
     for index in range(len(ordered), rows * columns):  # cells the last row leaves empty: the maps above them close the grid
-        row, column = divmod(index, columns)
-        axes[row, column].set_visible(False)
-        axes[row - 1, column].tick_params(labelbottom=True)
-        axes[row - 1, column].set_xlabel("x [m]", fontsize=figure_layout.LABEL_PT)
-    shared_layout.set_map_title(figure, f"Generated fields — case {atlas.record.case.case_index}")
+        shared_layout.empty_cell(axes[divmod(index, columns)], "")
+    case = f"Case {atlas.record.case.case_index}" if dataset is None else layout.case_caption(atlas.record, dataset)
+    shared_layout.set_map_title(figure, f"Generated fields — {case}")
     return figure

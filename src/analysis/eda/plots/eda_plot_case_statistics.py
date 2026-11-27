@@ -1,15 +1,24 @@
 """Plot case-level statistics and metadata distributions for EDA.
 
 Responsibilities:
-  - Plot disjoint generated-case and scalar-material parameter distributions
+  - Plot disjoint generated-case and scalar-material parameter distributions, the sampled parameters titled «group · name» as in
+    the generation-input tables
   - Plot case-level field-value summaries
+  - Count the drawn cases of the Datasets that hold values of a grid in its title, and the eligible ones a bound leaves out
+    in its note
   - Build interactive case-statistics viewers
 
 Design principles:
   - Statistics are aggregated per case from an explicit ordered prefix
-  - Incremental caches extend monotonically as notebook case limits increase
+  - Incremental caches extend monotonically as notebook case limits increase; a lower limit reads only its case prefix
   - Dataset values show on their shared display scales (°C, %, water as wet-basis moisture with bulk case means) and are
     labelled independently in the active label style
+  - Overlaid datasets draw unfilled outlines on the panel's common bins in their line styles; one constant that every shown
+    dataset holds is written once with its unit and coverage
+  - Outlines nest, an earlier one wider and constant lines alike, so a coincident outline of another colour stays visible;
+    datasets of one colour whose outlines coincide are named under the panel's x label, bin edges and counts unchanged
+  - Figure text names a dataset by its plotted label (``eda_capabilities.plotted_labels``); caches and styles stay keyed by
+    the dataset key
 
 This module does NOT:
   - Compute frequency-domain EDA or model-evaluation diagnostics
@@ -24,13 +33,16 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import same_color
 from matplotlib.lines import Line2D
+from matplotlib.ticker import MaxNLocator
 from scipy.linalg import LinAlgError
 from scipy.stats import gaussian_kde
 
 from src import analysis
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda.plots import eda_plot_transient as transient_plots
+from src.analysis.generation_inputs import generation_input_table_schema as table_schema
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_display_labels as display_labels
 from src.analysis.presentation import analysis_field_labels as field_labels
@@ -65,10 +77,20 @@ _SPATIAL_DIMENSIONS = 2
 _FOOTNOTE_INCHES = transient_plots.FOOTNOTE_INCHES
 _STAT_PANEL_IN = (4.0, 2.8)  # one parameter histogram
 _FIELD_PANEL_IN = (4.0, 2.4)  # one min, mean or max histogram of a field
-_HISTOGRAM_ALPHA = 0.35
+_OUTLINE_WIDTH = 1.2  # a histogram's bar outline, in the dataset's line style
+_OUTLINE_NEST_STEP = 1.4  # each earlier dataset's outline is this much wider, so outlines on shared bins stay visible one inside the other
 _LEGEND_LINE_WIDTH = 2.0  # thin enough that a dashed legend line shows its dashes
 _FIELD_STATISTICS = ("min", "mean", "max")
 _LEGEND_WRAP_WIDTH = transient_plots.LEGEND_WRAP_WIDTH
+_KDE_MINIMUM_OBSERVATIONS = 20  # a kernel density over fewer cases suggests a smoothness the sample cannot show
+_CLIP_MINIMUM_OBSERVATIONS = 100  # 1st-99th percentile display clipping needs at least 100 cases to trim more than the extremes
+_HISTOGRAM_X_TICKS = 4  # at most this many x tick intervals, so neighbouring value labels never touch
+_NOTE_LINE_PT = 11.0  # one 9 pt note line under a histogram's x label
+_NO_PARAMETERS_NOTE = (
+    "No sampled Generation parameters in the selected cases: a published Dataset runtime view does not carry them; "
+    "its scalar material conditioning has its own view."
+)
+_NO_SCALARS_NOTE = "No schema-declared scalar material conditioning in the selected cases."
 
 
 def plot_published_tensor(
@@ -151,12 +173,12 @@ class _StatCache(TypedDict):
     """
     Track incrementally loaded sampled generated-case parameters for one dataset.
 
-    ``loaded`` is the consumed ordered prefix length. ``cols`` retains flattened
-    numeric leaf histories keyed by parameter path.
+    ``loaded`` is the consumed ordered prefix length. ``cases`` retains each case's
+    flattened numeric leaves keyed by parameter path, in case order.
     """
 
     loaded: int
-    cols: dict[str, list[float]]
+    cases: list[dict[str, float]]
     units: dict[str, str]
 
 
@@ -169,7 +191,7 @@ class _ParamCache(TypedDict):
     """
 
     loaded: int
-    cols: dict[str, list[float]]
+    cases: list[dict[str, float]]
 
 
 class _FieldCache(TypedDict):
@@ -177,7 +199,8 @@ class _FieldCache(TypedDict):
     Track per-field min/mean/max histories for an incrementally loaded prefix.
 
     Values remain on each task field's stored scale and are partitioned by field
-    and statistic so extending a viewer does not recompute earlier cases.
+    and statistic so extending a viewer does not recompute earlier cases; a case
+    without values holds NaN, so list positions stay case positions.
     """
 
     loaded: int
@@ -333,6 +356,30 @@ def _scalar_material_parameter_keys(keys: Sequence[str]) -> list[str]:
     return [field.name for field in _SCALAR_MATERIAL_FIELDS if field.name in available]
 
 
+def _prefix_columns(cases: Sequence[Mapping[str, float]], max_cases: int) -> dict[str, list[float]]:
+    """Return every key's values over the first ``max_cases`` cached cases in case order, so a lowered control never shows more."""
+    columns: dict[str, list[float]] = {}
+    for case in cases[:max_cases]:
+        for key, value in case.items():
+            columns.setdefault(key, []).append(value)
+    return columns
+
+
+def _contributing_frames(
+    datasets: Mapping[str, pd.DataFrame], cases: Mapping[str, Sequence[Mapping[str, Any]]], keys: Sequence[str]
+) -> dict[str, pd.DataFrame]:
+    """Return, for each dataset with one, the rows of its drawn ``cases`` that give a finite value of one of ``keys``, for the title count."""
+    rows = {
+        name: [
+            index
+            for index, case in enumerate(cases[name])
+            if any(isinstance(value := case.get(key), (int, float, np.floating)) and math.isfinite(value) for key in keys)
+        ]
+        for name in datasets
+    }
+    return {name: datasets[name].iloc[indices] for name, indices in rows.items() if indices}
+
+
 def _clip_for_plot(vals: np.ndarray, *, q_low: float = 1.0, q_high: float = 99.0) -> np.ndarray:
     """
     Clip extreme values based on percentiles for better plotting.
@@ -353,7 +400,7 @@ def _clip_for_plot(vals: np.ndarray, *, q_low: float = 1.0, q_high: float = 99.0
 
     """
     vals = vals[np.isfinite(vals)]
-    if vals.size < 2:  # noqa: PLR2004
+    if vals.size < _CLIP_MINIMUM_OBSERVATIONS:  # a sparse sample's percentiles fall inside its extremes and would drop real cases
         return vals
 
     lo, hi = np.percentile(vals, [q_low, q_high])
@@ -438,10 +485,28 @@ def _infer_ncols(n_items: int, *, max_cols: int = 5) -> int:
 # ============================================================================
 
 
-def _draw_dataset_histogram(axis: Axes, values: np.ndarray, style: SeriesStyle) -> None:
-    """Draw one dataset's histogram and, for non-constant values, its kernel density in the dataset's color and line style."""
-    artists = histograms.plot_histogram(axis, values, bins=_infer_bins(values), color=style.color, alpha=_HISTOGRAM_ALPHA)
-    if artists.constant_line is None:
+def _draw_dataset_histogram(
+    axis: Axes, values: np.ndarray, style: SeriesStyle, bins: np.ndarray | None = None, *, linewidth: float = _OUTLINE_WIDTH
+) -> None:
+    """
+    Draw one dataset's histogram on ``bins`` (else its own) and, for enough non-constant values, its kernel density.
+
+    Bars are unfilled outlines and a constant is one vertical line, both of ``linewidth`` in the dataset's color and line style,
+    so overlaid datasets never blend into colors the legend does not show.
+    """
+    artists = histograms.plot_histogram(
+        axis,
+        values,
+        bins=_infer_bins(values) if bins is None else bins,
+        color=style.color,
+        fill=False,
+        edgecolor=style.color,
+        linestyle=style.linestyle,
+        linewidth=linewidth,
+    )
+    if artists.constant_line is not None:
+        artists.constant_line.set(linestyle=style.linestyle, linewidth=linewidth)
+    elif values.size >= _KDE_MINIMUM_OBSERVATIONS:
         try:
             kde = gaussian_kde(values)
             x = np.linspace(values.min(), values.max(), 300)
@@ -451,21 +516,108 @@ def _draw_dataset_histogram(axis: Axes, values: np.ndarray, style: SeriesStyle) 
             pass
 
 
-def _draw_panel_histograms(axis: Axes, series: Mapping[str, np.ndarray], styles: Mapping[str, SeriesStyle], unit: str | None) -> None:
-    """Draw every dataset's values of one panel; their common power of ten goes into the x label's unit bracket, never into offset text."""
-    series = {name: values for name, values in series.items() if values.size}
-    exponent = field_maps.state_exponent(min(v.min() for v in series.values()), max(v.max() for v in series.values())) if series else 0
-    for name, values in series.items():
-        _draw_dataset_histogram(axis, values / 10.0**exponent, styles[name])
+def _draw_panel_histograms(
+    axis: Axes, series: Mapping[str, np.ndarray], styles: Mapping[str, SeriesStyle], unit: str | None, plotted: Mapping[str, str]
+) -> tuple[int, list[tuple[str, str]]]:
+    """
+    Draw every dataset's values of one panel on common bins and thinned x ticks; return the axis' power of ten and its note lines.
+
+    A known display ``unit`` and the values' common power of ten share the x label's unit bracket (never offset text), so the
+    unit stands in one place for every panel; a panel without unit gets a label only for a power of ten. Where several datasets
+    hold one and the same constant, the panel writes it once with its unit and the datasets it covers instead of stacking lines.
+    Outlines nest, constant lines alike, so a coincident outline of another colour shows around a later one; in one colour they
+    merge, and the returned note lines (text, colour) name every such dataset by its ``plotted`` label (``_merged_outlines``).
+    """
+    shown = {name: values for name, values in series.items() if values.size}
+    pooled = np.concatenate(tuple(shown.values())) if shown else np.empty(0)
+    if len(shown) > 1 and np.all(pooled == pooled[0]):
+        coverage = f"all {len(shown)}" if len(shown) == len(series) else f"{len(shown)} of {len(series)}"
+        suffix = "" if unit in {None, field_labels.display_unit("1")} else f" {unit}"
+        axis.text(0.5, 0.5, f"constant {pooled[0]:g}{suffix}\nin {coverage} Datasets", transform=axis.transAxes, ha="center", va="center")
+        axis.set(xticks=[], yticks=[], xlabel="")
+        return 0, []
+    exponent = field_maps.state_exponent(float(pooled.min()), float(pooled.max())) if shown else 0
+    bins = np.histogram_bin_edges(pooled / 10.0**exponent, bins=_infer_bins(pooled)) if shown else None
+    scaled = {name: values / 10.0**exponent for name, values in shown.items()}
+    for rank, (name, values) in enumerate(scaled.items()):  # the first outline is the widest and the last the thinnest, drawn over the others
+        _draw_dataset_histogram(axis, values, styles[name], bins, linewidth=_OUTLINE_WIDTH + _OUTLINE_NEST_STEP * (len(scaled) - 1 - rank))
+    axis.xaxis.set_major_locator(MaxNLocator(nbins=_HISTOGRAM_X_TICKS))
     axis.ticklabel_format(axis="x", style="plain", useOffset=False)
-    if exponent:
+    if unit is not None or exponent:
         axis.set_xlabel(plot_layout.label_with_exponent(f"Value [{unit or '-'}]", exponent))
+    return exponent, [] if bins is None else _merged_outlines(scaled, bins, styles, plotted)
 
 
-def _dataset_legend(figure: Figure, axes: np.ndarray, active: Sequence[str], styles: Mapping[str, SeriesStyle]) -> None:
-    """Write the dataset legend of a histogram grid."""
+def _merged_outlines(
+    series: Mapping[str, np.ndarray], bins: np.ndarray, styles: Mapping[str, SeriesStyle], plotted: Mapping[str, str]
+) -> list[tuple[str, str]]:
+    """
+    Return a note line (text, colour) for every dataset whose outline lies on an earlier dataset's of its colour.
+
+    Nesting cannot show two such outlines apart: two constants at one value, or bars whose counts on ``bins`` equal the other
+    dataset's in every bin they fill. The line names both datasets by their ``plotted`` labels, and says «part of» where the
+    fuller dataset also fills other bins.
+    """
+    constants = {name: float(values[0]) for name, values in series.items() if np.all(values == values[0])}
+    counts = {name: np.histogram(values, bins)[0] for name, values in series.items() if name not in constants}
+
+    def merged(earlier: str, name: str) -> str | None:
+        if earlier in constants or name in constants:
+            return f"{plotted[name]} coincides with {plotted[earlier]}" if constants.get(earlier) == constants.get(name) else None
+        if np.array_equal(counts[name], counts[earlier]):
+            return f"{plotted[name]} coincides with {plotted[earlier]}"
+        for sparse, full in ((name, earlier), (earlier, name)):
+            if np.all((counts[sparse] == 0) | (counts[sparse] == counts[full])):
+                return f"{plotted[sparse]} coincides with part of {plotted[full]}"
+        return None
+
+    names = list(series)
+    lines = []
+    for index, name in enumerate(names):
+        same = (other for other in names[:index] if same_color(styles[other].color, styles[name].color))
+        note = next((text for other in same if (text := merged(other, name)) is not None), None)
+        if note is not None:
+            lines.append((note, styles[name].color))
+    return lines
+
+
+def _clipped_tail_lines(
+    cohorts: Mapping[str, np.ndarray], shown: Mapping[str, np.ndarray], styles: Mapping[str, SeriesStyle], exponent: int
+) -> list[tuple[str, str]]:
+    """
+    Return a note line (text, colour) per series that display clipping left cases out of: the shown range and the count.
+
+    The range reads in the axis' scaled values: ``exponent`` is the power of ten ``_draw_panel_histograms`` divided them by.
+    """
+    lines = []
+    for name, values in cohorts.items():
+        if shown[name].size < values.size:
+            lower, upper = (float(value) / 10.0**exponent for value in (shown[name].min(), shown[name].max()))
+            left_out = f"{values.size - shown[name].size} of {values.size} cases left out"
+            lines.append((f"shown {transient_plots.range_text(lower, upper, digits=3)}; {left_out}", styles[name].color))
+    return lines
+
+
+def _note_below_x_label(axis: Axes, lines: Sequence[tuple[str, str]]) -> None:
+    """Write every note line (text, colour) right-aligned below the panel's x label, one under the other."""
+    for line, (text, color) in enumerate(lines):
+        axis.annotate(
+            text,
+            xy=(1.0, 0.0),
+            xycoords=("axes fraction", axis.xaxis.label),
+            xytext=(0.0, -line * _NOTE_LINE_PT),
+            textcoords="offset points",
+            ha="right",
+            va="top",
+            fontsize=figure_layout.TICK_PT,
+            color=color,
+        )
+
+
+def _dataset_legend(figure: Figure, axes: np.ndarray, active: Sequence[str], styles: Mapping[str, SeriesStyle], plotted: Mapping[str, str]) -> None:
+    """Write the dataset legend of a histogram grid, every dataset under its ``plotted`` label."""
     handles = [Line2D([], [], lw=_LEGEND_LINE_WIDTH, color=styles[name].color, linestyle=styles[name].linestyle) for name in active]
-    names = [display_labels.wrapped_dataset_display_label(name, width=_LEGEND_WRAP_WIDTH) for name in active]
+    names = [display_labels.wrapped_dataset_display_label(plotted[name], width=_LEGEND_WRAP_WIDTH) for name in active]
     figure_layout.add_legend(figure, axes, handles, names, title="Dataset")
 
 
@@ -477,7 +629,11 @@ def _hist_grid(
     title: str,
     styles: Mapping[str, SeriesStyle],
     units_by_column: Mapping[str, str] | None = None,
-) -> Figure:
+    empty_note: str = _NO_PARAMETERS_NOTE,
+    titles: Mapping[str, str] | None = None,
+    note: str = "",
+    plotted: Mapping[str, str] | None = None,
+) -> Figure | str:
     """
     Create a grid of histogram plots for multiple datasets and columns.
 
@@ -494,22 +650,25 @@ def _hist_grid(
     styles : Mapping[str, SeriesStyle]
         Color and line style of every active dataset, resolved by the viewer over all loaded datasets.
     units_by_column : Mapping[str, str] | None, optional
-        Authoritative units used for unit-bearing subplot headings.
+        Authoritative stored units; a column with one shows its symbol as title and its display unit in the x label.
+    empty_note : str, optional
+        The one-line note that replaces the grid when no column is available.
+    titles : Mapping[str, str] | None, optional
+        Panel title of every column; without it a column with a unit shows its field symbol, any other its name.
+    note : str, optional
+        The figure note under the title, such as the drawn of the eligible cases.
+    plotted : Mapping[str, str] | None, optional
+        The label the figure writes for every active dataset (``eda_capabilities.plotted_labels``); without it, its name.
 
     Returns
     -------
-    Figure
-        Matplotlib Figure containing the histogram grid; "Counts" labels the first panel of every row.
+    Figure | str
+        Matplotlib Figure containing the histogram grid ("Counts" labels the first panel of every row), or ``empty_note``.
 
     """
     if not columns:
-        figure, axes = figure_layout.panel_figure(1, 1, panel_in=(8.0, 3.2))
-        axes[0, 0].set_axis_off()
-        axes[0, 0].text(
-            0.5, 0.5, "No numeric parameter evidence is available for the selected cases.", ha="center", va="center", transform=axes[0, 0].transAxes
-        )
-        figure_layout.set_figure_title(figure, axes, title)
-        return figure
+        return empty_note
+    plotted = {name: name for name in active_datasets} if plotted is None else plotted
 
     ncols = _infer_ncols(len(columns))
     nrows = math.ceil(len(columns) / ncols)
@@ -522,13 +681,24 @@ def _hist_grid(
     for axis, key in zip(grid_axes.flat, columns, strict=False):
         unit = None if units_by_column is None else units_by_column.get(key)
         series = {name: data_by_dataset[name].get(key, np.array([])) for name in active_datasets}
-        _draw_panel_histograms(axis, {name: vals[np.isfinite(vals)] for name, vals in series.items()}, styles, unit)
-        figure_layout.set_panel_title(axis, key if unit is None else field_labels.field_label_with_unit(key, unit))
+        shown_unit = None if unit is None else field_labels.display_unit(unit, field=key)
+        finite = {name: vals[np.isfinite(vals)] for name, vals in series.items()}
+        _note_below_x_label(axis, _draw_panel_histograms(axis, finite, styles, shown_unit, plotted)[1])
+        default_title = key if unit is None else field_labels.field_label(key, mathtext=True)
+        figure_layout.set_panel_title(axis, default_title if titles is None else titles[key])
         axis.grid(True, linestyle="--", alpha=0.25)
     figure_layout.label_rows_once(grid_axes, "Counts")
-    figure_layout.set_figure_title(figure, grid_axes, title)
-    _dataset_legend(figure, grid_axes, active_datasets, styles)
+    figure_layout.set_figure_title(figure, grid_axes, title, note=note or None)
+    _dataset_legend(figure, grid_axes, active_datasets, styles, plotted)
     return figure
+
+
+def _parameter_title(key: str) -> str:
+    """Return a sampled Generation parameter's panel title «group · name» of the generation-input tables, else its field label."""
+    for spec in (table_schema.parameter_row_spec(key), table_schema.boundary_row_spec(key)):
+        if spec.section != table_schema.UNCATEGORIZED_SECTION:
+            return f"{spec.category} · {spec.label}"
+    return field_labels.field_label(key, mathtext=True)
 
 
 # ============================================================================
@@ -579,14 +749,14 @@ def plot_meta_statistics(
     Notes
     -----
     Nested mapping/sequence paths are flattened and non-numeric leaves omitted.
-    Caches grow monotonically. Reducing the case control after loading a larger
-    prefix does not discard already accumulated observations.
+    Caches grow monotonically; a lowered case control shows only its case prefix.
 
     """
     names = list(datasets.keys())
-    cache: dict[str, _StatCache] = {name: {"loaded": 0, "cols": {}, "units": {}} for name in names}
+    plotted = capabilities.plotted_labels(datasets)
+    cache: dict[str, _StatCache] = {name: {"loaded": 0, "cases": [], "units": {}} for name in names}
 
-    def _plot(max_cases: int, *, datasets: dict[str, pd.DataFrame]) -> Figure:
+    def _plot(max_cases: int, *, datasets: dict[str, pd.DataFrame]) -> Figure | str:
         """
         Plot function for case count viewer.
 
@@ -599,8 +769,8 @@ def plot_meta_statistics(
 
         Returns
         -------
-        Figure
-            Matplotlib Figure containing the histogram grid.
+        Figure | str
+            Matplotlib Figure containing the histogram grid, or a one-line note when no parameter is available.
 
         """
         for name, df in datasets.items():
@@ -615,8 +785,8 @@ def plot_meta_statistics(
                     raise TypeError(message)
                 values = _case_parameter_values(meta)
                 units = _case_parameter_units(meta)
-                for key, value in values.items():
-                    entry["cols"].setdefault(key, []).append(value)
+                entry["cases"].append(values)
+                for key in values:
                     unit = units.get(key)
                     if unit is not None:
                         previous = entry["units"].setdefault(key, unit)
@@ -627,7 +797,8 @@ def plot_meta_statistics(
             entry["loaded"] = max_cases
 
         active = list(datasets)
-        keys = list(dict.fromkeys(k for n in active for k in cache[n]["cols"]))
+        columns = {name: _prefix_columns(cache[name]["cases"], max_cases) for name in active}
+        keys = list(dict.fromkeys(k for n in active for k in columns[n]))
 
         units_by_column: dict[str, str] = {}
         for key in keys:
@@ -640,7 +811,7 @@ def plot_meta_statistics(
         data = {
             name: {
                 key: field_labels.display_values(
-                    [value for value in cache[name]["cols"].get(key, []) if isinstance(value, (int, float, np.floating))],
+                    [value for value in columns[name].get(key, []) if isinstance(value, (int, float, np.floating))],
                     units_by_column.get(key, "1"),
                     field=key,
                 )
@@ -649,13 +820,19 @@ def plot_meta_statistics(
             for name in active
         }
 
+        visible = _visible_metadata_statistic_keys(keys)
+        drawn = _contributing_frames(datasets, {name: cache[name]["cases"][:max_cases] for name in active}, visible)
+        count, note = transient_plots.case_count_text(drawn, max_cases, plotted=plotted)
         return _hist_grid(
             data_by_dataset=data,
             active_datasets=active,
-            columns=_visible_metadata_statistic_keys(keys),
-            title=f"Generated case parameters — {max_cases} cases",
+            columns=visible,
+            title=f"Generated case parameters — {count}",
             styles=styles,
             units_by_column=units_by_column,
+            titles={key: _parameter_title(key) for key in visible},
+            note=note,
+            plotted=plotted,
         )
 
     return analysis.ui.viewers.case_count_view(
@@ -718,14 +895,15 @@ def plot_meta_parameters(
 
     Notes
     -----
-    Caches grow monotonically with the largest requested prefix. Reducing the
-    control later reuses, rather than truncates, accumulated observations.
+    Caches grow monotonically with the largest requested prefix; a lowered
+    control shows only its case prefix.
 
     """
     names = list(datasets.keys())
-    cache: dict[str, _ParamCache] = {n: {"loaded": 0, "cols": {}} for n in names}
+    plotted = capabilities.plotted_labels(datasets)
+    cache: dict[str, _ParamCache] = {n: {"loaded": 0, "cases": []} for n in names}
 
-    def _plot(max_cases: int, *, datasets: dict[str, pd.DataFrame]) -> Figure:
+    def _plot(max_cases: int, *, datasets: dict[str, pd.DataFrame]) -> Figure | str:
         """
         Plot function for case count viewer.
 
@@ -738,8 +916,8 @@ def plot_meta_parameters(
 
         Returns
         -------
-        Figure
-            Matplotlib Figure containing the histogram grid.
+        Figure | str
+            Matplotlib Figure containing the histogram grid, or a one-line note when no scalar is available.
 
         """
         for name, df in datasets.items():
@@ -753,21 +931,19 @@ def plot_meta_parameters(
                     message = "EDA case metadata must be a mapping."
                     raise TypeError(message)
                 scalar = row.get("scalar_conditioning")
-                if not isinstance(scalar, Mapping):
-                    continue
-                for key, value in _flatten_dict_raw(scalar).items():
-                    if key in _SCALAR_MATERIAL_KEYS:
-                        entry["cols"].setdefault(key, []).append(value)
+                flat = _flatten_dict_raw(scalar) if isinstance(scalar, Mapping) else {}
+                entry["cases"].append({key: value for key, value in flat.items() if key in _SCALAR_MATERIAL_KEYS})
 
             entry["loaded"] = max_cases
 
         active = list(datasets)
-        keys = list(dict.fromkeys(k for n in active for k in cache[n]["cols"]))
+        columns = {name: _prefix_columns(cache[name]["cases"], max_cases) for name in active}
+        keys = list(dict.fromkeys(k for n in active for k in columns[n]))
 
         data = {
             name: {
                 key: field_labels.display_values(
-                    [value for value in cache[name]["cols"].get(key, []) if isinstance(value, (int, float, np.floating))],
+                    [value for value in columns[name].get(key, []) if isinstance(value, (int, float, np.floating))],
                     _SCALAR_MATERIAL_UNITS[key],
                     field=key,
                 )
@@ -776,13 +952,19 @@ def plot_meta_parameters(
             for name in active
         }
 
+        scalars = _scalar_material_parameter_keys(keys)
+        drawn = _contributing_frames(datasets, {name: cache[name]["cases"][:max_cases] for name in active}, scalars)
+        count, note = transient_plots.case_count_text(drawn, max_cases, plotted=plotted)
         return _hist_grid(
             data_by_dataset=data,
             active_datasets=active,
-            columns=_scalar_material_parameter_keys(keys),
-            title=f"Scalar material conditioning — {max_cases} cases",
+            columns=scalars,
+            title=f"Scalar material conditioning — {count}",
             styles=styles,
             units_by_column=_SCALAR_MATERIAL_UNITS,
+            empty_note=_NO_SCALARS_NOTE,
+            note=note,
+            plotted=plotted,
         )
 
     return analysis.ui.viewers.case_count_view(
@@ -845,9 +1027,9 @@ def plot_field_value_distributions(
 
     Notes
     -----
-    Values are clipped to the 1st--99th percentile for display only. Source
-    frames are not mutated. Cached observations remain when a user
-    lowers the case-count control.
+    From 100 cases on, values are clipped to the 1st--99th percentile for display only; every
+    series that loses cases names the count and its shown range below its panel. Source frames
+    are not mutated; a lowered case-count control shows only its case prefix.
 
     """
     names = list(datasets)
@@ -863,7 +1045,8 @@ def plot_field_value_distributions(
         }
         for name in names
     }
-    availability = capabilities.availability_note(resolution)
+    plotted = capabilities.plotted_labels(datasets)
+    availability = capabilities.availability_note(resolution, plotted=plotted)
 
     def _plot(max_cases: int, *, datasets: dict[str, pd.DataFrame]) -> Figure:
         """
@@ -891,36 +1074,37 @@ def plot_field_value_distributions(
                 for field in entry["data"]:
                     raw = capabilities.field_values(df, row, field)
                     array = capabilities.field_display_values(df, row, field, raw)
-                    if array.size == 0:
-                        continue
-                    entry["data"][field]["min"].append(float(np.nanmin(array)))
-                    entry["data"][field]["mean"].append(capabilities.field_display_mean(df, row, field, raw))
-                    entry["data"][field]["max"].append(float(np.nanmax(array)))
+                    empty = array.size == 0
+                    entry["data"][field]["min"].append(np.nan if empty else float(np.nanmin(array)))
+                    entry["data"][field]["mean"].append(np.nan if empty else capabilities.field_display_mean(df, row, field, raw))
+                    entry["data"][field]["max"].append(np.nan if empty else float(np.nanmax(array)))
 
             entry["loaded"] = max_cases
 
         active = list(datasets)
 
         figure, axes = figure_layout.panel_figure(len(field_names), len(_FIELD_STATISTICS), panel_in=_FIELD_PANEL_IN)
-        for axis in axes[-1]:
-            axis.set_xlabel("Value")
         for i, f in enumerate(field_names):
             unit = capabilities.field_display_unit(datasets[resolution.datasets_by_field[f][0]], f)
             for j, stat in enumerate(_FIELD_STATISTICS):
                 ax = axes[i, j]
-                panel = {name: _clip_for_plot(np.asarray(cache[name]["data"][f][stat])) for name in active if f in cache[name]["data"]}
-                _draw_panel_histograms(ax, panel, styles, unit)
-                if i == 0:
-                    figure_layout.set_panel_title(ax, stat)
+                prefixes = {name: np.asarray(cache[name]["data"][f][stat][:max_cases]) for name in active if f in cache[name]["data"]}
+                cohorts = {name: values[np.isfinite(values)] for name, values in prefixes.items()}
+                panel = {name: _clip_for_plot(values) for name, values in cohorts.items()}
+                exponent, notes = _draw_panel_histograms(ax, panel, styles, unit, plotted)
+                _note_below_x_label(ax, [*notes, *_clipped_tail_lines(cohorts, panel, styles, exponent)])
+                figure_layout.set_panel_title(ax, stat)  # on every row, so a row reads without the one above
                 ax.grid(True, linestyle="--", alpha=0.25)
         figure_layout.label_rows_once(axes, "Counts")
         figure_layout.set_row_headers(
             figure,
             axes,
-            [capabilities.field_quantity_label(datasets[resolution.datasets_by_field[f][0]], f, mathtext=True) for f in field_names],
+            [capabilities.field_display_name(datasets[resolution.datasets_by_field[f][0]], f, mathtext=True) for f in field_names],
         )
-        figure_layout.set_figure_title(figure, axes, f"Field value distributions per channel — {max_cases} cases", note=availability or None)
-        _dataset_legend(figure, axes, active, styles)
+        count, count_note = transient_plots.case_count_text(capabilities.contributing_frames(datasets, resolution), max_cases, plotted=plotted)
+        note = " ".join(part for part in (count_note, availability) if part)
+        figure_layout.set_figure_title(figure, axes, f"Field value distributions per channel — {count}", note=note or None)
+        _dataset_legend(figure, axes, active, styles, plotted)
         return figure
 
     return analysis.ui.viewers.case_count_view(
